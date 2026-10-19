@@ -142,6 +142,21 @@ void AppController::handleSystemError(const QString &errorMsg)
     errorTags.insert("emotion", "sad");
     errorTags.insert("blush", "unblushing");
     m_appearance->applyTags(errorTags);
+    //按最终状态启动退火：sad 表情 15 秒后自动恢复 happyIdle
+    m_timeManager->notifyRoundEnded(errorTags);
+}
+
+void AppController::handleAbnormalReply(const QString &reason)
+{
+    qDebug() << "[AppController 拦截到异常回复]：" << reason;
+    m_bubble->showMessage("啊哦……茉子的脑袋突然一片空白，刚才想到什么忘掉了啦！");
+    QMap<QString, QString> errorTags;
+    errorTags.insert("emotion", "sad");
+    errorTags.insert("blush", "unblushing");
+    m_appearance->applyTags(errorTags);
+
+    //反馈后按最终状态启动退火：sad≠happyIdle → 15秒后自动恢复
+    m_timeManager->notifyRoundEnded(errorTags);
 }
 
 void AppController::onPlayAudioAction(const QString &zhText, const QMap<QString, QString> &tags)
@@ -162,6 +177,7 @@ void AppController::initConnections()
     connect(m_ttsService, &TTSService::playAudioAction, this, &AppController::onPlayAudioAction);
     connect(m_appearance, &AppearanceManager::characterPathChanged, m_character, &CharacterWidget::updatePath);
     connect(m_llmService, &LLMService::internetErrorSignal, this, &AppController::handleSystemError);
+    connect(m_llmService, &LLMService::replyAbnormal, this, &AppController::handleAbnormalReply);
 
     connect(m_character, &CharacterWidget::chatRequested, m_chatWidget,&ChatWidget::popup);
 

@@ -30,6 +30,8 @@ signals:
     //chat
     void sentencesReady(const QList<SentenceText> &sentences,const QString &rawReply);
     void internetErrorSignal(const QString &errorMessage);
+    //chat 回复内容异常（空/乱码/缺中文/缺日文/缺标签），不入库不走TTS
+    void replyAbnormal(const QString &reason);
     //Extract
     void memoryExtractionReady(const QJsonObject &extractionResult, qlonglong lastEndId, const QString &sourceIdsJson);
 private slots:
@@ -44,6 +46,11 @@ private:
     QString loadSystemPrompt();
 
     QPair<QList<SentenceText>, QString> parseJsonReply(const QString &replyText);
+
+    //回复内容合法性校验（异常回复整轮抛弃）
+    static bool containsHan(const QString &text);      //是否含中文（CJK汉字）
+    static bool containsKana(const QString &text);     //是否含日文（假名）
+    static bool isSentenceValid(const QJsonObject &sentenceObj, QString &reason);
 
 
     QNetworkAccessManager* m_networkManager;

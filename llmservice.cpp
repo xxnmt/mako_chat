@@ -438,16 +438,29 @@ void LLMService::onReplyFinished(QNetworkReply *reply)
             QList<SentenceText> parsedSentences = parseResult.first;
             QString correctedReply = parseResult.second;
 
-            qDebug()<<"[LLM]成功拆分为"<<parsedSentences.size()<<"个段落：";
-            for (int i=0;i<parsedSentences.size();i++) {
-                const auto &s = parsedSentences[i];
-                qDebug()<<QString("--------- [第 %1 句] ---------").arg(i + 1);
-                qDebug()<<"[LLM]中文气泡:"<<s.zhText;
-                qDebug()<<"[LLM]日文音频目标:"<<s.jaText;
-                qDebug()<<"[LLM]四维状态变更:"<<s.rawTags;
+            // 异常回复拦截（空/解析失败/缺中文/缺日文/缺标签）
+            // parseJsonReply 的所有异常路径统一返回空 sentences，以此作为唯一判据
+            if (parsedSentences.isEmpty()) {
+                qDebug()<<"[LLM]回复内容异常，抛弃本次回复（不入库，不走TTS）:"<<replyText;
+                emit replyAbnormal(replyText);
             }
-            //拆完传信号
-            emit sentencesReady(parsedSentences,correctedReply);
+            else {
+                qDebug()<<"[LLM]成功拆分为"<<parsedSentences.size()<<"个段落：";
+                for (int i=0;i<parsedSentences.size();i++) {
+                    const auto &s = parsedSentences[i];
+                    qDebug()<<QString("--------- [第 %1 句] ---------").arg(i + 1);
+                    qDebug()<<"[LLM]中文气泡:"<<s.zhText;
+                    qDebug()<<"[LLM]日文音频目标:"<<s.jaText;
+                    qDebug()<<"[LLM]四维状态变更:"<<s.rawTags;
+                }
+                //拆完传信号
+                emit sentencesReady(parsedSentences,correctedReply);
+            }
+        }
+        else {
+            // HTTP 200 但 choices 为空，视为异常回复（原本静默无反馈）
+            qDebug()<<"[LLM]choices为空，回复内容异常";
+            emit replyAbnormal(QStringLiteral("choices为空"));
         }
     }
     else {
@@ -542,6 +555,14 @@ QPair<QList<SentenceText>, QString> LLMService::parseJsonReply(const QString &re
     for (int i = 0; i < sentencesArray.size(); ++i) {
         QJsonObject sentenceObj = sentencesArray[i].toObject();
 
+        // 原始内容合法性校验（必须在 TagValidator 默认值兜底之前，否则检测不出"没有标签"）
+        // 任一句异常 → 整轮抛弃
+        QString invalidReason;
+        if (!isSentenceValid(sentenceObj, invalidReason)) {
+            qDebug()<<"[LLM]第"<<(i+1)<<"句内容异常("<<invalidReason<<")，整轮抛弃";
+            return {};
+        }
+
         SentenceText sentence;
         sentence.zhText = sentenceObj.value("zh_text").toString().trimmed();
         sentence.jaText = sentenceObj.value("ja_text").toString().trimmed();
@@ -591,6 +612,55 @@ QPair<QList<SentenceText>, QString> LLMService::parseJsonReply(const QString &re
 
     return qMakePair(result,currentReply);
 }
+//回复内容合法性校验
+//是否包含中文（CJK统一表意文字基本区 + 扩展A）
+bool LLMService::containsHan(const QString &text)
+{
+    for (const QChar &ch : text) {
+        char32_t c = ch.unicode();
+        if ((c >= 0x4E00 && c <= 0x9FFF) || (c >= 0x3400 && c <= 0x4DBF)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+//是否包含日文假名（平假名 + 片假名）
+bool LLMService::containsKana(const QString &text)
+{
+    for (const QChar &ch : text) {
+        char32_t c = ch.unicode();
+        if ((c >= 0x3040 && c <= 0x309F) || (c >= 0x30A0 && c <= 0x30FF)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+//单句原始内容校验（对 TagValidator 修正前的原始 JSON 执行），任一项异常则整轮回复抛弃
+bool LLMService::isSentenceValid(const QJsonObject &sentenceObj, QString &reason)
+{
+    //1. 中文文本：非空且至少含一个汉字
+    QString zhText = sentenceObj.value("zh_text").toString().trimmed();
+    if (zhText.isEmpty() || !containsHan(zhText)) {
+        reason = "zh_text缺失或不含中文";
+        return false;
+    }
+    //2. 日文文本：非空且至少含一个假名（茉子口语风格必然含假名，纯汉字视为输出错乱）
+    QString jaText = sentenceObj.value("ja_text").toString().trimmed();
+    if (jaText.isEmpty() || !containsKana(jaText)) {
+        reason = "ja_text缺失或不含日文假名";
+        return false;
+    }
+    //3. 标签：tags 对象存在且非空（个别标签缺失仍由 TagValidator 默认值兜底）
+    QJsonObject tagsObj = sentenceObj.value("tags").toObject();
+    if (tagsObj.isEmpty()) {
+        reason = "tags缺失或为空";
+        return false;
+    }
+    return true;
+}
+
 //Tags校验
 int TagValidator::levenshteinDistance(const QString &s1, const QString &s2)
 {

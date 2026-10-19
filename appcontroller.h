@@ -30,6 +30,7 @@ public:
 private slots:
     void handleMakoReply(const QList<SentenceText> &sentences,const QString &rawReply);
     void handleSystemError(const QString &errorMsg);
+    void handleAbnormalReply(const QString &reason);
     void onPlayAudioAction(const QString &zhText, const QMap<QString, QString> &tags);
 signals:
 
