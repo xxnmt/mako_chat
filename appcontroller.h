@@ -5,6 +5,7 @@
 #include <QQueue>
 #include <QMap>
 #include "sentencedata.h"
+#include "utterance.h"
 
 class CharacterWidget;
 class BubbleWidget;
@@ -17,6 +18,9 @@ class AnchorManager;
 class SettingsWidget;
 class MemoryManager;
 class TimeManager;
+class PetChannelAdapter;
+class QQChannelAdapter;
+class SessionRouter;
 
 class AppController : public QObject
 {
@@ -50,6 +54,10 @@ private:
     SettingsWidget *m_settingsWidget;
     MemoryManager *m_memoryManager;
     TimeManager *m_timeManager;
+    PetChannelAdapter *m_petChannel;    // 渠道：桌宠（气泡私有表现）
+    QQChannelAdapter *m_qqChannel;      // 渠道：QQ（Phase 1 启用）
+    SessionRouter *m_sessionRouter;     // 输入路由（渠道→大脑）
+    RequestMeta m_lastMeta;             // 最近一轮请求元数据（回复入库时随存）
 };
 
 #endif // APPCONTROLLER_H

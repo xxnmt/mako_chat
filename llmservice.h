@@ -7,6 +7,7 @@
 
 #include "sentencedata.h"
 #include "historyturn.h"
+#include "utterance.h"
 
 class MemoryManager;
 
@@ -18,7 +19,8 @@ public:
     //config
     void setApiKey(const QString &apiKey);
     //chat
-    void askDeepSeek(const QString& userInput,const QList<HistoryTurn> &historyQA=QList<HistoryTurn>());
+    void askDeepSeek(const QString& userInput,const QList<HistoryTurn> &historyQA=QList<HistoryTurn>(),
+                     const RequestMeta &meta = RequestMeta());
     void registerStateProvider(std::function<QString()> provider);
     void setMemoryManager(MemoryManager *manager);
     //Extract
@@ -62,6 +64,7 @@ private:
     std::function<QString()> m_stateProvider;
 
     MemoryManager *m_memoryManager = nullptr;
+    RequestMeta m_currentMeta;   // 当前轮次元数据（askDeepSeek 设置，prompt 组装与记忆注入使用）
 };
 
 class TagValidator{

@@ -25,7 +25,7 @@ MemoryManager::~MemoryManager()
     }
 }
 
-bool MemoryManager::saveQATurn(const QString &userInput, const QString &rawReply, const QList<SentenceText> &sentences)
+bool MemoryManager::saveQATurn(const QString &userInput, const QString &rawReply, const QList<SentenceText> &sentences, const RequestMeta &meta)
 {
     if(!m_db.isOpen()){
         qDebug()<<"[MemoryManager]:数据库打开失败";
@@ -50,24 +50,28 @@ bool MemoryManager::saveQATurn(const QString &userInput, const QString &rawReply
     rootObj["sentences"]=sentencesArray;
     QString JsonStr = QJsonDocument(rootObj).toJson(QJsonDocument::Compact);
 
-    // 执行原子行入库
+    // 执行原子行入库（渠道分桶：channel/session_id/speaker/sensitive）
     QSqlQuery query(m_db);
-    query.prepare("INSERT INTO chat_history (user_input, raw_reply) "
-                  "VALUES (:user_input, :raw_reply)");
+    query.prepare("INSERT INTO chat_history (user_input, raw_reply, channel, session_id, speaker, sensitive) "
+                  "VALUES (:user_input, :raw_reply, :channel, :session_id, :speaker, :sensitive)");
     query.bindValue(":user_input", userInput);
     query.bindValue(":raw_reply", JsonStr);
+    query.bindValue(":channel", meta.channel);
+    query.bindValue(":session_id", meta.sessionId);
+    query.bindValue(":speaker", meta.speaker);
+    query.bindValue(":sensitive", meta.sensitive ? 1 : 0);
 
     if (!query.exec()) {
         qDebug()<<"[MemoryManager]:本轮对话保存失败:"<<query.lastError().text();
         return false;
     }
 
-    qDebug()<<"[MemoryManager]:成功保存本轮对话";
+    qDebug()<<"[MemoryManager]:成功保存本轮对话"<<"channel="<<meta.channel<<"session="<<meta.sessionId;
     return true;
 
 }
 
-QList<HistoryTurn> MemoryManager::getHistoryTurn(int N)
+QList<HistoryTurn> MemoryManager::getHistoryTurn(int N, const QString &channel, const QString &sessionId)
 {
     QList<HistoryTurn> historyTurnList;
     if(!m_db.open()){
@@ -84,12 +88,15 @@ QList<HistoryTurn> MemoryManager::getHistoryTurn(int N)
         FROM (
             SELECT id, user_input, raw_reply,timestamp
             FROM chat_history
+            WHERE channel = :channel AND session_id = :session_id
             ORDER BY id DESC
             LIMIT :limit
         ) ORDER BY id ASC;
     )";
     query.prepare(sql);
     query.bindValue(":limit",N);
+    query.bindValue(":channel", channel);
+    query.bindValue(":session_id", sessionId);
     if(!query.exec()){
         qDebug()<<"[MemoryManager]获取历史记录失败:"<<query.lastError();
     }
@@ -188,7 +195,7 @@ bool MemoryManager::clearAllHistory()
     return true;
 }
 
-QList<HistoryTurn> MemoryManager::getUnsummarizedTurns(qlonglong &outLastEndId, QList<qlonglong> &outSourceIds)
+QList<HistoryTurn> MemoryManager::getUnsummarizedTurns(qlonglong &outLastEndId, QList<qlonglong> &outSourceIds, const QString &channel, const QString &sessionId)
 {
     QList<HistoryTurn> turns;
     outSourceIds.clear();
@@ -198,13 +205,21 @@ QList<HistoryTurn> MemoryManager::getUnsummarizedTurns(qlonglong &outLastEndId, 
         return turns;
     }
     QSqlQuery query(m_db);
+    // 摘要游标按 channel+session_id 双键取（与摘要分桶一致）
     QString sql = R"(
         SELECT id, user_input, raw_reply
         FROM chat_history
-        WHERE id > (SELECT COALESCE(MAX(covered_turn_end_id), 0) FROM long_term_summary)
+        WHERE channel = :channel AND session_id = :session_id
+          AND id > (SELECT COALESCE(MAX(covered_turn_end_id), 0) FROM long_term_summary
+                    WHERE channel = :channel2 AND session_id = :session_id2)
         ORDER BY id ASC;
     )";
-    if(query.exec(sql)){
+    query.prepare(sql);
+    query.bindValue(":channel", channel);
+    query.bindValue(":session_id", sessionId);
+    query.bindValue(":channel2", channel);
+    query.bindValue(":session_id2", sessionId);
+    if(query.exec()){
         while(query.next()){
             qlonglong id=query.value("id").toLongLong();
             HistoryTurn turn;
@@ -542,7 +557,7 @@ int MemoryManager::getEditDistanceThreshold(const QString &value)
     return 4;
 }
 
-bool MemoryManager::addLongTermSummary(const QString &summaryText, qlonglong coveredEndId, const QString &sourceIdsJson)
+bool MemoryManager::addLongTermSummary(const QString &summaryText, qlonglong coveredEndId, const QString &sourceIdsJson, const QString &channel, const QString &sessionId)
 {
     if(!m_db.open()){
         qDebug()<<"[MemoryManager]数据库打开失败:"<<m_db.lastError();
@@ -550,14 +565,16 @@ bool MemoryManager::addLongTermSummary(const QString &summaryText, qlonglong cov
     }
     QSqlQuery query(m_db);
     QString sql = R"(
-        INSERT INTO long_term_summary (summary_text, covered_turn_end_id, source_ids, is_dirty)
-        VALUES (:text, :end_id, :source_ids, 0)
+        INSERT INTO long_term_summary (summary_text, covered_turn_end_id, source_ids, is_dirty, channel, session_id)
+        VALUES (:text, :end_id, :source_ids, 0, :channel, :session_id)
     )";
 
     query.prepare(sql);
     query.bindValue(":text", summaryText);
     query.bindValue(":end_id", coveredEndId);
     query.bindValue(":source_ids", sourceIdsJson);
+    query.bindValue(":channel", channel);
+    query.bindValue(":session_id", sessionId);
 
     if (!query.exec()) {
         qDebug()<<"[MemoryManager]添加记忆摘要失败:"<<query.lastError();
@@ -567,7 +584,7 @@ bool MemoryManager::addLongTermSummary(const QString &summaryText, qlonglong cov
     return true;
 }
 
-QList<LongTermSummary> MemoryManager::getLatestSummaries(int limit)
+QList<LongTermSummary> MemoryManager::getLatestSummaries(int limit, const QString &channel, const QString &sessionId)
 {
     QList<LongTermSummary> summaries;
     if(!m_db.open()){
@@ -582,7 +599,7 @@ QList<LongTermSummary> MemoryManager::getLatestSummaries(int limit)
     QString sql = R"(
         SELECT * FROM (
             SELECT * FROM long_term_summary
-            WHERE is_dirty = 0
+            WHERE is_dirty = 0 AND channel = :channel AND session_id = :session_id
             ORDER BY id DESC
             LIMIT :limit
         ) ORDER BY id ASC
@@ -590,6 +607,8 @@ QList<LongTermSummary> MemoryManager::getLatestSummaries(int limit)
 
     query.prepare(sql);
     query.bindValue(":limit", limit);
+    query.bindValue(":channel", channel);
+    query.bindValue(":session_id", sessionId);
 
     if (query.exec()) {
         while (query.next()) {
@@ -634,20 +653,22 @@ bool MemoryManager::deleteLongTermSummary(qlonglong id)
 
 // ============== 关系状态 CRUD ==============
 
-bool MemoryManager::upsertRelationshipState(const QString &dimension, double delta)
+bool MemoryManager::upsertRelationshipState(const QString &dimension, double delta, const QString &subject)
 {
     if (!m_db.isOpen() && !m_db.open()) {
         qDebug() << "[MemoryManager]数据库打开失败:" << m_db.lastError();
         return false;
     }
     QSqlQuery query(m_db);
-    // 查询当前值
-    query.prepare("SELECT value FROM relationship_state WHERE dimension=?");
+    // 查询当前值（subject 隔离：'user' 即主人）
+    query.prepare("SELECT value FROM relationship_state WHERE subject=? AND dimension=?");
+    query.addBindValue(subject);
     query.addBindValue(dimension);
     if (!query.exec() || !query.next()) {
         // 维度不存在，新建（clamp 到 [0, 100]）
         double initVal = qBound(0.0, 30.0 + delta, 100.0);
-        query.prepare("INSERT OR REPLACE INTO relationship_state (dimension, value, updated_at) VALUES (?, ?, ?)");
+        query.prepare("INSERT OR REPLACE INTO relationship_state (subject, dimension, value, updated_at) VALUES (?, ?, ?, ?)");
+        query.addBindValue(subject);
         query.addBindValue(dimension);
         query.addBindValue(initVal);
         query.addBindValue(QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss"));
@@ -655,24 +676,25 @@ bool MemoryManager::upsertRelationshipState(const QString &dimension, double del
             qDebug() << "[MemoryManager]新增关系状态失败:" << query.lastError();
             return false;
         }
-        qDebug() << "[MemoryManager]关系状态已新增:" << dimension << "=" << initVal;
+        qDebug() << "[MemoryManager]关系状态已新增:" << subject << dimension << "=" << initVal;
         return true;
     }
     double oldVal = query.value(0).toDouble();
     double newVal = qBound(0.0, oldVal + delta, 100.0);
-    query.prepare("UPDATE relationship_state SET value=?, updated_at=? WHERE dimension=?");
+    query.prepare("UPDATE relationship_state SET value=?, updated_at=? WHERE subject=? AND dimension=?");
     query.addBindValue(newVal);
     query.addBindValue(QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss"));
+    query.addBindValue(subject);
     query.addBindValue(dimension);
     if (!query.exec()) {
         qDebug() << "[MemoryManager]更新关系状态失败:" << query.lastError();
         return false;
     }
-    qDebug() << "[MemoryManager]关系状态已更新:" << dimension << oldVal << "->" << newVal << "(delta=" << delta << ")";
+    qDebug() << "[MemoryManager]关系状态已更新:" << subject << dimension << oldVal << "->" << newVal << "(delta=" << delta << ")";
     return true;
 }
 
-QList<RelationshipState> MemoryManager::getRelationshipStates()
+QList<RelationshipState> MemoryManager::getRelationshipStates(const QString &subject)
 {
     QList<RelationshipState> states;
     if (!m_db.isOpen() && !m_db.open()) {
@@ -680,18 +702,21 @@ QList<RelationshipState> MemoryManager::getRelationshipStates()
         return states;
     }
     QSqlQuery query(m_db);
-    if (!query.exec("SELECT dimension, value, updated_at FROM relationship_state ORDER BY dimension")) {
+    query.prepare("SELECT dimension, value, updated_at FROM relationship_state WHERE subject=? ORDER BY dimension");
+    query.addBindValue(subject);
+    if (!query.exec()) {
         qDebug() << "[MemoryManager]查询关系状态失败:" << query.lastError();
         return states;
     }
     while (query.next()) {
         RelationshipState s;
+        s.subject = subject;
         s.dimension = query.value(0).toString();
         s.value = query.value(1).toDouble();
         s.updatedAt = query.value(2).toDateTime();
         states.append(s);
     }
-    qDebug() << "[MemoryManager]获取关系状态成功，共" << states.size() << "条";
+    qDebug() << "[MemoryManager]获取关系状态成功，subject=" << subject << "共" << states.size() << "条";
     return states;
 }
 
@@ -710,14 +735,40 @@ bool MemoryManager::initRelationshipState()
         qDebug() << "[MemoryManager]关系状态已存在，无需初始化";
         return true;
     }
-    query.prepare("INSERT OR IGNORE INTO relationship_state (dimension, value) VALUES ('intimacy', 30.0)");
+    query.prepare("INSERT OR IGNORE INTO relationship_state (subject, dimension, value) VALUES ('user', 'intimacy', 30.0)");
     bool ok1 = query.exec();
-    query.prepare("INSERT OR IGNORE INTO relationship_state (dimension, value) VALUES ('trust', 30.0)");
+    query.prepare("INSERT OR IGNORE INTO relationship_state (subject, dimension, value) VALUES ('user', 'trust', 30.0)");
     bool ok2 = query.exec();
     qDebug() << "[MemoryManager]关系状态初始化:" << (ok1 && ok2 ? "成功" : "失败");
     return ok1 && ok2;
 }
 
+
+// 幂等加列：预检列存在性 + duplicate column 容忍，应对重复/并发启动（三重防御）
+static bool ensureColumn(QSqlQuery &query, const QString &table, const QString &column, const QString &alterDdl)
+{
+    // 1. 预检：列已存在则跳过
+    if (query.exec(QString("PRAGMA table_info(%1)").arg(table))) {
+        while (query.next()) {
+            if (query.value(1).toString() == column) {
+                return true;
+            }
+        }
+    }
+    // 2. 执行加列
+    if (query.exec(alterDdl)) {
+        qDebug() << "[MemoryManager]已加列:" << table << "." << column;
+        return true;
+    }
+    // 3. 容忍：并发窗口内另一连接已完成加列
+    const QString err = query.lastError().text();
+    if (err.contains("duplicate column", Qt::CaseInsensitive)) {
+        qDebug() << "[MemoryManager]列已被其他连接添加(并发忽略):" << column;
+        return true;
+    }
+    qDebug() << "[MemoryManager]加列失败:" << alterDdl << "错误:" << err;
+    return false;
+}
 
 void MemoryManager::initDatabase(const QString &dbFilePath)
 {
@@ -733,7 +784,11 @@ void MemoryManager::initDatabase(const QString &dbFilePath)
 
     const QString connName = "memory_db_connection";
     if (QSqlDatabase::contains(connName)) {
-        m_db = QSqlDatabase::database(connName);
+        // 复用连接时不自动 open（旧文件可能已不存在），改由下方 setDatabaseName 后统一打开
+        m_db = QSqlDatabase::database(connName, false);
+        if (m_db.isOpen()) {
+            m_db.close();
+        }
     }
     else
     {
@@ -859,6 +914,83 @@ void MemoryManager::initDatabase(const QString &dbFilePath)
                 qDebug()<<"[MemoryManager]设置数据库版本异常:"<<query.lastError();
             }
             currentVersion = 1;
+        }
+
+        // ============== v2: 多渠道记忆扩展（Phase 0，见 docs/HUMANIZATION_PLAN.md 8.5） ==============
+        if (currentVersion < 2) {
+            qDebug() << "[MemoryManager]正在升级数据库结构至 v2(多渠道记忆扩展):";
+
+            // 1. chat_history 渠道分桶列
+            ensureColumn(query, "chat_history", "channel",
+                         "ALTER TABLE chat_history ADD COLUMN channel TEXT NOT NULL DEFAULT 'pet'");
+            ensureColumn(query, "chat_history", "session_id",
+                         "ALTER TABLE chat_history ADD COLUMN session_id TEXT NOT NULL DEFAULT 'default'");
+            ensureColumn(query, "chat_history", "speaker",
+                         "ALTER TABLE chat_history ADD COLUMN speaker TEXT");
+            ensureColumn(query, "chat_history", "sensitive",
+                         "ALTER TABLE chat_history ADD COLUMN sensitive INTEGER NOT NULL DEFAULT 0");
+            query.exec("CREATE INDEX IF NOT EXISTS idx_history_session ON chat_history(channel, session_id);");
+
+            // 2. long_term_summary 渠道分桶列（摘要与未摘要游标按双键，审查修订 A1）
+            ensureColumn(query, "long_term_summary", "channel",
+                         "ALTER TABLE long_term_summary ADD COLUMN channel TEXT NOT NULL DEFAULT 'pet'");
+            ensureColumn(query, "long_term_summary", "session_id",
+                         "ALTER TABLE long_term_summary ADD COLUMN session_id TEXT NOT NULL DEFAULT 'default'");
+
+            // 3. episodic_memory 渠道溯源列
+            ensureColumn(query, "episodic_memory", "origin",
+                         "ALTER TABLE episodic_memory ADD COLUMN origin TEXT NOT NULL DEFAULT 'pet'");
+
+            // 4. relationship_state 重建：旧结构 dimension 单列 UNIQUE → 新结构 UNIQUE(subject, dimension)
+            //    存量行复制为 subject='user'（'user' 即主人，E2 决策：永久保留不迁移）
+            QString createRelV2Sql = R"(
+                CREATE TABLE IF NOT EXISTS relationship_state_v2 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    subject TEXT NOT NULL DEFAULT 'user',
+                    dimension TEXT NOT NULL,
+                    value REAL NOT NULL,
+                    updated_at DATETIME DEFAULT (datetime('now', 'localtime')),
+                    UNIQUE(subject, dimension)
+                );
+            )";
+            if (!query.exec(createRelV2Sql)) {
+                qDebug() << "[MemoryManager]创建relationship_state_v2异常:" << query.lastError();
+            }
+            if (!query.exec("INSERT OR IGNORE INTO relationship_state_v2 (subject, dimension, value) "
+                            "SELECT 'user', dimension, value FROM relationship_state")) {
+                qDebug() << "[MemoryManager]关系状态数据迁移异常:" << query.lastError();
+            }
+            if (!query.exec("DROP TABLE relationship_state")) {
+                qDebug() << "[MemoryManager]删除旧relationship_state表异常:" << query.lastError();
+            }
+            if (!query.exec("ALTER TABLE relationship_state_v2 RENAME TO relationship_state")) {
+                qDebug() << "[MemoryManager]relationship_state重命名异常:" << query.lastError();
+            }
+
+            // 5. raw_messages 群聊原始消息表（Phase 0 只建不写，Phase 1 接数据源）
+            QString createRawSql = R"(
+                CREATE TABLE IF NOT EXISTS raw_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    speaker TEXT,
+                    content TEXT NOT NULL,
+                    timestamp DATETIME DEFAULT (datetime('now', 'localtime')),
+                    sensitive INTEGER NOT NULL DEFAULT 0,
+                    consolidated INTEGER NOT NULL DEFAULT 0
+                );
+            )";
+            if (!query.exec(createRawSql)) {
+                qDebug() << "[MemoryManager]创建raw_messages异常:" << query.lastError();
+            }
+            query.exec("CREATE INDEX IF NOT EXISTS idx_raw_session ON raw_messages(session_id, timestamp);");
+            query.exec("CREATE INDEX IF NOT EXISTS idx_raw_consolidated ON raw_messages(consolidated);");
+
+            if (!query.exec("PRAGMA user_version = 2")) {
+                qDebug() << "[MemoryManager]设置数据库版本异常:" << query.lastError();
+            }
+            currentVersion = 2;
+            qDebug() << "[MemoryManager]数据库结构升级完成,版本:" << currentVersion;
         }
 
         m_db.commit();

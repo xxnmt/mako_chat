@@ -2,8 +2,33 @@
 #define CONFIGMANAGER_H
 
 #include <QString>
+#include <QStringList>
 #include <QSettings>
 #include "ttsreference.h"
+
+// 记忆盲区（该渠道会话产生的对话不入长期记忆）
+struct BlindZone {
+    QString channel;
+    QString sessionId;
+};
+
+// 主动对话调度项（Phase 2 使用）
+struct ScheduleItem {
+    QString at;      // "07:30" 固定时刻
+    QString type;    // "fixed" | "random"（random=在窗口内随机）
+};
+
+// 主动对话配置（Phase 0 只解析不调度；Phase 2 接入 ChatPlanner）
+struct ProactiveConfig {
+    bool enabled = false;
+    QList<QPair<QString, QString>> targets;  // 发起对象 (channel, sessionId)，默认 [pet/default]
+    int dailyLimit = 3;                      // 每日主动上限
+    int cooldownSeconds = 900;               // 两次主动的最小间隔
+    QString quietStart = "23:00";            // 免打扰时段
+    QString quietEnd = "08:00";
+    int idleSeconds = 1800;                  // 闲聊冷却（自上次对话起）
+    QList<ScheduleItem> schedule;            // 定时主动
+};
 
 class ConfigManager
 {
@@ -53,6 +78,14 @@ public:
     QString getAppDataPath()const;
     QString getMemoryPath()const;
 
+    // ===== 多渠道扩展配置（identity.json，Phase 0 只读解析，缺失时用默认值）=====
+    QStringList getSelfQQAccounts();      // 她自己的 QQ（防自触发、群聊回声排除）
+    QStringList getMasterQQAccounts();    // 主人的 QQ 列表（多账号均归 subject='user'）
+    bool isMasterQQ(const QString &uin);
+    bool isBlindZone(const QString &channel, const QString &sessionId);
+    bool getFollowExternalMood();         // D1：外部渠道情绪是否驱动桌设立绘（默认 true）
+    ProactiveConfig getProactiveConfig();
+
 private:
     ConfigManager();
     ~ConfigManager() = default;
@@ -70,6 +103,15 @@ private:
     QString m_pythonPath;
 
     int m_shortMemoryLength=15;
+
+    // identity.json 懒加载缓存（mutable：只读接口内部触发加载）
+    mutable bool m_identityLoaded = false;
+    mutable QStringList m_selfQQ;
+    mutable QStringList m_masterQQ;
+    mutable QList<BlindZone> m_blindZones;
+    mutable bool m_followExternalMood = true;
+    mutable ProactiveConfig m_proactive;
+    void ensureIdentityLoaded() const;
 
     QString m_configDirPath;
     QString m_configFilePath;

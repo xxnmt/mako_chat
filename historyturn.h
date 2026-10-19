@@ -43,8 +43,9 @@ struct LongTermSummary {
     QDateTime updatedAt;//更新于
 };
 
-//关系状态（量化 user 与 AI 之间的关系维度）
+//关系状态（量化 AI 与各对话主体之间的关系维度）
 struct RelationshipState {
+    QString subject = QStringLiteral("user");  // 'user'(主人) / 'qq:<uin>' / 'group:<群号>'
     QString dimension;   // 'intimacy'(亲密度) / 'trust'(信任度)
     double value = 0.0;  // 0-100
     QDateTime updatedAt;

@@ -2,7 +2,7 @@
 
 > 项目：Windows_AI 桌面看板娘（桌宠）
 > 类型：规划文档（方案探讨阶段，未实施）
-> 版本：v0.2（记忆系统设计 v2 修订）
+> 版本：v0.3（Phase 0 详细设计定稿 + 完整性审查修订）
 > 制定日期：2026-10-19
 > 关联文档：[ROADMAP.md](ROADMAP.md)、[ARCHITECTURE.md](ARCHITECTURE.md)
 
@@ -250,6 +250,10 @@ proactive:
 | 群消息存储 | **原始层全量落库 + 空闲蒸馏**（v2 修订，取代早期"只存参与"方案） |
 | 关系状态 | **全对象分层**（对主人/每个好友/每个群分别维护） |
 | 身份归属权 | **宿主配置层声明，模型无权判定**（mem0 模式，防 prompt 注入冒认） |
+| 关系共享（B3） | 同一 subject 跨渠道**共享同一份数值**——关系是人对人的，不是人对渠道的 |
+| 立绘跟随（D1） | **可配置项** `[appearance] followExternalMood`（默认开）：QQ 聊天情绪是否驱动桌设立绘 |
+| 情绪/退火分层（D2） | **情绪状态全局、退火表现桌宠渠道私有**——QQ 渠道永不直接调 TimeManager |
+| 群聊私密过滤（C3） | 初期简单规则：群聊 prompt 不注入 relationship 数值与亲密档案 key |
 
 ### 8.1 dsh 社区调研结论（Memory 分类 211 个插件）
 
@@ -341,17 +345,22 @@ ALTER TABLE chat_history        ADD COLUMN channel    TEXT NOT NULL DEFAULT 'pet
 ALTER TABLE chat_history        ADD COLUMN session_id TEXT NOT NULL DEFAULT 'default';
 ALTER TABLE chat_history        ADD COLUMN speaker    TEXT;                      -- 群聊说话人
 ALTER TABLE chat_history        ADD COLUMN sensitive  INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE relationship_state  ADD COLUMN subject    TEXT NOT NULL DEFAULT 'master';  -- 现有行自动归入主人
+ALTER TABLE relationship_state  ADD COLUMN subject    TEXT NOT NULL DEFAULT 'user';    -- 'user' 即主人（E2 修正：永久保留不迁移）
+ALTER TABLE long_term_summary   ADD COLUMN channel    TEXT NOT NULL DEFAULT 'pet';     -- 摘要分桶（审查修订 A1）
+ALTER TABLE long_term_summary   ADD COLUMN session_id TEXT NOT NULL DEFAULT 'default';
+ALTER TABLE episodic_memory     ADD COLUMN origin     TEXT NOT NULL DEFAULT 'pet';     -- 渠道溯源（B5/E3）
 ```
 
-带 DEFAULT 的 `ALTER TABLE ADD COLUMN` 对现有数据零迁移成本。subject 命名规范：`master`（主人）/ `qq:<uin>`（好友群友）/ `group:<群号>`（群整体关系）。
+带 DEFAULT 的 `ALTER TABLE ADD COLUMN` 对现有数据零迁移成本。subject 命名规范（**E2 修正**）：`'user'` **永久保留**为"主人"的正式 subject 名（与 character_profile 存量语义一致），新主体用 `qq:<uin>`（好友群友）/ `group:<群号>`（群整体关系），IdentityResolver 将 master 映射输出为 `'user'`。
+
+**摘要与未摘要游标同样按 `channel + session_id` 双键分桶**——否则 QQ 轮次会搅乱桌宠的 `coveredTurnEndId`（完整性审查 A1 挖出的漏洞）。
 
 ### 8.6 分阶段落地清单
 
 | 阶段 | 记忆侧改动 | 涉及文件 |
 |---|---|---|
-| **Phase 0** | 五项 ALTER；`saveQATurn`/`getHistoryTurn` 扩参；`identity.yaml` 解析 + subject 归一；`memory.yaml` 盲区解析；`raw_messages` 建表 | memorymanager.h/cpp、configmanager |
-| **Phase 1** | 群聊上下文组装（"【群名】张三：xxx"格式 + 临时窗口注入）；QQ 回复触发提取（prompt 注入群聊语境）；subject=`qq:<uin>` 落地；提取触发点抽象为"渠道无关的 Utterance 消费后钩子" | memorymanager、新 SessionRouter |
+| **Phase 0** | 八项 ALTER（含摘要分桶双键、episodic origin）；`saveQATurn`/`getHistoryTurn`/`getUnsummarizedTurns`/`getLatestSummaries` 扩参（全带默认值）；`identity`/`memory`/`proactive` 配置解析（QSettings INI）；`raw_messages` 建表；`followExternalMood` 解析。**细则见 10.1** | memorymanager、configmanager、新 utterance.h / ichanneladapter.h / petchanneladapter / sessionrouter |
+| **Phase 1** | **前置项**：TTSService 合成/播放分离（synthesize→产物 / speak→播放，播放器归桌宠渠道）；新增 PromptAssembler（渠道可见性过滤，C3）与 GlobalMoodState（全局情绪，D2）。群聊上下文组装（"【群名】张三：xxx"格式 + 临时窗口注入）；QQ 回复触发提取（prompt 注入群聊语境）；subject=`qq:<uin>` 落地；提取触发点抽象为"渠道无关的 Utterance 消费后钩子" | memorymanager、PromptAssembler、GlobalMoodState、QQChannelAdapter |
 | **Phase 2** | 门控统计直接读 raw 层滑动窗口（内存 RingBuffer + raw 表计数）；"今日主动次数"持久化用 QSettings | 新 ChatPlanner |
 | **Phase 3** | 空闲批量蒸馏调度（TimeManager 空闲检测 + 低 reasoning 批量提取）；冲突冻结人审接入现有记忆管理 UI；群关系（`group:<群号>`）与群友档案启用；群氛围认知复用 episodic_memories 的 `type='group_atmosphere'` | memorymanager、提取 prompt、settingswidget |
 
@@ -423,13 +432,42 @@ dsh 是一个**四层洋葱结构**，内核是 Cordis 插件框架（"Everythin
 
 | 阶段 | 内容 | 外部依赖 |
 |---|---|---|
-| **Phase 0** | 架构解耦：抽出 `Utterance` 统一出口 + 渠道适配器抽象；`chat_history` 加 `channel`/`session_id`；实现 `proactive` 配置解析 | **无**（零风险纯重构） |
+| **Phase 0** | 架构解耦（细则见 10.1）：`Utterance`/`RequestMeta` 统一协议 + `IChannelAdapter` 抽象 + `SessionRouter` 输入路由；记忆侧八项 ALTER + 读写扩参；identity/memory/proactive 配置解析 | **无**（零风险纯重构） |
 | **Phase 1** | NapCat 部署（小号）+ `QQProtocolClient` 收私聊/群聊 + 发文字/表情包/语音 | NapCat |
 | **Phase 2** | `ChatPlanner` 发言门控（frequency/dynamic）+ `ProactiveScheduler` 按配置主动开口 | 无 |
 | **Phase 3** | QQ 空间说说 + 高级互动（合并转发/戳一戳/表情回应）——**注意：NapCat 无评论/点赞，若需要须换 SnowLuma** | SnowLuma（按需） |
 | **Phase 4** | 浏览器类经 dsh ACP（Playwright MCP）；评估 dsh 混合深度 | dsh（nightly） |
 
 **Phase 0 必须先行**：唯一"零外部依赖、零风险"的一步，且是后续所有阶段的地基。即使 QQ 方案失败，桌宠本身也变得更健壮。
+
+### 10.1 Phase 0 详细设计（2026-10-19 完整性审查定稿）
+
+**三条红线**：外部行为零变化 / 旧数据零迁移 / 每步独立可构建。
+
+**关键事实**（代码核实）：表现层已天然解耦——气泡+立绘由 `TTSService::playAudioAction` 逐句回调驱动（`AppController::onPlayAudioAction`），`handleMakoReply` 只含记忆+TTS入队+提取。因此渠道适配器是薄包装，风险低于最初评估。
+
+**新增文件**：
+
+| 文件 | 内容 |
+|---|---|
+| `utterance.h` | `Utterance`（text/ttsText/tags/channel/sessionId/speaker）+ `RequestMeta`（channel/sessionId/speaker/subject）纯数据头文件 |
+| `ichanneladapter.h` | `channelName()` + `sendUtterance(const Utterance&)` 纯虚接口 |
+| `petchanneladapter.h/cpp` | 薄包装：订阅 `playAudioAction` → 气泡+立绘；错误反馈沿用现有槽 |
+| `sessionrouter.h/cpp` | `submitInput(channel, sessionId, speaker, text)` → 身份解析 → 查历史 → `requestReply` 信号；身份由 `IdentityResolver(platform, senderId)` 决定（C2），渠道无权定归属 |
+
+**职责切分**：`saveQATurn`/`extractMemoryAsync` 触发留 AppController（大脑侧）；气泡/语音播放进 PetChannelAdapter；**情绪/立绘联动是全局层**（applyTags 留全局，不进任何渠道——D1 开关 Phase 1 于此处生效）；TimeManager 归属标注为桌宠渠道私有（D2），Phase 0 代码零搬动。
+
+**MemoryManager 扩展**：`ensureColumn`（PRAGMA table_info 预检 + busy_timeout=3000 + duplicate column 错误容忍，三重保险应对重复/并发启动）；八项 ALTER（见 8.5）；`raw_messages` 建表（Phase 0 只建不写）；`saveQATurn(..., meta=RequestMeta())`、`getHistoryTurn(N, channel, sessionId)`、`getUnsummarizedTurns`/`getLatestSummaries` 双键扩参——全部带默认值，旧调用点零改动。
+
+**ConfigManager 扩展**（QSettings INI，修正早期 yaml 设想）：`[identity]`（self/master/whitelist）、`[memory]`（blindZones）、`[proactive]`（含 targets，默认 [pet/default]）；Phase 0 只做解析与只读访问器，无调度行为、无 UI 勾选框。
+
+**askDeepSeek 扩参**：第三参 `const RequestMeta &meta = RequestMeta()`，现有调用点零改动；meta 用于提取 prompt 元数据与 subject 归属。
+
+**实施顺序（5 提交）**：1 表结构 → 2 读写扩参 → 3 utterance.h+adapter → 4 SessionRouter+装配 → 5 配置解析。依赖：1→2→4，3、5 独立可插，无依赖倒置。
+
+**验收清单**：全功能回归与改前一致；旧行自动 `channel='pet'`；二次启动不报 duplicate column；ini 手填主人 QQ 后 `getMasterAccounts()` 返回正确；QQChannelAdapter 占位编译通过。
+
+**完整性审查结论**（A-E 共 14 项，2026-10-19）：挖出并修正 2 处方案漏洞——① 未摘要游标与摘要在历史分桶后失配（→ long_term_summary 双键，A1）；② 群聊"只存参与"导致旁听失忆（→ 8.4 原始层+蒸馏层）。其余结论已并入 8.0 决策表与各节正文：subject=`'user'` 永久保留不迁移（E2）；群聊防串群三重隔离 = session_id 过滤 + episodic origin 过滤 + subject 按人（E3）；TTSService 分离列为 Phase 1 前置项（E1）。
 
 ---
 
@@ -451,7 +489,7 @@ dsh 是一个**四层洋葱结构**，内核是 Cordis 插件框架（"Everythin
 
 | # | 事项 | 说明 |
 |---|---|---|
-| 1 | Phase 0 实施范围 | 仅架构解耦 / 解耦+门控骨架 / 暂不启动，待用户确认 |
+| 1 | ~~Phase 0 实施范围~~ | **已定稿**：仅架构解耦（不含门控骨架），细则见 10.1，待用户批准实施 |
 | 2 | Phase 3 协议端选型 | 若需要"评论/点赞动态"则 Phase 1 直接用 SnowLuma，否则 NapCat；建议尽早决定 |
 | 3 | QQ 小号准备 | 需专用小号并养号（绑定手机、稳定设备、避免新号立刻群发） |
 | 4 | NapCat 部署验证 | 建议实施前先独立部署验证收发链路 |

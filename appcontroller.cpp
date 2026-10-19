@@ -11,6 +11,10 @@
 #include "settingswidget.h"
 #include "memorymanager.h"
 #include "timemanager.h"
+#include "utterance.h"
+#include "petchanneladapter.h"
+#include "qqchanneladapter.h"
+#include "sessionrouter.h"
 
 #include <QDebug>
 #include <QJsonArray>
@@ -39,6 +43,11 @@ AppController::AppController(QObject *parent)
     m_llmService->setMemoryManager(m_memoryManager);
 
     m_timeManager =new TimeManager(this);
+
+    // 渠道装配（Phase 0：桌宠渠道接管气泡私有表现；QQ 为 Phase 1 占位）
+    m_petChannel = new PetChannelAdapter(m_bubble, this);
+    m_qqChannel = new QQChannelAdapter(this);
+    m_sessionRouter = new SessionRouter(m_memoryManager, this);
 
     m_anchorManager = new AnchorManager(m_character, this);
     //ui绑定
@@ -116,12 +125,13 @@ void AppController::startApp()
 
 void AppController::handleMakoReply(const QList<SentenceText> &sentences, const QString &rawReply)
 {
-    m_memoryManager->saveQATurn(m_lastUserInput,rawReply,sentences);
+    m_memoryManager->saveQATurn(m_lastUserInput,rawReply,sentences,m_lastMeta);
     m_ttsService->enqueueSentences(sentences);
 
     qlonglong lastEndId = -1;
     QList<qlonglong> sourceIds;
-    QList<HistoryTurn> unsummarizedTurns = m_memoryManager->getUnsummarizedTurns(lastEndId, sourceIds);
+    QList<HistoryTurn> unsummarizedTurns = m_memoryManager->getUnsummarizedTurns(lastEndId, sourceIds,
+                                                                                m_lastMeta.channel, m_lastMeta.sessionId);
 
 
     const int SUMMARY_THRESHOLD = ConfigManager::instance().getShortMemoryLength();
@@ -161,10 +171,13 @@ void AppController::handleAbnormalReply(const QString &reason)
 
 void AppController::onPlayAudioAction(const QString &zhText, const QMap<QString, QString> &tags)
 {
-    // 1. 你的 BubbleWidget 自己有 typeWriteEffect，直接调用即可
-    m_bubble->showMessage(zhText);
+    // 渠道私有表现：气泡跟读（PetChannelAdapter）
+    Utterance u;
+    u.text = zhText;
+    u.channel = Channel::kPet;
+    m_petChannel->sendUtterance(u);
 
-    // 2. 更新多重状态标签（退火定时器在每轮结束 notifyRoundEnded 时按最终状态统一启动）
+    // 全局情绪层：立绘四维状态不随渠道拆分（D1 开关 Phase 1 在 QQ 渠道路径生效）
     m_appearance->applyTags(tags);
 
     qDebug()<<"[AppController] 当前播放文本:" << zhText;
@@ -192,12 +205,16 @@ void AppController::initConnections()
         m_llmService->setApiKey(ConfigManager::instance().getApiKey());});
 
     connect(m_llmService,&LLMService::sentencesReady,this,&AppController::handleMakoReply);
-    connect(m_chatWidget,&ChatWidget::textSubmitted,this,[this](const QString &text){
-        m_lastUserInput=text;
+    // 输入路由：渠道 → SessionRouter（身份解析+历史组装）→ 大脑
+    connect(m_sessionRouter, &SessionRouter::requestReply, this,
+            [this](const QString &userText, const QList<HistoryTurn> &history, const RequestMeta &meta) {
+        m_lastUserInput = userText;
+        m_lastMeta = meta;
         m_timeManager->notifyUserInputStarted();
-        int memoryLength=ConfigManager::instance().getShortMemoryLength();;
-        QList<HistoryTurn> shortTermMemory = m_memoryManager->getHistoryTurn(memoryLength);
-        m_llmService->askDeepSeek(text,shortTermMemory);
+        m_llmService->askDeepSeek(userText, history, meta);
+    });
+    connect(m_chatWidget,&ChatWidget::textSubmitted,this,[this](const QString &text){
+        m_sessionRouter->submitInput(Channel::kPet, Channel::kDefaultSession, QStringLiteral("欧尼酱"), text);
     });
     connect(m_llmService, &LLMService::memoryExtractionReady, this, [this](const QJsonObject &extractionResult, qlonglong lastEndId, const QString &sourceIdsJson) {
         // 1. 角色档案更新
@@ -226,20 +243,21 @@ void AppController::initConnections()
             }
         }
 
-        // 3. 工作摘要 → 写入长期记忆摘要表（保留兼容）
+        // 3. 工作摘要 → 写入长期记忆摘要表（保留兼容，按渠道分桶写入）
         QString summary = extractionResult["working_summary"].toString();
         if (!summary.isEmpty()) {
-            m_memoryManager->addLongTermSummary(summary, lastEndId, sourceIdsJson);
+            m_memoryManager->addLongTermSummary(summary, lastEndId, sourceIdsJson,
+                                                m_lastMeta.channel, m_lastMeta.sessionId);
         }
 
-        // 4. 关系状态更新
+        // 4. 关系状态更新（subject 隔离：'user' 即主人）
         QJsonArray relUpdates = extractionResult["relationship_updates"].toArray();
         for (const QJsonValue &val : relUpdates) {
             QJsonObject obj = val.toObject();
             QString dimension = obj["dimension"].toString();
             double delta = obj["delta"].toDouble(0.0);
             if (!dimension.isEmpty() && delta != 0.0) {
-                m_memoryManager->upsertRelationshipState(dimension, delta);
+                m_memoryManager->upsertRelationshipState(dimension, delta, m_lastMeta.subject);
             }
         }
 

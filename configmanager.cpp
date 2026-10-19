@@ -1,10 +1,12 @@
 #include "configmanager.h"
+#include "utterance.h"
 
 #include <QCoreApplication>
 #include <QDir>
 #include <QJsonParseError>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QJsonArray>
 
 bool ConfigManager::loadSetting()
 {
@@ -268,4 +270,126 @@ QString ConfigManager::getMemoryPath() const
 ConfigManager::ConfigManager() {
     initAppDataPath();
     loadSetting();
+}
+
+// ===== 多渠道扩展配置（identity.json，Phase 0 只读解析）=====
+
+// 懒加载 identity.json：缺失或损坏时使用默认值并提示（不自动创建，由用户手动配置）
+void ConfigManager::ensureIdentityLoaded() const
+{
+    if (m_identityLoaded) {
+        return;
+    }
+    m_identityLoaded = true;
+
+    const QString identityPath = m_configDirPath + "/identity.json";
+    QFile file(identityPath);
+    if (!file.exists()) {
+        qDebug() << "[ConfigManager]identity.json 不存在，使用默认配置（QQ 渠道接入前请手动创建）:" << identityPath;
+        return;
+    }
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        qDebug() << "[ConfigManager]identity.json 打开失败，使用默认配置";
+        return;
+    }
+    QJsonParseError parseError;
+    QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &parseError);
+    file.close();
+    if (parseError.error != QJsonParseError::NoError) {
+        qDebug() << "[ConfigManager]identity.json 解析失败:" << parseError.errorString();
+        return;
+    }
+
+    QJsonObject rootObj = doc.object();
+
+    // 身份绑定（按 uin 绑定，与昵称无关）
+    QJsonObject identityObj = rootObj.value("identity").toObject();
+    for (const QJsonValue &v : identityObj.value("self").toObject().value("qq").toArray()) {
+        m_selfQQ.append(v.toString());
+    }
+    for (const QJsonValue &v : identityObj.value("master").toObject().value("qq").toArray()) {
+        m_masterQQ.append(v.toString());
+    }
+
+    // 记忆盲区
+    for (const QJsonValue &v : rootObj.value("memory").toObject().value("blind_zones").toArray()) {
+        QJsonObject z = v.toObject();
+        BlindZone zone;
+        zone.channel = z.value("channel").toString();
+        zone.sessionId = z.value("session_id").toString();
+        if (!zone.channel.isEmpty() && !zone.sessionId.isEmpty()) {
+            m_blindZones.append(zone);
+        }
+    }
+
+    // 立绘跟随开关（D1 决策）
+    m_followExternalMood = rootObj.value("appearance").toObject().value("follow_external_mood").toBool(true);
+
+    // 主动对话配置（Phase 0 只解析不调度）
+    QJsonObject proObj = rootObj.value("proactive").toObject();
+    m_proactive.enabled = proObj.value("enabled").toBool(false);
+    m_proactive.dailyLimit = proObj.value("daily_limit").toInt(3);
+    m_proactive.cooldownSeconds = proObj.value("cooldown_seconds").toInt(900);
+    m_proactive.idleSeconds = proObj.value("idle_seconds").toInt(1800);
+    QJsonObject quietObj = proObj.value("quiet_hours").toObject();
+    m_proactive.quietStart = quietObj.value("start").toString("23:00");
+    m_proactive.quietEnd = quietObj.value("end").toString("08:00");
+    for (const QJsonValue &v : proObj.value("targets").toArray()) {
+        QJsonObject t = v.toObject();
+        m_proactive.targets.append(qMakePair(t.value("channel").toString(Channel::kPet),
+                                             t.value("session_id").toString(Channel::kDefaultSession)));
+    }
+    for (const QJsonValue &v : proObj.value("schedule").toArray()) {
+        QJsonObject s = v.toObject();
+        ScheduleItem item;
+        item.at = s.value("at").toString();
+        item.type = s.value("type").toString("fixed");
+        if (!item.at.isEmpty()) {
+            m_proactive.schedule.append(item);
+        }
+    }
+
+    qDebug() << "[ConfigManager]identity.json 加载完成: self" << m_selfQQ.size()
+             << "个 / master" << m_masterQQ.size() << "个 / 盲区" << m_blindZones.size() << "个";
+}
+
+QStringList ConfigManager::getSelfQQAccounts()
+{
+    ensureIdentityLoaded();
+    return m_selfQQ;
+}
+
+QStringList ConfigManager::getMasterQQAccounts()
+{
+    ensureIdentityLoaded();
+    return m_masterQQ;
+}
+
+bool ConfigManager::isMasterQQ(const QString &uin)
+{
+    ensureIdentityLoaded();
+    return m_masterQQ.contains(uin);
+}
+
+bool ConfigManager::isBlindZone(const QString &channel, const QString &sessionId)
+{
+    ensureIdentityLoaded();
+    for (const BlindZone &z : m_blindZones) {
+        if (z.channel == channel && z.sessionId == sessionId) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ConfigManager::getFollowExternalMood()
+{
+    ensureIdentityLoaded();
+    return m_followExternalMood;
+}
+
+ProactiveConfig ConfigManager::getProactiveConfig()
+{
+    ensureIdentityLoaded();
+    return m_proactive;
 }

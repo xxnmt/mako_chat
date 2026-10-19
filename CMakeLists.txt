@@ -27,6 +27,14 @@ qt_add_executable(Windows_AI
     anchormanager.h anchormanager.cpp
     memorymanager.h memorymanager.cpp
     historyturn.h
+    utterance.h
+    ichanneladapter.h
+    petchanneladapter.h
+    petchanneladapter.cpp
+    qqchanneladapter.h
+    qqchanneladapter.cpp
+    sessionrouter.h
+    sessionrouter.cpp
     ttsreference.h
     ittsprovider.h
     apittsprovider.h apittsprovider.cpp
@@ -63,3 +71,10 @@ qt_generate_deploy_app_script(
 )
 install(SCRIPT ${deploy_script})
 target_include_directories(Windows_AI PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+# ===== 自动化测试（Qt Test，ctest 运行：ctest --test-dir <build> -C Debug --output-on-failure）=====
+include(CTest)
+if(BUILD_TESTING)
+    find_package(Qt6 6.5 REQUIRED COMPONENTS Test)
+    add_subdirectory(tests)
+endif()

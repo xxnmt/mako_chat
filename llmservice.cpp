@@ -30,9 +30,9 @@ LLMService::LLMService(const QString &apiKey,QObject *parent)
 }
 
 
-void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> &historyQA)
+void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> &historyQA, const RequestMeta &meta)
 {
-
+    m_currentMeta = meta;   // 本轮元数据（渠道/会话/主体），供 prompt 组装与记忆注入使用
 
     QUrl url("https://api.deepseek.com/chat/completions");
     QNetworkRequest request(url);
@@ -88,8 +88,8 @@ void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> 
             }
         }
 
-        // 3. 长期摘要（保留兼容）
-        QList<LongTermSummary> summaries = m_memoryManager->getLatestSummaries(5);
+        // 3. 长期摘要（保留兼容，按渠道分桶取）
+        QList<LongTermSummary> summaries = m_memoryManager->getLatestSummaries(5, m_currentMeta.channel, m_currentMeta.sessionId);
         qDebug()<<"[LLM]摘要数量:"<<summaries.size();
         if (!summaries.isEmpty()) {
             finalSystemPrompt += "\n# 最近发生\n";
@@ -98,8 +98,8 @@ void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> 
             }
         }
 
-        // 4. 关系状态（量化 user 与 AI 之间的关系维度）
-        QList<RelationshipState> relStates = m_memoryManager->getRelationshipStates();
+        // 4. 关系状态（量化 user 与 AI 之间的关系维度，按当前对话主体取）
+        QList<RelationshipState> relStates = m_memoryManager->getRelationshipStates(m_currentMeta.subject);
         if (!relStates.isEmpty()) {
             finalSystemPrompt += "\n# 我们的关系\n";
             for (const auto &r : relStates) {
@@ -247,7 +247,7 @@ void LLMService::extractMemoryAsync(const QList<HistoryTurn> &turns, qlonglong l
     // 构建当前关系状态上下文
     QString existingRelationshipText;
     if (m_memoryManager) {
-        QList<RelationshipState> relStates = m_memoryManager->getRelationshipStates();
+        QList<RelationshipState> relStates = m_memoryManager->getRelationshipStates(m_currentMeta.subject);
         if (!relStates.isEmpty()) {
             for (const RelationshipState &r : relStates) {
                 QString label;
