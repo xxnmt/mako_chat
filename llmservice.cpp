@@ -666,8 +666,8 @@ int TagValidator::levenshteinDistance(const QString &s1, const QString &s2)
 {
     int n=s1.length();
     int m=s2.length();
-    if(m==0)return m;
-    if(n==0)return n;
+    if(m==0)return n;
+    if(n==0)return m;
 
     QVector<QVector<int>>dp(n+1,QVector<int>(m+1));
 
