@@ -36,7 +36,7 @@
 | | TimeManager | 时间管理、表情/脸红退火（QTimer singleShot）、服装时段切换 | timemanager.h/cpp |
 | | AnchorManager | 位置锚点管理、统一位置跟随 | anchormanager.h/cpp |
 | | TagValidator | 标签合法性校验、编辑距离修正 | llmservice.h/cpp（内部类） |
-| **数据层** | ConfigManager | API Key配置、记忆长度配置、单例模式 | configmanager.h/cpp |
+| **数据层** | ConfigManager | API Key、记忆长度、时间/退火配置、单例模式 | configmanager.h/cpp |
 | | MemoryManager | AI对话历史管理、SQLite数据库 | memorymanager.h/cpp |
 | **设置层** | SettingsWidget | 设置界面（左右目录+滚动双向同步）、API/记忆/TTS模型配置 | settingswidget.h/cpp/ui |
 | **数据结构** | SentenceText | 句子数据模型（中文/日文/标签） | sentencedata.h |
@@ -597,6 +597,12 @@ LLMService::parseJsonReply() → TagValidator校验
 | api.deepseek_api_key | `sk-placeholder-key` | DeepSeek API密钥 |
 | api.gpt_sovits_url | `http://127.0.0.1:9880` | GPT-SoVITS服务地址 |
 | memory.short_term_length | `15` | 短期记忆轮数 |
+| memory.summary_length | `15` | 长期记忆自动摘轮数（TD-037） |
+| time.night_start | `22:00` | 夜晚开始时间（TD-037） |
+| time.night_end | `07:00` | 夜晚结束时间（TD-037） |
+| time.blush_lasting | `30` | 脸红退火时长（秒，TD-037） |
+| time.emotion_lasting | `15` | 表情退火时长（秒，TD-037） |
+| time.distance_lasting | `15` | 距离退火时长（秒，TD-037） |
 
 **关键方法**：
 | 方法 | 作用 | 参数 | 返回值 |
@@ -607,6 +613,12 @@ LLMService::parseJsonReply() → TagValidator校验
 | `setApiKey()` | 设置API Key | QString | - |
 | `getTTSUrl()` | 获取TTS服务地址 | - | QString |
 | `getShortMemoryLength()` | 获取短期记忆长度 | - | int |
+| `getSummaryMemoryLength()` / `setSummaryMemoryLength()` | 长期记忆自动摘轮数 | - / int | int / - |
+| `getNightStartTime()` / `setNightStartTime()` | 夜晚开始时间 | - / QTime | QTime / - |
+| `getNightEndTime()` / `setNightEndTime()` | 夜晚结束时间 | - / QTime | QTime / - |
+| `getBlushLasting()` / `setBlushLasting()` | 脸红退火时长（秒） | - / int | int / - |
+| `getEmotionLasting()` / `setEmotionLasting()` | 表情退火时长（秒） | - / int | int / - |
+| `getDistanceLasting()` / `setDistanceLasting()` | 距离退火时长（秒） | - / int | int / - |
 | `getConfigDirPath()` | 获取配置目录路径 | - | QString |
 | `getMemoryPath()` | 获取数据库文件路径 | - | QString |
 
@@ -663,7 +675,7 @@ LLMService::parseJsonReply() → TagValidator校验
 
 ### 2.12 SettingsWidget
 
-**职责**：设置界面，管理API Key、记忆长度配置、TTS模型切换和对话历史管理
+**职责**：设置界面，管理API Key、记忆长度、长期记忆摘轮数、时间/退火配置、TTS模型切换和对话历史管理
 
 **设计要点**（v0.6.0 重构为「主-从式滚动布局」，替代原多标签页）：
 - 独立窗口（Qt::Window），支持关闭按钮
@@ -678,15 +690,16 @@ LLMService::parseJsonReply() → TagValidator校验
 - 短期记忆轮数（记忆系统→短期记忆区）
 - TTS模型切换（语音合成→GPT-Sovits区：GPT路径/模型、SoVITS路径/模型，保存时 `emit ttsModelSwitchRequested`）
 - 对话历史管理（历史会话记录区：表格展示、分页浏览、单条删除、清空全部，删除需API Key验证）
+- 长期记忆自动摘轮数（记忆系统→长期记忆区，保存到 `memory.summary_length`，TD-037）
+- 时间管理（时间管理区：夜晚开始/结束时间、脸红/表情/距离退火时长，保存到 `time.*`，TD-037）
 
-**待完善**（控件已就位，config 未接线）：
-- 长期记忆自动摘窗口轮数
-- 时间管理：夜晚开始/结束时间、脸红/表情/距离退火时长
+**待完善**：
+- 外观配置（气泡样式/窗口透明度）、快捷键配置
 
 **信号**：
 | 信号 | 触发时机 | 接收方 |
 |------|----------|--------|
-| `settingsSaved()` | API Key/记忆长度保存成功 | AppController → 更新LLMService API Key |
+| `settingsSaved()` | 任一配置保存成功 | AppController → 更新LLMService API Key + `applyTimeSettings()` + 重启 TimeManager |
 | `ttsModelSwitchRequested(gptPath, sovitsPath)` | GPT/SoVITS模型保存成功 | AppController → `m_ttsService->switchModel()` |
 
 **关键方法**：
@@ -978,6 +991,8 @@ struct RelationshipState {
 - 三个独立退火定时器：表情退火 + 脸红退火 + 距离退火，互不干扰
 - 退火由「每轮对话最终状态」驱动，而非逐句触发（重构：删除 notifyLLMEnded/notifyLLMtagsApplicated/notifyBlushingApplicated 三个方法，统一为 notifyRoundEnded）
 - 昼夜判定（onMinuteTick）跨午夜正确处理：`m_nightStart > m_nightEnd` 时用 `isNight = (now >= m_nightStart || now < m_nightEnd)`，修复整个白天被误判为夜晚（TD-035）
+- 退火时长与夜晚时段由 ConfigManager 配置驱动（TD-037）：AppController 启动时 `applyTimeSettings()`；设置保存后重新应用并 `start()` 立即重估昼夜
+- 退火门控（TD-034）：退火只对最新一轮生效——AppController 维护 `m_roundSeq`（每次用户输入 +1）与 `m_lastPlaybackRound`（本轮 TTS 入队时记录），`playbackQueueEmpty` 仅在两者相等时调用 `notifyRoundEnded()`；旧轮收尾被跳过，等新一轮播完再按最终状态处理
 
 **关键方法**：
 | 方法 | 作用 | 参数 | 返回值 |
@@ -1249,8 +1264,8 @@ image/
 | C-003 | 内联lambda过多 | appcontroller.cpp | 难以测试和复用 | ⚠️ 待优化 |
 | C-004 | LLMService头文件依赖MemoryManager | llmservice.h | 已用 `class MemoryManager;` 前向声明（TD-015 已修复） | ✅ 已修复 |
 | RC-012 | AnchorManager析构未清理 | anchormanager.cpp | 非问题：仅持弱引用，widget 所有权归 AppController（TD-014 已结案） | ✅ 非问题 |
-| TD-034 | 对话轮冲突导致退火误触发 | appcontroller.cpp + timemanager.cpp | 上一轮播放收尾的 playbackQueueEmpty 晚于新一轮输入，被误认为当前轮结束，用旧轮 finalTags 启动退火定时器，中途提前退火。根因：playbackQueueEmpty 裸信号不含轮次信息 | ⚠️ 待处理（下一步：加轮次序号，退火仅对最新轮生效） |
-| TD-037 | 设置界面三组控件未接线 | settingswidget.cpp / configmanager.* / timemanager.cpp | 长期记忆摘轮数、夜晚时段、退火时长控件与保存按钮已就位，但无槽函数、ConfigManager 无配置项、TimeManager 硬编码默认值；点击保存无反应 | ⚠️ 待处理（下一步） |
+| TD-034 | 对话轮冲突导致退火误触发 | appcontroller.cpp + timemanager.cpp | 上一轮播放收尾的 playbackQueueEmpty 晚于新一轮输入，被误认为当前轮结束，用旧轮 finalTags 启动退火定时器，中途提前退火 | ✅ 已修复（轮次门控：`playbackQueueEmpty` 仅在 `m_lastPlaybackRound == m_roundSeq` 时退火） |
+| TD-037 | 设置界面三组控件未接线 | settingswidget.cpp / configmanager.* / timemanager.cpp | 长期记忆摘轮数、夜晚时段、退火时长控件与保存按钮已就位，但无槽函数、ConfigManager 无配置项、TimeManager 硬编码默认值 | ✅ 已修复（`memory.summary_length`/`time.*` 配置 + 三个保存槽 + `applyTimeSettings()` 热应用） |
 
 ### 7.3 架构演进规划
 

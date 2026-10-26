@@ -44,6 +44,9 @@ private slots:
 
     //tab memory
     void on_btn_saveShortMemoryLength_clicked();
+    void on_btn_saveMemorySummaryLength_clicked();
+    void on_btn_saveNightTime_clicked();
+    void on_btn_saveAnnealingTime_clicked();
     void on_btn_deleteSelectedMemory_clicked();
     void on_btn_claenAllMemory_clicked();
     void on_btn_previousMemoryPage_clicked();

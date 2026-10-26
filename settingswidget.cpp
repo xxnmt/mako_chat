@@ -19,6 +19,7 @@
 #include <QTreeWidgetItem>
 #include <QAbstractItemView>
 #include <QPoint>
+#include <QSpinBox>
 
 SettingsWidget::SettingsWidget(QWidget *parent)
     : QWidget(parent),
@@ -33,6 +34,21 @@ SettingsWidget::SettingsWidget(QWidget *parent)
     resize(760, 520);
     setMinimumSize(520, 400);
     setupHistoryTable();
+
+    // 记忆摘要 / 时间管理控件参数（TD-037 接线）
+    ui->spinBox_MemorySummaryLength->setRange(1, 999);
+    ui->spinBox_MemorySummaryLength->setSuffix(QStringLiteral(" 轮"));
+    ui->timeEdit_nightStart->setDisplayFormat(QStringLiteral("HH:mm"));
+    ui->timeEdit_nightEnd->setDisplayFormat(QStringLiteral("HH:mm"));
+    const QList<QSpinBox*> lastingSpinBoxes = {
+        ui->spinBox_blushingLasting,
+        ui->spinBox_emotionLasting,
+        ui->spinBox_distanceLasting,
+    };
+    for (QSpinBox *spin : lastingSpinBoxes) {
+        spin->setRange(1, 3600);
+        spin->setSuffix(QStringLiteral(" 秒"));
+    }
 
     ui->btn_previousMemoryPage->setEnabled(false);
     ui->btn_nextMemoryPage->setEnabled(false);
@@ -212,6 +228,51 @@ void SettingsWidget::on_btn_saveShortMemoryLength_clicked()
 }
 
 
+void SettingsWidget::on_btn_saveMemorySummaryLength_clicked()
+{
+    ConfigManager &configSettings = ConfigManager::instance();
+    configSettings.setSummaryMemoryLength(ui->spinBox_MemorySummaryLength->value());
+    if (configSettings.saveSetting()) {
+        emit settingsSaved();
+        qDebug() << "[SettingsWidget]:长期记忆自动摘轮数设置为"
+                 << ui->spinBox_MemorySummaryLength->value() << "轮";
+    } else {
+        qDebug() << "[SettingsWidget]:长期记忆自动摘轮数设置失败";
+    }
+}
+
+void SettingsWidget::on_btn_saveNightTime_clicked()
+{
+    ConfigManager &configSettings = ConfigManager::instance();
+    configSettings.setNightStartTime(ui->timeEdit_nightStart->time());
+    configSettings.setNightEndTime(ui->timeEdit_nightEnd->time());
+    if (configSettings.saveSetting()) {
+        emit settingsSaved();
+        qDebug() << "[SettingsWidget]:夜晚时段设置为"
+                 << ui->timeEdit_nightStart->time().toString("HH:mm")
+                 << "-" << ui->timeEdit_nightEnd->time().toString("HH:mm");
+    } else {
+        qDebug() << "[SettingsWidget]:夜晚时段设置失败";
+    }
+}
+
+void SettingsWidget::on_btn_saveAnnealingTime_clicked()
+{
+    ConfigManager &configSettings = ConfigManager::instance();
+    configSettings.setBlushLasting(ui->spinBox_blushingLasting->value());
+    configSettings.setEmotionLasting(ui->spinBox_emotionLasting->value());
+    configSettings.setDistanceLasting(ui->spinBox_distanceLasting->value());
+    if (configSettings.saveSetting()) {
+        emit settingsSaved();
+        qDebug() << "[SettingsWidget]:退火时长设置为 脸红"
+                 << ui->spinBox_blushingLasting->value() << "秒 表情"
+                 << ui->spinBox_emotionLasting->value() << "秒 距离"
+                 << ui->spinBox_distanceLasting->value() << "秒";
+    } else {
+        qDebug() << "[SettingsWidget]:退火时长设置失败";
+    }
+}
+
 void SettingsWidget::on_btn_deleteSelectedMemory_clicked()
 {
     if(!m_memoryManager){
@@ -342,6 +403,12 @@ void SettingsWidget::loadSettings()
     ConfigManager &configSettings= ConfigManager::instance();
     ui->lineEdit_apiKey->setText(configSettings.getApiKey());
     ui->spinBox_shortMemoryLength->setValue(configSettings.getShortMemoryLength());
+    ui->spinBox_MemorySummaryLength->setValue(cfg.getSummaryMemoryLength());
+    ui->timeEdit_nightStart->setTime(cfg.getNightStartTime());
+    ui->timeEdit_nightEnd->setTime(cfg.getNightEndTime());
+    ui->spinBox_blushingLasting->setValue(cfg.getBlushLasting());
+    ui->spinBox_emotionLasting->setValue(cfg.getEmotionLasting());
+    ui->spinBox_distanceLasting->setValue(cfg.getDistanceLasting());
     ui->lineEdit_GPTSovitsFilePath->setText(cfg.getGPTSovitsRootPath());
     ui->lineEdit_GPTModelFilePath->setText(cfg.getGPTModelDir());
     ui->lineEdit_sovitsModelFilePath->setText(cfg.getSoVITSModelDir());

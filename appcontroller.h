@@ -40,6 +40,7 @@ signals:
 
 private:
     void initConnections();
+    void applyTimeSettings();   // 把 ConfigManager 的时间/退火配置应用到 TimeManager
 
     QString m_lastUserInput;
 
@@ -58,6 +59,8 @@ private:
     QQChannelAdapter *m_qqChannel;      // 渠道：QQ（Phase 1 启用）
     SessionRouter *m_sessionRouter;     // 输入路由（渠道→大脑）
     RequestMeta m_lastMeta;             // 最近一轮请求元数据（回复入库时随存）
+    quint64 m_roundSeq = 0;             // 对话轮次序号：每次用户输入 +1（TD-034）
+    quint64 m_lastPlaybackRound = 0;    // 最近一次入队 TTS 的轮次（退火门控用）
 };
 
 #endif // APPCONTROLLER_H

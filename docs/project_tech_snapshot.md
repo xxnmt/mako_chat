@@ -24,6 +24,8 @@
 | | `m_memoryManager` | MemoryManager*，AI记忆系统 |
 | | `m_timeManager` | TimeManager*，时间管理器（表情/脸红退火、服装时段切换） |
 | | `m_lastUserInput` | QString，最后一次用户输入 |
+| | `m_roundSeq` | quint64，对话轮次序号（每次用户输入 +1，TD-034） |
+| | `m_lastPlaybackRound` | quint64，最近一次 TTS 入队所属轮次（退火门控，TD-034） |
 | **函数签名** | `void startApp()` | 启动应用，显示角色 |
 | | `void handleMakoReply(const QList<SentenceText>& sentences, const QString& rawReply)` | 处理AI回复，保存记忆+入队TTS+触发记忆提取 |
 | | `void handleSystemError(const QString& errorMsg)` | 统一错误处理 |
@@ -537,6 +539,12 @@ struct SentenceText {
 | | `int getShortMemoryLength() const` | 获取短期记忆长度 |
 | | `QString getConfigDirPath() const` | 获取配置目录路径 |
 | | `QString getMemoryPath() const` | 获取数据库文件路径 |
+| | `int getSummaryMemoryLength() const` / `setSummaryMemoryLength(int)` | 长期记忆自动摘轮数（TD-037） |
+| | `QTime getNightStartTime() const` / `setNightStartTime(QTime)` | 夜晚开始时间 |
+| | `QTime getNightEndTime() const` / `setNightEndTime(QTime)` | 夜晚结束时间 |
+| | `int getBlushLasting() const` / `setBlushLasting(int)` | 脸红退火时长（秒） |
+| | `int getEmotionLasting() const` / `setEmotionLasting(int)` | 表情退火时长（秒） |
+| | `int getDistanceLasting() const` / `setDistanceLasting(int)` | 距离退火时长（秒） |
 | | `bool loadSetting()` | 从JSON文件加载配置 |
 | | `bool saveSetting()` | 保存配置到JSON文件 |
 
@@ -566,7 +574,8 @@ struct SentenceText {
 | **布局** | 左侧目录树 `treeIndex` + 右侧滚动区 `scrollArea`；一级区域 `section1_*` + 二级分区 `section2_*` | - |
 | **双向同步** | 点击目录→滚到分区（`ensureWidgetVisible`）；滚动→按页面位置高亮目录项（`m_sectionMap` + `m_syncGuard`） | - |
 | **滚轮透传** | 下拉框/微调框/时间编辑框 `eventFilter`，滚轮转给右侧滚动条不拦截界面滚动 | - |
-| **待完善** | 长期记忆自动摘轮数、时间管理（夜晚时间/退火时长）控件已就位但 config 未接线；外观/快捷键配置尚未实现 | - |
+| **已接线** | 长期记忆摘轮数（`memory.summary_length`）、夜晚时段与退火时长（`time.*`），保存后通过 `settingsSaved` 热应用（TD-037） | - |
+| **待完善** | 外观/快捷键配置尚未实现 | - |
 | **函数签名** | `void show()` | 显示设置窗口 |
 | | `void setMemoryManager(MemoryManager* manager)` | 注入MemoryManager实例 |
 | | `void setMemoryLength(int length)` | 初始化记忆长度设置 |
@@ -708,7 +717,8 @@ struct SentenceText {
 - [x] 异常回复拦截 ✅ 已实现（zh_text/ja_text/tags 缺失整轮抛弃，replyAbnormal 反馈）
 - [ ] Phase 0.5（`visibility` + `appendRawMessage` + `origin`/`visibility` 过滤）
 - [ ] Phase 1 QQ 渠道（SnowLuma / OneBot v11）
-- [ ] 设置界面完善（长期记忆自动摘/时间管理 config 接线、外观配置、快捷键配置）
+- [x] 设置界面接线（TD-037：长期记忆摘轮数、夜晚时段、三档退火时长）✅ 已实现
+- [ ] 设置界面完善（外观配置、快捷键配置）
 - [ ] TTS语速、温度配置
 - [ ] 立绘切换过渡动画
 - [ ] 错误重试机制（LLM请求失败自动重试）
@@ -718,7 +728,7 @@ struct SentenceText {
 | 位置 | 问题描述 | 严重程度 |
 |------|----------|----------|
 | anchormanager.cpp | ~~AnchorManager析构未清理m_anchors（内存泄漏风险）~~（TD-014 已结案：仅持弱引用，widget 所有权归 AppController） | ~~高~~ |
-| appcontroller.cpp | ~~SUMMARY_THRESHOLD魔法数字硬编码~~（TD-016 已结案：设计意图，摘要轮数=短期记忆轮数） | ~~低~~ |
+| appcontroller.cpp | ~~SUMMARY_THRESHOLD魔法数字硬编码~~（TD-016 已取代：阈值改由 `memory.summary_length` 配置驱动，TD-037） | ~~低~~ |
 | llmservice.h | ~~头文件依赖memorymanager.h，增加编译依赖链~~（TD-015 已修复：llmservice.h 已用 `class MemoryManager;` 前向声明） | ~~中~~ |
 | ttsservice.cpp | ~~直接new StreamPlayer/FilePlayer~~（TD-023 已修复，改用 IPcmPlayer::create 静态工厂） | ~~低~~ |
 
@@ -826,6 +836,8 @@ Windows_AI/
 
 | 日期 | 变更内容 |
 |------|----------|
+| 2026-10-26 | TD-034 退火轮次门控：`m_roundSeq`/`m_lastPlaybackRound`，`playbackQueueEmpty` 仅在最新一轮生效，旧轮收尾不再打断新一轮 |
+| 2026-10-26 | TD-037 设置界面接线：长期记忆摘轮数 + 夜晚时段 + 三档退火时长（ConfigManager 新增 `memory.summary_length`/`time.*` 读写与 6 组 getter/setter；SettingsWidget 三个保存槽；AppController `applyTimeSettings()` 启动与保存时应用；tst_configmanager 新增 3 例） |
 | 2026-10-26 | 文档补录：README/ROADMAP/ARCHITECTURE/技术快照/开发记录同步 Phase 0 实际状态（渠道架构、DB v2、23 例测试、BUG-1/BUG-2） |
 | 2026-10-20 | Phase 0 验收：人工异常回复校验 5 场景通过；修复 BUG-2 空标签编辑距离误判；全量 23 用例通过 |
 | 2026-10-19 | Phase 0 架构解耦落地：Utterance/IChannelAdapter/PetChannelAdapter/QQChannelAdapter(占位)/SessionRouter；数据库 v2 迁移；identity.json 解析；23 例单元测试 |

@@ -5,6 +5,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QTime>
 
 #include "configmanager.h"
 #include "utterance.h"
@@ -76,6 +77,7 @@ private slots:
     void cleanupTestCase()
     {
         QFile::remove(m_identityPath);
+        QFile::remove(m_configDir + "/setting.json");
     }
 
     void parsesQQAccountLists()
@@ -132,7 +134,77 @@ private slots:
         QCOMPARE(ConfigManager::instance().getShortMemoryLength(), 15);
     }
 
+    void parsesTimeAndSummaryConfig()
+    {
+        QJsonObject memory;
+        memory.insert("short_term_length", 12);
+        memory.insert("summary_length", 8);
+        QJsonObject time;
+        time.insert("night_start", "21:30");
+        time.insert("night_end", "06:30");
+        time.insert("blush_lasting", 45);
+        time.insert("emotion_lasting", 20);
+        time.insert("distance_lasting", 25);
+        QJsonObject root;
+        root.insert("memory", memory);
+        root.insert("time", time);
+        writeSettingFile(root);
+
+        ConfigManager &cfg = ConfigManager::instance();
+        QVERIFY(cfg.loadSetting());
+        QCOMPARE(cfg.getShortMemoryLength(), 12);
+        QCOMPARE(cfg.getSummaryMemoryLength(), 8);
+        QCOMPARE(cfg.getNightStartTime(), QTime(21, 30));
+        QCOMPARE(cfg.getNightEndTime(), QTime(6, 30));
+        QCOMPARE(cfg.getBlushLasting(), 45);
+        QCOMPARE(cfg.getEmotionLasting(), 20);
+        QCOMPARE(cfg.getDistanceLasting(), 25);
+    }
+
+    void timeConfigFallsBackToDefaults()
+    {
+        QJsonObject memory;
+        memory.insert("short_term_length", 15);
+        QJsonObject root;
+        root.insert("memory", memory);
+        writeSettingFile(root);
+
+        ConfigManager &cfg = ConfigManager::instance();
+        QVERIFY(cfg.loadSetting());
+        QCOMPARE(cfg.getSummaryMemoryLength(), 15);
+        QCOMPARE(cfg.getNightStartTime(), QTime(22, 0));
+        QCOMPARE(cfg.getNightEndTime(), QTime(7, 0));
+        QCOMPARE(cfg.getBlushLasting(), 30);
+        QCOMPARE(cfg.getEmotionLasting(), 15);
+        QCOMPARE(cfg.getDistanceLasting(), 15);
+    }
+
+    void configValuesAreClamped()
+    {
+        QJsonObject time;
+        time.insert("blush_lasting", 0);
+        time.insert("emotion_lasting", 99999);
+        time.insert("distance_lasting", -5);
+        QJsonObject root;
+        root.insert("time", time);
+        writeSettingFile(root);
+
+        ConfigManager &cfg = ConfigManager::instance();
+        QVERIFY(cfg.loadSetting());
+        QCOMPARE(cfg.getBlushLasting(), 1);
+        QCOMPARE(cfg.getEmotionLasting(), 3600);
+        QCOMPARE(cfg.getDistanceLasting(), 1);
+    }
+
 private:
+    void writeSettingFile(const QJsonObject &root)
+    {
+        QFile file(m_configDir + "/setting.json");
+        QVERIFY2(file.open(QIODevice::WriteOnly | QIODevice::Truncate), "无法写入 setting.json");
+        file.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+        file.close();
+    }
+
     QString m_configDir;
     QString m_identityPath;
 };

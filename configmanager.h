@@ -4,6 +4,7 @@
 #include <QString>
 #include <QStringList>
 #include <QSettings>
+#include <QTime>
 #include "ttsreference.h"
 
 // 记忆盲区（该渠道会话产生的对话不入长期记忆）
@@ -73,6 +74,20 @@ public:
     int getShortMemoryLength();
     void setShortMemoryLength(const int length);
 
+    // ===== 长期记忆 / 时间管理（TD-037：设置界面接线）=====
+    int getSummaryMemoryLength() const;
+    void setSummaryMemoryLength(int length);
+    QTime getNightStartTime() const;
+    void setNightStartTime(const QTime &time);
+    QTime getNightEndTime() const;
+    void setNightEndTime(const QTime &time);
+    int getBlushLasting() const;
+    void setBlushLasting(int seconds);
+    int getEmotionLasting() const;
+    void setEmotionLasting(int seconds);
+    int getDistanceLasting() const;
+    void setDistanceLasting(int seconds);
+
     QString getConfigDirPath()const;
     QString getConfigFilePath()const;
     QString getAppDataPath()const;
@@ -103,6 +118,12 @@ private:
     QString m_pythonPath;
 
     int m_shortMemoryLength=15;
+    int m_summaryMemoryLength=15;          // 长期记忆自动摘轮数（未摘要轮次阈值）
+    QTime m_nightStart{22, 0};             // 夜晚开始
+    QTime m_nightEnd{7, 0};                // 夜晚结束（支持跨零点）
+    int m_blushLasting=30;                 // 脸红退火（秒）
+    int m_emotionLasting=15;               // 表情退火（秒）
+    int m_distanceLasting=15;              // 距离退火（秒）
 
     // identity.json 懒加载缓存（mutable：只读接口内部触发加载）
     mutable bool m_identityLoaded = false;

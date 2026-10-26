@@ -346,6 +346,24 @@
   - 修复 BUG-1（`getUnsummarizedTurns` 先 bind 后 `exec(sql)` 丢参数，导致长期记忆摘要链路失效）、BUG-2（Levenshtein 空串分支写反，缺失 clothing 标签被误改为 pajama）
   - 与方案偏差 3 处：relationship_state 走「复制重建」（SQLite 无法改 UNIQUE 约束）、配置用 identity.json 而非 QSettings（跟随项目 JSON 体系）、迁移用 `user_version` v1→v2（沿用现有惯例）
 
+### M30: 设置界面接线 —— 长期记忆/时间管理（已完成）
+
+- 日期：2026-10-26
+- 内容：
+  - **配置层**：ConfigManager 新增 `memory.summary_length` 与 `time.night_start/night_end/blush_lasting/emotion_lasting/distance_lasting` 读写；缺省值 15 / 22:00 / 07:00 / 30 / 15 / 15，非法值回落（分钟格式校验 + `qBound` 钳制）
+  - **设置界面**：三个保存槽接线（`btn_saveMemorySummaryLength` / `btn_saveNightTime` / `btn_saveAnnealingTime`），控件加范围与单位后缀（轮/秒），`loadSettings()` 回填当前值
+  - **应用层**：AppController 新增 `applyTimeSettings()`（夜晚时段 + 三档退火时长），启动时应用；`settingsSaved` 后重新应用并 `m_timeManager->start()` 立即重估昼夜；记忆提取阈值改读 `getSummaryMemoryLength()`
+  - **测试**：tst_configmanager 新增 3 例（时间/摘要解析、缺省回落、越界钳制），3 套件全绿
+
+### M31: 退火轮次门控（TD-034，已完成）
+
+- 日期：2026-10-26
+- 内容：
+  - **问题**：上一轮播放收尾的 `playbackQueueEmpty` 晚于新一轮用户输入时，被当作当前轮结束，用旧轮最终状态启动退火定时器，导致新一轮播放中途提前退回默认状态
+  - **方案**：AppController 维护 `m_roundSeq`（用户每次输入 +1）与 `m_lastPlaybackRound`（`handleMakoReply` 入队 TTS 时记录当前轮次）；`playbackQueueEmpty` 仅在两者相等时调用 `TimeManager::notifyRoundEnded()`
+  - **效果**：旧轮收尾直接跳过（日志 `忽略旧轮收尾的退火触发`）；新一轮播放结束时才按其最终视觉状态启动退火。用户输入仍会即时停止所有退火定时器（原有行为）
+  - **边界**：仍假设同一时刻只有一个在途 LLM 请求（并发请求时 `m_lastUserInput`/`m_lastMeta` 本就不安全，属独立问题）
+
 ---
 
 ## 技术债务
@@ -367,7 +385,7 @@
 | TD-013 | AppController职责过重（上帝对象） | ⚠️ 可接受（当前规模合适，TimeManager 已独立为子类） | 高 | v0.2.0 |
 | TD-014 | AnchorManager内存泄漏风险 | ✅ 非问题（仅持弱引用，widget 所有权归 AppController） | 高 | v0.2.1 |
 | TD-015 | LLMService头文件依赖MemoryManager | ✅ 已修复（llmservice.h 已用 `class MemoryManager;` 前向声明） | 中 | v0.2.4 |
-| TD-016 | AppController中魔法数字SUMMARY_THRESHOLD | ✅ 非问题（设计意图：摘要轮数=短期记忆轮数） | 低 | v0.2.4 |
+| TD-016 | AppController中魔法数字SUMMARY_THRESHOLD | ✅ 已取代（阈值改由 `memory.summary_length` 配置驱动，TD-037） | 低 | v0.2.4 |
 | TD-017 | LLM标签输出格式不稳定 | ✅ 已修复（JSON协议+TagValidator校验） | 高 | v0.5.0 |
 | TD-018 | 流式PCM解析丢失数据 | ✅ 已修复（readyRead跳过WAV头透传裸PCM） | 高 | v0.5.0 |
 | TD-019 | StreamPlayer野指针崩溃 | ✅ 已修复（m_buffer初始化nullptr+signals去重） | 高 | v0.6.0 |
@@ -385,10 +403,10 @@
 | TD-031 | TTSProcessManager 孤儿进程（异常退出后端口被占用导致下次启动复用坏实例） | ✅ 已修复（apiStart 开头 killProcessOnPort 清理占端口孤儿 python.exe） | 高 | v0.6.0 |
 | TD-032 | TimeManager 退火时间单位错误（hasExpired(15) 误为 15ms，配置为 15秒） | ✅ 已修复（改用 QTimer::start(15000) 正确为 15秒） | 高 | v0.6.0 |
 | TD-033 | 采样率硬编码/猜测（super_sampling 猜测 + 播放器硬编码 24000） | ✅ 已修复（流式/分段路径从服务端WAV头读取真实采样率，StreamPlayer::updateSampleRate 校正） | 中 | v0.6.0 |
-| TD-034 | 对话轮次冲突：playbackQueueEmpty 裸信号无轮次身份，上一轮退火在下一轮对话中途误触发 | ⚠️ 待处理（归属「对话轮次冲突」特性，未来提供打断当前轮/自动排队两种策略） | 高 | v0.6.0 |
+| TD-034 | 对话轮次冲突：playbackQueueEmpty 裸信号无轮次身份，上一轮退火在下一轮对话中途误触发 | ✅ 已修复（轮次门控：`m_roundSeq`/`m_lastPlaybackRound`，退火仅对最新一轮生效） | 高 | v0.6.0 |
 | TD-035 | TimeManager 昼夜判断逻辑颠倒（`now <= 22:00 || now > 7:00` 将整个白天 7:00-22:00 误判为夜，导致白天穿睡衣） | ✅ 已修复（跨零点判断改为 `now >= 22:00 || now < 7:00`） | 高 | v0.6.0 |
 | TD-036 | 立绘切换抖动/漂移（closer 相对 far 脚底差 30px，center 锚定让 closer 脚底向下坠，且 resize+move 两步重绘造成向右闪帧） | ✅ 已修复（脚底中心锚定 + 原子 setGeometry + repaint + WA_NoSystemBackground） | 高 | v0.6.0 |
-| TD-037 | 设置界面三组控件未接线（长期记忆摘轮数/夜晚时段/退火时长），点击保存无反应 | ⚠️ 待处理（控件与按钮已就位，缺 ConfigManager 配置项与槽函数；TimeManager 默认值硬编码） | 中 | v0.6.0 |
+| TD-037 | 设置界面三组控件未接线（长期记忆摘轮数/夜晚时段/退火时长），点击保存无反应 | ✅ 已修复（ConfigManager `memory.summary_length`/`time.*` + SettingsWidget 三槽 + AppController `applyTimeSettings()` 热应用） | 中 | v0.6.0 |
 
 ---
 

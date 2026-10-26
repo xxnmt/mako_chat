@@ -51,11 +51,39 @@ bool ConfigManager::loadSetting()
     if (rootObj.contains("memory") && rootObj["memory"].isObject()) {
         QJsonObject memoryObj = rootObj["memory"].toObject();
         m_shortMemoryLength = memoryObj.value("short_term_length").toInt(15);
+        m_summaryMemoryLength = memoryObj.value("summary_length").toInt(15);
     }
     else
     {
         qDebug()<<"[ConfigManger]:memory配置缺失，使用默认值";
         m_shortMemoryLength = 15;
+        m_summaryMemoryLength = 15;
+    }
+    if (m_summaryMemoryLength < 1) {
+        m_summaryMemoryLength = 15;
+    }
+
+    // 时间管理（TD-037；缺省值与 TimeManager 构造默认值保持一致）
+    m_nightStart = QTime(22, 0);
+    m_nightEnd = QTime(7, 0);
+    m_blushLasting = 30;
+    m_emotionLasting = 15;
+    m_distanceLasting = 15;
+    if (rootObj.contains("time") && rootObj["time"].isObject()) {
+        QJsonObject timeObj = rootObj["time"].toObject();
+        const QTime nightStart = QTime::fromString(
+            timeObj.value("night_start").toString("22:00"), "HH:mm");
+        const QTime nightEnd = QTime::fromString(
+            timeObj.value("night_end").toString("07:00"), "HH:mm");
+        if (nightStart.isValid()) {
+            m_nightStart = nightStart;
+        }
+        if (nightEnd.isValid()) {
+            m_nightEnd = nightEnd;
+        }
+        m_blushLasting = qBound(1, timeObj.value("blush_lasting").toInt(30), 3600);
+        m_emotionLasting = qBound(1, timeObj.value("emotion_lasting").toInt(15), 3600);
+        m_distanceLasting = qBound(1, timeObj.value("distance_lasting").toInt(15), 3600);
     }
     //tts
     if (rootObj.contains("tts") && rootObj["tts"].isObject()) {
@@ -92,10 +120,19 @@ bool ConfigManager::saveSetting()
 
     QJsonObject memoryObj;
     memoryObj.insert("short_term_length", m_shortMemoryLength);
+    memoryObj.insert("summary_length", m_summaryMemoryLength);
+
+    QJsonObject timeObj;
+    timeObj.insert("night_start", m_nightStart.toString("HH:mm"));
+    timeObj.insert("night_end", m_nightEnd.toString("HH:mm"));
+    timeObj.insert("blush_lasting", m_blushLasting);
+    timeObj.insert("emotion_lasting", m_emotionLasting);
+    timeObj.insert("distance_lasting", m_distanceLasting);
 
     QJsonObject rootObj;
     rootObj.insert("api", apiObj);
     rootObj.insert("memory", memoryObj);
+    rootObj.insert("time", timeObj);
 
     QJsonObject ttsObj;
     ttsObj.insert("mode", m_ttsMode);
@@ -243,6 +280,70 @@ int ConfigManager::getShortMemoryLength()
 void ConfigManager::setShortMemoryLength(const int length)
 {
     m_shortMemoryLength=length;
+}
+
+int ConfigManager::getSummaryMemoryLength() const
+{
+    return m_summaryMemoryLength;
+}
+
+void ConfigManager::setSummaryMemoryLength(int length)
+{
+    m_summaryMemoryLength = qBound(1, length, 999);
+}
+
+QTime ConfigManager::getNightStartTime() const
+{
+    return m_nightStart;
+}
+
+void ConfigManager::setNightStartTime(const QTime &time)
+{
+    if (time.isValid()) {
+        m_nightStart = time;
+    }
+}
+
+QTime ConfigManager::getNightEndTime() const
+{
+    return m_nightEnd;
+}
+
+void ConfigManager::setNightEndTime(const QTime &time)
+{
+    if (time.isValid()) {
+        m_nightEnd = time;
+    }
+}
+
+int ConfigManager::getBlushLasting() const
+{
+    return m_blushLasting;
+}
+
+void ConfigManager::setBlushLasting(int seconds)
+{
+    m_blushLasting = qBound(1, seconds, 3600);
+}
+
+int ConfigManager::getEmotionLasting() const
+{
+    return m_emotionLasting;
+}
+
+void ConfigManager::setEmotionLasting(int seconds)
+{
+    m_emotionLasting = qBound(1, seconds, 3600);
+}
+
+int ConfigManager::getDistanceLasting() const
+{
+    return m_distanceLasting;
+}
+
+void ConfigManager::setDistanceLasting(int seconds)
+{
+    m_distanceLasting = qBound(1, seconds, 3600);
 }
 
 QString ConfigManager::getConfigDirPath() const

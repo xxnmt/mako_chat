@@ -22,7 +22,7 @@
   - 长期记忆摘要（LLM自动提取重要事件，跨会话持久化）
   - 关系状态（relationship_state，亲密度/信任度量化）
   - 对话历史管理（分页浏览、删除、清空）
-- ⚙️ **设置界面**：左侧目录 + 右侧滚动内容，点击目录跳转、滚动自动高亮双向同步；支持 API Key、短期记忆轮数、TTS 模型切换、历史记录管理
+- ⚙️ **设置界面**：左侧目录 + 右侧滚动内容，点击目录跳转、滚动自动高亮双向同步；支持 API Key、短期记忆轮数、长期记忆摘轮数、夜晚时段与退火时长、TTS 模型切换、历史记录管理
 - 🔌 **多渠道架构（Phase 0）**：统一 `Utterance` 输出协议 + `IChannelAdapter` 渠道抽象 + `SessionRouter` 输入路由；记忆按 `channel + session_id` 双键隔离，为 QQ 等外部渠道预留接入点（QQ 渠道为 Phase 1 占位）
 
 ### 开发中功能
@@ -224,7 +224,15 @@ cmake --build . --config Release
         "gpt_sovits_url": "http://127.0.0.1:9880"
     },
     "memory": {
-        "short_term_length": 15
+        "short_term_length": 15,
+        "summary_length": 15
+    },
+    "time": {
+        "night_start": "22:00",
+        "night_end": "07:00",
+        "blush_lasting": 30,
+        "emotion_lasting": 15,
+        "distance_lasting": 15
     },
     "tts": {
         "mode": "api"
@@ -237,6 +245,12 @@ cmake --build . --config Release
 | `api.deepseek_api_key` | `sk-placeholder-key` | DeepSeek API 密钥 |
 | `api.gpt_sovits_url` | `http://127.0.0.1:9880` | GPT-SoVITS 服务地址 |
 | `memory.short_term_length` | `15` | 短期记忆轮数（AI对话时携带的历史上下文数量） |
+| `memory.summary_length` | `15` | 长期记忆自动摘轮数（未摘要对话达到该轮数时触发后台记忆提取） |
+| `time.night_start` | `22:00` | 夜晚开始时间（`HH:mm`，支持跨零点） |
+| `time.night_end` | `07:00` | 夜晚结束时间（`HH:mm`） |
+| `time.blush_lasting` | `30` | 脸红退火时长（秒，1-3600） |
+| `time.emotion_lasting` | `15` | 表情退火时长（秒，1-3600） |
+| `time.distance_lasting` | `15` | 距离退火时长（秒，1-3600） |
 | `tts.mode` | `api` | TTS 模式：`api`（真实API）或 `mock`（模拟实现） |
 
 ### 获取 DeepSeek API Key
@@ -291,7 +305,7 @@ cmake --build . --config Release
 | **长期摘要** | SQLite（long_term_summary） | LLM自动提取的重要事件摘要，跨会话持久化 |
 | **关系状态** | SQLite（relationship_state） | 亲密度/信任度量化（默认30/30），驱动角色关系 |
 
-**记忆提取机制**：当未摘要对话达到短期记忆长度阈值时，自动触发后台记忆提取，LLM 分析对话内容，传入已有档案做增量更新，生成角色档案、情景记忆、长期摘要和关系状态更新。
+**记忆提取机制**：当未摘要对话达到「长期记忆自动摘轮数」（默认 15 轮，可在设置界面或 `memory.summary_length` 配置）时，自动触发后台记忆提取，LLM 分析对话内容，传入已有档案做增量更新，生成角色档案、情景记忆、长期摘要和关系状态更新。
 
 **多渠道记忆隔离（v2）**：`chat_history` 与 `long_term_summary` 增加 `channel`/`session_id` 双键（默认 `pet`/`default`），`chat_history` 另有 `speaker`/`sensitive`；`episodic_memory` 增加 `origin` 溯源列；`relationship_state` 改为 `UNIQUE(subject, dimension)`，存量关系归入 `subject='user'`（主人）。另新增 `raw_messages` 群聊原始消息表（Phase 0 只建不写，Phase 1 接入）。
 

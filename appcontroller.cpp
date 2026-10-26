@@ -43,6 +43,7 @@ AppController::AppController(QObject *parent)
     m_llmService->setMemoryManager(m_memoryManager);
 
     m_timeManager =new TimeManager(this);
+    applyTimeSettings();   // TD-037：启动时应用用户配置（夜晚时段/退火时长）
 
     // 渠道装配（Phase 0：桌宠渠道接管气泡私有表现；QQ 为 Phase 1 占位）
     m_petChannel = new PetChannelAdapter(m_bubble, this);
@@ -125,6 +126,8 @@ void AppController::startApp()
 
 void AppController::handleMakoReply(const QList<SentenceText> &sentences, const QString &rawReply)
 {
+    // TD-034：本轮回复入队 TTS，记下它属于哪一轮（退火门控用）
+    m_lastPlaybackRound = m_roundSeq;
     m_memoryManager->saveQATurn(m_lastUserInput,rawReply,sentences,m_lastMeta);
     m_ttsService->enqueueSentences(sentences);
 
@@ -134,7 +137,8 @@ void AppController::handleMakoReply(const QList<SentenceText> &sentences, const 
                                                                                 m_lastMeta.channel, m_lastMeta.sessionId);
 
 
-    const int SUMMARY_THRESHOLD = ConfigManager::instance().getShortMemoryLength();
+    // 长期记忆自动摘轮数（TD-037：由设置界面独立配置，默认与短期记忆同为 15）
+    const int SUMMARY_THRESHOLD = ConfigManager::instance().getSummaryMemoryLength();
     if (unsummarizedTurns.size() >= SUMMARY_THRESHOLD) {
         qDebug()<<"[AppController]未摘要对话达到阈值，开始触发后台记忆提取...";
         QList<CharacterProfile> existingProfiles = m_memoryManager->getCharacterProfiles("user");
@@ -185,6 +189,16 @@ void AppController::onPlayAudioAction(const QString &zhText, const QMap<QString,
 
 }
 
+void AppController::applyTimeSettings()
+{
+    ConfigManager &cfg = ConfigManager::instance();
+    m_timeManager->setNightStart(cfg.getNightStartTime());
+    m_timeManager->setNightEnd(cfg.getNightEndTime());
+    m_timeManager->setBlushTime(cfg.getBlushLasting());
+    m_timeManager->setBackIdleTime(cfg.getEmotionLasting());
+    m_timeManager->setDistanceTime(cfg.getDistanceLasting());
+}
+
 void AppController::initConnections()
 {
     connect(m_ttsService, &TTSService::playAudioAction, this, &AppController::onPlayAudioAction);
@@ -202,13 +216,18 @@ void AppController::initConnections()
     //     m_llmService->setApiKey(ConfigManager::instance().getApiKey());});
     connect(m_character, &CharacterWidget::settingsRequested, m_settingsWidget, &SettingsWidget::show);
     connect(m_settingsWidget, &SettingsWidget::settingsSaved, this, [this](){
-        m_llmService->setApiKey(ConfigManager::instance().getApiKey());});
+        m_llmService->setApiKey(ConfigManager::instance().getApiKey());
+        // TD-037：时间/退火配置热生效（start() 会立即重估昼夜状态）
+        applyTimeSettings();
+        m_timeManager->start();
+    });
 
     connect(m_llmService,&LLMService::sentencesReady,this,&AppController::handleMakoReply);
     // 输入路由：渠道 → SessionRouter（身份解析+历史组装）→ 大脑
     connect(m_sessionRouter, &SessionRouter::requestReply, this,
             [this](const QString &userText, const QList<HistoryTurn> &history, const RequestMeta &meta) {
         m_lastUserInput = userText;
+        ++m_roundSeq;   // TD-034：用户开口即开启新一轮
         m_lastMeta = meta;
         m_timeManager->notifyUserInputStarted();
         m_llmService->askDeepSeek(userText, history, meta);
@@ -297,6 +316,14 @@ void AppController::initConnections()
 
     // 每轮对话结束：以最终视觉状态驱动退火（脸红/非默认表情/closer 各自开定时器）
     connect(m_ttsService, &TTSService::playbackQueueEmpty, m_timeManager, [this]() {
+                // TD-034：退火只对最新一轮生效——上一轮播放收尾时若已经开启新一轮
+                //（用户已输入但新回复尚未入队 TTS），这次收尾不属于当前轮，跳过退火；
+                // 等新一轮播放结束（m_lastPlaybackRound == m_roundSeq）再按最终状态处理。
+                if (m_lastPlaybackRound != m_roundSeq) {
+                    qDebug() << "[AppController]忽略旧轮收尾的退火触发: 播放轮次"
+                             << m_lastPlaybackRound << "当前轮次" << m_roundSeq;
+                    return;
+                }
                 QMap<QString, QString> finalTags;
                 finalTags["blush"]    = m_appearance->getBlush();
                 finalTags["emotion"]  = m_appearance->getEmotion();
