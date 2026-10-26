@@ -203,7 +203,7 @@
 - [x] **数据库 v2 迁移**：`chat_history`/`long_term_summary` 渠道双键、`episodic_memory.origin`、`relationship_state` 按 subject 重建、`raw_messages` 建表（只建不写）
 - [x] **identity.json 配置解析**（self/master/盲区/立绘跟随/主动对话，Phase 0 只读、无调度）
 - [x] **Phase 0 单元测试 23 例**（memorymanager 10 / configmanager 8 / sessionrouter 5），修复 BUG-1 未摘要游标恒空、BUG-2 空标签误判
-- [ ] **Phase 0.5**：`episodic_memory.visibility` + `appendRawMessage()` + `getActiveEpisodicMemories` 按 `origin`/`visibility` 过滤
+- [x] **Phase 0.5 / 记忆库 v3**（提交 `8f24ae5`）：`chat_history` 轮次语义（`user_input` 可空 + `turn_kind`/`trigger_event_ids`/`subject`）、`raw_messages`→`raw_events`、`episodic_memory` 加 `visibility`/`subject`、新建 `memory_cursor`、`appendRawEvent`/游标/过滤 API
 - [ ] **Phase 1**：SnowLuma 部署 + `QQProtocolClient`/`QQChannelAdapter` 收发（前置：TTSService 合成/播放分离、`PromptAssembler`、`GlobalMoodState`）
 - [ ] **Phase 2**：`ChatPlanner` 发言门控 + `ProactiveScheduler` 主动对话
 - [ ] **Phase 3**：QQ 空间说说/评论/点赞、合并转发/戳一戳/表情回应
@@ -486,7 +486,7 @@ v0.4.1  ████████████████████ 100%  TTS�
 v0.5.0  ████████████████████ 100%  JSON协议 & 标签校验
 v0.6.0  ████████████████████   95%  流式TTS播放 & 播放器抽象 & 时间管理（剩外观/快捷键/托盘等）
 Phase 0   ████████████████████  100%  多渠道架构解耦（已提交 61f1767）
-Phase 0.5 ░░░░░░░░░░░░░░░░░░░░    0%  记忆可见性/溯源预留（下一步）
+Phase 0.5 ████████████████████  100%  记忆库 v3（已提交 8f24ae5）
 Phase 1   ░░░░░░░░░░░░░░░░░░░░    0%  QQ 渠道接入（依赖 SnowLuma）
 v0.7.0  ░░░░░░░░░░░░░░░░░░░░   0%  架构改进 & 独立存档
 v0.8.0  ░░░░░░░░░░░░░░░░░░░░   0%  角色自定义 & 剧本系统
@@ -495,17 +495,12 @@ v0.9.0  ░░░░░░░░░░░░░░░░░░░░   0%  智�
 
 ---
 
-## 近期任务（Next Up，2026-10-26 更新）
+## 近期任务（Next Up，2026-10-27 更新）
 
-1. **Phase 0.5**
-   - v3 迁移：`episodic_memory.visibility`（默认 `private`）
-   - `appendRawMessage()`（只写方法，不接线）
-   - `getActiveEpisodicMemories` 扩参：`origin` + `visibility`（默认不过滤，见 HUMANIZATION_PLAN 10.3）
-
-2. **Phase 1 前置项**
+1. **Phase 1 前置项**
    - TTSService 合成/播放分离、`GlobalMoodState`、`PromptAssembler`、`resolveSubject` 接 identity.json
 
-3. **Phase 1 主体**
+2. **Phase 1 主体**
    - SnowLuma 收发链路验证 → `QQProtocolClient` / `QQChannelAdapter`
 
 > 顺延（不影响主线）：LLM 错误重试、ShortcutManager、TTS 语速/温度、外观配置、历史导出、立绘过渡动画、系统托盘、右键菜单扩展、AppController 职责拆分（TD-013）、独立存档、插件化。

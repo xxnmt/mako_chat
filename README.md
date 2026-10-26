@@ -158,7 +158,7 @@ POST /tts
 - **AI 服务**: DeepSeek API (deepseek-v4-flash)
 - **语音合成**: GPT-SoVITS（API 已接入，策略模式封装）
 - **音频播放**: IPcmPlayer 抽象（StreamPlayer 流式 / FilePlayer 文件，QAudioSink + QBuffer）
-- **数据库**: SQLite（v2 结构：对话历史、角色档案、情景记忆、长期摘要、关系状态 + 群聊原始消息 `raw_messages`）
+- **数据库**: SQLite（v3 结构：原始事件流水 `raw_events` + 对话轮次 `chat_history` + 蒸馏记忆：角色档案、情景记忆、长期摘要、关系状态 + 蒸馏游标 `memory_cursor`）
 
 ## 📦 安装与构建
 
@@ -295,7 +295,7 @@ cmake --build . --config Release
 
 ### 记忆系统说明
 
-茉子的记忆系统分为五个层次（数据库当前为 v2 结构：v1 迁移块创建基础表，v2 迁移块扩展多渠道字段）：
+茉子的记忆系统分为五个层次（v3 结构：底层新增原始事件流水与轮次元数据，上层仍是五层蒸馏记忆）：
 
 | 记忆类型 | 存储方式 | 描述 |
 |----------|----------|------|
@@ -307,7 +307,7 @@ cmake --build . --config Release
 
 **记忆提取机制**：当未摘要对话达到「长期记忆自动摘轮数」（默认 15 轮，可在设置界面或 `memory.summary_length` 配置）时，自动触发后台记忆提取，LLM 分析对话内容，传入已有档案做增量更新，生成角色档案、情景记忆、长期摘要和关系状态更新。
 
-**多渠道记忆隔离（v2）**：`chat_history` 与 `long_term_summary` 增加 `channel`/`session_id` 双键（默认 `pet`/`default`），`chat_history` 另有 `speaker`/`sensitive`；`episodic_memory` 增加 `origin` 溯源列；`relationship_state` 改为 `UNIQUE(subject, dimension)`，存量关系归入 `subject='user'`（主人）。另新增 `raw_messages` 群聊原始消息表（Phase 0 只建不写，Phase 1 接入）。
+**三层存储（v3）**：`raw_events` 存全量原始事件（QQ / B 站 / 窥屏 / 主动触发；`message_id` 去重，默认不进上下文）；`chat_history` 存对话轮次（`turn_kind` = reply/proactive/perception，`user_input` 可为 NULL，`trigger_event_ids` 关联原始事件，`subject` 标记对话对象）；`episodic_memory` / `long_term_summary` / `character_profile` / `relationship_state` 存蒸馏产物（情景记忆带 `origin` / `visibility` / `subject`）。`memory_cursor` 按 `channel + session_id` 记录蒸馏进度。多渠道双键隔离与 `relationship_state` 的 `UNIQUE(subject, dimension)` 保持 v2 设计。
 
 ## 📁 项目结构
 

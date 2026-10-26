@@ -1,8 +1,8 @@
 # 架构设计文档
 
 > 项目：Windows_AI 桌面看板娘（桌宠）
-> 版本：v0.6.0 + Phase 0（多渠道架构）
-> 更新日期：2026-10-26
+> 版本：v0.6.0 + Phase 0/0.5（多渠道 + 记忆库 v3）
+> 更新日期：2026-10-27
 
 ---
 
@@ -723,7 +723,7 @@ LLMService::parseJsonReply() → TagValidator校验
 **职责**：管理AI对话历史记录、角色档案、情景记忆、长期摘要和关系状态
 
 **设计要点**：
-- 使用SQLite数据库存储五类数据（数据库版本 `PRAGMA user_version = 2`；v2 增加多渠道字段与 `raw_messages`）
+- 使用SQLite存储三层数据：原始事件流水（`raw_events`）+ 对话轮次（`chat_history`）+ 蒸馏记忆（档案/情景/摘要/关系）；数据库版本 `PRAGMA user_version = 3`
 - 每次对话后保存用户输入、AI回复（JSON对象）
 - 对话前读取最近N轮历史作为短期记忆
 - 角色档案区分 `user` / `mako` 两个主体，长期稳定特质
@@ -733,19 +733,22 @@ LLMService::parseJsonReply() → TagValidator校验
 - 数据库路径：`app_data/memory/QianDaoMoZi_memory.db`
 - 注：旧的 `user_profile` 表已被 `character_profile` 表取代（通过 subject 字段区分 user/mako）
 
-**数据库结构**（`PRAGMA user_version = 2`；v1 块 5 张基础表 + v2 块多渠道扩展，合计 6 张表）：
+**数据库结构**（`PRAGMA user_version = 3`；v1/v2 基础 + v3 记忆库调整，合计 7 张表）：
 
 **表1：chat_history（对话历史）**
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | id | INTEGER PRIMARY KEY AUTOINCREMENT | 记录ID |
 | timestamp | DATETIME DEFAULT (datetime('now','localtime')) | 创建时间（本地时间） |
-| user_input | TEXT NOT NULL | 用户输入文本 |
+| user_input | TEXT（可空） | 用户输入；主动/感知轮次为 NULL（v3） |
 | raw_reply | TEXT NOT NULL | AI回复的JSON对象 `{"sentences": [...]}` |
 | channel | TEXT NOT NULL DEFAULT 'pet' | 渠道：pet / qq_private / qq_group（v2） |
 | session_id | TEXT NOT NULL DEFAULT 'default' | 会话 ID（QQ 为好友号/群号，v2） |
 | speaker | TEXT | 说话人（群聊场景，v2） |
 | sensitive | INTEGER NOT NULL DEFAULT 0 | 记忆盲区/敏感标记（v2） |
+| turn_kind | TEXT NOT NULL DEFAULT 'reply' | 轮次类型：reply / proactive / perception（v3） |
+| trigger_event_ids | TEXT | 触发事件 id 列表（JSON，指向 raw_events.id，v3） |
+| subject | TEXT NOT NULL DEFAULT 'user' | 本轮对象：user / qq:<uin> / group:<群号>（v3） |
 
 **表2：long_term_summary（长期记忆摘要）**
 | 字段 | 类型 | 说明 |
@@ -785,7 +788,9 @@ LLMService::parseJsonReply() → TagValidator校验
 | last_accessed | DATETIME DEFAULT (datetime('now','localtime')) | 最后访问时间（检索时更新） |
 | last_decay_at | DATETIME DEFAULT (datetime('now','localtime')) | 最后衰减计算时间 |
 | source_ids | TEXT | 来源对话ID列表（JSON） |
-| origin | TEXT NOT NULL DEFAULT 'pet' | 渠道溯源：pet / qq_private / qq_group（v2） |
+| origin | TEXT NOT NULL DEFAULT 'pet' | 渠道溯源：pet / qq_private / qq_group / bilibili / screen（v2） |
+| visibility | TEXT NOT NULL DEFAULT 'private' | 可见性：private / channel / public（v3） |
+| subject | TEXT NOT NULL DEFAULT 'user' | 记忆所属主体（v3） |
 
 索引：`idx_episodic_importance`(importance)、`idx_episodic_type`(type)、`idx_episodic_status`(status)
 
@@ -802,19 +807,37 @@ LLMService::parseJsonReply() → TagValidator校验
 
 初始化数据：`intimacy=30.0`、`trust=30.0`（initDatabase 时若表为空自动插入）
 
-**表6：raw_messages（群聊原始消息，v2 新增，Phase 0 只建不写）**
+**表6：raw_events（原始事件流水，v3 由 raw_messages 泛化；本阶段只建不写）**
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | id | INTEGER PRIMARY KEY AUTOINCREMENT | 记录ID |
-| channel | TEXT NOT NULL | 渠道 |
-| session_id | TEXT NOT NULL | 会话（群号） |
-| speaker | TEXT | 说话人 |
-| content | TEXT NOT NULL | 原始内容 |
-| timestamp | DATETIME DEFAULT (datetime('now','localtime')) | 时间 |
-| sensitive | INTEGER NOT NULL DEFAULT 0 | 盲区标记 |
-| consolidated | INTEGER NOT NULL DEFAULT 0 | 是否已被蒸馏 |
+| platform | TEXT NOT NULL | qq / bilibili / screen / system |
+| channel | TEXT NOT NULL | pet / qq_private / qq_group / bilibili / screen |
+| session_id | TEXT NOT NULL | 会话（群号/好友号/默认） |
+| message_id | TEXT | 平台消息 ID（`UNIQUE(channel, message_id)` 去重） |
+| direction | TEXT NOT NULL DEFAULT 'in' | in / out / event |
+| sender_id | TEXT | 稳定身份（uin/uid；自己为 'self'） |
+| sender_name | TEXT | 显示名快照 |
+| event_type | TEXT NOT NULL | message / at / notice / percept / trigger / outbound |
+| content | TEXT | 纯文本（可空） |
+| payload | TEXT | JSON 原文（媒体/元数据） |
+| occurred_at | DATETIME DEFAULT (datetime('now','localtime')) | 事件时间 |
+| sensitive | INTEGER NOT NULL DEFAULT 0 | 盲区/敏感标记 |
+| visibility | TEXT NOT NULL DEFAULT 'private' | private / channel / public |
+| processed | INTEGER NOT NULL DEFAULT 0 | 是否已被蒸馏 |
 
-索引：`idx_raw_session(session_id, timestamp)`、`idx_raw_consolidated(consolidated)`
+索引：`idx_raw_events_session(channel, session_id, occurred_at)`、`idx_raw_events_processed(processed)`
+
+**表7：memory_cursor（蒸馏游标，v3 新增）**
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| channel | TEXT NOT NULL | 渠道 |
+| session_id | TEXT NOT NULL | 会话 |
+| last_event_id | INTEGER NOT NULL DEFAULT 0 | 已蒸馏到的 raw_events.id |
+| last_turn_id | INTEGER NOT NULL DEFAULT 0 | 已蒸馏到的 chat_history.id |
+| updated_at | DATETIME DEFAULT (datetime('now','localtime')) | 更新时间 |
+
+约束：`PRIMARY KEY(channel, session_id)`
 
 **关键方法**：
 
@@ -829,6 +852,13 @@ LLMService::parseJsonReply() → TagValidator校验
 | `clearAllHistory()` | 清空所有记录 | - | bool |
 | `getUnsummarizedTurns()` | 按双键获取 id > long_term_summary.max(covered_turn_end_id) 的未摘要对话 | outLastEndId, outSourceIds, channel, sessionId | QList\<HistoryTurn\> |
 
+**原始事件与蒸馏游标（v3）**：
+| 方法 | 作用 | 参数 | 返回值 |
+|------|------|------|--------|
+| `appendRawEvent()` | 写入 raw_events（`INSERT OR IGNORE`，按 message_id 去重；本阶段不接线） | platform, channel, sessionId, eventType, content, messageId, direction, senderId, senderName, payloadJson, occurredAt, sensitive, visibility | bool |
+| `updateMemoryCursor()` | 更新每 channel+session 的蒸馏游标 | channel, sessionId, lastEventId, lastTurnId | bool |
+| `getMemoryCursorEventId()` | 读取事件游标（无记录返回 0） | channel, sessionId | qlonglong |
+
 **角色档案 CRUD**：
 | 方法 | 作用 | 参数 | 返回值 |
 |------|------|------|--------|
@@ -839,8 +869,8 @@ LLMService::parseJsonReply() → TagValidator校验
 **情景记忆 CRUD**：
 | 方法 | 作用 | 参数 | 返回值 |
 |------|------|------|--------|
-| `addEpisodicMemory()` | 新增情景记忆（eventTime 无效时用当前时间） | content, type, importance, eventTime, sourceIds | bool |
-| `getActiveEpisodicMemories()` | 获取活跃记忆（status='active' AND importance≥minImportance，按 importance DESC 排序，并更新 last_accessed） | minImportance=0.2, limit=20 | QList\<EpisodicMemory\> |
+| `addEpisodicMemory()` | 新增情景记忆（eventTime 无效时用当前时间） | content, type, importance, eventTime, sourceIds, origin="pet", visibility="private", subject="user" | bool |
+| `getActiveEpisodicMemories()` | 获取活跃记忆（status='active' AND importance≥minImportance，按 importance DESC 排序，并更新 last_accessed；可按 origin/visibility 过滤） | minImportance=0.2, limit=20, origin="", visibility="" | QList\<EpisodicMemory\> |
 | `deleteEpisodicMemory()` | 删除记忆 | id | bool |
 | `updateEpisodicMemoryStatus()` | 更新记忆状态（如 promise 兑现 → resolved / 失约 → broken） | id, status | bool |
 | `decayEpisodicMemory()` | 衰减扫描：importance≥0.8 不衰减；其余 -0.05/天；<0.1 删除 | - | int（删除条数） |
@@ -1158,6 +1188,8 @@ ChatWidget::textSubmitted(text)
 ```
 
 **设计决策**：只注入纯文本，不注入标签格式，避免影响LLM的输出格式。
+
+**v3 轮次渲染规则**：`reply` 轮注入 `user` + `assistant`；`proactive` / `perception`（或 `user_input` 为 NULL）只注入 `assistant`，不生成空 `user` 消息；记忆提取 prompt 对主动/感知轮输出「茉子（主动）: …」，不生成「用户:」空行。
 
 ---
 

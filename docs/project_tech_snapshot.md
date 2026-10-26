@@ -1,9 +1,9 @@
 # 【项目技术快照】
 
 > 项目：Windows_AI 桌面看板娘（桌宠）
-> 日期：2026-10-26
-> 版本：v0.6.0 + Phase 0（多渠道架构）
-> 状态：开发中（Phase 0 已完成并通过测试，Phase 0.5 待开始）
+> 日期：2026-10-27
+> 版本：v0.6.0 + Phase 0/0.5（多渠道 + 记忆库 v3）
+> 状态：开发中（Phase 0/0.5 已完成，Phase 1 待开始）
 
 ---
 
@@ -329,7 +329,7 @@ signals:
 
 | 类型 | 名称 | 说明 |
 |------|------|------|
-| **职责** | 管理AI对话历史、角色档案、情景记忆、长期摘要和关系状态 | - |
+| **职责** | 管理原始事件流水、对话轮次、角色档案、情景记忆、长期摘要和关系状态 | - |
 | **私有变量** | `m_db` | QSqlDatabase，SQLite数据库连接 |
 | **函数签名** | `bool saveQATurn(const QString& userInput, const QString& rawReply, const QList<SentenceText>& sentences, const RequestMeta& meta = RequestMeta())` | 保存单轮对话（raw_reply为JSON对象；meta 写入 channel/session/speaker/sensitive） |
 | | `QList<HistoryTurn> getHistoryTurn(int N, const QString& channel = "pet", const QString& sessionId = "default")` | 按渠道+会话双键获取最近N轮对话历史 |
@@ -337,12 +337,15 @@ signals:
 | | `qlonglong getTotalHistoryCount()` | 获取历史记录总数 |
 | | `bool deleteTurnByID(int id)` | 根据ID删除单条记录 |
 | | `bool clearAllHistory()` | 清空所有历史记录 |
+| | `bool appendRawEvent(platform, channel, sessionId, eventType, content, messageId, direction, senderId, senderName, payloadJson, occurredAt, sensitive, visibility)` | 写入 raw_events（`INSERT OR IGNORE`，message_id 去重；本阶段不接线） |
+| | `bool updateMemoryCursor(channel, sessionId, lastEventId, lastTurnId)` | 更新蒸馏游标 |
+| | `qlonglong getMemoryCursorEventId(channel, sessionId)` | 读取事件游标（无记录返回 0） |
 | | `QList<HistoryTurn> getUnsummarizedTurns(qlonglong& outLastEndId, QList<qlonglong>& outSourceIds, const QString& channel = "pet", const QString& sessionId = "default")` | 按双键获取未摘要对话（游标子查询同样按双键） |
 | | `bool upsertCharacterProfile(const QString& subject, const QString& key, const QString& value)` | 插入或更新角色档案（先 normalizeProfileKey 归一化 key，已存在则 mergeProfileValue 合并 value） |
 | | `QList<CharacterProfile> getCharacterProfiles(const QString& subject)` | 获取档案（subject 为空时返回全部） |
 | | `bool deleteCharacterProfile(qlonglong id)` | 删除档案 |
-| | `bool addEpisodicMemory(const QString& content, const QString& type, double importance, const QDateTime& eventTime = QDateTime(), const QString& sourceIds = QString())` | 新增情景记忆（eventTime 无效时用当前时间） |
-| | `QList<EpisodicMemory> getActiveEpisodicMemories(double minImportance = 0.2, int limit = 20)` | 获取活跃记忆（status='active' AND importance≥阈值，按 importance DESC 排序，更新 last_accessed）；Phase 0.5 计划扩 origin/visibility 过滤 |
+| | `bool addEpisodicMemory(content, type, importance, eventTime = QDateTime(), sourceIds = QString(), origin = "pet", visibility = "private", subject = "user")` | 新增情景记忆（含渠道溯源/可见性/主体） |
+| | `QList<EpisodicMemory> getActiveEpisodicMemories(double minImportance = 0.2, int limit = 20, const QString& origin = QString(), const QString& visibility = QString())` | 获取活跃记忆（status='active' AND importance≥阈值，按 importance DESC 排序，更新 last_accessed；可按 origin/visibility 过滤，默认不过滤） |
 | | `bool deleteEpisodicMemory(qlonglong id)` | 删除记忆 |
 | | `bool updateEpisodicMemoryStatus(qlonglong id, const QString& status)` | 更新记忆状态（promise 兑现→resolved / 失约→broken） |
 | | `int decayEpisodicMemory()` | 衰减扫描：importance≥0.8 不衰减；其余 -0.05/天；<0.1 删除（基于 last_decay_at） |
@@ -356,22 +359,25 @@ signals:
 | | `bool upsertRelationshipState(const QString& dimension, double delta, const QString& subject = "user")` | 按 subject 维度不存在时初始化为 clamp(30+delta,0,100)；存在时 clamp(oldVal+delta,0,100) |
 | | `QList<RelationshipState> getRelationshipStates(const QString& subject = "user")` | 获取指定主体的全部关系维度（按 dimension 排序） |
 | | `bool initRelationshipState()` | 若表为空，插入 intimacy=30、trust=30 |
-| | `void initDatabase(const QString& dbFilePath)` | 初始化数据库：v1 块创建 5 张基础表，v2 块做多渠道扩展并新增 raw_messages（`user_version=2`） |
+| | `void initDatabase(const QString& dbFilePath)` | 初始化数据库：v1 基础表 → v2 多渠道 → v3 记忆库调整（`user_version=3`，7 张表） |
 | **数据库路径** | `app_data/memory/QianDaoMoZi_memory.db` | - |
 
-**数据库结构**（`PRAGMA user_version = 2`；v1 块创建 5 张基础表，v2 块做多渠道扩展并新增 `raw_messages`，合计 6 张表）：
+**数据库结构**（`PRAGMA user_version = 3`；v1/v2 基础 + v3 记忆库调整，合计 7 张表）：
 
 **表1：chat_history（对话历史）**
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | id | INTEGER PRIMARY KEY AUTOINCREMENT | 记录ID |
 | timestamp | DATETIME DEFAULT (datetime('now','localtime')) | 创建时间（本地时间） |
-| user_input | TEXT NOT NULL | 用户输入文本 |
+| user_input | TEXT（可空） | 用户输入；主动/感知轮次为 NULL（v3） |
 | raw_reply | TEXT NOT NULL | AI回复的JSON对象 `{"sentences": [...]}` |
 | channel | TEXT NOT NULL DEFAULT 'pet' | 渠道：pet / qq_private / qq_group（v2） |
 | session_id | TEXT NOT NULL DEFAULT 'default' | 会话 ID（QQ 为好友号/群号，v2） |
 | speaker | TEXT | 说话人（群聊场景，v2） |
 | sensitive | INTEGER NOT NULL DEFAULT 0 | 记忆盲区/敏感标记（v2） |
+| turn_kind | TEXT NOT NULL DEFAULT 'reply' | 轮次类型：reply / proactive / perception（v3） |
+| trigger_event_ids | TEXT | 触发事件 id 列表（JSON，指向 raw_events.id，v3） |
+| subject | TEXT NOT NULL DEFAULT 'user' | 本轮对象：user / qq:<uin> / group:<群号>（v3） |
 
 **表2：long_term_summary（长期记忆摘要）**
 | 字段 | 类型 | 说明 |
@@ -411,7 +417,9 @@ signals:
 | last_accessed | DATETIME DEFAULT (datetime('now','localtime')) | 最后访问时间（检索时更新） |
 | last_decay_at | DATETIME DEFAULT (datetime('now','localtime')) | 最后衰减计算时间 |
 | source_ids | TEXT | 来源对话ID列表（JSON） |
-| origin | TEXT NOT NULL DEFAULT 'pet' | 渠道溯源：pet / qq_private / qq_group（v2） |
+| origin | TEXT NOT NULL DEFAULT 'pet' | 渠道溯源：pet / qq_private / qq_group / bilibili / screen（v2） |
+| visibility | TEXT NOT NULL DEFAULT 'private' | 可见性：private / channel / public（v3） |
+| subject | TEXT NOT NULL DEFAULT 'user' | 记忆所属主体（v3） |
 
 索引：`idx_episodic_importance`(importance)、`idx_episodic_type`(type)、`idx_episodic_status`(status)
 
@@ -428,19 +436,37 @@ signals:
 
 初始化数据：`intimacy=30.0`、`trust=30.0`（initDatabase 时若表为空自动插入）
 
-**表6：raw_messages（群聊原始消息，v2 新增，Phase 0 只建不写）**
+**表6：raw_events（原始事件流水，v3 由 raw_messages 泛化；本阶段只建不写）**
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | id | INTEGER PRIMARY KEY AUTOINCREMENT | 记录ID |
-| channel | TEXT NOT NULL | 渠道 |
-| session_id | TEXT NOT NULL | 会话（群号） |
-| speaker | TEXT | 说话人 |
-| content | TEXT NOT NULL | 原始内容 |
-| timestamp | DATETIME DEFAULT (datetime('now','localtime')) | 时间 |
-| sensitive | INTEGER NOT NULL DEFAULT 0 | 盲区标记 |
-| consolidated | INTEGER NOT NULL DEFAULT 0 | 是否已被蒸馏 |
+| platform | TEXT NOT NULL | qq / bilibili / screen / system |
+| channel | TEXT NOT NULL | pet / qq_private / qq_group / bilibili / screen |
+| session_id | TEXT NOT NULL | 会话（群号/好友号/默认） |
+| message_id | TEXT | 平台消息 ID（`UNIQUE(channel, message_id)` 去重） |
+| direction | TEXT NOT NULL DEFAULT 'in' | in / out / event |
+| sender_id | TEXT | 稳定身份（uin/uid；自己为 'self'） |
+| sender_name | TEXT | 显示名快照 |
+| event_type | TEXT NOT NULL | message / at / notice / percept / trigger / outbound |
+| content | TEXT | 纯文本（可空） |
+| payload | TEXT | JSON 原文（媒体/元数据） |
+| occurred_at | DATETIME DEFAULT (datetime('now','localtime')) | 事件时间 |
+| sensitive | INTEGER NOT NULL DEFAULT 0 | 盲区/敏感标记 |
+| visibility | TEXT NOT NULL DEFAULT 'private' | private / channel / public |
+| processed | INTEGER NOT NULL DEFAULT 0 | 是否已被蒸馏 |
 
-索引：`idx_raw_session(session_id, timestamp)`、`idx_raw_consolidated(consolidated)`
+索引：`idx_raw_events_session(channel, session_id, occurred_at)`、`idx_raw_events_processed(processed)`
+
+**表7：memory_cursor（蒸馏游标，v3 新增）**
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| channel | TEXT NOT NULL | 渠道 |
+| session_id | TEXT NOT NULL | 会话 |
+| last_event_id | INTEGER NOT NULL DEFAULT 0 | 已蒸馏到的 raw_events.id |
+| last_turn_id | INTEGER NOT NULL DEFAULT 0 | 已蒸馏到的 chat_history.id |
+| updated_at | DATETIME DEFAULT (datetime('now','localtime')) | 更新时间 |
+
+约束：`PRIMARY KEY(channel, session_id)`
 
 ### 数据结构
 
@@ -449,8 +475,10 @@ signals:
 struct HistoryTurn {
     qlonglong id = -1;
     QDateTime timestamp;
-    QString userInput;
-    QString rawReply;  // JSON对象: {"sentences": [...]}
+    QString userInput;  // 主动/感知轮次为 SQL NULL（读取后为空串）
+    QString rawReply;   // JSON对象: {"sentences": [...]}
+    QString turnKind = "reply";  // reply / proactive / perception
+    QString subject = "user";    // user / qq:<uin> / group:<群号>
 };
 ```
 
@@ -476,6 +504,9 @@ struct EpisodicMemory {
     QString status;     // 'active'/'resolved'/'broken'
     QDateTime lastAccessed;
     QString sourceIds;
+    QString origin = "pet";          // 渠道溯源
+    QString visibility = "private";  // private / channel / public
+    QString subject = "user";        // 记忆所属主体
 };
 ```
 
@@ -715,7 +746,7 @@ struct SentenceText {
 - [x] TTS模型切换 ✅ 已实现（设置界面「语音合成」区：GPT路径/模型、SoVITS路径/模型，保存时热切换）
 - [x] 多渠道架构（Phase 0）✅ 已实现（Utterance/IChannelAdapter/SessionRouter、DB v2、identity.json、23 例测试）
 - [x] 异常回复拦截 ✅ 已实现（zh_text/ja_text/tags 缺失整轮抛弃，replyAbnormal 反馈）
-- [ ] Phase 0.5（`visibility` + `appendRawMessage` + `origin`/`visibility` 过滤）
+- [x] Phase 0.5 / 记忆库 v3 ✅ 已实现（`raw_events`、轮次语义、`visibility`/`subject`、`memory_cursor`；提交 8f24ae5）
 - [ ] Phase 1 QQ 渠道（SnowLuma / OneBot v11）
 - [x] 设置界面接线（TD-037：长期记忆摘轮数、夜晚时段、三档退火时长）✅ 已实现
 - [ ] 设置界面完善（外观配置、快捷键配置）
@@ -836,6 +867,7 @@ Windows_AI/
 
 | 日期 | 变更内容 |
 |------|----------|
+| 2026-10-27 | 记忆库 v3（提交 `8f24ae5`）：`chat_history` 轮次语义、`raw_events` 泛化、`episodic_memory` + visibility/subject、`memory_cursor`；真实库 v2→v3（107→108 行）迁移验证通过 |
 | 2026-10-26 | TD-034 退火轮次门控：`m_roundSeq`/`m_lastPlaybackRound`，`playbackQueueEmpty` 仅在最新一轮生效，旧轮收尾不再打断新一轮 |
 | 2026-10-26 | TD-037 设置界面接线：长期记忆摘轮数 + 夜晚时段 + 三档退火时长（ConfigManager 新增 `memory.summary_length`/`time.*` 读写与 6 组 getter/setter；SettingsWidget 三个保存槽；AppController `applyTimeSettings()` 启动与保存时应用；tst_configmanager 新增 3 例） |
 | 2026-10-26 | 文档补录：README/ROADMAP/ARCHITECTURE/技术快照/开发记录同步 Phase 0 实际状态（渠道架构、DB v2、23 例测试、BUG-1/BUG-2） |

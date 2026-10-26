@@ -2,9 +2,9 @@
 
 > 项目：Windows_AI 桌面看板娘（桌宠）
 > 类型：规划文档（分阶段实施中）
-> 版本：v0.7（记忆库 v3 设计定稿，2026-10-27）
+> 版本：v0.8（记忆库 v3 已实施，2026-10-27）
 > 制定日期：2026-10-19
-> 状态：Phase 0 已实施并通过验收；Phase 0.5/v3 设计已定稿（10.4），待实施
+> 状态：Phase 0 与记忆库 v3（Phase 0.5）已实施并通过验收（2026-10-27）；Phase 1 待开始
 > 关联文档：[ROADMAP.md](ROADMAP.md)、[ARCHITECTURE.md](ARCHITECTURE.md)
 
 ---
@@ -486,7 +486,7 @@ dsh 是一个**四层洋葱结构**，内核是 Cordis 插件框架（"Everythin
 
 ### 10.2 Phase 0.5 收缩裁决与架构演进预留（2026-10-20 定稿）
 
-> **2026-10-27 更新**：Phase 0.5 已并入 10.4 的 v3 迁移，范围扩大为「visibility + raw_events 泛化 + 轮次语义 + memory_cursor」；本节保留为决策来源。
+> **2026-10-27 更新**：Phase 0.5 已并入 10.4 的 v3 迁移，范围扩大为「visibility + raw_events 泛化 + 轮次语义 + memory_cursor」；**已实施**（提交 `8f24ae5`，真实库 v2→v3 验证通过）。本节保留为决策来源。
 
 > 来源：与另一 agent 的探讨汇总经核实后的裁决。事实纠正：配置体系为 **identity.json（JSON）** 而非 QSettings/INI；relationship_state 为重建表而非加列；B3/C3/D1 在 Phase 0 已拍板（D1=可配置 `followExternalMood`）。
 
@@ -517,6 +517,7 @@ dsh 是一个**四层洋葱结构**，内核是 Cordis 插件框架（"Everythin
 
 ### 10.4 记忆库 v3 设计决议（2026-10-27 定稿）
 
+> **状态**：✅ 已实施（提交 `8f24ae5`；单测 15 例通过；真实库 107→108 行迁移成功）
 > 触发：评估「一问一答」存储能否承载 QQ 群聊、主动对话、B 站浏览、窥屏。结论：不能。
 > 范围：本决议吸收原 Phase 0.5（`visibility` / `appendRawMessage` / `origin` 过滤），统一为一次 v3 迁移。
 
@@ -626,13 +627,13 @@ CREATE TABLE memory_cursor (
 
 #### 10.4.6 验收清单
 
-- [ ] v1/v2 库升级到 v3，存量数据零丢失，二次启动不重复迁移。
-- [ ] 新建库直接为 v3，6+1 张表结构正确。
-- [ ] `reply` 轮行为与改前一致；`proactive` 行 `user_input IS NULL`，短期注入**无空 user 消息**，提取 prompt 无「用户:」空行。
-- [ ] `raw_events` 可写入、`message_id` 去重生效、默认不参与上下文。
-- [ ] `episodic_memory` 按 `origin`/`visibility` 过滤，默认不过滤。
-- [ ] `memory_cursor` upsert/读取正确，失败不推进。
-- [ ] 全量 ctest 通过。
+- [x] v1/v2 库升级到 v3，存量数据零丢失，二次启动不重复迁移（`legacyMigrationPreservesData` / `migratesFromV2PreservingData` / `migrationIsIdempotent`）。
+- [x] 新建库直接为 v3，7 张表结构正确（`freshDatabaseIsV3`）。
+- [x] `reply` 轮行为与改前一致；`proactive` 行 `user_input IS NULL`（`proactiveTurnAllowsNullInput`）。短期注入与提取 prompt 的渲染规则已实现，真实主动轮次待 Phase 1 实跑验证。
+- [x] `raw_events` 可写入、`message_id` 去重生效、默认不参与上下文（`appendRawEventDedupAndFields`）。
+- [x] `episodic_memory` 按 `origin`/`visibility` 过滤，默认不过滤（`episodicOriginAndVisibilityFilters`）。
+- [x] `memory_cursor` upsert/读取正确（`memoryCursorUpsert`）。
+- [x] 全量 ctest 通过（3 套件 / 31 例）。
 
 #### 10.4.7 本阶段明确不做
 

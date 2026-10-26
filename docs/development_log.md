@@ -1,7 +1,7 @@
 # 开发记录
 
 > 项目：Windows_AI 桌面看板娘（桌宠）
-> 最后更新：2026-10-26
+> 最后更新：2026-10-27
 
 ---
 
@@ -9,6 +9,7 @@
 
 | 哈希 | 日期 | 类型 | 描述 | 关键变更 |
 |------|------|------|------|----------|
+| `8f24ae5` | 2026-10-27 | refactor | 升级记忆库结构至 v3 | `chat_history` 轮次语义、`raw_events`、`episodic` visibility/subject、`memory_cursor`、LLM 轮次渲染规则、15 例记忆测试 |
 | `1646ff4` | 2026-10-26 | docs | 更新 HUMANIZATION_PLAN 协议端选型与 Phase 规划 | SnowLuma 选型、Phase 0.5 收缩裁决、记忆 v2 设计 |
 | `b126180` | 2026-10-20 | docs | 补充 Phase 0 测试报告 | 人工异常回复校验、BUG-1/BUG-2 修复记录 |
 | `485b5e3` | 2026-10-20 | fix | 修正 Levenshtein 空串边界 | 空标签不再误判为枚举首项（BUG-2） |
@@ -364,6 +365,19 @@
   - **效果**：旧轮收尾直接跳过（日志 `忽略旧轮收尾的退火触发`）；新一轮播放结束时才按其最终视觉状态启动退火。用户输入仍会即时停止所有退火定时器（原有行为）
   - **边界**：仍假设同一时刻只有一个在途 LLM 请求（并发请求时 `m_lastUserInput`/`m_lastMeta` 本就不安全，属独立问题）
 
+### M32: 记忆库 v3 —— 原始事件流水与灵活轮次（已完成）
+
+- 日期：2026-10-27
+- 提交：`8f24ae5`
+- 内容：
+  - **chat_history**：重建为 v3（`user_input` 可空），新增 `turn_kind` / `trigger_event_ids` / `subject`；存量行默认 `reply` / `user`
+  - **raw_events**：由 `raw_messages` 泛化（platform/message_id/direction/sender_id/sender_name/event_type/payload/occurred_at/visibility/processed），旧表数据映射后删除；`INSERT OR IGNORE` + `UNIQUE(channel, message_id)` 去重
+  - **episodic_memory**：新增 `visibility`（默认 private）/ `subject`（默认 user）；`addEpisodicMemory` 与 `getActiveEpisodicMemories` 扩参（默认不过滤）
+  - **memory_cursor**：新建，`updateMemoryCursor` / `getMemoryCursorEventId`，为 Phase 1 按事件蒸馏预留
+  - **LLM 渲染**：proactive/perception（或无 user_input）只注入 assistant，不产生空 user 消息；提取 prompt 输出「茉子（主动）: …」
+  - **测试**：tst_memorymanager 10 → 15 例（v2→v3 迁移、proactive NULL、raw_events 去重、episodic 过滤、cursor），全量 31 例通过
+  - **真实库验证**：v2 107 行 → v3 108 行，数据无损；对话/气泡/立绘/TTS 正常
+
 ---
 
 ## 技术债务
@@ -449,6 +463,7 @@
 | v0.5.0 | JSON协议与标签校验 | LLMService + TagValidator + MemoryManager | JSON输出协议替代标签格式、response_format参数强制JSON输出、TagValidator标签校验与编辑距离修正、数据库结构简化（删除parsed_json列）、历史记忆纯文本注入 |
 | v0.6.0 | 流式TTS播放与播放器抽象 & 时间管理 | TTSService + IPcmPlayer + StreamPlayer + FilePlayer + TimeManager + TTSProcessManager | 流式PCM播放（streaming_mode+pcmDataReady）、IPcmPlayer抽象接口（静态工厂方法）、播放完成检测（setSynthesisDone+IdleState+兜底定时器）、预填充防吞开头、FilePlayer WAV头解析完善、signals遮蔽bug修复、野指针崩溃修复、TimeManager QTimer singleShot 退火机制、TTSProcessManager 孤儿进程清理（killProcessOnPort） |
 | v0.7.0-alpha | 大脑/渠道解耦（Phase 0） | SessionRouter + IChannelAdapter + PetChannelAdapter + QQChannelAdapter(占位) + MemoryManager v2 + ConfigManager(identity.json) | 统一 Utterance/RequestMeta 协议、渠道适配器、输入路由、记忆按 channel+session 双键隔离、身份层配置预留、23 例自动化测试 |
+| v0.7.0-beta | 记忆库 v3（Phase 0.5） | MemoryManager v3 + LLMService 轮次渲染 | `raw_events` 原始事件流水、`chat_history` 轮次语义（user_input 可空/turn_kind/trigger_event_ids/subject）、`episodic` visibility/subject、`memory_cursor`、31 例自动化测试 |
 
 ---
 
