@@ -20,6 +20,8 @@ struct RequestMeta {
     QString speaker;                            // 桌宠="欧尼酱"；群聊=对方昵称
     QString subject = QStringLiteral("user");   // 身份解析结果（'user' 即主人，IdentityResolver 产出）
     bool sensitive = false;                     // 记忆盲区标记（渠道侧查配置后设置，MemoryManager 保持中立）
+    QString turnKind = QStringLiteral("reply"); // 轮次类型：reply / proactive / perception
+    QString triggerEventIds;                    // 触发事件 id 列表（JSON 数组，指向 raw_events.id）
 };
 
 // 输出侧：一句话 + 路由元数据（由 SentenceText 在大脑侧一次映射，渠道层协议）

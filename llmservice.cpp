@@ -126,17 +126,25 @@ void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> 
         messagesArray.append(historyNote);
     }
     for (const HistoryTurn &turn : historyQA) {
-        // 历史用户输入
-        QJsonObject histUserMsg;
-        histUserMsg["role"] = "user";
-        histUserMsg["name"] = QString("用户 [%1]").arg(turn.timestamp.toString("yyyy-MM-dd HH:mm:ss"));
-        histUserMsg["content"] = turn.userInput;
-        messagesArray.append(histUserMsg);
+        // v3 轮次语义：proactive/perception（或没有用户输入）只注入 assistant，
+        // 不生成空的 user 消息（HUMANIZATION_PLAN 10.4.2）
+        const bool assistantOnly = turn.turnKind == QStringLiteral("proactive")
+                                   || turn.turnKind == QStringLiteral("perception")
+                                   || turn.userInput.isEmpty();
+        if (!assistantOnly) {
+            QJsonObject histUserMsg;
+            histUserMsg["role"] = "user";
+            histUserMsg["name"] = QString("用户 [%1]").arg(turn.timestamp.toString("yyyy-MM-dd HH:mm:ss"));
+            histUserMsg["content"] = turn.userInput;
+            messagesArray.append(histUserMsg);
+        }
 
         // 历史茉子回复
         QJsonObject histMakoMsg;
         histMakoMsg["role"] = "assistant";
-        histMakoMsg["name"] = QString("茉子 [%1]").arg(turn.timestamp.toString("yyyy-MM-dd HH:mm:ss"));
+        const QString makoName = assistantOnly ? QStringLiteral("茉子（主动/感知）")
+                                               : QStringLiteral("茉子");
+        histMakoMsg["name"] = QString("%1 [%2]").arg(makoName, turn.timestamp.toString("yyyy-MM-dd HH:mm:ss"));
         // 从 JSON 提取中文文本作为历史回复
         QString aiContent;
         QJsonParseError parseError;
@@ -349,8 +357,14 @@ void LLMService::extractMemoryAsync(const QList<HistoryTurn> &turns, qlonglong l
             }
             aiText = zhTexts.join("");
         }
-        conversationText += QString("用户: %1\nAI: %2\n---\n")
-                                .arg(turn.userInput, aiText);
+        if (turn.turnKind == QStringLiteral("proactive")) {
+            conversationText += QString("茉子（主动）: %1\n---\n").arg(aiText);
+        } else if (turn.turnKind == QStringLiteral("perception")) {
+            conversationText += QString("茉子（因观察到某事而开口）: %1\n---\n").arg(aiText);
+        } else {
+            conversationText += QString("用户: %1\nAI: %2\n---\n")
+                                    .arg(turn.userInput, aiText);
+        }
     }
 
     QJsonArray messagesArray;

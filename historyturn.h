@@ -7,8 +7,10 @@
 struct HistoryTurn {
     qlonglong id = -1;//id
     QDateTime timestamp;//时间戳
-    QString userInput;//用户输入
+    QString userInput;//用户输入；主动/感知轮次为 SQL NULL（读取后为空串）
     QString rawReply;//未处理回复
+    QString turnKind = QStringLiteral("reply");// reply / proactive / perception
+    QString subject = QStringLiteral("user");// 本轮对象：user / qq:<uin> / group:<群号>
 };
 
 //角色档案（长期稳定特质，user 或 mako）
@@ -30,6 +32,9 @@ struct EpisodicMemory {
     QString status;     // 'active'/'resolved'/'broken'
     QDateTime lastAccessed;
     QString sourceIds;
+    QString origin = QStringLiteral("pet");          // 渠道溯源：pet / qq_private / qq_group / bilibili / screen
+    QString visibility = QStringLiteral("private");  // private / channel / public
+    QString subject = QStringLiteral("user");        // 记忆所属主体
 };
 
 //记忆摘要（保留兼容）

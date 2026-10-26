@@ -50,16 +50,21 @@ bool MemoryManager::saveQATurn(const QString &userInput, const QString &rawReply
     rootObj["sentences"]=sentencesArray;
     QString JsonStr = QJsonDocument(rootObj).toJson(QJsonDocument::Compact);
 
-    // 执行原子行入库（渠道分桶：channel/session_id/speaker/sensitive）
+    // 执行原子行入库（渠道分桶 + 轮次语义：user_input 可为 NULL，TD-034/v3）
     QSqlQuery query(m_db);
-    query.prepare("INSERT INTO chat_history (user_input, raw_reply, channel, session_id, speaker, sensitive) "
-                  "VALUES (:user_input, :raw_reply, :channel, :session_id, :speaker, :sensitive)");
-    query.bindValue(":user_input", userInput);
+    query.prepare("INSERT INTO chat_history "
+                  "(user_input, raw_reply, channel, session_id, speaker, sensitive, turn_kind, trigger_event_ids, subject) "
+                  "VALUES (:user_input, :raw_reply, :channel, :session_id, :speaker, :sensitive, :turn_kind, :trigger_event_ids, :subject)");
+    // 主动/感知轮次没有用户输入：绑定 SQL NULL，而不是空串
+    query.bindValue(":user_input", userInput.isEmpty() ? QVariant(QMetaType(QMetaType::QString)) : QVariant(userInput));
     query.bindValue(":raw_reply", JsonStr);
     query.bindValue(":channel", meta.channel);
     query.bindValue(":session_id", meta.sessionId);
     query.bindValue(":speaker", meta.speaker);
     query.bindValue(":sensitive", meta.sensitive ? 1 : 0);
+    query.bindValue(":turn_kind", meta.turnKind.isEmpty() ? QStringLiteral("reply") : meta.turnKind);
+    query.bindValue(":trigger_event_ids", meta.triggerEventIds.isEmpty() ? QVariant(QMetaType(QMetaType::QString)) : QVariant(meta.triggerEventIds));
+    query.bindValue(":subject", meta.subject.isEmpty() ? QStringLiteral("user") : meta.subject);
 
     if (!query.exec()) {
         qDebug()<<"[MemoryManager]:本轮对话保存失败:"<<query.lastError().text();
@@ -84,9 +89,9 @@ QList<HistoryTurn> MemoryManager::getHistoryTurn(int N, const QString &channel, 
 
     QSqlQuery query(m_db);
     QString sql = R"(
-        SELECT user_input, raw_reply,timestamp
+        SELECT user_input, raw_reply, timestamp, turn_kind, subject
         FROM (
-            SELECT id, user_input, raw_reply,timestamp
+            SELECT id, user_input, raw_reply, timestamp, turn_kind, subject
             FROM chat_history
             WHERE channel = :channel AND session_id = :session_id
             ORDER BY id DESC
@@ -105,6 +110,8 @@ QList<HistoryTurn> MemoryManager::getHistoryTurn(int N, const QString &channel, 
         turn.userInput = query.value("user_input").toString();
         turn.rawReply = query.value("raw_reply").toString();
         turn.timestamp = query.value("timestamp").toDateTime();
+        turn.turnKind = query.value("turn_kind").toString();
+        turn.subject = query.value("subject").toString();
         historyTurnList.append(turn);
     }
     qDebug()<<"[MemoryManager]获取历史记录成功";
@@ -120,7 +127,7 @@ QList<HistoryTurn> MemoryManager::getHistoryTurn(int offset, int limit)
     }
     QSqlQuery query(m_db);
     query.prepare(R"(
-        SELECT id, user_input, raw_reply, timestamp
+        SELECT id, user_input, raw_reply, timestamp, turn_kind, subject
         FROM chat_history
         ORDER BY id DESC
         LIMIT :limit OFFSET :offset
@@ -137,6 +144,8 @@ QList<HistoryTurn> MemoryManager::getHistoryTurn(int offset, int limit)
         turn.userInput = query.value("user_input").toString();
         turn.rawReply = query.value("raw_reply").toString();
         turn.timestamp = query.value("timestamp").toDateTime();
+        turn.turnKind = query.value("turn_kind").toString();
+        turn.subject = query.value("subject").toString();
         historyList.append(turn);
     }
     qDebug()<<"[MemoryManager]分页查询成功";
@@ -207,7 +216,7 @@ QList<HistoryTurn> MemoryManager::getUnsummarizedTurns(qlonglong &outLastEndId, 
     QSqlQuery query(m_db);
     // 摘要游标按 channel+session_id 双键取（与摘要分桶一致）
     QString sql = R"(
-        SELECT id, user_input, raw_reply
+        SELECT id, user_input, raw_reply, turn_kind, subject
         FROM chat_history
         WHERE channel = :channel AND session_id = :session_id
           AND id > (SELECT COALESCE(MAX(covered_turn_end_id), 0) FROM long_term_summary
@@ -226,6 +235,8 @@ QList<HistoryTurn> MemoryManager::getUnsummarizedTurns(qlonglong &outLastEndId, 
             turn.id = id;
             turn.userInput = query.value("user_input").toString();
             turn.rawReply = query.value("raw_reply").toString();
+            turn.turnKind = query.value("turn_kind").toString();
+            turn.subject = query.value("subject").toString();
 
             turns.append(turn);
             outSourceIds.append(id);
@@ -335,15 +346,18 @@ bool MemoryManager::deleteCharacterProfile(qlonglong id)
 
 // ============== v4: 情景记忆 CRUD ==============
 
-bool MemoryManager::addEpisodicMemory(const QString &content, const QString &type, double importance, const QDateTime &eventTime, const QString &sourceIds)
+bool MemoryManager::addEpisodicMemory(const QString &content, const QString &type, double importance,
+                                      const QDateTime &eventTime, const QString &sourceIds,
+                                      const QString &origin, const QString &visibility, const QString &subject)
 {
     if (!m_db.isOpen() && !m_db.open()) {
         qDebug() << "[MemoryManager]数据库打开失败:" << m_db.lastError();
         return false;
     }
     QSqlQuery query(m_db);
-    query.prepare("INSERT INTO episodic_memory (content, event_time, importance, type, status, last_accessed, last_decay_at, source_ids) "
-                  "VALUES (?, ?, ?, ?, 'active', ?, ?, ?)");
+    query.prepare("INSERT INTO episodic_memory "
+                  "(content, event_time, importance, type, status, last_accessed, last_decay_at, source_ids, origin, visibility, subject) "
+                  "VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)");
     query.addBindValue(content);
     QDateTime et = eventTime.isValid() ? eventTime : QDateTime::currentDateTime();
     query.addBindValue(et.toString("yyyy-MM-dd HH:mm:ss"));
@@ -352,15 +366,21 @@ bool MemoryManager::addEpisodicMemory(const QString &content, const QString &typ
     query.addBindValue(et.toString("yyyy-MM-dd HH:mm:ss"));
     query.addBindValue(et.toString("yyyy-MM-dd HH:mm:ss"));
     query.addBindValue(sourceIds);
+    query.addBindValue(origin.isEmpty() ? QStringLiteral("pet") : origin);
+    query.addBindValue(visibility.isEmpty() ? QStringLiteral("private") : visibility);
+    query.addBindValue(subject.isEmpty() ? QStringLiteral("user") : subject);
     if (!query.exec()) {
         qDebug() << "[MemoryManager]新增情景记忆失败:" << query.lastError();
         return false;
     }
-    qDebug() << "[MemoryManager]情景记忆已新增:" << content << "type=" << type << "importance=" << importance;
+    qDebug() << "[MemoryManager]情景记忆已新增:" << content << "type=" << type
+             << "importance=" << importance << "origin=" << origin
+             << "visibility=" << visibility << "subject=" << subject;
     return true;
 }
 
-QList<EpisodicMemory> MemoryManager::getActiveEpisodicMemories(double minImportance, int limit)
+QList<EpisodicMemory> MemoryManager::getActiveEpisodicMemories(double minImportance, int limit,
+                                                              const QString &origin, const QString &visibility)
 {
     QList<EpisodicMemory> memories;
     if (!m_db.isOpen() && !m_db.open()) {
@@ -368,11 +388,24 @@ QList<EpisodicMemory> MemoryManager::getActiveEpisodicMemories(double minImporta
         return memories;
     }
     QSqlQuery query(m_db);
-    query.prepare("SELECT id, content, event_time, importance, type, status, last_accessed, source_ids "
-                  "FROM episodic_memory WHERE status='active' AND importance >= ? "
-                  "ORDER BY importance DESC, event_time DESC LIMIT ?");
-    query.addBindValue(minImportance);
-    query.addBindValue(limit);
+    QString sql = "SELECT id, content, event_time, importance, type, status, last_accessed, source_ids, origin, visibility, subject "
+                  "FROM episodic_memory WHERE status='active' AND importance >= :min";
+    if (!origin.isEmpty()) {
+        sql += " AND origin = :origin";
+    }
+    if (!visibility.isEmpty()) {
+        sql += " AND visibility = :visibility";
+    }
+    sql += " ORDER BY importance DESC, event_time DESC LIMIT :limit";
+    query.prepare(sql);
+    query.bindValue(":min", minImportance);
+    query.bindValue(":limit", limit);
+    if (!origin.isEmpty()) {
+        query.bindValue(":origin", origin);
+    }
+    if (!visibility.isEmpty()) {
+        query.bindValue(":visibility", visibility);
+    }
     if (!query.exec()) {
         qDebug() << "[MemoryManager]查询情景记忆失败:" << query.lastError();
         return memories;
@@ -387,6 +420,9 @@ QList<EpisodicMemory> MemoryManager::getActiveEpisodicMemories(double minImporta
         m.status = query.value(5).toString();
         m.lastAccessed = query.value(6).toDateTime();
         m.sourceIds = query.value(7).toString();
+        m.origin = query.value(8).toString();
+        m.visibility = query.value(9).toString();
+        m.subject = query.value(10).toString();
         memories.append(m);
     }
 
@@ -770,6 +806,86 @@ static bool ensureColumn(QSqlQuery &query, const QString &table, const QString &
     return false;
 }
 
+bool MemoryManager::appendRawEvent(const QString &platform, const QString &channel,
+                                   const QString &sessionId, const QString &eventType,
+                                   const QString &content, const QString &messageId,
+                                   const QString &direction, const QString &senderId,
+                                   const QString &senderName, const QString &payloadJson,
+                                   const QDateTime &occurredAt, bool sensitive,
+                                   const QString &visibility)
+{
+    if (!m_db.isOpen() && !m_db.open()) {
+        qDebug() << "[MemoryManager]数据库打开失败:" << m_db.lastError();
+        return false;
+    }
+    QSqlQuery query(m_db);
+    query.prepare("INSERT OR IGNORE INTO raw_events "
+                  "(platform, channel, session_id, message_id, direction, sender_id, sender_name, "
+                  " event_type, content, payload, occurred_at, sensitive, visibility, processed) "
+                  "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)");
+    query.addBindValue(platform);
+    query.addBindValue(channel);
+    query.addBindValue(sessionId);
+    query.addBindValue(messageId.isEmpty() ? QVariant(QMetaType(QMetaType::QString)) : QVariant(messageId));
+    query.addBindValue(direction.isEmpty() ? QStringLiteral("in") : direction);
+    query.addBindValue(senderId.isEmpty() ? QVariant(QMetaType(QMetaType::QString)) : QVariant(senderId));
+    query.addBindValue(senderName.isEmpty() ? QVariant(QMetaType(QMetaType::QString)) : QVariant(senderName));
+    query.addBindValue(eventType);
+    query.addBindValue(content);
+    query.addBindValue(payloadJson.isEmpty() ? QVariant(QMetaType(QMetaType::QString)) : QVariant(payloadJson));
+    query.addBindValue((occurredAt.isValid() ? occurredAt : QDateTime::currentDateTime())
+                           .toString("yyyy-MM-dd HH:mm:ss"));
+    query.addBindValue(sensitive ? 1 : 0);
+    query.addBindValue(visibility.isEmpty() ? QStringLiteral("private") : visibility);
+    if (!query.exec()) {
+        qDebug() << "[MemoryManager]写入raw_events失败:" << query.lastError();
+        return false;
+    }
+    qDebug() << "[MemoryManager]raw_events写入: platform=" << platform
+             << "channel=" << channel << "session=" << sessionId
+             << "type=" << eventType << "affected=" << query.numRowsAffected();
+    return true;
+}
+
+bool MemoryManager::updateMemoryCursor(const QString &channel, const QString &sessionId,
+                                       qlonglong lastEventId, qlonglong lastTurnId)
+{
+    if (!m_db.isOpen() && !m_db.open()) {
+        qDebug() << "[MemoryManager]数据库打开失败:" << m_db.lastError();
+        return false;
+    }
+    QSqlQuery query(m_db);
+    query.prepare("INSERT OR REPLACE INTO memory_cursor "
+                  "(channel, session_id, last_event_id, last_turn_id, updated_at) "
+                  "VALUES (?, ?, ?, ?, datetime('now', 'localtime'))");
+    query.addBindValue(channel);
+    query.addBindValue(sessionId);
+    query.addBindValue(lastEventId);
+    query.addBindValue(lastTurnId);
+    if (!query.exec()) {
+        qDebug() << "[MemoryManager]更新memory_cursor失败:" << query.lastError();
+        return false;
+    }
+    return true;
+}
+
+qlonglong MemoryManager::getMemoryCursorEventId(const QString &channel, const QString &sessionId)
+{
+    if (!m_db.isOpen() && !m_db.open()) {
+        qDebug() << "[MemoryManager]数据库打开失败:" << m_db.lastError();
+        return 0;
+    }
+    QSqlQuery query(m_db);
+    query.prepare("SELECT COALESCE(last_event_id, 0) FROM memory_cursor "
+                  "WHERE channel = ? AND session_id = ?");
+    query.addBindValue(channel);
+    query.addBindValue(sessionId);
+    if (query.exec() && query.next()) {
+        return query.value(0).toLongLong();
+    }
+    return 0;
+}
+
 void MemoryManager::initDatabase(const QString &dbFilePath)
 {
     QDir dbDir = QFileInfo(dbFilePath).dir();
@@ -990,6 +1106,106 @@ void MemoryManager::initDatabase(const QString &dbFilePath)
                 qDebug() << "[MemoryManager]设置数据库版本异常:" << query.lastError();
             }
             currentVersion = 2;
+            qDebug() << "[MemoryManager]数据库结构升级完成,版本:" << currentVersion;
+        }
+
+        // ============== v3: 记忆库调整（HUMANIZATION_PLAN 10.4） ==============
+        if (currentVersion < 3) {
+            qDebug() << "[MemoryManager]正在升级数据库结构至 v3(记忆库调整):";
+
+            // 1. chat_history 重建：user_input 放开 NOT NULL + 轮次字段
+            query.exec("DROP TABLE IF EXISTS chat_history_v3");
+            QString createChatV3 = R"(
+                CREATE TABLE chat_history_v3 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp DATETIME DEFAULT (datetime('now', 'localtime')),
+                    user_input TEXT,
+                    raw_reply TEXT NOT NULL,
+                    channel TEXT NOT NULL DEFAULT 'pet',
+                    session_id TEXT NOT NULL DEFAULT 'default',
+                    speaker TEXT,
+                    sensitive INTEGER NOT NULL DEFAULT 0,
+                    turn_kind TEXT NOT NULL DEFAULT 'reply',
+                    trigger_event_ids TEXT,
+                    subject TEXT NOT NULL DEFAULT 'user'
+                );
+            )";
+            if (!query.exec(createChatV3)) throw query.lastError();
+            if (!query.exec("INSERT INTO chat_history_v3 "
+                            "(id, timestamp, user_input, raw_reply, channel, session_id, speaker, sensitive) "
+                            "SELECT id, timestamp, user_input, raw_reply, channel, session_id, speaker, sensitive "
+                            "FROM chat_history")) throw query.lastError();
+            if (!query.exec("DROP TABLE chat_history")) throw query.lastError();
+            if (!query.exec("ALTER TABLE chat_history_v3 RENAME TO chat_history")) throw query.lastError();
+            query.exec("CREATE INDEX IF NOT EXISTS idx_history_session ON chat_history(channel, session_id);");
+
+            // 2. raw_messages → raw_events（全量事件流水）
+            bool hasLegacyRaw = false;
+            if (query.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='raw_messages'")
+                && query.next()) {
+                hasLegacyRaw = true;
+            }
+            QString createRawEvents = R"(
+                CREATE TABLE IF NOT EXISTS raw_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    platform TEXT NOT NULL,
+                    channel TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    message_id TEXT,
+                    direction TEXT NOT NULL DEFAULT 'in',
+                    sender_id TEXT,
+                    sender_name TEXT,
+                    event_type TEXT NOT NULL,
+                    content TEXT,
+                    payload TEXT,
+                    occurred_at DATETIME DEFAULT (datetime('now', 'localtime')),
+                    sensitive INTEGER NOT NULL DEFAULT 0,
+                    visibility TEXT NOT NULL DEFAULT 'private',
+                    processed INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(channel, message_id)
+                );
+            )";
+            if (!query.exec(createRawEvents)) throw query.lastError();
+            if (hasLegacyRaw) {
+                if (!query.exec("INSERT OR IGNORE INTO raw_events "
+                                "(platform, channel, session_id, sender_name, event_type, content, "
+                                " occurred_at, sensitive, visibility, processed, direction) "
+                                "SELECT CASE WHEN channel LIKE 'qq%' THEN 'qq' ELSE 'pet' END, "
+                                "       channel, session_id, speaker, 'message', content, "
+                                "       timestamp, sensitive, 'private', consolidated, 'in' "
+                                "FROM raw_messages")) throw query.lastError();
+                if (!query.exec("DROP TABLE raw_messages")) throw query.lastError();
+            }
+            query.exec("CREATE INDEX IF NOT EXISTS idx_raw_events_session ON raw_events(channel, session_id, occurred_at);");
+            query.exec("CREATE INDEX IF NOT EXISTS idx_raw_events_processed ON raw_events(processed);");
+
+            // 3. episodic_memory 可见性/主体
+            if (!ensureColumn(query, "episodic_memory", "visibility",
+                              "ALTER TABLE episodic_memory ADD COLUMN visibility TEXT NOT NULL DEFAULT 'private'")) {
+                throw query.lastError();
+            }
+            if (!ensureColumn(query, "episodic_memory", "subject",
+                              "ALTER TABLE episodic_memory ADD COLUMN subject TEXT NOT NULL DEFAULT 'user'")) {
+                throw query.lastError();
+            }
+
+            // 4. 蒸馏游标（每 channel+session 一条）
+            QString createCursor = R"(
+                CREATE TABLE IF NOT EXISTS memory_cursor (
+                    channel TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    last_event_id INTEGER NOT NULL DEFAULT 0,
+                    last_turn_id INTEGER NOT NULL DEFAULT 0,
+                    updated_at DATETIME DEFAULT (datetime('now', 'localtime')),
+                    PRIMARY KEY(channel, session_id)
+                );
+            )";
+            if (!query.exec(createCursor)) throw query.lastError();
+
+            if (!query.exec("PRAGMA user_version = 3")) {
+                qDebug() << "[MemoryManager]设置数据库版本异常:" << query.lastError();
+            }
+            currentVersion = 3;
             qDebug() << "[MemoryManager]数据库结构升级完成,版本:" << currentVersion;
         }
 

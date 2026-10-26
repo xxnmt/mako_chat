@@ -147,21 +147,34 @@ private slots:
             RawDb raw(dbPath, "verify");
             QVERIFY(raw.open());
 
-            // 版本推进到 v2
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 2);
+            // 版本推进到 v3
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 3);
 
-            // 列扩展
+            // 列扩展（v2 渠道 + v3 轮次）
             const QStringList historyCols = raw.columns("chat_history");
             QVERIFY2(historyCols.contains("channel"), qPrintable(historyCols.join(",")));
             QVERIFY(historyCols.contains("session_id"));
             QVERIFY(historyCols.contains("speaker"));
             QVERIFY(historyCols.contains("sensitive"));
+            QVERIFY(historyCols.contains("turn_kind"));
+            QVERIFY(historyCols.contains("trigger_event_ids"));
+            QVERIFY(historyCols.contains("subject"));
+            // v3：user_input 放开 NOT NULL
+            QCOMPARE(raw.scalar("SELECT \"notnull\" FROM pragma_table_info('chat_history') "
+                                "WHERE name='user_input'").toInt(), 0);
 
             const QStringList summaryCols = raw.columns("long_term_summary");
             QVERIFY(summaryCols.contains("channel"));
             QVERIFY(summaryCols.contains("session_id"));
 
-            QVERIFY(raw.columns("episodic_memory").contains("origin"));
+            const QStringList episodicCols = raw.columns("episodic_memory");
+            QVERIFY(episodicCols.contains("origin"));
+            QVERIFY(episodicCols.contains("visibility"));
+            QVERIFY(episodicCols.contains("subject"));
+            QCOMPARE(raw.scalar("SELECT visibility FROM episodic_memory LIMIT 1").toString(),
+                     QStringLiteral("private"));
+            QCOMPARE(raw.scalar("SELECT subject FROM episodic_memory LIMIT 1").toString(),
+                     QStringLiteral("user"));
 
             // 存量行按默认值归入 pet/default，数据不丢
             QCOMPARE(raw.scalar("SELECT user_input FROM chat_history LIMIT 1").toString(),
@@ -171,6 +184,11 @@ private slots:
             QCOMPARE(raw.scalar("SELECT session_id FROM chat_history LIMIT 1").toString(),
                      QStringLiteral("default"));
             QCOMPARE(raw.scalar("SELECT sensitive FROM chat_history LIMIT 1").toInt(), 0);
+            QCOMPARE(raw.scalar("SELECT turn_kind FROM chat_history LIMIT 1").toString(),
+                     QStringLiteral("reply"));
+            QCOMPARE(raw.scalar("SELECT subject FROM chat_history LIMIT 1").toString(),
+                     QStringLiteral("user"));
+            QCOMPARE(raw.scalar("SELECT trigger_event_ids IS NULL FROM chat_history LIMIT 1").toInt(), 1);
             QCOMPARE(raw.scalar("SELECT summary_text FROM long_term_summary LIMIT 1").toString(),
                      QStringLiteral("旧摘要"));
             QCOMPARE(raw.scalar("SELECT channel FROM long_term_summary LIMIT 1").toString(),
@@ -189,10 +207,19 @@ private slots:
                              "VALUES ('qq:10001', 'intimacy', 10.0)"));
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM relationship_state").toInt(), 3);
 
-            // raw_messages 只建不写
-            const QStringList rawCols = raw.columns("raw_messages");
-            QCOMPARE(rawCols.size(), 8);
-            QCOMPARE(raw.scalar("SELECT COUNT(*) FROM raw_messages").toInt(), 0);
+            // raw_messages → raw_events（旧表删除，新表 15 列）
+            QCOMPARE(raw.scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+                                "AND name='raw_messages'").toInt(), 0);
+            const QStringList rawCols = raw.columns("raw_events");
+            QCOMPARE(rawCols.size(), 15);
+            QVERIFY(rawCols.contains("message_id"));
+            QVERIFY(rawCols.contains("sender_id"));
+            QVERIFY(rawCols.contains("event_type"));
+            QVERIFY(rawCols.contains("visibility"));
+            QCOMPARE(raw.scalar("SELECT COUNT(*) FROM raw_events").toInt(), 0);
+
+            // 蒸馏游标表
+            QVERIFY(raw.columns("memory_cursor").contains("last_event_id"));
         }
     }
 
@@ -207,18 +234,18 @@ private slots:
             MemoryManager first(dbPath);
         }
         {
-            // 二次启动：user_version 已是 2，不再执行迁移，数据不重复
+            // 二次启动：user_version 已是 3，不再执行迁移，数据不重复
             MemoryManager second(dbPath);
             RawDb raw(dbPath, "verify2");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 2);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 3);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM chat_history").toInt(), 1);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM relationship_state").toInt(), 2);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM long_term_summary").toInt(), 1);
         }
     }
 
-    void freshDatabaseIsV2()
+    void freshDatabaseIsV3()
     {
         QTemporaryDir dir;
         QVERIFY(dir.isValid());
@@ -228,8 +255,9 @@ private slots:
             MemoryManager mm(dbPath);
             RawDb raw(dbPath, "fresh");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 2);
-            QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('raw_messages')").toInt() > 0);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 3);
+            QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('raw_events')").toInt() > 0);
+            QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('memory_cursor')").toInt() > 0);
 
             // 默认关系维度：user / intimacy=30 / trust=30
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM relationship_state WHERE subject='user'").toInt(), 2);
@@ -292,6 +320,8 @@ private slots:
         QCOMPARE(raw.scalar("SELECT session_id FROM chat_history").toString(), QStringLiteral("group:123"));
         QCOMPARE(raw.scalar("SELECT speaker FROM chat_history").toString(), QStringLiteral("小明"));
         QCOMPARE(raw.scalar("SELECT sensitive FROM chat_history").toInt(), 1);
+        QCOMPARE(raw.scalar("SELECT turn_kind FROM chat_history").toString(), QStringLiteral("reply"));
+        QCOMPARE(raw.scalar("SELECT subject FROM chat_history").toString(), QStringLiteral("qq:10001"));
     }
 
     void unsummarizedCursorIsBucketed()
@@ -379,6 +409,160 @@ private slots:
         QCOMPARE(qqStates.at(0).value, 37.0);
 
         QVERIFY(mm.getRelationshipStates("qq:99999").isEmpty());
+    }
+
+    void migratesFromV2PreservingData()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString dbPath = dir.filePath("v2.db");
+        QVERIFY(createLegacyV1Db(dbPath));
+        {
+            RawDb raw(dbPath, "v2setup");
+            QVERIFY(raw.open());
+            const QStringList ddl = {
+                "ALTER TABLE chat_history ADD COLUMN channel TEXT NOT NULL DEFAULT 'pet'",
+                "ALTER TABLE chat_history ADD COLUMN session_id TEXT NOT NULL DEFAULT 'default'",
+                "ALTER TABLE chat_history ADD COLUMN speaker TEXT",
+                "ALTER TABLE chat_history ADD COLUMN sensitive INTEGER NOT NULL DEFAULT 0",
+                "CREATE INDEX idx_history_session ON chat_history(channel, session_id)",
+                "ALTER TABLE long_term_summary ADD COLUMN channel TEXT NOT NULL DEFAULT 'pet'",
+                "ALTER TABLE long_term_summary ADD COLUMN session_id TEXT NOT NULL DEFAULT 'default'",
+                "ALTER TABLE episodic_memory ADD COLUMN origin TEXT NOT NULL DEFAULT 'pet'",
+                "CREATE TABLE relationship_state_v2 ("
+                "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "  subject TEXT NOT NULL DEFAULT 'user',"
+                "  dimension TEXT NOT NULL,"
+                "  value REAL NOT NULL,"
+                "  updated_at DATETIME DEFAULT (datetime('now','localtime')),"
+                "  UNIQUE(subject, dimension))",
+                "INSERT INTO relationship_state_v2 (subject, dimension, value) "
+                "SELECT 'user', dimension, value FROM relationship_state",
+                "DROP TABLE relationship_state",
+                "ALTER TABLE relationship_state_v2 RENAME TO relationship_state",
+                "CREATE TABLE raw_messages ("
+                "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "  channel TEXT NOT NULL,"
+                "  session_id TEXT NOT NULL,"
+                "  speaker TEXT,"
+                "  content TEXT NOT NULL,"
+                "  timestamp DATETIME DEFAULT (datetime('now','localtime')),"
+                "  sensitive INTEGER NOT NULL DEFAULT 0,"
+                "  consolidated INTEGER NOT NULL DEFAULT 0)",
+                "INSERT INTO raw_messages (channel, session_id, speaker, content, sensitive) "
+                "VALUES ('qq_group', 'group:1', '小明', '旧群消息', 1)",
+                "PRAGMA user_version = 2",
+            };
+            for (const QString &sql : ddl) {
+                QVERIFY2(raw.exec(sql), qPrintable(sql + " | " + raw.lastError()));
+            }
+        }
+
+        MemoryManager mm(dbPath);
+        Q_UNUSED(mm);
+        RawDb raw(dbPath, "v2verify");
+        QVERIFY(raw.open());
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 3);
+        QCOMPARE(raw.scalar("SELECT user_input FROM chat_history").toString(), QStringLiteral("旧输入"));
+        QCOMPARE(raw.scalar("SELECT turn_kind FROM chat_history").toString(), QStringLiteral("reply"));
+        QCOMPARE(raw.scalar("SELECT subject FROM chat_history").toString(), QStringLiteral("user"));
+        QCOMPARE(raw.scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='raw_messages'").toInt(), 0);
+        QCOMPARE(raw.scalar("SELECT COUNT(*) FROM raw_events").toInt(), 1);
+        QCOMPARE(raw.scalar("SELECT platform FROM raw_events").toString(), QStringLiteral("qq"));
+        QCOMPARE(raw.scalar("SELECT channel FROM raw_events").toString(), QStringLiteral("qq_group"));
+        QCOMPARE(raw.scalar("SELECT sender_name FROM raw_events").toString(), QStringLiteral("小明"));
+        QCOMPARE(raw.scalar("SELECT event_type FROM raw_events").toString(), QStringLiteral("message"));
+        QCOMPARE(raw.scalar("SELECT visibility FROM raw_events").toString(), QStringLiteral("private"));
+        QCOMPARE(raw.scalar("SELECT COUNT(*) FROM memory_cursor").toInt(), 0);
+    }
+
+    void proactiveTurnAllowsNullInput()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString dbPath = dir.filePath("proactive.db");
+        MemoryManager mm(dbPath);
+
+        RequestMeta meta;
+        meta.turnKind = QStringLiteral("proactive");
+        meta.subject = QStringLiteral("user");
+        QVERIFY(mm.saveQATurn(QString(), "[]", {}, meta));
+
+        RawDb raw(dbPath, "proactive");
+        QVERIFY(raw.open());
+        QCOMPARE(raw.scalar("SELECT user_input IS NULL FROM chat_history").toInt(), 1);
+        QCOMPARE(raw.scalar("SELECT turn_kind FROM chat_history").toString(),
+                 QStringLiteral("proactive"));
+        QCOMPARE(raw.scalar("SELECT subject FROM chat_history").toString(),
+                 QStringLiteral("user"));
+
+        const QList<HistoryTurn> turns = mm.getHistoryTurn(10, Channel::kPet, Channel::kDefaultSession);
+        QCOMPARE(turns.size(), 1);
+        QCOMPARE(turns.at(0).turnKind, QStringLiteral("proactive"));
+        QVERIFY(turns.at(0).userInput.isEmpty());
+    }
+
+    void appendRawEventDedupAndFields()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString dbPath = dir.filePath("raw.db");
+        MemoryManager mm(dbPath);
+
+        QVERIFY(mm.appendRawEvent(QStringLiteral("qq"), Channel::kQQGroup, QStringLiteral("group:123"),
+                                  QStringLiteral("message"), QStringLiteral("今晚开黑吗"),
+                                  QStringLiteral("m-1001"), QStringLiteral("in"),
+                                  QStringLiteral("10001"), QStringLiteral("小明")));
+        // 同 message_id 重复上报 → INSERT OR IGNORE
+        QVERIFY(mm.appendRawEvent(QStringLiteral("qq"), Channel::kQQGroup, QStringLiteral("group:123"),
+                                  QStringLiteral("message"), QStringLiteral("重复"),
+                                  QStringLiteral("m-1001")));
+
+        RawDb raw(dbPath, "raw");
+        QVERIFY(raw.open());
+        QCOMPARE(raw.scalar("SELECT COUNT(*) FROM raw_events").toInt(), 1);
+        QCOMPARE(raw.scalar("SELECT sender_id FROM raw_events").toString(), QStringLiteral("10001"));
+        QCOMPARE(raw.scalar("SELECT sender_name FROM raw_events").toString(), QStringLiteral("小明"));
+        QCOMPARE(raw.scalar("SELECT event_type FROM raw_events").toString(), QStringLiteral("message"));
+        QCOMPARE(raw.scalar("SELECT direction FROM raw_events").toString(), QStringLiteral("in"));
+        QCOMPARE(raw.scalar("SELECT visibility FROM raw_events").toString(), QStringLiteral("private"));
+        QCOMPARE(raw.scalar("SELECT processed FROM raw_events").toInt(), 0);
+    }
+
+    void episodicOriginAndVisibilityFilters()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager mm(dir.filePath("episodic.db"));
+
+        QVERIFY(mm.addEpisodicMemory(QStringLiteral("桌宠私密"), QStringLiteral("event"), 0.5,
+                                     QDateTime(), QString(), QStringLiteral("pet"),
+                                     QStringLiteral("private"), QStringLiteral("user")));
+        QVERIFY(mm.addEpisodicMemory(QStringLiteral("群聊记忆"), QStringLiteral("event"), 0.6,
+                                     QDateTime(), QString(), QStringLiteral("qq_group"),
+                                     QStringLiteral("channel"), QStringLiteral("qq:10001")));
+
+        QCOMPARE(mm.getActiveEpisodicMemories().size(), 2);
+        QCOMPARE(mm.getActiveEpisodicMemories(0.2, 20, QStringLiteral("qq_group")).size(), 1);
+        QCOMPARE(mm.getActiveEpisodicMemories(0.2, 20, QString(), QStringLiteral("private")).size(), 1);
+        QCOMPARE(mm.getActiveEpisodicMemories(0.2, 20, QStringLiteral("qq_group"),
+                                              QStringLiteral("channel")).size(), 1);
+        QCOMPARE(mm.getActiveEpisodicMemories(0.2, 20, QStringLiteral("pet"),
+                                              QStringLiteral("channel")).size(), 0);
+    }
+
+    void memoryCursorUpsert()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager mm(dir.filePath("cursor_table.db"));
+
+        QCOMPARE(mm.getMemoryCursorEventId(Channel::kPet, Channel::kDefaultSession), qlonglong(0));
+        QVERIFY(mm.updateMemoryCursor(Channel::kPet, Channel::kDefaultSession, 42, 7));
+        QCOMPARE(mm.getMemoryCursorEventId(Channel::kPet, Channel::kDefaultSession), qlonglong(42));
+        QVERIFY(mm.updateMemoryCursor(Channel::kPet, Channel::kDefaultSession, 43, 8));
+        QCOMPARE(mm.getMemoryCursorEventId(Channel::kPet, Channel::kDefaultSession), qlonglong(43));
+        QCOMPARE(mm.getMemoryCursorEventId(Channel::kQQGroup, QStringLiteral("group:123")), qlonglong(0));
     }
 };
 
