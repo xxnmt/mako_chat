@@ -1,8 +1,8 @@
 # 开发路线图
 
 > 项目：Windows_AI 桌面看板娘（桌宠）
-> 版本：v0.6.0
-> 更新日期：2026-08-08
+> 版本：v0.6.0（Phase 0 多渠道架构已完成）
+> 更新日期：2026-10-26
 
 ---
 
@@ -196,6 +196,21 @@
 
 **预计时间**：2-3周
 
+### 多渠道 / 类人化路线（详见 HUMANIZATION_PLAN.md）
+**状态**：Phase 0 ✅ 已完成（提交 `61f1767`）
+
+- [x] **Phase 0 架构解耦**：`Utterance`/`RequestMeta` 统一协议、`IChannelAdapter` 渠道抽象、`SessionRouter` 输入路由、渠道适配器（桌宠/QQ 占位）
+- [x] **数据库 v2 迁移**：`chat_history`/`long_term_summary` 渠道双键、`episodic_memory.origin`、`relationship_state` 按 subject 重建、`raw_messages` 建表（只建不写）
+- [x] **identity.json 配置解析**（self/master/盲区/立绘跟随/主动对话，Phase 0 只读、无调度）
+- [x] **Phase 0 单元测试 23 例**（memorymanager 10 / configmanager 8 / sessionrouter 5），修复 BUG-1 未摘要游标恒空、BUG-2 空标签误判
+- [ ] **Phase 0.5**：`episodic_memory.visibility` + `appendRawMessage()` + `getActiveEpisodicMemories` 按 `origin`/`visibility` 过滤
+- [ ] **Phase 1**：SnowLuma 部署 + `QQProtocolClient`/`QQChannelAdapter` 收发（前置：TTSService 合成/播放分离、`PromptAssembler`、`GlobalMoodState`）
+- [ ] **Phase 2**：`ChatPlanner` 发言门控 + `ProactiveScheduler` 主动对话
+- [ ] **Phase 3**：QQ 空间说说/评论/点赞、合并转发/戳一戳/表情回应
+- [ ] **Phase 4**：经 dsh ACP 接入浏览器类工具
+
+**当前阻塞**：Phase 1 依赖 SnowLuma + 专用 QQ 小号部署验证。
+
 ### v0.7.0 - 架构改进 & 独立存档
 **状态**：📋 待开始
 
@@ -299,6 +314,7 @@
 | TD-034 | 对话轮冲突导致退火误触发：上一轮播放收尾（playbackQueueEmpty）晚于新一轮用户输入，被当作当前轮结束，用旧轮 finalTags 启动退火定时器，导致新一轮播放中途提前退回默认状态 | 中 | v0.7.0 | ⚠️ 待处理（需对话轮次冲突解决策略：用户可选"打断当前轮"或"自动排队"） |
 | TD-035 | 昼夜判定写反（跨午夜比较符用错，整个白天被误判为夜晚而穿睡衣） | 中 | v0.6.0 | ✅ 已修复（onMinuteTick 跨午夜分支改为 `(now >= m_nightStart || now < m_nightEnd)`） |
 | TD-036 | 立绘 far/closer 切换漂移与闪帧（切换原点不当 + resize/move 两步重绘） | 中 | v0.6.0 | ✅ 已修复（updatePath 锚定脚底中心 + 原子 setGeometry + setPixmap 后 repaint + WA_NoSystemBackground） |
+| TD-037 | 设置界面三组控件未接线：长期记忆摘轮数、夜晚时段、退火时长（按钮/控件已就位，但无槽函数、ConfigManager 无配置项、TimeManager 硬编码默认值） | 中 | v0.6.0 收尾（下一步） | ⚠️ 待处理 |
 
 ---
 
@@ -468,7 +484,10 @@ v0.3.0  ████████████████████ 100%  AI资
 v0.4.0  ████████████████████ 100%  AI记忆系统（三层记忆）
 v0.4.1  ████████████████████ 100%  TTS策略模式重构
 v0.5.0  ████████████████████ 100%  JSON协议 & 标签校验
-v0.6.0  ███████████████████░   90%  流式TTS播放 & 播放器抽象 & 时间管理（当前）
+v0.6.0  ███████████████████░   90%  流式TTS播放 & 播放器抽象 & 时间管理（当前，剩设置接线）
+Phase 0   ████████████████████  100%  多渠道架构解耦（已提交 61f1767）
+Phase 0.5 ░░░░░░░░░░░░░░░░░░░░    0%  记忆可见性/溯源预留（下一步）
+Phase 1   ░░░░░░░░░░░░░░░░░░░░    0%  QQ 渠道接入（依赖 SnowLuma）
 v0.7.0  ░░░░░░░░░░░░░░░░░░░░   0%  架构改进 & 独立存档
 v0.8.0  ░░░░░░░░░░░░░░░░░░░░   0%  角色自定义 & 剧本系统
 v0.9.0  ░░░░░░░░░░░░░░░░░░░░   0%  智能助手 & 性能优化
@@ -476,25 +495,25 @@ v0.9.0  ░░░░░░░░░░░░░░░░░░░░   0%  智�
 
 ---
 
-## 近期任务（Next Up）
+## 近期任务（Next Up，2026-10-26 排序）
 
-1. **代码质量提升**
-   - 添加错误重试机制（LLM请求失败自动重试）
-   - 创建ShortcutManager全局快捷键管理
+1. **设置界面接线（v0.6.0 收尾）**
+   - 长期记忆自动摘轮数（`btn_saveMemorySummaryLength`）
+   - 时间管理：夜晚时段、脸红/表情/距离退火时长（`btn_saveNightTime` / `btn_saveAnnealingTime`）
+   - ConfigManager 增加对应 getter/setter，TimeManager 启动时读取（当前硬编码 22:00-7:00、30/15/15 秒）
 
-2. **设置界面扩展**
-   - 接线长期记忆自动摘轮数、时间管理（夜晚时间/退火时长）配置（控件已就位）
-   - TTS语速、温度配置
-   - 外观配置（气泡样式、窗口透明度）
-   - 快捷键配置
+2. **TD-034 对话轮次冲突**
+   - `playbackQueueEmpty` 增加轮次身份，退火仅对最新轮生效
 
-3. **功能增强**
-   - 历史记录导出功能
-   - 立绘切换过渡动画
-   - 右键菜单扩展（服装/表情快捷切换）
-   - 系统托盘图标
+3. **Phase 0.5**
+   - v3 迁移：`episodic_memory.visibility`（默认 `private`）
+   - `appendRawMessage()`（只写方法，不接线）
+   - `getActiveEpisodicMemories` 扩参：`origin` + `visibility`（默认不过滤，见 HUMANIZATION_PLAN 10.3）
 
-4. **长期规划**
-   - AppController职责拆分（TD-013 维持⚠️ 可接受）
-   - 独立存档系统
-   - 插件化架构
+4. **Phase 1 前置项**
+   - TTSService 合成/播放分离、`GlobalMoodState`、`PromptAssembler`、`resolveSubject` 接 identity.json
+
+5. **Phase 1 主体**
+   - SnowLuma 收发链路验证 → `QQProtocolClient` / `QQChannelAdapter`
+
+> 顺延（不影响主线）：LLM 错误重试、ShortcutManager、TTS 语速/温度、外观配置、历史导出、立绘过渡动画、系统托盘、右键菜单扩展、AppController 职责拆分（TD-013）、独立存档、插件化。

@@ -1,7 +1,7 @@
 # 开发记录
 
 > 项目：Windows_AI 桌面看板娘（桌宠）
-> 最后更新：2026-08-25
+> 最后更新：2026-10-26
 
 ---
 
@@ -9,6 +9,11 @@
 
 | 哈希 | 日期 | 类型 | 描述 | 关键变更 |
 |------|------|------|------|----------|
+| `1646ff4` | 2026-10-26 | docs | 更新 HUMANIZATION_PLAN 协议端选型与 Phase 规划 | SnowLuma 选型、Phase 0.5 收缩裁决、记忆 v2 设计 |
+| `b126180` | 2026-10-20 | docs | 补充 Phase 0 测试报告 | 人工异常回复校验、BUG-1/BUG-2 修复记录 |
+| `485b5e3` | 2026-10-20 | fix | 修正 Levenshtein 空串边界 | 空标签不再误判为枚举首项（BUG-2） |
+| `61f1767` | 2026-10-19 | feat | 实现大脑与渠道架构解耦 | Utterance/IChannelAdapter/SessionRouter、DB v2、identity.json、23 例测试 |
+| `5e6facd` | 2026-10-19 | feat | 异常回复拦截与校验 | zh_text/ja_text/tags 缺失整轮抛弃，新增 replyAbnormal |
 | `7dd8ce4` | 2026-07-16 | feat | 添加句子解析、TTS服务和外观管理功能 | 新增 AppController/TTSService/AppearanceManager/SentenceText，LLM多标签解析升级 |
 | `88df6b2` | 2026-07-15 | refactor | 重构项目资源与应用架构 | 统一图片命名，BubbleWidget解耦attachTo，CharacterWidget瘦身 |
 | `08a4808` | 2026-07-15 | docs | 添加GPT-SoVITS API接口文档 | 新增TTS接口文档 |
@@ -327,6 +332,22 @@
 
 ---
 
+### M29: Phase 0 大脑/渠道架构解耦（已完成）
+
+- 日期：2026-10-19（实施）、2026-10-20（测试与缺陷修复）
+- 提交：`61f1767`（代码）、`485b5e3`（BUG-2 修复）、`b126180`（测试报告）
+- 内容：
+  - 新增 8 个文件：`utterance.h`、`ichanneladapter.h`、`petchanneladapter.h/cpp`、`qqchanneladapter.h/cpp`、`sessionrouter.h/cpp`
+  - 输入链路改为 `textSubmitted → SessionRouter::submitInput → requestReply → AppController → askDeepSeek`，`RequestMeta` 随轮次贯穿入库/摘要/关系更新
+  - 输出链路分层：气泡等渠道私有表现归 `PetChannelAdapter`，四维立绘（全局情绪层）仍由 AppController 直接驱动
+  - 数据库 v2 迁移：渠道双键、speaker/sensitive、episodic origin、relationship_state 按 subject 重建、raw_messages 建表（只建不写）
+  - ConfigManager 新增 identity.json 懒加载解析（self/master/盲区/立绘跟随/主动对话），Phase 0 无调度行为
+  - 测试基线：tst_memorymanager(10) + tst_configmanager(8) + tst_sessionrouter(5) = 23 例全绿
+  - 修复 BUG-1（`getUnsummarizedTurns` 先 bind 后 `exec(sql)` 丢参数，导致长期记忆摘要链路失效）、BUG-2（Levenshtein 空串分支写反，缺失 clothing 标签被误改为 pajama）
+  - 与方案偏差 3 处：relationship_state 走「复制重建」（SQLite 无法改 UNIQUE 约束）、配置用 identity.json 而非 QSettings（跟随项目 JSON 体系）、迁移用 `user_version` v1→v2（沿用现有惯例）
+
+---
+
 ## 技术债务
 
 | 编号 | 描述 | 状态 | 优先级 | 引入版本 |
@@ -367,6 +388,7 @@
 | TD-034 | 对话轮次冲突：playbackQueueEmpty 裸信号无轮次身份，上一轮退火在下一轮对话中途误触发 | ⚠️ 待处理（归属「对话轮次冲突」特性，未来提供打断当前轮/自动排队两种策略） | 高 | v0.6.0 |
 | TD-035 | TimeManager 昼夜判断逻辑颠倒（`now <= 22:00 || now > 7:00` 将整个白天 7:00-22:00 误判为夜，导致白天穿睡衣） | ✅ 已修复（跨零点判断改为 `now >= 22:00 || now < 7:00`） | 高 | v0.6.0 |
 | TD-036 | 立绘切换抖动/漂移（closer 相对 far 脚底差 30px，center 锚定让 closer 脚底向下坠，且 resize+move 两步重绘造成向右闪帧） | ✅ 已修复（脚底中心锚定 + 原子 setGeometry + repaint + WA_NoSystemBackground） | 高 | v0.6.0 |
+| TD-037 | 设置界面三组控件未接线（长期记忆摘轮数/夜晚时段/退火时长），点击保存无反应 | ⚠️ 待处理（控件与按钮已就位，缺 ConfigManager 配置项与槽函数；TimeManager 默认值硬编码） | 中 | v0.6.0 |
 
 ---
 
@@ -408,6 +430,7 @@
 | v0.4.1 | TTS策略模式 | TTSService + ITTSProvider + ApiTTSProvider | 策略模式重构TTS、GPT-SoVITS HTTP API接入、双队列模型优化（合成→播放）、Qt Multimedia集成、参考音频情绪映射、错误处理（合成失败跳过不阻塞） |
 | v0.5.0 | JSON协议与标签校验 | LLMService + TagValidator + MemoryManager | JSON输出协议替代标签格式、response_format参数强制JSON输出、TagValidator标签校验与编辑距离修正、数据库结构简化（删除parsed_json列）、历史记忆纯文本注入 |
 | v0.6.0 | 流式TTS播放与播放器抽象 & 时间管理 | TTSService + IPcmPlayer + StreamPlayer + FilePlayer + TimeManager + TTSProcessManager | 流式PCM播放（streaming_mode+pcmDataReady）、IPcmPlayer抽象接口（静态工厂方法）、播放完成检测（setSynthesisDone+IdleState+兜底定时器）、预填充防吞开头、FilePlayer WAV头解析完善、signals遮蔽bug修复、野指针崩溃修复、TimeManager QTimer singleShot 退火机制、TTSProcessManager 孤儿进程清理（killProcessOnPort） |
+| v0.7.0-alpha | 大脑/渠道解耦（Phase 0） | SessionRouter + IChannelAdapter + PetChannelAdapter + QQChannelAdapter(占位) + MemoryManager v2 + ConfigManager(identity.json) | 统一 Utterance/RequestMeta 协议、渠道适配器、输入路由、记忆按 channel+session 双键隔离、身份层配置预留、23 例自动化测试 |
 
 ---
 
@@ -441,6 +464,8 @@
 | 2026-08-08 | TimeManager 退火时间单位错误（hasExpired(15) 误为 15ms） | 改用 QTimer::start(15000) 正确为 15秒 | v0.6.0 |
 | 2026-08-08 | SoVITS 切换 400 Bad Request（端口被孤儿 python.exe 占用） | TTSProcessManager::apiStart 开头 TCP 探测端口占用 → killProcessOnPort 清理孤儿进程 | v0.6.0 |
 | 2026-08-08 | 崩溃后留孤儿 python.exe（异常退出端口未释放） | killProcessOnPort 在 apiStart 开头强制清理占端口进程 | v0.6.0 |
+| 2026-10-19 | 未摘要历史查询恒为空（prepare+bind 后又 exec(sql)，参数被丢弃，`channel = NULL` 恒不成立） | 改为 `query.exec()` 复用预编译语句，恢复长期记忆摘要链路（BUG-1） | `61f1767` |
+| 2026-10-20 | 空标签被编辑距离误判为枚举首项（`distance("", x)` 恒为 0，缺失 clothing 被改成 pajama） | 修正 Levenshtein 空串边界（`distance("", x) = len(x)`），空标签回到「继承 → 默认值」降级链（BUG-2） | `485b5e3` |
 
 ---
 
@@ -453,3 +478,4 @@
 | 2026-07-16 | 架构评审 | 模块职责清晰，信号槽连接合理 | 通过 |
 | 2026-07-23 | 架构审查 | 识别16个技术债务项 | 更新ARCHITECTURE.md，添加改进建议 |
 | 2026-07-29 | JSON协议审查 | LLM输出格式不一致，标签校验缺失 | 实现JSON协议+TagValidator，完成修复 |
+| 2026-10-19 | Phase 0 完整性审查（A-E 共 14 项） | 未摘要游标与摘要分桶失配、群聊「只存参与」导致旁听失忆 | 修正方案：`long_term_summary` 双键、`raw_messages` 原始层+空闲蒸馏层 |

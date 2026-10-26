@@ -172,3 +172,17 @@ ctest --test-dir build/Desktop_Qt_6_11_1_MinGW_64_bit_Debug --output-on-failure
    - 将验收项 4 的表述调整到 Phase 1（或届时在 QQ 渠道装配处显式触发一次身份加载）；
    - 考虑为 `TagValidator` 空标签兜底补充回归用例（需解决 `llmservice.cpp` 的链接依赖）；
    - 修复项与测试代码需随 Phase 0 一并提交。
+
+---
+
+## 八、后续状态（2026-10-26 复核）
+
+| 项 | 状态 |
+|---|---|
+| 代码提交 | ✅ `61f1767`（Phase 0）、`485b5e3`（BUG-2）、`b126180`（本报告） |
+| 构建 | ✅ Debug 全量构建通过 |
+| 自动化测试 | ✅ ctest 3/3 通过（0.52s） |
+| 运行时库 | ✅ `user_version=2`；`chat_history` 106 行；`raw_messages` 0 行 |
+| 验收项 4 | ↪ 顺延至 Phase 1（QQ 渠道装配时显式触发 identity 加载） |
+| 验收项 5 | ⏸ 仍待人工目检 |
+| TagValidator 回归用例 | ⏸ 待补（需先解决 llmservice.cpp 链接依赖） |

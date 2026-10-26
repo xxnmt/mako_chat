@@ -1,8 +1,8 @@
 # 架构设计文档
 
 > 项目：Windows_AI 桌面看板娘（桌宠）
-> 版本：v0.6.0
-> 更新日期：2026-08-08
+> 版本：v0.6.0 + Phase 0（多渠道架构）
+> 更新日期：2026-10-26
 
 ---
 
@@ -17,6 +17,10 @@
 | 层级 | 模块 | 职责 | 文件 |
 |------|------|------|------|
 | **中枢层** | AppController | 应用生命周期管理、信号调度、模块组装 | appcontroller.h/cpp |
+| **渠道层** | IChannelAdapter | 渠道抽象接口（channelName/sendUtterance） | ichanneladapter.h |
+| | PetChannelAdapter | 桌宠渠道：气泡显示/播放跟读 | petchanneladapter.h/cpp |
+| | QQChannelAdapter | QQ 渠道占位（Phase 1：OneBot v11） | qqchanneladapter.h/cpp |
+| | SessionRouter | 输入路由：身份解析 + 会话历史组装 | sessionrouter.h/cpp |
 | **UI层** | CharacterWidget | 立绘显示、鼠标拖拽、右键菜单 | characterwidget.h/cpp |
 | | BubbleWidget | 气泡显示、打字机特效 | bubblewidget.h/cpp/ui |
 | | ChatWidget | 聊天输入窗口、弹出跟随 | chatwidget.h/cpp |
@@ -24,6 +28,7 @@
 | | TTSService | 语音合成队列、播放队列、策略模式（ITTSProvider） | ttsservice.h/cpp, ittsprovider.h, apittsprovider.h/cpp |
 | | ApiTTSProvider | GPT-SoVITS API 调用、流式 PCM 解析 | apittsprovider.h/cpp |
 | | TTSProcessManager | GPT-SoVITS 进程管理、孤儿进程清理（killProcessOnPort） | ttsprocessmanager.h/cpp |
+| | TTSReferenceManager | 按情绪加载参考音频映射（tts_map.json） | ttsreferencemanager.h/cpp |
 | | IPcmPlayer | 播放器抽象接口（静态工厂方法+PcmPlayerFinished/Error 信号） | ipcmplayer.h/cpp |
 | | StreamPlayer | 流式 PCM 播放（QAudioSink + QBuffer，预填充+兜底检测） | streamplayer.h/cpp |
 | | FilePlayer | 文件型 WAV 播放（QAudioSink + QFile，WAV头解析） | fileplayer.h/cpp |
@@ -35,6 +40,8 @@
 | | MemoryManager | AI对话历史管理、SQLite数据库 | memorymanager.h/cpp |
 | **设置层** | SettingsWidget | 设置界面（左右目录+滚动双向同步）、API/记忆/TTS模型配置 | settingswidget.h/cpp/ui |
 | **数据结构** | SentenceText | 句子数据模型（中文/日文/标签） | sentencedata.h |
+| | Utterance | 输出协议（text/ttsText/tags/channel/sessionId/speaker） | utterance.h |
+| | RequestMeta | 输入元数据（channel/sessionId/speaker/subject/sensitive） | utterance.h |
 | | HistoryTurn | 对话历史数据结构 | historyturn.h |
 | | CharacterProfile | 角色档案数据结构（user/mako 主体） | historyturn.h |
 | | EpisodicMemory | 情景记忆数据结构（事件/承诺/冲突/里程碑） | historyturn.h |
@@ -90,6 +97,33 @@
 │  位置策略：AnchorStrategy (AnchorPosition枚举 + AnchorConfig)       │
 └─────────────────────────────────────────────────────────────────────┘
 ```
+
+### 1.4 多渠道分层（Phase 0）
+
+```
+输入源（桌宠输入框 / 未来 QQ 私聊、群聊 / 未来定时触发）
+        │
+        ▼
+SessionRouter::submitInput(channel, sessionId, speaker, text)
+        ├─ resolveSubject(channel, speaker) → subject（Phase 0 恒 'user'；Phase 1：self→丢弃 / master→'user' / 未知→qq:<uin>）
+        ├─ MemoryManager::getHistoryTurn(N, channel, sessionId)   ← 双键隔离
+        └─ emit requestReply(text, history, meta)
+                │
+                ▼
+        LLMService::askDeepSeek(text, history, meta)
+                │  sentencesReady
+                ▼
+        AppController::handleMakoReply
+                ├─ saveQATurn(..., meta) / 记忆提取（带 meta）
+                └─ TTSService::enqueueSentences
+                        │ playAudioAction
+                        ▼
+        AppController::onPlayAudioAction
+                ├─ PetChannelAdapter::sendUtterance → BubbleWidget（渠道私有表现）
+                └─ AppearanceManager::applyTags（全局情绪层，D1 开关在 Phase 1 对 QQ 路径生效）
+```
+
+**边界**：`QQChannelAdapter` 为占位；`resolveSubject` 恒返回 `'user'`；`raw_messages` 只建不写；`identity.json` 已解析但生产代码尚未调用（Phase 1 接线）。
 
 ---
 
@@ -676,7 +710,7 @@ LLMService::parseJsonReply() → TagValidator校验
 **职责**：管理AI对话历史记录、角色档案、情景记忆、长期摘要和关系状态
 
 **设计要点**：
-- 使用SQLite数据库存储五类数据（数据库版本 `PRAGMA user_version = 1`）
+- 使用SQLite数据库存储五类数据（数据库版本 `PRAGMA user_version = 2`；v2 增加多渠道字段与 `raw_messages`）
 - 每次对话后保存用户输入、AI回复（JSON对象）
 - 对话前读取最近N轮历史作为短期记忆
 - 角色档案区分 `user` / `mako` 两个主体，长期稳定特质
@@ -686,7 +720,7 @@ LLMService::parseJsonReply() → TagValidator校验
 - 数据库路径：`app_data/memory/QianDaoMoZi_memory.db`
 - 注：旧的 `user_profile` 表已被 `character_profile` 表取代（通过 subject 字段区分 user/mako）
 
-**数据库结构**（共 5 张表）：
+**数据库结构**（`PRAGMA user_version = 2`；v1 块 5 张基础表 + v2 块多渠道扩展，合计 6 张表）：
 
 **表1：chat_history（对话历史）**
 | 字段 | 类型 | 说明 |
@@ -695,6 +729,10 @@ LLMService::parseJsonReply() → TagValidator校验
 | timestamp | DATETIME DEFAULT (datetime('now','localtime')) | 创建时间（本地时间） |
 | user_input | TEXT NOT NULL | 用户输入文本 |
 | raw_reply | TEXT NOT NULL | AI回复的JSON对象 `{"sentences": [...]}` |
+| channel | TEXT NOT NULL DEFAULT 'pet' | 渠道：pet / qq_private / qq_group（v2） |
+| session_id | TEXT NOT NULL DEFAULT 'default' | 会话 ID（QQ 为好友号/群号，v2） |
+| speaker | TEXT | 说话人（群聊场景，v2） |
+| sensitive | INTEGER NOT NULL DEFAULT 0 | 记忆盲区/敏感标记（v2） |
 
 **表2：long_term_summary（长期记忆摘要）**
 | 字段 | 类型 | 说明 |
@@ -704,6 +742,8 @@ LLMService::parseJsonReply() → TagValidator校验
 | covered_turn_end_id | INTEGER NOT NULL | 覆盖的对话结束ID |
 | source_ids | TEXT NOT NULL | 来源对话ID列表（JSON） |
 | is_dirty | INTEGER DEFAULT 0 | 是否待重建 |
+| channel | TEXT NOT NULL DEFAULT 'pet' | 渠道分桶（v2） |
+| session_id | TEXT NOT NULL DEFAULT 'default' | 会话分桶（v2） |
 | created_at | DATETIME DEFAULT (datetime('now','localtime')) | 创建时间 |
 | updated_at | DATETIME DEFAULT (datetime('now','localtime')) | 更新时间 |
 
@@ -732,6 +772,7 @@ LLMService::parseJsonReply() → TagValidator校验
 | last_accessed | DATETIME DEFAULT (datetime('now','localtime')) | 最后访问时间（检索时更新） |
 | last_decay_at | DATETIME DEFAULT (datetime('now','localtime')) | 最后衰减计算时间 |
 | source_ids | TEXT | 来源对话ID列表（JSON） |
+| origin | TEXT NOT NULL DEFAULT 'pet' | 渠道溯源：pet / qq_private / qq_group（v2） |
 
 索引：`idx_episodic_importance`(importance)、`idx_episodic_type`(type)、`idx_episodic_status`(status)
 
@@ -739,24 +780,41 @@ LLMService::parseJsonReply() → TagValidator校验
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | id | INTEGER PRIMARY KEY AUTOINCREMENT | 记录ID |
-| dimension | TEXT NOT NULL UNIQUE | 维度名：`intimacy`(亲密度) / `trust`(信任度) |
+| subject | TEXT NOT NULL DEFAULT 'user' | 主体：`user`（主人）/ `qq:<uin>` / `group:<群号>`（v2 重建表） |
+| dimension | TEXT NOT NULL | 维度名：`intimacy`(亲密度) / `trust`(信任度) |
 | value | REAL NOT NULL | 维度值 0-100 |
 | updated_at | DATETIME DEFAULT (datetime('now','localtime')) | 更新时间 |
 
+约束：`UNIQUE(subject, dimension)`（v2 重建；存量行复制为 `subject='user'`）
+
 初始化数据：`intimacy=30.0`、`trust=30.0`（initDatabase 时若表为空自动插入）
+
+**表6：raw_messages（群聊原始消息，v2 新增，Phase 0 只建不写）**
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| id | INTEGER PRIMARY KEY AUTOINCREMENT | 记录ID |
+| channel | TEXT NOT NULL | 渠道 |
+| session_id | TEXT NOT NULL | 会话（群号） |
+| speaker | TEXT | 说话人 |
+| content | TEXT NOT NULL | 原始内容 |
+| timestamp | DATETIME DEFAULT (datetime('now','localtime')) | 时间 |
+| sensitive | INTEGER NOT NULL DEFAULT 0 | 盲区标记 |
+| consolidated | INTEGER NOT NULL DEFAULT 0 | 是否已被蒸馏 |
+
+索引：`idx_raw_session(session_id, timestamp)`、`idx_raw_consolidated(consolidated)`
 
 **关键方法**：
 
 **对话历史 CRUD**：
 | 方法 | 作用 | 参数 | 返回值 |
 |------|------|------|--------|
-| `saveQATurn()` | 保存单轮对话（raw_reply 为 sentences JSON） | userInput, rawReply, sentences | bool |
-| `getHistoryTurn(N)` | 获取最近N轮对话 | int N | QList\<HistoryTurn\> |
+| `saveQATurn()` | 保存单轮对话（raw_reply 为 sentences JSON，meta 写入渠道/会话/说话人/敏感标记） | userInput, rawReply, sentences, meta=RequestMeta() | bool |
+| `getHistoryTurn(N)` | 按渠道+会话双键获取最近N轮对话 | int N, channel="pet", sessionId="default" | QList\<HistoryTurn\> |
 | `getHistoryTurn(offset, limit)` | 分页获取对话 | int offset, int limit | QList\<HistoryTurn\> |
 | `getTotalHistoryCount()` | 获取记录总数 | - | qlonglong |
 | `deleteTurnByID(id)` | 删除单条记录 | int id | bool |
 | `clearAllHistory()` | 清空所有记录 | - | bool |
-| `getUnsummarizedTurns()` | 获取 id > long_term_summary.max(covered_turn_end_id) 的未摘要对话 | outLastEndId, outSourceIds | QList\<HistoryTurn\> |
+| `getUnsummarizedTurns()` | 按双键获取 id > long_term_summary.max(covered_turn_end_id) 的未摘要对话 | outLastEndId, outSourceIds, channel, sessionId | QList\<HistoryTurn\> |
 
 **角色档案 CRUD**：
 | 方法 | 作用 | 参数 | 返回值 |
@@ -777,15 +835,15 @@ LLMService::parseJsonReply() → TagValidator校验
 **长期记忆摘要 CRUD**：
 | 方法 | 作用 | 参数 | 返回值 |
 |------|------|------|--------|
-| `addLongTermSummary()` | 添加摘要 | summaryText, coveredEndId, sourceIdsJson | bool |
-| `getLatestSummaries()` | 获取最新摘要（is_dirty=0） | limit=5 | QList\<LongTermSummary\> |
+| `addLongTermSummary()` | 添加摘要（按渠道双键分桶） | summaryText, coveredEndId, sourceIdsJson, channel, sessionId | bool |
+| `getLatestSummaries()` | 获取最新摘要（is_dirty=0，按双键过滤） | limit=5, channel, sessionId | QList\<LongTermSummary\> |
 | `deleteLongTermSummary()` | 删除摘要 | id | bool |
 
 **关系状态 CRUD**：
 | 方法 | 作用 | 参数 | 返回值 |
 |------|------|------|--------|
-| `upsertRelationshipState()` | 维度不存在时初始化为 clamp(30+delta,0,100)；存在时 clamp(oldVal+delta,0,100) | dimension, delta | bool |
-| `getRelationshipStates()` | 获取全部关系维度（按 dimension 排序） | - | QList\<RelationshipState\> |
+| `upsertRelationshipState()` | 按 subject：维度不存在时初始化为 clamp(30+delta,0,100)；存在时 clamp(oldVal+delta,0,100) | dimension, delta, subject="user" | bool |
+| `getRelationshipStates()` | 获取指定主体的全部关系维度（按 dimension 排序） | subject="user" | QList\<RelationshipState\> |
 | `initRelationshipState()` | 若表为空，插入 intimacy=30、trust=30 | - | bool |
 
 **工具函数**：
@@ -962,6 +1020,38 @@ struct RelationshipState {
 
 ---
 
+### 2.16 多渠道适配层（Phase 0）
+
+**职责**：把「大脑」与「渠道表现」解耦。大脑只产出 `Utterance`，渠道只负责自己的表现；渠道无权判定身份归属。
+
+| 组件 | 职责 | 关键点 |
+|------|------|--------|
+| `Utterance` | 输出单元：text/ttsText/tags/channel/sessionId/speaker | 纯数据结构，无 Qt 依赖 |
+| `RequestMeta` | 输入元数据：channel/sessionId/speaker/subject/sensitive | 默认 `pet/default/user`，旧调用零改动 |
+| `IChannelAdapter` | `channelName()` + `sendUtterance()` 纯虚接口 | 大脑侧不感知具体渠道 |
+| `PetChannelAdapter` | 桌宠渠道：气泡显示 | 持 `BubbleWidget*` 非所有权；立绘/情绪不在此层 |
+| `QQChannelAdapter` | QQ 渠道占位 | Phase 1 接 OneBot v11；当前 `sendUtterance` 仅打日志 |
+| `SessionRouter` | 输入路由：身份解析 → 双键历史组装 → `requestReply` | `resolveSubject` Phase 0 恒 `'user'`；空输入拦截 |
+
+**调用时序**：
+```
+ChatWidget::textSubmitted(text)
+  → SessionRouter::submitInput("pet", "default", "欧尼酱", text)
+      ├─ 组装 RequestMeta（subject='user'）
+      ├─ getHistoryTurn(memoryLength, "pet", "default")
+      └─ emit requestReply(text, history, meta)
+  → AppController lambda：m_lastMeta=meta → notifyUserInputStarted() → askDeepSeek(text, history, meta)
+  → handleMakoReply：saveQATurn(..., meta) + 记忆提取（按 meta 双键）
+  → onPlayAudioAction：PetChannelAdapter 显示气泡；AppearanceManager 应用四维标签
+```
+
+**设计约束**：
+- 渠道私有表现（气泡/IM 发送/语音消息）只进适配器；情绪与立绘是全局层，不进任何渠道（D1 开关在 Phase 1 对 QQ 路径生效）
+- 身份归属由宿主配置层决定（`SessionRouter::resolveSubject`），模型与渠道无权判定（C2）
+- 记忆按 `channel + session_id` 双键隔离，摘要与未摘要游标同样按双键分桶（A1）
+
+---
+
 ## 3. 核心数据流
 
 ### 3.1 完整对话流程
@@ -973,11 +1063,18 @@ struct RelationshipState {
 2. CharacterWidget::chatRequested() → ChatWidget::popup() → 用户输入 → textSubmitted(input)
    │
    ▼
-3. AppController lambda
+3. SessionRouter::submitInput("pet", "default", "欧尼酱", input)   ← Phase 0
    │
-   ├── 保存 m_lastUserInput
-   ├── 读取短期记忆: m_memoryManager->getHistoryTurn(memoryLength)
-   └── 调用 askDeepSeek(userInput, shortTermMemory)
+   ├── resolveSubject(channel, speaker) → 'user'
+   ├── 读取短期记忆: getHistoryTurn(memoryLength, channel, sessionId)
+   └── emit requestReply(text, history, meta)
+   │
+   ▼
+3.5 AppController lambda
+   │
+   ├── 保存 m_lastUserInput / m_lastMeta
+   ├── TimeManager::notifyUserInputStarted()
+   └── 调用 askDeepSeek(userInput, shortTermMemory, meta)
    │
    ▼
 4. LLMService::askDeepSeek()
@@ -1000,7 +1097,7 @@ struct RelationshipState {
    ▼
 6. AppController::handleMakoReply()
    │
-   ├── saveQATurn(userInput, correctedReply, sentences) 保存对话
+   ├── saveQATurn(userInput, correctedReply, sentences, m_lastMeta) 保存对话（含渠道/会话/主体）
    ├── enqueueSentences(sentences) 入队TTS
    └── 检查是否触发记忆提取
    │
@@ -1084,6 +1181,8 @@ image/
 | **观察者模式** | 信号槽系统（AppController为中枢） | 模块间松耦合通信 |
 | **生产者-消费者** | TTSService（合成队列→播放队列） | TTS流水线解耦 |
 | **策略模式** | TTSService（ITTSProvider接口） | 多种TTS实现可切换 |
+| **适配器模式** | IChannelAdapter（PetChannelAdapter/QQChannelAdapter） | 渠道表现可插拔，大脑不感知渠道 |
+| **上下文对象** | RequestMeta | 渠道/会话/主体元数据随轮次贯穿全链路 |
 | **多态接口** | IPcmPlayer（StreamPlayer/FilePlayer） | 统一播放器生命周期管理 |
 | **静态工厂方法** | IPcmPlayer::create(Type, parent) | 集中创建逻辑，TTSService 不依赖具体子类 |
 | **状态管理** | AppearanceManager | 角色外观状态机 |
@@ -1139,6 +1238,8 @@ image/
 | TD-032 | TimeManager 退火时间单位错误 | hasExpired(15) 误为 15ms → QTimer::start(15000) 正确为 15秒 | ✅ 已修复 |
 | TD-035 | 昼夜判定写反（跨午夜分支比较符用错，整个白天被误判为夜晚） | onMinuteTick 跨午夜分支改为 `(now >= m_nightStart || now < m_nightEnd)` | ✅ 已修复 |
 | TD-036 | 立绘 far/closer 切换漂移与闪帧 | updatePath 锚定脚底中心 + 原子 setGeometry + setPixmap 后 repaint + WA_NoSystemBackground | ✅ 已修复 |
+| BUG-001 | 未摘要历史查询恒为空（bind 后 exec(sql) 丢参数） | 改为 `query.exec()` 复用预编译语句 | ✅ 已修复（61f1767） |
+| BUG-002 | 空标签被编辑距离误判为枚举首项 | 修正 Levenshtein 空串边界 | ✅ 已修复（485b5e3） |
 
 ### 7.2 待优化项
 
@@ -1148,13 +1249,16 @@ image/
 | C-003 | 内联lambda过多 | appcontroller.cpp | 难以测试和复用 | ⚠️ 待优化 |
 | C-004 | LLMService头文件依赖MemoryManager | llmservice.h | 已用 `class MemoryManager;` 前向声明（TD-015 已修复） | ✅ 已修复 |
 | RC-012 | AnchorManager析构未清理 | anchormanager.cpp | 非问题：仅持弱引用，widget 所有权归 AppController（TD-014 已结案） | ✅ 非问题 |
-| TD-034 | 对话轮冲突导致退火误触发 | appcontroller.cpp + timemanager.cpp | 上一轮播放收尾的 playbackQueueEmpty 晚于新一轮输入，被误认为当前轮结束，用旧轮 finalTags 启动退火定时器，中途提前退火。根因：playbackQueueEmpty 裸信号不含轮次信息 | ⚠️ 待处理（需轮次冲突策略：打断当前轮 / 自动入队，让用户选择） |
+| TD-034 | 对话轮冲突导致退火误触发 | appcontroller.cpp + timemanager.cpp | 上一轮播放收尾的 playbackQueueEmpty 晚于新一轮输入，被误认为当前轮结束，用旧轮 finalTags 启动退火定时器，中途提前退火。根因：playbackQueueEmpty 裸信号不含轮次信息 | ⚠️ 待处理（下一步：加轮次序号，退火仅对最新轮生效） |
+| TD-037 | 设置界面三组控件未接线 | settingswidget.cpp / configmanager.* / timemanager.cpp | 长期记忆摘轮数、夜晚时段、退火时长控件与保存按钮已就位，但无槽函数、ConfigManager 无配置项、TimeManager 硬编码默认值；点击保存无反应 | ⚠️ 待处理（下一步） |
 
 ### 7.3 架构演进规划
 
 | 阶段 | 版本 | 内容 |
 |------|------|------|
 | 当前 | v0.6.0 | 流式TTS播放、IPcmPlayer抽象（静态工厂）、播放完成检测、预填充防吞开头、TimeManager QTimer singleShot 退火、TTSProcessManager 孤儿进程清理 |
+| 已完成 | Phase 0 | 大脑/渠道解耦：Utterance/IChannelAdapter/SessionRouter、DB v2 双键记忆、identity.json 解析、23 例测试 |
+| 下一步 | Phase 0.5 → Phase 1 | 记忆 visibility/appendRawMessage 预留 → SnowLuma/OneBot v11 QQ 渠道接入 |
 | 中期 | v0.7.0 | 设置界面完善、AppController职责拆分、独立存档系统 |
 | 远期 | v0.8.0+ | 架构改进、独立存档、插件化 |
 
@@ -1170,4 +1274,6 @@ image/
 | 新服装/表情 | 添加资源文件，AppearanceManager自动支持 |
 | 设置界面 | 连接 ConfigManager 的setter方法 |
 | 新交互方式 | 在CharacterWidget中添加新信号，连接到AppController |
+| 新消息渠道 | 实现 `IChannelAdapter`，输入经 `SessionRouter::submitInput(channel, sessionId, speaker, text)` 进入大脑 |
+| 新记忆渠道隔离 | `RequestMeta.channel/sessionId` 随轮次传递，MemoryManager 按双键读写 |
 | 插件系统 | AppController中注册新模块，通过信号槽通信 |

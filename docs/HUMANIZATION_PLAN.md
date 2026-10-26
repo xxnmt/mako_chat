@@ -1,9 +1,10 @@
 # 类人化升级方案（茉子 → 拥有自己的社交生活）
 
 > 项目：Windows_AI 桌面看板娘（桌宠）
-> 类型：规划文档（方案探讨阶段，未实施）
-> 版本：v0.5（协议端选型修正：SnowLuma 推荐，2026-10 调研修订）
+> 类型：规划文档（分阶段实施中）
+> 版本：v0.6（Phase 0.5 增补决议：origin + visibility，2026-10-26）
 > 制定日期：2026-10-19
+> 状态：Phase 0 已实施并通过验收（2026-10-26）；Phase 0.5 待开始
 > 关联文档：[ROADMAP.md](ROADMAP.md)、[ARCHITECTURE.md](ARCHITECTURE.md)
 
 ---
@@ -492,7 +493,7 @@ dsh 是一个**四层洋葱结构**，内核是 Cordis 插件框架（"Everythin
 | 项 | 裁决 | 理由 |
 |---|---|---|
 | `episodic_memory` + `visibility` 列 | ✅ 现在做 | Phase 1 C3 必需，schema 稳定，存量默认 `'private'`（桌宠私密经历不外泄） |
-| `getActiveEpisodicMemories` 扩参 | ✅ 现在做 | 默认不过滤，零风险 |
+| `getActiveEpisodicMemories` 扩参（`visibility` + `origin`） | ✅ 现在做 | 默认不过滤，零风险；`origin` 供 C3 防串群三重隔离，见 10.3 |
 | `appendRawMessage()` | ⚠️ 半做 | 方法现在写；**接线只限 IM 渠道**（Phase 1），桌宠已由 saveQATurn 全量入库不双写 |
 | `daily_journal`/`reflection_log` 建表 | ❌ 缓到 Phase 2 | schema 未经实现检验，不提前固化 |
 | Percept / ChannelCapability / ToolRegistry 三空壳 | ❌ 缓建 | 判断标准：空壳只对"schema 已定死、马上接数据"的东西有价值（raw_messages 合格）；对"形状未知、调用方不存在"的东西是仪式性代码。Percept 届时（Phase 1）改 `submitInput` 仅 1 处调用方，一行成本 |
@@ -507,6 +508,12 @@ dsh 是一个**四层洋葱结构**，内核是 Cordis 插件框架（"Everythin
 4. **主动唤醒模式**（Phase 2）：采纳 dsh-proactive 的 wake framing notice + `proactive_reclaim` 静默收尾（整轮折叠为墓碑）；openher 的 Drive 随时间演化超阈值触发。**克制项**：不采纳 Mai_love 的"独立日程生活/想念机制"重人格模拟，等门控数据跑出基线后再评估；不抄 DSH Cordis 插件内核
 
 
+
+### 10.3 Phase 0.5 增补决议（2026-10-26）
+
+`getActiveEpisodicMemories` 的扩参同时纳入 **`origin` 与 `visibility`** 两个过滤维度：C3 群聊「防串群」三重隔离明确要用 `origin` 过滤，提前在 Phase 0.5 一次加齐，避免 Phase 1 二次修改签名。两者默认均不过滤，旧调用零改动；`visibility` 默认 `private`（桌宠私密经历不外泄）。
+
+---
 
 ## 十一、风险清单
 
@@ -526,10 +533,10 @@ dsh 是一个**四层洋葱结构**，内核是 Cordis 插件框架（"Everythin
 
 | # | 事项 | 说明 |
 |---|---|---|
-| 1 | ~~Phase 0 实施范围~~ | **已定稿**：仅架构解耦（不含门控骨架），细则见 10.1，待用户批准实施 |
-| 2 | Phase 3 协议端选型 | 若需要"评论/点赞动态"则 Phase 1 直接用 SnowLuma，否则 NapCat；建议尽早决定 |
+| 1 | ~~Phase 0 实施范围~~ | **已实施并通过验收**（提交 `61f1767`；23 例测试全绿；2026-10-26 复核构建/测试通过） |
+| 2 | ~~Phase 3 协议端选型~~ | **已定 SnowLuma**（v0.5 调研修订，见 3.2）：空间评论/点赞内置，Phase 3 无需换端 |
 | 3 | QQ 小号准备 | 需专用小号并养号（绑定手机、稳定设备、避免新号立刻群发） |
-| 4 | NapCat 部署验证 | 建议实施前先独立部署验证收发链路 |
+| 4 | SnowLuma 部署验证 | Phase 1 实施前先用小号独立验证收发链路（私聊/群聊/图片/语音） |
 | 5 | IM 模式提示词 | Phase 1 前需单独设计 IM 模式系统提示词（自然语言输出 + 公开 AI 身份声明） |
 
 ---

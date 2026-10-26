@@ -1,10 +1,11 @@
 # Phase 0 实施报告：架构解耦（大脑 + 渠道）
 
-> 类型：实施报告（已完成，待审批）
+> 类型：实施报告（已完成并通过验收）
 > 依据：[HUMANIZATION_PLAN.md](HUMANIZATION_PLAN.md) v0.3 第 10.1 节详细设计（2026-10-19 定稿并获批准）
-> 实施日期：2026-10-19
-> 版本：v1.0
-> 构建状态：Debug 构建通过（MinGW 6.11.1，零错误）
+> 实施日期：2026-10-19（测试与缺陷修复：2026-10-20；复核：2026-10-26）
+> 版本：v1.1
+> 提交：`61f1767`（代码）/ `485b5e3`（BUG-2 修复）/ `b126180`（测试报告）
+> 构建状态：Debug 构建通过（MinGW 6.11.1，零错误）；ctest 3 套件 / 23 用例全绿
 
 ---
 
@@ -22,7 +23,7 @@
 
 ## 二、改动总览
 
-### 2.1 新增文件（5 个）
+### 2.1 新增文件（8 个）
 
 | 文件 | 职责 | 关键内容 |
 |---|---|---|
@@ -32,7 +33,7 @@
 | [qqchanneladapter.h](../qqchanneladapter.h) / [.cpp](../qqchanneladapter.cpp) | QQ 渠道占位 | Phase 1 启用；头文件注释含 OneBot v11 反向 WS 实施计划 |
 | [sessionrouter.h](../sessionrouter.h) / [.cpp](../sessionrouter.cpp) | 输入路由 | `submitInput` → 身份解析 → 双键历史组装 → `requestReply` 信号；`resolveSubject` 预留 identity 查表 |
 
-### 2.2 修改文件（5 个）
+### 2.2 修改文件（6 个）
 
 | 文件 | 改动 |
 |---|---|
@@ -176,4 +177,16 @@
 |---|---|
 | 实施与批准方案一致性 | 一致（3 处偏差已在第四节说明理由） |
 | 待审批人确认 | 运行期验收 5 项（第六节） |
-| 审批结果 | （待填写：通过 / 需修改项） |
+| 审批结果 | ✅ 通过（2026-10-26 复核：Debug 构建全量通过，ctest 3/3 通过，详见 [TEST_REPORT_PHASE0.md](TEST_REPORT_PHASE0.md)） |
+
+---
+
+## 九、2026-10-26 复核记录
+
+| 项 | 结果 |
+|---|---|
+| Git 状态 | 工作树干净；Phase 0 相关提交 `61f1767` / `485b5e3` / `b126180` 已在 `main` |
+| 构建 | `cmake --build build/Desktop_Qt_6_11_1_MinGW_64_bit_Debug` 全部目标 up-to-date / 通过 |
+| 测试 | `ctest` 3 套件（tst_memorymanager / tst_configmanager / tst_sessionrouter）3/3 通过，0.52s |
+| 运行时库 | `user_version=2`；`chat_history` 106 行（channel/session 齐全）、`raw_messages` 0 行、`relationship_state` 2 行（subject='user'） |
+| 待办 | 验收项 4 移至 Phase 1；验收项 5（历史表格目检）仍待人工 |

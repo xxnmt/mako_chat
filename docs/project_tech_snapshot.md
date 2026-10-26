@@ -1,9 +1,9 @@
 # 【项目技术快照】
 
 > 项目：Windows_AI 桌面看板娘（桌宠）
-> 日期：2026-08-23
-> 版本：v0.6.0
-> 状态：开发中
+> 日期：2026-10-26
+> 版本：v0.6.0 + Phase 0（多渠道架构）
+> 状态：开发中（Phase 0 已完成并通过测试，Phase 0.5 待开始）
 
 ---
 
@@ -298,24 +298,49 @@ signals:
 | | `void killProcessOnPort(int port)` | 清理占用指定端口的进程（Windows: netstat+taskkill） |
 | **设计要点** | 修复 SoVITS 切换 400 Bad Request（端口被占用导致复用坏实例，TD-031）；修复崩溃后留孤儿 python.exe（异常退出端口未释放） | - |
 
+### Utterance / RequestMeta（Phase 0 统一协议）
+
+| 类型 | 名称 | 说明 |
+|------|------|------|
+| **Utterance（输出）** | `text` / `ttsText` / `tags` / `channel` / `sessionId` / `speaker` | 渠道无关的统一输出单元（由 SentenceText 映射） |
+| **RequestMeta（输入）** | `channel` / `sessionId` / `speaker` / `subject` / `sensitive` | 随轮次贯穿入库、摘要分桶、关系更新 |
+| **Channel 常量** | `kPet="pet"` / `kQQPrivate="qq_private"` / `kQQGroup="qq_group"` / `kQZone="qzone"` / `kDefaultSession="default"` | 与 DB channel 列、盲区配置取值一致 |
+
+### IChannelAdapter（渠道抽象）
+
+| 类型 | 名称 | 说明 |
+|------|------|------|
+| **接口** | `channelName()` / `sendUtterance(const Utterance&)` | 纯虚接口，大脑侧不感知具体渠道 |
+| **PetChannelAdapter** | 持 `BubbleWidget*`（非所有权） | `sendUtterance` → `showMessage`；`onAudioReady` 槽保留播放跟读入口 |
+| **QQChannelAdapter** | 占位 | `sendUtterance` 仅打印日志；Phase 1 接 OneBot v11（协议端选型见 HUMANIZATION_PLAN 3.2：SnowLuma） |
+
+### SessionRouter（输入路由）
+
+| 类型 | 名称 | 说明 |
+|------|------|------|
+| **职责** | 输入归一化 → 身份解析 → 按会话桶组装历史 → 发 `requestReply` | - |
+| **函数** | `void submitInput(channel, sessionId, speaker, text)` | 空输入拦截；组装 `RequestMeta` |
+| **函数** | `QString resolveSubject(channel, senderId)` | Phase 0 恒返回 `'user'`；Phase 1 查 identity.json（self→丢弃 / master→'user' / 未知→`qq:<uin>`） |
+| **信号** | `void requestReply(const QString&, const QList<HistoryTurn>&, const RequestMeta&)` | AppController 接收后写 `m_lastMeta` 并调用 askDeepSeek |
+
 ### MemoryManager（AI记忆系统）
 
 | 类型 | 名称 | 说明 |
 |------|------|------|
 | **职责** | 管理AI对话历史、角色档案、情景记忆、长期摘要和关系状态 | - |
 | **私有变量** | `m_db` | QSqlDatabase，SQLite数据库连接 |
-| **函数签名** | `bool saveQATurn(const QString& userInput, const QString& rawReply, const QList<SentenceText>& sentences)` | 保存单轮对话（raw_reply为JSON对象） |
-| | `QList<HistoryTurn> getHistoryTurn(int N)` | 获取最近N轮对话历史 |
+| **函数签名** | `bool saveQATurn(const QString& userInput, const QString& rawReply, const QList<SentenceText>& sentences, const RequestMeta& meta = RequestMeta())` | 保存单轮对话（raw_reply为JSON对象；meta 写入 channel/session/speaker/sensitive） |
+| | `QList<HistoryTurn> getHistoryTurn(int N, const QString& channel = "pet", const QString& sessionId = "default")` | 按渠道+会话双键获取最近N轮对话历史 |
 | | `QList<HistoryTurn> getHistoryTurn(int offset, int limit)` | 分页获取对话历史 |
 | | `qlonglong getTotalHistoryCount()` | 获取历史记录总数 |
 | | `bool deleteTurnByID(int id)` | 根据ID删除单条记录 |
 | | `bool clearAllHistory()` | 清空所有历史记录 |
-| | `QList<HistoryTurn> getUnsummarizedTurns(qlonglong& outLastEndId, QList<qlonglong>& outSourceIds)` | 获取 id > long_term_summary.max(covered_turn_end_id) 的未摘要对话 |
+| | `QList<HistoryTurn> getUnsummarizedTurns(qlonglong& outLastEndId, QList<qlonglong>& outSourceIds, const QString& channel = "pet", const QString& sessionId = "default")` | 按双键获取未摘要对话（游标子查询同样按双键） |
 | | `bool upsertCharacterProfile(const QString& subject, const QString& key, const QString& value)` | 插入或更新角色档案（先 normalizeProfileKey 归一化 key，已存在则 mergeProfileValue 合并 value） |
 | | `QList<CharacterProfile> getCharacterProfiles(const QString& subject)` | 获取档案（subject 为空时返回全部） |
 | | `bool deleteCharacterProfile(qlonglong id)` | 删除档案 |
 | | `bool addEpisodicMemory(const QString& content, const QString& type, double importance, const QDateTime& eventTime = QDateTime(), const QString& sourceIds = QString())` | 新增情景记忆（eventTime 无效时用当前时间） |
-| | `QList<EpisodicMemory> getActiveEpisodicMemories(double minImportance = 0.2, int limit = 20)` | 获取活跃记忆（status='active' AND importance≥阈值，按 importance DESC 排序，更新 last_accessed） |
+| | `QList<EpisodicMemory> getActiveEpisodicMemories(double minImportance = 0.2, int limit = 20)` | 获取活跃记忆（status='active' AND importance≥阈值，按 importance DESC 排序，更新 last_accessed）；Phase 0.5 计划扩 origin/visibility 过滤 |
 | | `bool deleteEpisodicMemory(qlonglong id)` | 删除记忆 |
 | | `bool updateEpisodicMemoryStatus(qlonglong id, const QString& status)` | 更新记忆状态（promise 兑现→resolved / 失约→broken） |
 | | `int decayEpisodicMemory()` | 衰减扫描：importance≥0.8 不衰减；其余 -0.05/天；<0.1 删除（基于 last_decay_at） |
@@ -323,16 +348,16 @@ signals:
 | | `QString mergeProfileValue(const QString& key, const QString& oldVal, const QString& newVal)` | 合并 value（newVal 非空且更长则采纳 newVal，否则保留 oldVal） |
 | | `int levenshteinDistance(const QString& s1, const QString& s2)` | 计算两个字符串的 Levenshtein 编辑距离 |
 | | `int getEditDistanceThreshold(const QString& value)` | 根据 value 长度动态返回编辑距离阈值（≤4字=1，≤8字=2，≤12字=3，>12字=4） |
-| | `bool addLongTermSummary(const QString& summaryText, qlonglong coveredEndId, const QString& sourceIdsJson)` | 添加长期摘要 |
-| | `QList<LongTermSummary> getLatestSummaries(int limit = 5)` | 获取最新摘要（is_dirty=0） |
+| | `bool addLongTermSummary(const QString& summaryText, qlonglong coveredEndId, const QString& sourceIdsJson, const QString& channel = "pet", const QString& sessionId = "default")` | 添加长期摘要（按双键分桶） |
+| | `QList<LongTermSummary> getLatestSummaries(int limit = 5, const QString& channel = "pet", const QString& sessionId = "default")` | 获取最新摘要（is_dirty=0，按双键过滤） |
 | | `bool deleteLongTermSummary(qlonglong id)` | 删除摘要 |
-| | `bool upsertRelationshipState(const QString& dimension, double delta)` | 维度不存在时初始化为 clamp(30+delta,0,100)；存在时 clamp(oldVal+delta,0,100) |
-| | `QList<RelationshipState> getRelationshipStates()` | 获取全部关系维度（按 dimension 排序） |
+| | `bool upsertRelationshipState(const QString& dimension, double delta, const QString& subject = "user")` | 按 subject 维度不存在时初始化为 clamp(30+delta,0,100)；存在时 clamp(oldVal+delta,0,100) |
+| | `QList<RelationshipState> getRelationshipStates(const QString& subject = "user")` | 获取指定主体的全部关系维度（按 dimension 排序） |
 | | `bool initRelationshipState()` | 若表为空，插入 intimacy=30、trust=30 |
-| | `void initDatabase(const QString& dbFilePath)` | 初始化数据库，单一 v1 迁移块创建 5 张表 |
+| | `void initDatabase(const QString& dbFilePath)` | 初始化数据库：v1 块创建 5 张基础表，v2 块做多渠道扩展并新增 raw_messages（`user_version=2`） |
 | **数据库路径** | `app_data/memory/QianDaoMoZi_memory.db` | - |
 
-**数据库结构**（共 5 张表，单一 v1 迁移块创建，`PRAGMA user_version = 1`）：
+**数据库结构**（`PRAGMA user_version = 2`；v1 块创建 5 张基础表，v2 块做多渠道扩展并新增 `raw_messages`，合计 6 张表）：
 
 **表1：chat_history（对话历史）**
 | 字段 | 类型 | 说明 |
@@ -341,6 +366,10 @@ signals:
 | timestamp | DATETIME DEFAULT (datetime('now','localtime')) | 创建时间（本地时间） |
 | user_input | TEXT NOT NULL | 用户输入文本 |
 | raw_reply | TEXT NOT NULL | AI回复的JSON对象 `{"sentences": [...]}` |
+| channel | TEXT NOT NULL DEFAULT 'pet' | 渠道：pet / qq_private / qq_group（v2） |
+| session_id | TEXT NOT NULL DEFAULT 'default' | 会话 ID（QQ 为好友号/群号，v2） |
+| speaker | TEXT | 说话人（群聊场景，v2） |
+| sensitive | INTEGER NOT NULL DEFAULT 0 | 记忆盲区/敏感标记（v2） |
 
 **表2：long_term_summary（长期记忆摘要）**
 | 字段 | 类型 | 说明 |
@@ -350,6 +379,8 @@ signals:
 | covered_turn_end_id | INTEGER NOT NULL | 覆盖的对话结束ID |
 | source_ids | TEXT NOT NULL | 来源对话ID列表（JSON） |
 | is_dirty | INTEGER DEFAULT 0 | 是否待重建 |
+| channel | TEXT NOT NULL DEFAULT 'pet' | 渠道分桶（v2） |
+| session_id | TEXT NOT NULL DEFAULT 'default' | 会话分桶（v2） |
 | created_at | DATETIME DEFAULT (datetime('now','localtime')) | 创建时间 |
 | updated_at | DATETIME DEFAULT (datetime('now','localtime')) | 更新时间 |
 
@@ -378,6 +409,7 @@ signals:
 | last_accessed | DATETIME DEFAULT (datetime('now','localtime')) | 最后访问时间（检索时更新） |
 | last_decay_at | DATETIME DEFAULT (datetime('now','localtime')) | 最后衰减计算时间 |
 | source_ids | TEXT | 来源对话ID列表（JSON） |
+| origin | TEXT NOT NULL DEFAULT 'pet' | 渠道溯源：pet / qq_private / qq_group（v2） |
 
 索引：`idx_episodic_importance`(importance)、`idx_episodic_type`(type)、`idx_episodic_status`(status)
 
@@ -385,11 +417,28 @@ signals:
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | id | INTEGER PRIMARY KEY AUTOINCREMENT | 记录ID |
-| dimension | TEXT NOT NULL UNIQUE | 维度名：`intimacy`(亲密度) / `trust`(信任度) |
+| subject | TEXT NOT NULL DEFAULT 'user' | 主体：`user`（主人）/ `qq:<uin>` / `group:<群号>`（v2 重建表） |
+| dimension | TEXT NOT NULL | 维度名：`intimacy`(亲密度) / `trust`(信任度) |
 | value | REAL NOT NULL | 维度值 0-100 |
 | updated_at | DATETIME DEFAULT (datetime('now','localtime')) | 更新时间 |
 
+约束：`UNIQUE(subject, dimension)`（v2 重建；存量行复制为 `subject='user'`）
+
 初始化数据：`intimacy=30.0`、`trust=30.0`（initDatabase 时若表为空自动插入）
+
+**表6：raw_messages（群聊原始消息，v2 新增，Phase 0 只建不写）**
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| id | INTEGER PRIMARY KEY AUTOINCREMENT | 记录ID |
+| channel | TEXT NOT NULL | 渠道 |
+| session_id | TEXT NOT NULL | 会话（群号） |
+| speaker | TEXT | 说话人 |
+| content | TEXT NOT NULL | 原始内容 |
+| timestamp | DATETIME DEFAULT (datetime('now','localtime')) | 时间 |
+| sensitive | INTEGER NOT NULL DEFAULT 0 | 盲区标记 |
+| consolidated | INTEGER NOT NULL DEFAULT 0 | 是否已被蒸馏 |
+
+索引：`idx_raw_session(session_id, timestamp)`、`idx_raw_consolidated(consolidated)`
 
 ### 数据结构
 
@@ -493,6 +542,19 @@ struct SentenceText {
 
 > ✅ 配置文件持久化已实现：`app_data/config/setting.json`
 
+**Phase 0 扩展（`app_data/config/identity.json`，懒加载、只读解析、缺失用默认值）**：
+
+| 类型 | 名称 | 说明 |
+|------|------|------|
+| **结构** | `BlindZone` | 记忆盲区（channel + sessionId） |
+| | `ScheduleItem` | 主动对话时刻表项（at + type: fixed/random） |
+| | `ProactiveConfig` | enabled/targets/dailyLimit/cooldownSeconds/quietStart/quietEnd/idleSeconds/schedule |
+| **函数** | `QStringList getSelfQQAccounts()` / `getMasterQQAccounts()` | 她自己的 QQ / 主人 QQ（多账号均归 `subject='user'`） |
+| | `bool isMasterQQ(const QString& uin)` | 按 uin 精确匹配 |
+| | `bool isBlindZone(channel, sessionId)` | 双键查盲区 |
+| | `bool getFollowExternalMood()` | D1：外部渠道情绪是否驱动桌设立绘（默认 true） |
+| | `ProactiveConfig getProactiveConfig()` | Phase 0 只解析，Phase 2 接入调度 |
+
 ### SettingsWidget（设置界面）
 
 > v0.6.0 重构：删除原多标签页实现，改为「左侧目录 + 右侧滚动内容」的主-从式布局，支持双向 scroll-spy 同步。
@@ -568,13 +630,16 @@ struct SentenceText {
                                                                气泡显示中文    立绘切换状态
 ```
 
+> **Phase 0 变更**：对话流程第 3 步已由 `SessionRouter` 接管——`textSubmitted → submitInput("pet","default","欧尼酱",text)`，路由层完成身份解析与 `getHistoryTurn(N, channel, sessionId)` 双键历史组装后，再以 `requestReply(text, history, meta)` 交回 AppController。
+
 ### 信号槽连接（AppController中统一管理）
 
 | 发送方 | 信号 | 接收方 | 槽/处理 |
 |--------|------|--------|---------|
 | CharacterWidget | `chatRequested()` | ChatWidget | `popup()` |
 | CharacterWidget | `settingsRequested()` | SettingsWidget | `show()` |
-| ChatWidget | `textSubmitted(text)` | AppController lambda | 保存输入→读取记忆→调用askDeepSeek |
+| ChatWidget | `textSubmitted(text)` | SessionRouter | `submitInput("pet","default","欧尼酱",text)`（身份解析+双键历史） |
+| SessionRouter | `requestReply(text, history, meta)` | AppController lambda | 写 `m_lastUserInput`/`m_lastMeta` → `notifyUserInputStarted` → `askDeepSeek` |
 | LLMService | `sentencesReady(sentences, rawReply)` | AppController | `handleMakoReply()` |
 | LLMService | `internetErrorSignal(msg)` | AppController | `handleSystemError()` |
 | LLMService | `memoryExtractionReady(extractionResult, lastEndId, sourceIdsJson)` | AppController lambda | 写入角色档案+情景记忆+长期摘要+关系状态 |
@@ -639,6 +704,10 @@ struct SentenceText {
 - [x] TTSProcessManager 孤儿进程清理 ✅ 已实现（killProcessOnPort）
 - [x] 设置界面重构 ✅ 已实现（左侧目录+右侧滚动主从布局，双向 scroll-spy 同步，滚轮透传）
 - [x] TTS模型切换 ✅ 已实现（设置界面「语音合成」区：GPT路径/模型、SoVITS路径/模型，保存时热切换）
+- [x] 多渠道架构（Phase 0）✅ 已实现（Utterance/IChannelAdapter/SessionRouter、DB v2、identity.json、23 例测试）
+- [x] 异常回复拦截 ✅ 已实现（zh_text/ja_text/tags 缺失整轮抛弃，replyAbnormal 反馈）
+- [ ] Phase 0.5（`visibility` + `appendRawMessage` + `origin`/`visibility` 过滤）
+- [ ] Phase 1 QQ 渠道（SnowLuma / OneBot v11）
 - [ ] 设置界面完善（长期记忆自动摘/时间管理 config 接线、外观配置、快捷键配置）
 - [ ] TTS语速、温度配置
 - [ ] 立绘切换过渡动画
@@ -668,6 +737,11 @@ Windows_AI/
 ├── CMakeLists.txt           # 构建配置
 ├── image.qrc                # 资源文件
 ├── appcontroller.h/cpp      # 应用中枢
+├── utterance.h              # 统一协议（Utterance/RequestMeta/Channel）
+├── ichanneladapter.h        # 渠道抽象接口
+├── petchanneladapter.h/cpp  # 桌宠渠道适配器
+├── qqchanneladapter.h/cpp   # QQ 渠道占位（Phase 1）
+├── sessionrouter.h/cpp      # 输入路由
 ├── anchormanager.h/cpp      # 位置锚点管理
 ├── anchorstrategy.h         # 锚点策略
 ├── chatwidget.h/cpp         # 聊天输入窗口
@@ -687,6 +761,9 @@ Windows_AI/
 ├── characterwidget.h/cpp    # 角色主组件
 ├── bubblewidget.h/cpp/ui    # 气泡组件
 ├── settingswidget.h/cpp/ui  # 设置界面
+├── ttsreference.h           # 参考音频数据结构
+├── ttsreferencemanager.h/cpp  # 参考音频情绪映射
+├── tests/                   # Phase 0 单元测试（Qt Test + CTest）
 └── image/                   # 立绘资源目录
     ├── closer/              # 近景
     ├── far/                 # 远景
@@ -749,6 +826,9 @@ Windows_AI/
 
 | 日期 | 变更内容 |
 |------|----------|
+| 2026-10-26 | 文档补录：README/ROADMAP/ARCHITECTURE/技术快照/开发记录同步 Phase 0 实际状态（渠道架构、DB v2、23 例测试、BUG-1/BUG-2） |
+| 2026-10-20 | Phase 0 验收：人工异常回复校验 5 场景通过；修复 BUG-2 空标签编辑距离误判；全量 23 用例通过 |
+| 2026-10-19 | Phase 0 架构解耦落地：Utterance/IChannelAdapter/PetChannelAdapter/QQChannelAdapter(占位)/SessionRouter；数据库 v2 迁移；identity.json 解析；23 例单元测试 |
 | 2026-08-23 | 立绘切换修复（TD-036）：`updatePath` 锚定脚底中心 + 原子 setGeometry + repaint + WA_NoSystemBackground，消除 closer 下坠漂移与切换闪帧；昼夜判断跨零点修正（TD-035）：`isNight = (now >= 22:00 || now < 7:00)`，修复白天误判为夜穿睡衣 |
 | 2026-08-08 | TimeManager 重构为 QTimer singleShot 退火机制（表情/脸红退火倒计时、服装时段切换），修复野指针崩溃（TD-030，QElapsedTimer 指针未初始化）与退火时间单位错误（TD-032，hasExpired(15) 误为 15ms → start(15000) 为 15秒）；AppController onPlayAudioAction 接入脸红退火触发（blush=blushing 时 notifyBlushingApplicated） |
 | 2026-08-08 | TTSProcessManager 孤儿进程清理：apiStart 开头 TCP 探测端口占用 → killProcessOnPort 杀孤儿 python.exe（Windows: netstat+taskkill），修复 SoVITS 切换 400 Bad Request 与崩溃后留孤儿进程（TD-031） |

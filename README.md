@@ -23,6 +23,7 @@
   - 关系状态（relationship_state，亲密度/信任度量化）
   - 对话历史管理（分页浏览、删除、清空）
 - ⚙️ **设置界面**：左侧目录 + 右侧滚动内容，点击目录跳转、滚动自动高亮双向同步；支持 API Key、短期记忆轮数、TTS 模型切换、历史记录管理
+- 🔌 **多渠道架构（Phase 0）**：统一 `Utterance` 输出协议 + `IChannelAdapter` 渠道抽象 + `SessionRouter` 输入路由；记忆按 `channel + session_id` 双键隔离，为 QQ 等外部渠道预留接入点（QQ 渠道为 Phase 1 占位）
 
 ### 开发中功能
 - 🔊 **语音合成**：✅ 已实现（见下方「TTS 语音系统说明」：策略模式 + 流式播放 + GPT/SoVITS 模型热切换）
@@ -114,6 +115,7 @@ POST /tts
 > **采样率说明**：流式模式下客户端从服务端返回的首个 WAV 头（偏移 24）读取真实采样率（v3=24000Hz，v1/v2=32000Hz，v4/超分=48000Hz），不再按 `super_sampling` 硬编码；非流式文件播放由 FilePlayer 解析文件头自适。v3 模型的"流式"实为句子级分段返回（首音需等首句整句合成完成）。
 
 ### 计划功能（按优先级）
+- 🔌 **QQ 渠道接入**：Phase 1（SnowLuma / OneBot v11 反向 WS，文字/表情包/语音）
 - 🔧 **架构改进**：拆分 AppController 职责（信号路由、记忆协调、错误处理）
 - 📁 **独立存档系统**：支持多个存档，每个存档有独立的记忆和角色关系
 - ⏰ **时间驱动主动对话**：到饭点提醒、睡前聊天等
@@ -156,7 +158,7 @@ POST /tts
 - **AI 服务**: DeepSeek API (deepseek-v4-flash)
 - **语音合成**: GPT-SoVITS（API 已接入，策略模式封装）
 - **音频播放**: IPcmPlayer 抽象（StreamPlayer 流式 / FilePlayer 文件，QAudioSink + QBuffer）
-- **数据库**: SQLite（对话历史、角色档案、情景记忆、长期摘要、关系状态五类存储）
+- **数据库**: SQLite（v2 结构：对话历史、角色档案、情景记忆、长期摘要、关系状态 + 群聊原始消息 `raw_messages`）
 
 ## 📦 安装与构建
 
@@ -279,7 +281,7 @@ cmake --build . --config Release
 
 ### 记忆系统说明
 
-茉子的记忆系统分为五个层次（数据库统一 v1 单一迁移块创建）：
+茉子的记忆系统分为五个层次（数据库当前为 v2 结构：v1 迁移块创建基础表，v2 迁移块扩展多渠道字段）：
 
 | 记忆类型 | 存储方式 | 描述 |
 |----------|----------|------|
@@ -290,6 +292,8 @@ cmake --build . --config Release
 | **关系状态** | SQLite（relationship_state） | 亲密度/信任度量化（默认30/30），驱动角色关系 |
 
 **记忆提取机制**：当未摘要对话达到短期记忆长度阈值时，自动触发后台记忆提取，LLM 分析对话内容，传入已有档案做增量更新，生成角色档案、情景记忆、长期摘要和关系状态更新。
+
+**多渠道记忆隔离（v2）**：`chat_history` 与 `long_term_summary` 增加 `channel`/`session_id` 双键（默认 `pet`/`default`），`chat_history` 另有 `speaker`/`sensitive`；`episodic_memory` 增加 `origin` 溯源列；`relationship_state` 改为 `UNIQUE(subject, dimension)`，存量关系归入 `subject='user'`（主人）。另新增 `raw_messages` 群聊原始消息表（Phase 0 只建不写，Phase 1 接入）。
 
 ## 📁 项目结构
 
@@ -317,6 +321,10 @@ Windows_AI/
 │   ├── closer/              # 近景立绘
 │   ├── far/                 # 远景立绘
 │   └── default_config/      # 默认配置（prompt.txt）
+├── tests/                   # Phase 0 单元测试（Qt Test + CTest）
+│   ├── tst_memorymanager.cpp
+│   ├── tst_configmanager.cpp
+│   └── tst_sessionrouter.cpp
 ├── image.qrc                # Qt 资源文件
 ├── CMakeLists.txt           # CMake 构建配置
 ├── main.cpp                 # 入口函数
@@ -327,10 +335,22 @@ Windows_AI/
 ├── anchormanager.h/cpp      # 位置锚点管理
 ├── anchorstrategy.h         # 锚点策略枚举
 ├── llmservice.h/cpp         # AI 服务模块
+├── utterance.h              # 统一输出协议（Utterance/RequestMeta/Channel 常量）
+├── ichanneladapter.h        # 渠道抽象接口（IChannelAdapter）
+├── petchanneladapter.h/cpp  # 桌宠渠道适配器（气泡/播放跟读）
+├── qqchanneladapter.h/cpp   # QQ 渠道占位（Phase 1 接入 OneBot v11）
+├── sessionrouter.h/cpp      # 输入路由（身份解析 + 双键历史组装）
 ├── ttsservice.h/cpp         # TTS 语音服务（双队列+策略模式）
 ├── ittsprovider.h           # TTS 抽象接口（策略模式基类）
 ├── apittsprovider.h/cpp    # GPT-SoVITS API 实现
 ├── mockttsprovider.h/cpp   # Mock 模拟实现
+├── ttsreference.h          # 参考音频数据结构
+├── ttsreferencemanager.h/cpp # 按情绪加载参考音频映射（tts_map.json）
+├── ipcmplayer.h/cpp        # 播放器抽象接口（静态工厂 + 统一信号）
+├── streamplayer.h/cpp      # 流式 PCM 播放器
+├── fileplayer.h/cpp        # 文件型 WAV 播放器
+├── ttsprocessmanager.h/cpp # GPT-SoVITS 进程管理/孤儿进程清理
+├── timemanager.h/cpp       # 时间管理（退火 + 昼夜服装切换）
 ├── appearancemanager.h/cpp  # 外观管理器
 ├── configmanager.h/cpp      # 配置管理器（单例）
 ├── memorymanager.h/cpp      # AI 记忆系统（SQLite）
@@ -404,6 +424,7 @@ Windows_AI/
 3. **无网络状态检测**：应用启动时不会检测网络连接状态
 4. **立绘切换无过渡动画**：换图时直接切换，没有淡入淡出效果
 5. **仅支持单角色**：当前仅支持「千岛茉子」一个角色
+6. **外部渠道未接入**：Phase 0 只完成渠道抽象与输入路由，QQ 收发为占位实现（Phase 1 接入 SnowLuma / OneBot v11）
 
 ## 🔧 故障排除
 
