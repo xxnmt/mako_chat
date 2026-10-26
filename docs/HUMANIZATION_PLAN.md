@@ -2,9 +2,9 @@
 
 > 项目：Windows_AI 桌面看板娘（桌宠）
 > 类型：规划文档（分阶段实施中）
-> 版本：v0.6（Phase 0.5 增补决议：origin + visibility，2026-10-26）
+> 版本：v0.7（记忆库 v3 设计定稿，2026-10-27）
 > 制定日期：2026-10-19
-> 状态：Phase 0 已实施并通过验收（2026-10-26）；Phase 0.5 待开始
+> 状态：Phase 0 已实施并通过验收；Phase 0.5/v3 设计已定稿（10.4），待实施
 > 关联文档：[ROADMAP.md](ROADMAP.md)、[ARCHITECTURE.md](ARCHITECTURE.md)
 
 ---
@@ -486,6 +486,8 @@ dsh 是一个**四层洋葱结构**，内核是 Cordis 插件框架（"Everythin
 
 ### 10.2 Phase 0.5 收缩裁决与架构演进预留（2026-10-20 定稿）
 
+> **2026-10-27 更新**：Phase 0.5 已并入 10.4 的 v3 迁移，范围扩大为「visibility + raw_events 泛化 + 轮次语义 + memory_cursor」；本节保留为决策来源。
+
 > 来源：与另一 agent 的探讨汇总经核实后的裁决。事实纠正：配置体系为 **identity.json（JSON）** 而非 QSettings/INI；relationship_state 为重建表而非加列；B3/C3/D1 在 Phase 0 已拍板（D1=可配置 `followExternalMood`）。
 
 **Phase 0.5 收缩裁决**（原一揽子预留 → 收缩）：
@@ -512,6 +514,131 @@ dsh 是一个**四层洋葱结构**，内核是 Cordis 插件框架（"Everythin
 ### 10.3 Phase 0.5 增补决议（2026-10-26）
 
 `getActiveEpisodicMemories` 的扩参同时纳入 **`origin` 与 `visibility`** 两个过滤维度：C3 群聊「防串群」三重隔离明确要用 `origin` 过滤，提前在 Phase 0.5 一次加齐，避免 Phase 1 二次修改签名。两者默认均不过滤，旧调用零改动；`visibility` 默认 `private`（桌宠私密经历不外泄）。
+
+### 10.4 记忆库 v3 设计决议（2026-10-27 定稿）
+
+> 触发：评估「一问一答」存储能否承载 QQ 群聊、主动对话、B 站浏览、窥屏。结论：不能。
+> 范围：本决议吸收原 Phase 0.5（`visibility` / `appendRawMessage` / `origin` 过滤），统一为一次 v3 迁移。
+
+#### 10.4.1 四项决策
+
+| # | 决策项 | 结论 |
+|---|---|---|
+| 1 | 主动轮次 | `user_input` 允许 NULL，配 `turn_kind='proactive'`；**不塞空串** |
+| 2 | 感知事件存储 | 统一 `raw_events`（`platform`/`event_type` 区分）；窥屏只存**摘要级事件**，原始帧不入库（将来如需另建 `percept_samples` 短保留表） |
+| 3 | 可见性 | 三档 `private / channel / public` 够用；与 `sensitive` **正交** |
+| 4 | 蒸馏游标 | 独立 `memory_cursor` 表，**不塞进** `long_term_summary` |
+
+#### 10.4.2 轮次语义与渲染规则
+
+| `turn_kind` | 含义 | `user_input` | 短期上下文注入 | 记忆提取 prompt |
+|---|---|---|---|---|
+| `reply` | 用户说→她回（现状） | 文本 | `user` + `assistant`（照旧） | 「用户: … / AI: …」（照旧） |
+| `proactive` | 她主动开口（定时/空闲触发） | **NULL** | **只注入 `assistant`**，不生成空 `user`；历史开头若为 assistant，靠既有 system note 说明 | 「茉子（主动）: …」，不生成「用户:」行，不提取用户档案 |
+| `perception` | 看到某事而开口（B 站/窥屏） | **NULL** | 同 proactive，可附「因观察到某事而开口」 | 标注触发来源，不计为用户发言 |
+
+**规则**：
+- 短期记忆 N 轮按 `turn_kind` 全部计数，主动轮占槽位（可接受；若嫌吵，后续可加「只统计 reply」配置）。
+- 主动轮仍参与 `relationship_updates` / 摘要（她主动关心也影响关系），但**不产生用户档案更新**。
+- `saveQATurn` 写入时空 `user_input` 绑定为 SQL NULL。
+
+#### 10.4.3 目标 schema（v3）
+
+**1. `chat_history`（重建：`user_input` 放开 NOT NULL，新增轮次字段）**
+```sql
+CREATE TABLE chat_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  timestamp DATETIME DEFAULT (datetime('now','localtime')),
+  user_input TEXT,                                  -- 可空：proactive / perception
+  raw_reply TEXT NOT NULL,
+  channel TEXT NOT NULL DEFAULT 'pet',
+  session_id TEXT NOT NULL DEFAULT 'default',
+  speaker TEXT,
+  sensitive INTEGER NOT NULL DEFAULT 0,
+  turn_kind TEXT NOT NULL DEFAULT 'reply',          -- reply / proactive / perception
+  trigger_event_ids TEXT,                           -- JSON 数组，指向 raw_events.id
+  subject TEXT NOT NULL DEFAULT 'user'              -- user / qq:<uin> / group:<群号>
+);
+CREATE INDEX idx_history_session ON chat_history(channel, session_id);
+```
+
+**2. `raw_messages` → `raw_events`（泛化：全量事件流水，不进上下文）**
+```sql
+CREATE TABLE raw_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  platform TEXT NOT NULL,                    -- qq / bilibili / screen / system
+  channel TEXT NOT NULL,                     -- pet / qq_private / qq_group / bilibili / screen
+  session_id TEXT NOT NULL,
+  message_id TEXT,                           -- 平台消息 ID；UNIQUE(channel, message_id) 去重
+  direction TEXT NOT NULL DEFAULT 'in',      -- in / out / event
+  sender_id TEXT,                            -- 稳定身份（uin/uid；自己为 'self'）
+  sender_name TEXT,                          -- 显示名快照
+  event_type TEXT NOT NULL,                  -- message / at / notice / percept / trigger / outbound
+  content TEXT,                              -- 纯文本（可空）
+  payload TEXT,                              -- JSON 原文（图片/语音/视频标题/停留时长等）
+  occurred_at DATETIME DEFAULT (datetime('now','localtime')),
+  sensitive INTEGER NOT NULL DEFAULT 0,
+  visibility TEXT NOT NULL DEFAULT 'private',
+  processed INTEGER NOT NULL DEFAULT 0,       -- 是否已被蒸馏
+  UNIQUE(channel, message_id)
+);
+CREATE INDEX idx_raw_events_session ON raw_events(channel, session_id, occurred_at);
+CREATE INDEX idx_raw_events_processed ON raw_events(processed);
+```
+
+**3. `episodic_memory`（扩两列）**
+```sql
+ALTER TABLE episodic_memory ADD COLUMN visibility TEXT NOT NULL DEFAULT 'private';
+ALTER TABLE episodic_memory ADD COLUMN subject    TEXT NOT NULL DEFAULT 'user';
+```
+
+**4. `memory_cursor`（新增：每 channel+session 一条）**
+```sql
+CREATE TABLE memory_cursor (
+  channel TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  last_event_id INTEGER NOT NULL DEFAULT 0,
+  last_turn_id  INTEGER NOT NULL DEFAULT 0,
+  updated_at DATETIME DEFAULT (datetime('now','localtime')),
+  PRIMARY KEY(channel, session_id)
+);
+```
+
+**5. 不动的三张表**：`character_profile`（已按 subject）、`relationship_state`（已按 subject）、`long_term_summary`（已按 channel+session 分桶）。
+
+#### 10.4.4 `visibility` 语义
+
+| 值 | 可见范围 | 典型内容 | 默认来源 |
+|---|---|---|---|
+| `private` | 仅桌宠/主人，**不进任何外部渠道上下文** | 窥屏、B 站私密浏览、桌宠私密对话 | 桌宠、B 站、窥屏 |
+| `channel` | 仅同一渠道会话（同一 QQ 群 / 同一好友 / 同一 B 站会话） | 群聊记忆、群友档案、群内约定 | QQ 群 / 私聊 |
+| `public` | 可跨渠道复用的人格/公开事实 | 公开人设、自我介绍、主人明确允许共享的信息 | **仅手动/高置信写入** |
+
+约束：`public` 不自动升级（episodic 默认 private/channel）；`sensitive` 与 `visibility` 同时保留，前者管「不要主动提/不进长期」，后者管「谁能看到」。
+
+#### 10.4.5 v2 → v3 迁移
+
+1. **重建 `chat_history`**：建 v3 表 → 复制存量（`turn_kind='reply'`、`subject='user'`、`trigger_event_ids=NULL`）→ 删旧表 → 重命名 → 重建索引。
+2. **`raw_messages` → `raw_events`**：建新表 → 复制存量（`platform`：qq*→qq/其余→pet；`direction='in'`；`event_type='message'`；`sender_name=speaker`；`occurred_at=timestamp`；`visibility='private'`；`processed=consolidated`）→ 删旧表。
+3. `episodic_memory` 两个 ADD COLUMN（带默认值，存量零迁移）。
+4. 新建 `memory_cursor`。
+5. `PRAGMA user_version = 3`；全程事务，失败整体回滚。
+
+#### 10.4.6 验收清单
+
+- [ ] v1/v2 库升级到 v3，存量数据零丢失，二次启动不重复迁移。
+- [ ] 新建库直接为 v3，6+1 张表结构正确。
+- [ ] `reply` 轮行为与改前一致；`proactive` 行 `user_input IS NULL`，短期注入**无空 user 消息**，提取 prompt 无「用户:」空行。
+- [ ] `raw_events` 可写入、`message_id` 去重生效、默认不参与上下文。
+- [ ] `episodic_memory` 按 `origin`/`visibility` 过滤，默认不过滤。
+- [ ] `memory_cursor` upsert/读取正确，失败不推进。
+- [ ] 全量 ctest 通过。
+
+#### 10.4.7 本阶段明确不做
+
+- 不接 QQ/B 站/窥屏数据源；不实现屏幕原始帧/OCR 存储。
+- 不改蒸馏逻辑本身（Phase 1 再让提取管道读 `raw_events` + 推进 `memory_cursor`）。
+- 不做 `chat_history` 的 UI 类型展示（设置界面历史表格 Phase 1 再适配）。
 
 ---
 
