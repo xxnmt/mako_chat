@@ -2,7 +2,7 @@
 
 > 项目：Windows_AI 桌面看板娘（桌宠）
 > 类型：规划文档（方案探讨阶段，未实施）
-> 版本：v0.3（Phase 0 详细设计定稿 + 完整性审查修订）
+> 版本：v0.5（协议端选型修正：SnowLuma 推荐，2026-10 调研修订）
 > 制定日期：2026-10-19
 > 关联文档：[ROADMAP.md](ROADMAP.md)、[ARCHITECTURE.md](ARCHITECTURE.md)
 
@@ -24,7 +24,7 @@
 | 决策项 | 结论 | 备注 |
 |---|---|---|
 | 角色大脑归属 | **Qt 自研为主线**（LLMService + 五层记忆 + 立绘 + GPT-SoVITS 全部保留） | dsh 不承载核心人格资产 |
-| QQ 技术路线 | **路线 A：Qt `QWebSocket` 直连 NapCat（OneBot v11 反向 WS）**；Phase 4 再将 dsh 作为"外挂工具执行器"接入 | 用户已拍板 |
+| QQ 技术路线 | **路线 A：Qt `QWebSocket` 直连协议端（OneBot v11 反向 WS）**；Phase 4 再将 dsh 作为"外挂工具执行器"接入 | 协议端选型见 3.2 |
 | QQ 账号 | 专用小号；好友和群聊由用户登录 QQ 号手动管理添加 | 不主动加陌生人/陌生群 |
 | 身份策略 | **公开 AI 身份**（在签名/资料/必要时坦承） | 合规风险显著降低 |
 | 主动对话触发 | **Qt 定时器 + 状态/时间驱动**，主动权始终由 Qt 持有 | dsh 三条路径均不支持 agent 主动发起 |
@@ -65,10 +65,21 @@
 | **NapCat / SnowLuma**（OneBot v11 私有协议端） | 私聊·群聊·图片·表情包·语音·合并转发·戳一戳·表情回应·空间说说 | 注入 NTQQ，**有封禁风险**，需小号；NapCat 许可证禁商用 |
 | **官方 QQ 机器人平台** | 群聊/单聊、图片、语音 | **主动消息每月各仅 4 条**、**无空间说说**、需提审——与"主动撩人"根本冲突 |
 
-**空间说说能力差异（影响 Phase 3 协议端选型）**：
-- NapCat：有 `send_qzone_msg`（发说说）、`delete_qzone_msg`、`get_qzone_msg_list`；**无评论/点赞**
-- SnowLuma：最完整，专设"空间"分组 10 个动作（`send_qzone_msg`/`comment_qzone`/`like_qzone`/`get_qzone_feeds` 等）
-- **若需要"她跟我的动态互动"（评论/点赞），须换 SnowLuma**
+**协议端选型（2026-10 修订，推翻旧结论）**：
+
+| 能力 | NapCat | SnowLuma | Lagrange.OneBot | LLOneBot |
+|---|---|---|---|---|
+| 基础聊天（私聊/群聊/图片/语音/表情包/合并转发/戳一戳/表情回应） | ✅ 全 | ✅ 全 | ✅ 全 | ✅ 全 |
+| 发说说（`send_qzone_msg`） | ✅ | ✅ | ⚠️ 部分 | ❌ |
+| 说说评论/点赞 | ❌ 无内置（需第三方 qzone-mcp） | ✅ 内置（专设"空间"分组） | ❌ | ❌ |
+| Windows 原生（无 Docker/WSL） | ✅ | ✅ 更自动化（自动注入 QQ.exe） | ⚠️ 需 .NET 运行时 | ⚠️ 需 LiteLoader 框架 |
+| WebUI 管理 | ✅ | ✅ 更强（5099 端口，调试价值高） | 简单 | 弱 |
+| MCP 接入 | 第三方 | ✅ 原生（与 Phase 4 dsh 方向一致） | ❌ | ❌ |
+| 生态成熟度 | 中文社区最活跃 | 较新（2024 起步），文档完整 | 活跃 | 一般 |
+
+**推荐：SnowLuma**。理由：① Phase 3 空间互动（评论/点赞）内置，NapCat 需第三方 MCP 拼装；② Windows 原生部署体验更好；③ 原生 MCP 与 Phase 4 的 dsh 集成方向一致；④ WebUI 可作 QQChannelAdapter 调试观察台。**唯一风险**：项目较新、长期维护风险略高——但协议端可插拔，换端成本只是改连接配置。
+
+**旧结论修正**：NapCat 并非"无评论/点赞"——`send_like` ✅ 支持点赞，但空间评论需第三方扩展，深度不如 SnowLuma 内置。
 
 **语音技术要点**：QQ 语音为 silk v3 格式，但 **NapCat 发送时自动把 wav/mp3 转 silk**，C++ 端无需自备编码器，直接把 GPT-SoVITS 输出的 wav 塞进 `record.file` 即可。
 
@@ -433,9 +444,10 @@ dsh 是一个**四层洋葱结构**，内核是 Cordis 插件框架（"Everythin
 | 阶段 | 内容 | 外部依赖 |
 |---|---|---|
 | **Phase 0** | 架构解耦（细则见 10.1）：`Utterance`/`RequestMeta` 统一协议 + `IChannelAdapter` 抽象 + `SessionRouter` 输入路由；记忆侧八项 ALTER + 读写扩参；identity/memory/proactive 配置解析 | **无**（零风险纯重构） |
-| **Phase 1** | NapCat 部署（小号）+ `QQProtocolClient` 收私聊/群聊 + 发文字/表情包/语音 | NapCat |
+| **Phase 0.5** | 记忆预留收缩版（细则见 10.2）：v3 迁移仅加 `episodic_memory.visibility` 列 + `appendRawMessage`（不接线）；Percept/ChannelCapability/ToolRegistry 三空壳**缓建** | **无** |
+| **Phase 1** | SnowLuma 部署（小号）+ `QQProtocolClient` 收私聊/群聊 + 发文字/表情包/语音；届时完成 Percept 泛化与 raw_messages 接线 | SnowLuma |
 | **Phase 2** | `ChatPlanner` 发言门控（frequency/dynamic）+ `ProactiveScheduler` 按配置主动开口 | 无 |
-| **Phase 3** | QQ 空间说说 + 高级互动（合并转发/戳一戳/表情回应）——**注意：NapCat 无评论/点赞，若需要须换 SnowLuma** | SnowLuma（按需） |
+| **Phase 3** | QQ 空间说说 + 高级互动（合并转发/戳一戳/表情回应）——**SnowLuma 内置空间互动（评论/点赞），无需换端** | SnowLuma |
 | **Phase 4** | 浏览器类经 dsh ACP（Playwright MCP）；评估 dsh 混合深度 | dsh（nightly） |
 
 **Phase 0 必须先行**：唯一"零外部依赖、零风险"的一步，且是后续所有阶段的地基。即使 QQ 方案失败，桌宠本身也变得更健壮。
@@ -471,15 +483,40 @@ dsh 是一个**四层洋葱结构**，内核是 Cordis 插件框架（"Everythin
 
 ---
 
+### 10.2 Phase 0.5 收缩裁决与架构演进预留（2026-10-20 定稿）
+
+> 来源：与另一 agent 的探讨汇总经核实后的裁决。事实纠正：配置体系为 **identity.json（JSON）** 而非 QSettings/INI；relationship_state 为重建表而非加列；B3/C3/D1 在 Phase 0 已拍板（D1=可配置 `followExternalMood`）。
+
+**Phase 0.5 收缩裁决**（原一揽子预留 → 收缩）：
+
+| 项 | 裁决 | 理由 |
+|---|---|---|
+| `episodic_memory` + `visibility` 列 | ✅ 现在做 | Phase 1 C3 必需，schema 稳定，存量默认 `'private'`（桌宠私密经历不外泄） |
+| `getActiveEpisodicMemories` 扩参 | ✅ 现在做 | 默认不过滤，零风险 |
+| `appendRawMessage()` | ⚠️ 半做 | 方法现在写；**接线只限 IM 渠道**（Phase 1），桌宠已由 saveQATurn 全量入库不双写 |
+| `daily_journal`/`reflection_log` 建表 | ❌ 缓到 Phase 2 | schema 未经实现检验，不提前固化 |
+| Percept / ChannelCapability / ToolRegistry 三空壳 | ❌ 缓建 | 判断标准：空壳只对"schema 已定死、马上接数据"的东西有价值（raw_messages 合格）；对"形状未知、调用方不存在"的东西是仪式性代码。Percept 届时（Phase 1）改 `submitInput` 仅 1 处调用方，一行成本 |
+
+**十问裁决记录**：#4 AgentLoop 叠加不替换（Phase 3/4 事项）；#5 daily_journal 只注入 pet+私聊；#6 B站/PC 经历默认 private；#7 代谢跟随夜间时段；#8 Percept Phase 1 再泛化；#9 位掩码之争 Phase 1 有第二个使用者时再定；#10 ToolRegistry 待 Phase 3 表情包 / Phase 4 ACP 有真实工具时建。
+
+**架构演进预留地图**（进文档不进代码）：
+
+1. **渠道 ≠ 工具**，未来接入物分三类——消息渠道（QQ/微信，双向有回复）、感知事件（B站观看/PC 操作，单向流入）、实时流（电话/语音通话，持续双向音频）
+2. **Episode 改造三步**（核心问题："她没回的消息永远不入记忆"）——Step 1 Phase 1：QQ 渠道写 `raw_messages`；Step 2 Phase 1：反思游标从 `chat_history` 挪到 `raw_messages`（参考 dsh-qqchat 双游标：群反思 + 成员批量反思）；Step 3 Phase 2：`HistoryTurn` 增加 `triggerMessageIds`/`turnKind`。桌宠反思继续走 chat_history（每次输入必有回复，无损失）
+3. **记忆代谢**（Phase 2）：`MemoryMetabolism` 每日跑（跟随夜间时段）——汇总各 origin episodic → `daily_journal` → 衰减巩固（现 `decayEpisodicMemory` 启动跑一次改为每日批处理）→ `reflection_log`
+4. **主动唤醒模式**（Phase 2）：采纳 dsh-proactive 的 wake framing notice + `proactive_reclaim` 静默收尾（整轮折叠为墓碑）；openher 的 Drive 随时间演化超阈值触发。**克制项**：不采纳 Mai_love 的"独立日程生活/想念机制"重人格模拟，等门控数据跑出基线后再评估；不抄 DSH Cordis 插件内核
+
+
+
 ## 十一、风险清单
 
 | 风险 | 等级 | 说明 |
 |---|---|---|
-| **QQ 封号** | **高** | NapCat 注入 NTQQ，腾讯有检测；必须小号、养号、控频。**无绝对安全** |
+| **QQ 封号** | **高** | SnowLuma 注入 NTQQ，腾讯有检测；必须小号、养号、控频。**无绝对安全** |
 | 人格漂移 | 中 | 多群多人并发时人格不一致，需共享人格档案 + 严格记忆隔离 |
 | 隐私/社交风险 | 中→低 | 已定公开 AI 身份，群友预期明确；群聊内容入库需谨慎 |
 | 合规 | 低 | 公开 AI 身份 + 仅好友/自家群，风险显著下降 |
-| 商用限制 | 中 | NapCat 许可证禁商用、禁公开分发修改版；个人自用不受影响 |
+| 商用限制 | 中 | NapCat 许可证禁商用、禁公开分发修改版；SnowLuma 为开源框架，商用风险更低 |
 | dsh 依赖 | 中 | 仅 Phase 4，非核心路径；nightly rc 接口会漂移 |
 | 成本 | 低-中 | dsh 走账号额度；自研走 DeepSeek API 按量计费 |
 
