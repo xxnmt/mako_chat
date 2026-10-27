@@ -38,6 +38,7 @@ qt_add_executable(Windows_AI
     sessionrouter.h
     sessionrouter.cpp
     qqmessageparser.h qqmessageparser.cpp
+    qqreplypolicy.h qqreplypolicy.cpp
     qqprotocolclient.h qqprotocolclient.cpp
     ttsreference.h
     ittsprovider.h

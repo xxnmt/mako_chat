@@ -55,6 +55,12 @@ add_phase0_test(tst_promptassembler
     ${PROJECT_SOURCE_DIR}/promptassembler.cpp
 )
 
+add_phase0_test(tst_qqreplypolicy
+    tst_qqreplypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/qqreplypolicy.h
+    ${PROJECT_SOURCE_DIR}/qqreplypolicy.cpp
+)
+
 add_phase0_test(tst_qqmessageparser
     tst_qqmessageparser.cpp
     ${PROJECT_SOURCE_DIR}/qqmessageparser.h

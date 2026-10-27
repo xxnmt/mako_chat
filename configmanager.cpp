@@ -94,6 +94,25 @@ bool ConfigManager::loadSetting()
         m_qqEnabled = qqObj.value("enabled").toBool(false);
         m_qqWsUrl = qqObj.value("ws_url").toString(QStringLiteral("ws://127.0.0.1:3001"));
         m_qqAccessToken = qqObj.value("access_token").toString();
+
+        m_qqReply = QQReplyPolicy{};
+        if (qqObj.contains("reply") && qqObj.value("reply").isObject()) {
+            const QJsonObject replyObj = qqObj.value("reply").toObject();
+            m_qqReply.privateMode = replyObj.value("private").toString(m_qqReply.privateMode);
+            m_qqReply.groupMode = replyObj.value("group").toString(m_qqReply.groupMode);
+            m_qqReply.masterAnyGroup = replyObj.value("master_any_group").toBool(false);
+            auto readIds = [](const QJsonArray &array) {
+                QList<qlonglong> ids;
+                for (const QJsonValue &value : array) {
+                    ids.append(value.isDouble()
+                                    ? static_cast<qlonglong>(value.toDouble())
+                                    : value.toString().toLongLong());
+                }
+                return ids;
+            };
+            m_qqReply.privateAllow = readIds(replyObj.value("private_allow").toArray());
+            m_qqReply.groupAllow = readIds(replyObj.value("group_allow").toArray());
+        }
     }
 
     //tts
@@ -144,6 +163,22 @@ bool ConfigManager::saveSetting()
     qqObj.insert("enabled", m_qqEnabled);
     qqObj.insert("ws_url", m_qqWsUrl);
     qqObj.insert("access_token", m_qqAccessToken);
+
+    QJsonObject replyObj;
+    replyObj.insert("private", m_qqReply.privateMode);
+    replyObj.insert("group", m_qqReply.groupMode);
+    replyObj.insert("master_any_group", m_qqReply.masterAnyGroup);
+    QJsonArray privateAllow;
+    for (qlonglong id : m_qqReply.privateAllow) {
+        privateAllow.append(static_cast<double>(id));
+    }
+    QJsonArray groupAllow;
+    for (qlonglong id : m_qqReply.groupAllow) {
+        groupAllow.append(static_cast<double>(id));
+    }
+    replyObj.insert("private_allow", privateAllow);
+    replyObj.insert("group_allow", groupAllow);
+    qqObj.insert("reply", replyObj);
 
     QJsonObject rootObj;
     rootObj.insert("api", apiObj);
@@ -518,6 +553,7 @@ QQConfig ConfigManager::getQQConfig() const
     config.enabled = m_qqEnabled;
     config.wsUrl = m_qqWsUrl;
     config.accessToken = m_qqAccessToken;
+    config.reply = m_qqReply;
     return config;
 }
 

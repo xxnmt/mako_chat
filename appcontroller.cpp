@@ -18,6 +18,7 @@
 #include "sessionrouter.h"
 #include "qqprotocolclient.h"
 #include "qqmessageparser.h"
+#include "qqreplypolicy.h"
 
 #include <QDebug>
 #include <QJsonArray>
@@ -68,7 +69,15 @@ AppController::AppController(QObject *parent)
         if (!message.valid) {
             return;
         }
-        // 本批只落原始事件，不接大脑/不回复（下一批再接 SessionRouter）
+        const QQReplyDecision decision = QQReplyPolicyEngine::decide(
+            message, ConfigManager::instance().getQQConfig().reply,
+            ConfigManager::instance().getMasterQQAccounts());
+        if (decision == QQReplyDecision::Drop) {
+            qDebug() << "[QQ]未通过白名单，已忽略（不记录）:"
+                     << message.channel << message.sessionId << message.senderId;
+            return;
+        }
+
         m_memoryManager->appendRawEvent(QStringLiteral("qq"), message.channel,
                                         message.sessionId, QStringLiteral("message"),
                                         message.text, message.messageId,
@@ -78,8 +87,8 @@ AppController::AppController(QObject *parent)
                                         QStringLiteral("channel"));
         qDebug() << "[QQ]收到消息:" << message.channel << message.sessionId
                  << message.speaker << message.text;
-        // 群聊默认只响应 @ 机器人（避免刷屏和风控）；私聊始终响应
-        if (message.channel == Channel::kQQGroup && !message.mentionedSelf) {
+
+        if (decision == QQReplyDecision::RecordOnly) {
             qDebug() << "[QQ]群消息未@我，已记录但不回复";
             return;
         }
