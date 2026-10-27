@@ -2,9 +2,9 @@
 
 > 项目：Windows_AI 桌面看板娘（桌宠）
 > 类型：规划文档（分阶段实施中）
-> 版本：v1.0（Phase 1 前置项完成，2026-10-27）
+> 版本：v1.1（Phase 1 主体 QQ 文本已通，2026-10-27）
 > 制定日期：2026-10-19
-> 状态：Phase 0 / 0.5 已完成；Phase 1 前置项（identity / PromptAssembler / v4 / TTS 分离 / GlobalMoodState）**全部完成**；下一步 Phase 1 主体（SnowLuma + QQ）
+> 状态：Phase 0 / 0.5 已完成；Phase 1 前置项全部完成；Phase 1 主体 **QQ 私聊/群聊文本收发已通**（SnowLuma + OneBot WS + 白名单/@ 门控）；下一步 QQ 语音/图片与 Phase 2 主动对话
 > 关联文档：[ROADMAP.md](ROADMAP.md)、[ARCHITECTURE.md](ARCHITECTURE.md)
 
 ---
@@ -25,7 +25,7 @@
 | 决策项 | 结论 | 备注 |
 |---|---|---|
 | 角色大脑归属 | **Qt 自研为主线**（LLMService + 五层记忆 + 立绘 + GPT-SoVITS 全部保留） | dsh 不承载核心人格资产 |
-| QQ 技术路线 | **路线 A：Qt `QWebSocket` 直连协议端（OneBot v11 反向 WS）**；Phase 4 再将 dsh 作为"外挂工具执行器"接入 | 协议端选型见 3.2 |
+| QQ 技术路线 | **路线 A：Qt `QWebSocket` 客户端连接协议端 WS 服务端（OneBot v11）**；Phase 4 再将 dsh 作为"外挂工具执行器"接入 | 协议端选型见 3.2 |
 | QQ 账号 | 专用小号；好友和群聊由用户登录 QQ 号手动管理添加 | 不主动加陌生人/陌生群 |
 | 身份策略 | **公开 AI 身份**（在签名/资料/必要时坦承） | 合规风险显著降低 |
 | 主动对话触发 | **Qt 定时器 + 状态/时间驱动**，主动权始终由 Qt 持有 | dsh 三条路径均不支持 agent 主动发起 |
@@ -169,7 +169,7 @@
 
 | 模块 | 职责 | 技术要点 |
 |---|---|---|
-| `QQProtocolClient` | OneBot v11 反向 WS 客户端 | `QWebSocket`（Qt 原生，无需 Python 中间层）；心跳/重连/`post_type=message` 事件 |
+| `QQProtocolClient` | OneBot v11 WS 客户端（连协议端 WS 服务端） | `QWebSocket`（Qt 原生，无需 Python 中间层）；心跳/重连/`post_type=message` 事件 |
 | `QQChannelAdapter` | Utterance → OneBot 消息段 | 文本 / `image`(表情包，`base64://` 或 `file:///`) / `record`(语音，wav 直接给) |
 | `ChatPlanner` | **决定"该不该开口"** | 照搬 MaiBot 的 frequency/dynamic 门控（见第五节） |
 | `ProactiveScheduler` | 主动发起对话 | `QTimer` + `QDateTime`，配置 schema 见第六节 |
@@ -232,15 +232,85 @@ proactive:
 - 安静时段（如 23:00–08:00 不主动）
 - 冷却期内即使满足条件也不触发
 
+### 6.4 跨渠道观察与主动转述（Phase 2 设计）
+
+> 状态：设计已确认，未实现。当前 QQ 只做白名单内的被动回复；未通过白名单的消息不记录、不回复（见 10.5.6）。
+
+**三种权限**（互斥，按来源配置）：
+
+| 权限 | 记录 `raw_events` | 回复 | 用途 |
+|---|---|---|---|
+| `reply` | ✅ | ✅ | 当前白名单群/好友 |
+| `observe` | ✅ | ❌ | 只看不说，供主动转述 |
+| `drop` | ❌ | ❌ | 未通过白名单 |
+
+观察范围必须显式配置：
+
+```yaml
+qq:
+  reply:
+    private: allowlist
+    group: mention
+    private_allow: [10001, 10002]   # 示例
+    group_allow: [90001]           # 示例
+  observe:
+    groups: [90002]       # 只记录、不回复（示例）
+    private: []           # 非主人私聊默认不观察
+```
+
+**转述隐私矩阵**：
+
+| 来源 | 默认能否告诉主人 | 内容 |
+|---|---|---|
+| 白名单群的公开话题 | ✅ 可聚合/匿名 | “今天群里在聊 X” |
+| 群里有人提到主人/问主人在不在 | ✅ 优先 | “有人在群里问你去哪了” |
+| 群里敏感/盲区内容 | ❌ | 不记录转述 |
+| 非主人私聊 | ❌ 默认不转述 | 可配置“仅 metadata”：只说 U 找过你，不说内容 |
+| 主人自己也在的群 | ❌ 不转述 | 主人已经知道 |
+
+### 6.5 价值判断与投递
+
+**Salience 评分**（先用规则，后续可加轻量 LLM 分类）：
+
+| 信号 | 权重 |
+|---|---|
+| 涉及主人（@、称呼、问“主人在吗”） | 高 |
+| 主人可能感兴趣的领域/话题 | 中高 |
+| 强情绪、冲突、表白、重大计划 | 中高 |
+| 多人重复讨论 | 中 |
+| 日常闲聊/表情包 | 低 |
+| 敏感/隐私/他人私事 | 直接排除 |
+
+**投递优先级**：
+
+1. **pet**：主人在电脑前，气泡 + TTS，最自然
+2. **主人 QQ 私聊**：pet 不在/最小化，且配置允许
+3. **不投递**：主人在忙/免打扰，进队列等下次
+
+同一件事只在一个渠道说；已转述事件写回 `raw_events.id` 标记，避免重复。
+
+### 6.6 分期与验收
+
+| 阶段 | 范围 | 验收 |
+|---|---|---|
+| **2a 主人相关事件转述** | 只观察白名单群；只转述涉及主人/被问在不在；只投 pet；每日 1~3 次 | 群友闲聊不打扰；有人问主人时能转述；私聊内容永不出现 |
+| **2b 群话题摘要** | 主人离开 >2 小时，回来给一次聚合摘要；匿名、不引用原话 | 不刷屏、不泄露成员身份 |
+| **2c 私聊 metadata** | 默认关闭；只告诉“U 找过你”，不说内容 | 主人开启后才生效 |
+| **2d 反馈学习** | 主人回复/追问提高权重；说“别说了”/长期忽略降低 | 同类事件打扰率下降 |
+
+> 依赖：请求上下文隔离（并发不串话）→ scope/audience 模型 → 群聊上下文预算 → 2a。
+
 ---
 
 ## 七、QQ 接入详细设计
 
-**部署**：NapCatQQ（无头注入 NTQQ）+ **专用小号**，开启反向 WebSocket。
+**部署**：SnowLuma v2.2.0（Windows 完整包）+ **专用小号**；SnowLuma 提供 OneBot v11 **WebSocket 服务端**（`127.0.0.1:3001`），Qt 端 `QQProtocolClient` 作为客户端连接。
+
+**当前已实现**：私聊/群聊文本收发、`get_login_info` 自检、断线重连、白名单过滤、群聊 @ 门控、`raw_events` 落库。语音/图片/表情包与主动观察待后续批次。
 
 | 能力 | 接口 | 说明 |
 |---|---|---|
-| 收私聊/群聊 | 反向 WS `post_type=message` | 含 `sender`(nickname/card/role)、`message` 段数组 |
+| 收私聊/群聊 | WS 事件推送 `post_type=message` | 含 `sender`(nickname/card/role)、`message` 段数组 |
 | 发文字 | `send_private_msg` / `send_group_msg` | 消息段数组（推荐） |
 | 表情包 | `image` 段，`file` 支持 `base64://` / `file:///` / `http(s)://` | 本地表情包库 → base64 或 file 路径 |
 | 语音 | `record` 段，`file` 给 wav/mp3 | **协议端自动转 silk v3**，C++ 端无需自备编码器 |
@@ -258,7 +328,8 @@ proactive:
 
 | 决策项 | 结论 |
 |---|---|
-| 跨渠道记忆 | **互通 + 可配置盲区**（默认互通，敏感渠道可设为"记忆盲区"） |
+| 跨渠道记忆（目标） | **主人 owner 内互通**（pet + 主人私聊）；非主人按 `scope/audience` 隔离；群聊永不看私聊 |
+| 跨渠道记忆（现状） | 短历史/摘要/情景按 `channel + session_id` 隔离；档案/关系按 `subject` 共享；`audience` 模型尚未实现 |
 | 群消息存储 | **原始层全量落库 + 空闲蒸馏**（v2 修订，取代早期"只存参与"方案） |
 | 关系状态 | **全对象分层**（对主人/每个好友/每个群分别维护） |
 | 身份归属权 | **宿主配置层声明，模型无权判定**（mem0 模式，防 prompt 注入冒认） |
@@ -266,6 +337,18 @@ proactive:
 | 立绘跟随（D1） | **可配置项** `[appearance] followExternalMood`（默认开）：QQ 聊天情绪是否驱动桌设立绘 |
 | 情绪/退火分层（D2） | **情绪状态全局、退火表现桌宠渠道私有**——QQ 渠道永不直接调 TimeManager |
 | 群聊私密过滤（C3） | 初期简单规则：群聊 prompt 不注入 relationship 数值与亲密档案 key |
+
+### 8.0.1 现状差距（2026-10-27）
+
+| 问题 | 现状 | 影响 |
+|---|---|---|
+| 主人 QQ 私聊 vs pet | 短历史/摘要/情景不共享；档案/关系共享 | pet 不记得主人刚在 QQ 私聊里说过的事 |
+| 非主人档案 | 提取会写 `subject=qq:<uin>`，但 `LLMService` 固定取 `getCharacterProfiles("user")` | 非主人档案写了但从不注入 |
+| 群聊记忆 vs 私聊 | 情景按 `origin + session` 过滤，群记忆在私聊不可见 | “私聊记得群聊”不成立 |
+| 盲区/敏感 | `isBlindZone()` 无调用点；`meta.sensitive` 恒 false；prompt 未过滤 sensitive | 盲区配置不生效 |
+| 摘要/情景 | 同一批轮次同时产出 working_summary 与 episodic；`memory_cursor` 未使用 | 内容重叠、游标重复提取 |
+| L0 消费 | `raw_events.processed` 始终为 0 | 只存不蒸馏，群聊未 @ 消息成为死数据 |
+| 并发 | `m_lastMeta`/`m_lastUserInput` 全局单份 | 两条 QQ 消息并发时可能串话 |
 
 ### 8.1 dsh 社区调研结论（Memory 分类 211 个插件）
 
@@ -645,7 +728,7 @@ CREATE TABLE memory_cursor (
 
 ### 10.5 Phase 1 前置实施记录（2026-10-27）
 
-> 代码提交：`1aa4436`（identity + PromptAssembler + v4 提取链路）；测试：5 套件 / 45 例全绿；真实库 v3→v4 迁移验证通过。
+> 代码提交：`1aa4436`（identity + PromptAssembler + v4 提取链路）；当前测试：7 套件 / 64 例全绿；真实库 v3→v4 迁移验证通过。
 
 #### 10.5.1 identity 身份接入
 
@@ -681,7 +764,17 @@ CREATE TABLE memory_cursor (
 - [x] TTSService 合成/播放分离（批次 C）：新增 `IAudioSink` / `PetAudioSink`，播放器与播放队列归桌宠渠道；`TTSService` 只负责合成；无 sink 时只合成不播放。人工回归：多句流式、单句、起播/切换时序正常
 - [x] GlobalMoodState（批次 D）：`emotion/blush/distance` 提升为全局状态；桌宠侧 `applyPetTags()` 同步立绘与全局情绪；外部渠道情绪按 `followExternalMood`（D1，来自 `identity.json [appearance]`）决定是否驱动桌宠立绘；退火仍归桌宠渠道（D2）。自动化 5 例；桌宠人工回归通过
 
-至此 Phase 1 前置项全部完成，下一步进入 **Phase 1 主体**（SnowLuma 部署 + QQ 渠道接入）。
+至此 Phase 1 前置项全部完成，随后进入 **Phase 1 主体**（QQ 文本进展见 10.5.6）。
+
+#### 10.5.6 Phase 1 主体进展（QQ 文本，2026-10-27）
+
+- [x] SnowLuma v2.2.0 完整包 + OneBot WebSocket 服务端（`127.0.0.1:3001`）
+- [x] `QQProtocolClient`：连接/重连（3s→30s）、token 鉴权、`get_login_info` 自检、动作发送
+- [x] `QQMessageParser`：私聊/群聊、text/at/image/record/face、`mentionedSelf`、原始 JSON
+- [x] 白名单与 @ 门控：未通过不记录/不回复；通过群未 @ 只记录；`retcode=100` 4 秒后重试一次
+- [x] 入站 → `raw_events` → `SessionRouter`；QQ 文本回复 → `QQChannelAdapter`，不触发桌宠气泡/TTS
+- [ ] QQ 语音/图片/表情包输出
+- [ ] 群聊滑动窗口/发言门控（Phase 2）
 
 ---
 

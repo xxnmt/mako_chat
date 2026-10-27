@@ -2,8 +2,8 @@
 
 > 项目：Windows_AI 桌面看板娘（桌宠）
 > 日期：2026-10-27
-> 版本：v0.6.0 + Phase 0/0.5 + Phase 1 前置（记忆库 v4）
-> 状态：开发中（Phase 0/0.5 与 Phase 1 前置项已完成，Phase 1 主体待开始）
+> 版本：v0.7.0-rc5 + Phase 1 前置（记忆库 v4）+ QQ 文本
+> 状态：开发中（Phase 0/0.5 与 Phase 1 前置项已完成；Phase 1 主体 QQ 文本已通）
 
 ---
 
@@ -19,6 +19,7 @@
 | | `m_appearance` | AppearanceManager*，外观管理 |
 | | `m_globalMood` | GlobalMoodState*，全局情绪（D2；外部情绪驱动受 D1 控制） |
 | | `m_ttsService` | TTSService*，TTS服务 |
+| | `m_qqClient` | QQProtocolClient*，OneBot WS 客户端（入站落 raw_events） |
 | | `m_chatWidget` | ChatWidget*，聊天输入窗口 |
 | | `m_anchorManager` | AnchorManager*，位置锚点管理 |
 | | `m_settingsWidget` | SettingsWidget*，设置界面 |
@@ -320,7 +321,16 @@ signals:
 |------|------|------|
 | **接口** | `channelName()` / `sendUtterance(const Utterance&)` | 纯虚接口，大脑侧不感知具体渠道 |
 | **PetChannelAdapter** | 持 `BubbleWidget*`（非所有权） | `sendUtterance` → `showMessage`；持有 `PetAudioSink`（`audioSink()`），播放器归桌宠渠道 |
-| **QQChannelAdapter** | 占位 | `sendUtterance` 仅打印日志；Phase 1 接 OneBot v11（协议端选型见 HUMANIZATION_PLAN 3.2：SnowLuma） |
+| **QQChannelAdapter** | QQ 文本输出 | `sendUtterance` → `send_private_msg`/`send_group_msg`；依赖 `QQProtocolClient` |
+
+### QQ 渠道（文本已接入）
+
+| 类 | 职责 | 关键点 |
+|----|------|--------|
+| `QQProtocolClient` | OneBot v11 WS 客户端 | 连接 `ws://127.0.0.1:3001`；Bearer token；3s→30s 重连；`get_login_info` 自检；发送 `retcode=100` 重试一次 |
+| `QQMessageParser` | 入站事件解析 | `post_type=message`、private/group、speaker（card→nickname）、`mentionedSelf`、text/at/image/record/face 占位、原始 JSON |
+| `QQReplyPolicyEngine` | 回复策略 | `private: none/master/allowlist/all`；`group: none/mention/all`；`group_allow`；`master_any_group`；Drop/RecordOnly/Reply |
+| `QQChannelAdapter` | 文本出站 | 文本消息段数组；群/私聊动作选择；未连接只打日志 |
 
 ### SessionRouter（输入路由）
 
@@ -612,6 +622,14 @@ struct SentenceText {
 
 > ✅ 配置文件持久化已实现：`app_data/config/setting.json`
 
+**QQ 配置（`setting.json` 的 `qq` 段）**：
+
+| 类型 | 名称 | 说明 |
+|------|------|------|
+| **结构** | `QQConfig` | `enabled` / `wsUrl`（默认 `ws://127.0.0.1:3001`）/ `accessToken` |
+| | `QQReplyPolicy` | `privateMode` / `groupMode` / `privateAllow` / `groupAllow` / `masterAnyGroup` |
+| **函数** | `QQConfig getQQConfig() const` | 读取 QQ 连接与回复策略 |
+
 **Phase 0 扩展（`app_data/config/identity.json`，懒加载、只读解析、缺失用默认值）**：
 
 | 类型 | 名称 | 说明 |
@@ -812,7 +830,10 @@ Windows_AI/
 ├── utterance.h              # 统一协议（Utterance/RequestMeta/Channel）
 ├── ichanneladapter.h        # 渠道抽象接口
 ├── petchanneladapter.h/cpp  # 桌宠渠道适配器
-├── qqchanneladapter.h/cpp   # QQ 渠道占位（Phase 1）
+├── qqprotocolclient.h/cpp   # OneBot v11 WS 客户端
+├── qqmessageparser.h/cpp    # QQ 入站事件解析
+├── qqreplypolicy.h/cpp      # QQ 白名单/@ 门控策略
+├── qqchanneladapter.h/cpp   # QQ 文本输出
 ├── sessionrouter.h/cpp      # 输入路由
 ├── anchormanager.h/cpp      # 位置锚点管理
 ├── anchorstrategy.h         # 锚点策略
@@ -898,6 +919,8 @@ Windows_AI/
 
 | 日期 | 变更内容 |
 |------|----------|
+| 2026-10-27 | QQ 文本接入（M38）：`QQProtocolClient`/`QQMessageParser`/`QQChannelAdapter`；入站 `raw_events` + `SessionRouter`，回复走 QQ 不触发 pet TTS |
+| 2026-10-27 | QQ 白名单/@ 门控（M39）：`QQReplyPolicy`（Drop/RecordOnly/Reply）、未通过不记录、通过群未 @ 只记录、`retcode=100` 重试；7 套件 / 64 例 |
 | 2026-10-27 | GlobalMoodState（批次 D）：情绪三维提升为全局状态；`applyPetTags()` 统一桌宠立绘+全局情绪；D1 `followExternalMood` 控制外部情绪是否驱动立绘；TimeManager 退火仍归桌宠（D2） |
 | 2026-10-27 | TTS 合成/播放分离（批次 C）：新增 `IAudioSink` / `PetAudioSink`；播放器与播放队列归桌宠渠道；TTSService 只合成，无 sink 时只合成不播放；人工听感回归通过 |
 | 2026-10-27 | v4 提取链路（提交 `1aa4436`）：`episodic_memory` + session_id；提取 prompt 带渠道/说话人/主体；档案三条准入规则；写入按本轮 meta 归属；信号回传 meta |

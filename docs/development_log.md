@@ -407,6 +407,22 @@
 - 内容：新增 `GlobalMoodState`（emotion/blush/distance 全局状态）；AppController 新增 `applyPetTags()` 统一桌宠立绘+全局情绪；外部渠道情绪按 `followExternalMood`（D1，identity.json `[appearance]`）决定是否驱动桌宠立绘，且只应用情绪三维；TimeManager 退火仍只归桌宠（D2）
 - 验证：构建通过、5 套件 / 45 例通过；桌宠人工回归（表情/脸红/距离、退火回落、气泡/TTS）正常
 
+### M38: QQ 文本链路接入（已完成）
+
+- 日期：2026-10-27（Phase 1 主体）
+- 内容：SnowLuma v2.2.0 + OneBot WS；`QQProtocolClient`（连接/重连/token/动作）；`QQMessageParser`（私聊/群聊、text/at/image/record、`mentionedSelf`）；入站写 `raw_events` 并接 `SessionRouter`；QQ 回复走 `QQChannelAdapter` 文本，不触发 pet TTS/气泡
+- 验证：私聊/群聊收发、`raw_events` 字段完整、群回复送达；构建通过
+
+### M39: QQ 白名单与 @ 门控（已完成）
+
+- 日期：2026-10-27（Phase 1 主体）
+- 内容：`QQReplyPolicy`（Drop/RecordOnly/Reply）；`private: none/master/allowlist/all`、`group: none/mention/all`、`private_allow/group_allow/master_any_group`；未通过白名单不写 `raw_events`；通过群未 @ 只记录；`retcode=100` 4 秒后重试一次
+- 验证：白名单/未通过/@ 门控/发送回归；7 套件 / 64 例通过
+
+### 设计记录：跨渠道主动转述（Phase 2）
+
+- 2026-10-27：确认 `reply` / `observe` / `drop` 三权限；默认只观察白名单群、非主人私聊不观察；转述只投 pet、每日 1~3 次、免打扰/冷却；隐私矩阵与 2a–2d 分期见 HUMANIZATION_PLAN 6.4–6.6
+
 ---
 
 ## 技术债务
@@ -496,6 +512,8 @@
 | v0.7.0-rc | Phase 1 前置项 | SessionRouter(identity) + PromptAssembler + MemoryManager v4 | 身份解析、渠道可见性上下文组装、提取带 meta、`episodic.session_id`、38 例自动化测试 |
 | v0.7.0-rc2 | TTS 合成/播放分离 | TTSService + IAudioSink + PetAudioSink | 播放器归桌宠渠道、无 sink 只合成不播放、人工听感回归通过 |
 | v0.7.0-rc3 | GlobalMoodState（Phase 1 前置收尾） | GlobalMoodState + AppController | 全局情绪三维、D1 外部情绪驱动开关、D2 退火仍归桌宠、45 例自动化测试 |
+| v0.7.0-rc4 | QQ 文本链路（Phase 1 主体） | QQProtocolClient + Parser + QQChannelAdapter | 私聊/群聊文本、raw_events、SessionRouter、QQ 回复不触发 pet TTS |
+| v0.7.0-rc5 | QQ 白名单/@ 门控 | QQReplyPolicy + ConfigManager | Drop/RecordOnly/Reply、未通过不记录、群 @ 回复、发送重试 |
 
 ---
 

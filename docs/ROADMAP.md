@@ -1,8 +1,8 @@
 # 开发路线图
 
 > 项目：Windows_AI 桌面看板娘（桌宠）
-> 版本：v0.6.0（Phase 0/0.5 已完成，Phase 1 前置进行中）
-> 更新日期：2026-10-26
+> 版本：v0.7.0-rc5（Phase 0/0.5 与 Phase 1 前置完成；Phase 1 主体 QQ 文本已通）
+> 更新日期：2026-10-27
 
 ---
 
@@ -210,12 +210,21 @@
   - [x] v4 提取链路（`episodic.session_id`、提取带渠道/说话人/主体、档案三条准入规则）
   - [x] TTSService 合成/播放分离（`IAudioSink` / `PetAudioSink`，播放器归桌宠；无 sink 只合成不播放）
   - [x] GlobalMoodState（全局情绪；外部情绪驱动立绘受 D1 控制，退火归桌宠 D2）
-- [ ] **Phase 1 主体**：SnowLuma 部署 + `QQProtocolClient`/`QQChannelAdapter` 收发
-- [ ] **Phase 2**：`ChatPlanner` 发言门控 + `ProactiveScheduler` 主动对话
+- [ ] **Phase 1 主体（进行中：QQ 文本已通）**：
+  - [x] SnowLuma v2.2.0 + OneBot WS 服务端 + `QQProtocolClient` 连接/重连
+  - [x] 私聊/群聊文本收发、`raw_events` 落库、白名单、群聊 @ 门控、发送重试
+  - [ ] QQ 语音/图片/表情包输出
+  - [ ] 群聊滑动窗口/发言门控
+- [ ] **Phase 2**：
+  - [ ] 2a 观察权 + 主人相关事件转述（只观察白名单群，只投 pet）
+  - [ ] 2b 群话题摘要（主人离开后聚合）
+  - [ ] 2c 非主人私聊 metadata（默认关闭）
+  - [ ] 2d 主动转述反馈学习
+  - [ ] `ChatPlanner` 发言门控
 - [ ] **Phase 3**：QQ 空间说说/评论/点赞、合并转发/戳一戳/表情回应
 - [ ] **Phase 4**：经 dsh ACP 接入浏览器类工具
 
-**当前阻塞**：Phase 1 依赖 SnowLuma + 专用 QQ 小号部署验证。
+**当前状态**：SnowLuma + 专用小号已部署，QQ 私聊/群聊文本链路已通；下一批为语音/图片输出与稳定化。
 
 ### v0.7.0 - 架构改进 & 独立存档
 **状态**：📋 待开始
@@ -494,7 +503,7 @@ v0.6.0  ████████████████████   95%  流�
 Phase 0   ████████████████████  100%  多渠道架构解耦（已提交 61f1767）
 Phase 0.5 ████████████████████  100%  记忆库 v3（已提交 8f24ae5）
 Phase 1 前置 ████████████████████  100%  全部完成（identity/上下文/v4/TTS 分离/GlobalMoodState）
-Phase 1   ░░░░░░░░░░░░░░░░░░░░    0%  QQ 渠道接入（依赖 SnowLuma）
+Phase 1    ██████████░░░░░░░░░░   50%  QQ 文本已通；语音/图片/群聊门控待做
 v0.7.0  ░░░░░░░░░░░░░░░░░░░░   0%  架构改进 & 独立存档
 v0.8.0  ░░░░░░░░░░░░░░░░░░░░   0%  角色自定义 & 剧本系统
 v0.9.0  ░░░░░░░░░░░░░░░░░░░░   0%  智能助手 & 性能优化
@@ -504,9 +513,14 @@ v0.9.0  ░░░░░░░░░░░░░░░░░░░░   0%  智�
 
 ## 近期任务（Next Up，2026-10-27 更新）
 
-1. **Phase 1 主体**
-   - SnowLuma 部署 + 收发链路验证（私聊/群聊/图片/语音）
-   - `QQProtocolClient` / `QQChannelAdapter` 接入
-   > 前置项已全部完成（identity、PromptAssembler、v4 提取链路、TTSService 分离、GlobalMoodState）
+1. **稳定性与记忆正确性（P0）**
+   - 请求上下文隔离：每次 LLM 请求携带 `requestId + meta`，避免 QQ 并发串话
+   - 盲区/敏感接线；提取事务/幂等；`memory_cursor` 消费 `raw_events`
+2. **Phase 1 主体剩余**
+   - QQ 语音/图片/表情包输出
+   - 群聊窗口/发言门控
+3. **Phase 2 主动对话**
+   - 2a 观察权 + 主人相关事件转述（只投 pet）→ 2b 群摘要 → 2c 私聊 metadata → 2d 反馈
+   > 设计见 HUMANIZATION_PLAN 6.4–6.6；前置依赖 P0 与 scope/audience
 
 > 顺延（不影响主线）：LLM 错误重试、ShortcutManager、TTS 语速/温度、外观配置、历史导出、立绘过渡动画、系统托盘、右键菜单扩展、AppController 职责拆分（TD-013）、独立存档、插件化。

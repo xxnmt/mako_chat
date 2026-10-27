@@ -23,7 +23,7 @@
   - 关系状态（relationship_state，亲密度/信任度量化）
   - 对话历史管理（分页浏览、删除、清空）
 - ⚙️ **设置界面**：左侧目录 + 右侧滚动内容，点击目录跳转、滚动自动高亮双向同步；支持 API Key、短期记忆轮数、长期记忆摘轮数、夜晚时段与退火时长、TTS 模型切换、历史记录管理
-- 🔌 **多渠道架构（Phase 0）**：统一 `Utterance` 输出协议 + `IChannelAdapter` 渠道抽象 + `SessionRouter` 输入路由；记忆按 `channel + session_id` 双键隔离，为 QQ 等外部渠道预留接入点（QQ 渠道为 Phase 1 占位）
+- 🔌 **多渠道架构（Phase 0）**：统一 `Utterance` 输出协议 + `IChannelAdapter` 渠道抽象 + `SessionRouter` 输入路由；记忆按 `channel + session_id` 双键隔离。QQ 文本已接入（SnowLuma / OneBot v11 WS），语音/图片待扩展
 
 ### 开发中功能
 - 🔊 **语音合成**：✅ 已实现（见下方「TTS 语音系统说明」：策略模式 + 流式播放 + GPT/SoVITS 模型热切换）
@@ -117,7 +117,7 @@ POST /tts
 > **采样率说明**：流式模式下客户端从服务端返回的首个 WAV 头（偏移 24）读取真实采样率（v3=24000Hz，v1/v2=32000Hz，v4/超分=48000Hz），不再按 `super_sampling` 硬编码；非流式文件播放由 FilePlayer 解析文件头自适。v3 模型的"流式"实为句子级分段返回（首音需等首句整句合成完成）。
 
 ### 计划功能（按优先级）
-- 🔌 **QQ 渠道接入**：Phase 1（SnowLuma / OneBot v11 反向 WS，文字/表情包/语音）
+- 🔌 **QQ 语音/图片/表情包**：Phase 1 剩余（文本已通；协议端 SnowLuma，Qt 作为 WS 客户端）
 - 🔧 **架构改进**：拆分 AppController 职责（信号路由、记忆协调、错误处理）
 - 📁 **独立存档系统**：支持多个存档，每个存档有独立的记忆和角色关系
 - ⏰ **时间驱动主动对话**：到饭点提醒、睡前聊天等
@@ -273,9 +273,13 @@ cmake --build . --config Release
 |------|------|
 | `identity.self.qq` | 她自己的 QQ（用于丢弃自触发消息） |
 | `identity.master.qq` | 主人的 QQ 列表（多账号都归一为 `subject='user'`） |
-| `appearance.follow_external_mood` | D1：外部渠道（未来 QQ）的情绪是否驱动桌宠立绘；默认 `true`，`false` 时只更新全局情绪 |
+| `appearance.follow_external_mood` | D1：外部渠道（QQ）的情绪是否驱动桌宠立绘；默认 `true`，`false` 时只更新全局情绪 |
 
 规则：按 uin 绑定（与昵称无关）；`self` 消息直接丢弃、`master` → `user`、未知 QQ → `qq:<uin>`；应用启动时加载，日志输出 `identity.json 加载完成: self N 个 / master N 个`。
+
+### QQ 接入（可选）
+
+SnowLuma 提供 OneBot v11 WebSocket 服务端；在 `setting.json` 的 `qq` 段填写 `ws_url`、`access_token`，并用 `reply` 白名单控制哪些好友/群可回复。未通过白名单不记录、不回复。字段与策略见 [ARCHITECTURE.md](docs/ARCHITECTURE.md#L1142)。
 
 ### 获取 DeepSeek API Key
 
@@ -360,7 +364,7 @@ Windows_AI/
 │   ├── closer/              # 近景立绘
 │   ├── far/                 # 远景立绘
 │   └── default_config/      # 默认配置（prompt.txt）
-├── tests/                   # 单元测试（Qt Test + CTest，5 套件 / 45 例）
+├── tests/                   # 单元测试（Qt Test + CTest，7 套件 / 64 例）
 │   ├── tst_memorymanager.cpp
 │   ├── tst_configmanager.cpp
 │   ├── tst_sessionrouter.cpp
@@ -380,7 +384,10 @@ Windows_AI/
 ├── utterance.h              # 统一输出协议（Utterance/RequestMeta/Channel 常量）
 ├── ichanneladapter.h        # 渠道抽象接口（IChannelAdapter）
 ├── petchanneladapter.h/cpp  # 桌宠渠道适配器（气泡/播放跟读）
-├── qqchanneladapter.h/cpp   # QQ 渠道占位（Phase 1 接入 OneBot v11）
+├── qqprotocolclient.h/cpp   # OneBot v11 WS 客户端（连接/重连/动作/事件）
+├── qqmessageparser.h/cpp    # QQ 入站事件解析
+├── qqreplypolicy.h/cpp      # QQ 白名单/@ 门控
+├── qqchanneladapter.h/cpp   # QQ 文本输出
 ├── sessionrouter.h/cpp      # 输入路由（身份解析 + 双键历史组装）
 ├── ttsservice.h/cpp         # TTS 合成服务（策略模式；播放交 IAudioSink）
 ├── iaudiosink.h             # 音频输出抽象接口
@@ -469,7 +476,7 @@ Windows_AI/
 3. **无网络状态检测**：应用启动时不会检测网络连接状态
 4. **立绘切换无过渡动画**：换图时直接切换，没有淡入淡出效果
 5. **仅支持单角色**：当前仅支持「千岛茉子」一个角色
-6. **外部渠道未接入**：Phase 0 只完成渠道抽象与输入路由，QQ 收发为占位实现（Phase 1 接入 SnowLuma / OneBot v11）
+6. **外部渠道**：QQ 文本收发已接入；语音/图片/表情包与主动转述待后续（主动转述设计见 `docs/HUMANIZATION_PLAN.md` 6.4–6.6）
 
 ## 🔧 故障排除
 

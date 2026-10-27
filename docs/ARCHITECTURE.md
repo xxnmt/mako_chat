@@ -19,7 +19,10 @@
 | **中枢层** | AppController | 应用生命周期管理、信号调度、模块组装 | appcontroller.h/cpp |
 | **渠道层** | IChannelAdapter | 渠道抽象接口（channelName/sendUtterance） | ichanneladapter.h |
 | | PetChannelAdapter | 桌宠渠道：气泡显示/播放跟读 | petchanneladapter.h/cpp |
-| | QQChannelAdapter | QQ 渠道占位（Phase 1：OneBot v11） | qqchanneladapter.h/cpp |
+| | QQProtocolClient | OneBot v11 WS 客户端：连接/重连/动作/事件 | qqprotocolclient.h/cpp |
+| | QQMessageParser | OneBot 私聊/群聊事件解析（文本/@/媒体占位） | qqmessageparser.h/cpp |
+| | QQReplyPolicy | 白名单/@ 门控：Drop / RecordOnly / Reply | qqreplypolicy.h/cpp |
+| | QQChannelAdapter | QQ 文本输出（`send_private_msg`/`send_group_msg`） | qqchanneladapter.h/cpp |
 | | SessionRouter | 输入路由：身份解析 + 会话历史组装 | sessionrouter.h/cpp |
 | **UI层** | CharacterWidget | 立绘显示、鼠标拖拽、右键菜单 | characterwidget.h/cpp |
 | | BubbleWidget | 气泡显示、打字机特效 | bubblewidget.h/cpp/ui |
@@ -104,7 +107,7 @@
 ### 1.4 多渠道分层（Phase 0）
 
 ```
-输入源（桌宠输入框 / 未来 QQ 私聊、群聊 / 未来定时触发）
+输入源（桌宠输入框 / QQ 私聊、群聊 / 定时或事件触发）
         │
         ▼
 SessionRouter::submitInput(channel, sessionId, speaker, text, senderId)   // 桌宠 senderId 留空
@@ -127,7 +130,7 @@ SessionRouter::submitInput(channel, sessionId, speaker, text, senderId)   // 桌
                 └─ AppearanceManager::applyTags（立绘表现；外部情绪经 D1 才驱动）
 ```
 
-**边界**：`QQChannelAdapter` 为占位；identity 已接线（self→丢弃 / master→user / 未知→`qq:<uin>`）；`raw_messages` 只建不写；QQ 渠道尚未接入。
+**边界**：QQ 文本链路已接线（WS 客户端→解析→策略→`raw_events`→`SessionRouter`）；QQ 语音/图片/表情包未实现；观察权/主动转述为 Phase 2 设计（见 HUMANIZATION_PLAN 6.4–6.6）。
 
 ---
 
@@ -1076,7 +1079,10 @@ struct RelationshipState {
 | `RequestMeta` | 输入元数据：channel/sessionId/speaker/subject/sensitive | 默认 `pet/default/user`，旧调用零改动 |
 | `IChannelAdapter` | `channelName()` + `sendUtterance()` 纯虚接口 | 大脑侧不感知具体渠道 |
 | `PetChannelAdapter` | 桌宠渠道：气泡显示 | 持 `BubbleWidget*` 非所有权；立绘/情绪不在此层 |
-| `QQChannelAdapter` | QQ 渠道占位 | Phase 1 接 OneBot v11；当前 `sendUtterance` 仅打日志 |
+| `QQChannelAdapter` | QQ 文本输出 | 经 `QQProtocolClient` 发 `send_private_msg`/`send_group_msg`；语音/图片待扩展 |
+| `QQProtocolClient` | OneBot WS 客户端 | 连接 SnowLuma WS 服务端；重连/鉴权/动作/事件 |
+| `QQMessageParser` | 入站解析 | 私聊/群聊、speaker、`mentionedSelf`、媒体占位、原始 JSON |
+| `QQReplyPolicy` | 回复策略 | 白名单、`master_any_group`、群聊 mention-only；未通过 Drop |
 | `SessionRouter` | 输入路由：身份解析 → 双键历史组装 → `requestReply` | `submitInput(..., senderId)`；self→丢弃、master→`user`、未知 QQ→`qq:<uin>`；启动时加载 identity.json |
 
 **调用时序**：
@@ -1129,7 +1135,41 @@ ChatWidget::textSubmitted(text)
 
 **接线**：
 - 桌宠：`AppController::applyPetTags()` → `AppearanceManager::applyTags()` + `GlobalMoodState::applyTags(..., pet)`
-- 外部渠道（未来 QQ）：`GlobalMoodState::applyTags(..., qq)` →（D1 开启）`AppearanceManager::applyTags(三维)`；不触发 TimeManager
+- 外部渠道（QQ）：`GlobalMoodState::applyTags(..., qq)` →（D1 开启）`AppearanceManager::applyTags(三维)`；不触发 TimeManager
+
+---
+
+### 2.19 QQ 渠道（文本已接入）
+
+**职责**：OneBot v11 文本收发；QQ 语音/图片/表情包与主动观察为后续批次。
+
+**入站链路**：
+```
+SnowLuma WS 服务端 (:3001)
+  → QQProtocolClient::messageEvent(QJsonObject)
+  → QQMessageParser::parse（channel/session/speaker/senderId/mentionedSelf/rawJson）
+  → QQReplyPolicyEngine::decide（Drop / RecordOnly / Reply）
+  → raw_events（仅非 Drop）
+  → SessionRouter::submitInput（仅 Reply）
+```
+
+**出站链路**：
+```
+AppController::handleMakoReply
+  ├─ pet：TTSService（气泡/TTS）
+  └─ qq_private / qq_group：QQChannelAdapter::sendUtterance
+        → QQProtocolClient::sendAction(send_private_msg / send_group_msg)
+        （不触发桌宠气泡/TTS；情绪写入 GlobalMoodState，D1 决定是否驱动立绘）
+```
+
+**策略语义**：
+- `private`：`none` / `master` / `allowlist` / `all`；`allowlist` 自动包含 master
+- `group`：`none` / `mention` / `all`；`group_allow` 非空时只处理这些群
+- 未通过白名单：不写 `raw_events`、不回复
+- 通过群但未 @：只写 `raw_events`，不进大脑
+- `retcode=100` 视为瞬时发送失败，4 秒后重试一次
+
+**配置**：`setting.json` 的 `qq` 段（`enabled/ws_url/access_token/reply`）。
 
 ---
 
@@ -1179,7 +1219,8 @@ ChatWidget::textSubmitted(text)
 6. AppController::handleMakoReply()
    │
    ├── saveQATurn(userInput, correctedReply, sentences, m_lastMeta) 保存对话（含渠道/会话/主体）
-   ├── enqueueSentences(sentences) 入队TTS
+   ├── pet：enqueueSentences(sentences) 入队TTS
+   ├── QQ：QQChannelAdapter::sendUtterance 发文本（不触发桌宠 TTS/气泡）
    └── 检查是否触发记忆提取
    │
    ▼
