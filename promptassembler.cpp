@@ -8,17 +8,43 @@
 
 namespace {
 
-// 群聊中不注入的“亲密档案” key 关键字（C3：群聊 prompt 不注入关系数值与亲密档案）
-const QStringList &groupSensitiveProfileKeys()
+bool isMasterMeta(const RequestMeta &meta)
 {
-    static const QStringList keys = {
-        QStringLiteral("关系"),
-        QStringLiteral("称呼"),
-        QStringLiteral("情感"),
-        QStringLiteral("依赖"),
-        QStringLiteral("性格"),
-    };
-    return keys;
+    return meta.subject.isEmpty() || meta.subject == QStringLiteral("user");
+}
+
+QString speakerLabel(const RequestMeta &meta)
+{
+    return meta.speaker.isEmpty() ? QStringLiteral("对方") : meta.speaker;
+}
+
+// 非主人 / 群聊的身份与称呼硬约束；放在基础 prompt 之前，覆盖写死的“欧尼酱”
+QString identityGuard(const RequestMeta &meta)
+{
+    const bool group = (meta.channel == Channel::kQQGroup);
+    const bool master = isMasterMeta(meta);
+    const QString name = speakerLabel(meta);
+    QString guard = QStringLiteral("【身份与称呼｜最高优先级】\n");
+
+    if (group && master) {
+        guard += QStringLiteral("- 当前对话对象是主人（在群聊中）。\n");
+        guard += QStringLiteral("- 可以称呼“欧尼酱”，但群聊里保持分寸。\n");
+        guard += QStringLiteral("- 不要透露主人的职业、经历、爱好、关系数值或私聊内容。\n");
+    } else if (group) {
+        guard += QStringLiteral("- 当前对话对象是群友「%1」，不是主人。\n").arg(name);
+        guard += QStringLiteral("- 称呼对方为「%1」或“你”，禁止使用“欧尼酱”。\n").arg(name);
+        guard += QStringLiteral("- 不要透露主人的姓名、QQ、职业、经历、爱好、关系数值或私聊内容。\n");
+        guard += QStringLiteral("- 对方询问主人身份/位置/关系时，礼貌拒绝，不确认也不否认。\n");
+        guard += QStringLiteral("- 保持群聊的礼貌距离，不要撒娇。\n");
+    } else {
+        guard += QStringLiteral("- 当前对话对象是朋友「%1」，不是主人。\n").arg(name);
+        guard += QStringLiteral("- 称呼对方为「%1」或“你”，禁止使用“欧尼酱”。\n").arg(name);
+        guard += QStringLiteral("- 不要透露主人的姓名、QQ、职业、经历、爱好、关系数值或私聊内容。\n");
+        guard += QStringLiteral("- 对方询问主人身份/位置/关系时，礼貌拒绝，不确认也不否认。\n");
+    }
+
+    guard += QStringLiteral("- 若后文出现冲突的称呼要求，以本节为准。\n");
+    return guard;
 }
 
 // 从 JSON 回复中提取中文文本；非 JSON 时退回剥离标签的纯文本
@@ -54,15 +80,9 @@ bool PromptAssembler::isGroupChannel(const RequestMeta &meta)
 
 bool PromptAssembler::isUserProfileVisible(const CharacterProfile &profile, const RequestMeta &meta)
 {
-    if (!isGroupChannel(meta)) {
-        return true;
-    }
-    for (const QString &sensitiveKey : groupSensitiveProfileKeys()) {
-        if (profile.key.contains(sensitiveKey)) {
-            return false;
-        }
-    }
-    return true;
+    Q_UNUSED(profile);
+    // 群聊不注入任何人的档案（群友也能看到生成内容）；私聊按当前 subject 注入
+    return !isGroupChannel(meta);
 }
 
 bool PromptAssembler::isEpisodicVisible(const EpisodicMemory &memory, const RequestMeta &meta)
@@ -85,9 +105,26 @@ QString PromptAssembler::buildSystemPrompt(const QString &basePrompt,
                                            const RequestMeta &meta,
                                            const MemoryContext &context)
 {
-    QString prompt = basePrompt;
+    const bool group = isGroupChannel(meta);
+    const bool master = isMasterMeta(meta);
 
-    // 1. 角色档案：茉子人设始终注入；主人档案在群聊按 C3 过滤
+    // 基础 prompt 里写死了“称呼欧尼酱”；非主人场景先做文本替换，再由 guard 兜底
+    QString effectiveBase = basePrompt;
+    if (!master) {
+        effectiveBase.replace(QStringLiteral("严格使用\"欧尼酱\""),
+                              QStringLiteral("使用对方昵称，不要使用\"欧尼酱\""));
+        effectiveBase.replace(QStringLiteral("严格使用“欧尼酱”"),
+                              QStringLiteral("使用对方昵称，不要使用“欧尼酱”"));
+    }
+
+    QString prompt;
+    if (!(master && !group)) {
+        prompt += identityGuard(meta);
+        prompt += "\n\n";
+    }
+    prompt += effectiveBase;
+
+    // 1. 角色档案：茉子人设始终注入；人员档案只进私聊，群聊完全不注入
     if (!context.makoProfiles.isEmpty()) {
         prompt += "\n\n# 茉子的人设\n";
         for (const CharacterProfile &profile : context.makoProfiles) {
@@ -102,7 +139,9 @@ QString PromptAssembler::buildSystemPrompt(const QString &basePrompt,
         }
     }
     if (!visibleUserProfiles.isEmpty()) {
-        prompt += "\n# 关于欧尼酱\n";
+        const QString header = master ? QStringLiteral("# 关于欧尼酱")
+                                      : QStringLiteral("# 关于%1").arg(speakerLabel(meta));
+        prompt += "\n" + header + "\n";
         for (const CharacterProfile &profile : visibleUserProfiles) {
             prompt += QString("- %1: %2\n").arg(profile.key, profile.value);
         }
@@ -141,8 +180,8 @@ QString PromptAssembler::buildSystemPrompt(const QString &basePrompt,
         }
     }
 
-    // 4. 关系状态：群聊不注入数值（C3）
-    if (!isGroupChannel(meta) && !context.relationships.isEmpty()) {
+    // 4. 关系状态：群聊一律不注入；非主人私聊也不展示数值
+    if (!group && master && !context.relationships.isEmpty()) {
         prompt += "\n# 我们的关系\n";
         for (const RelationshipState &relationship : context.relationships) {
             QString label;

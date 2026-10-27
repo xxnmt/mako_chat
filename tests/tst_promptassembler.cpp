@@ -107,10 +107,108 @@ private slots:
         QVERIFY(!prompt.contains(QStringLiteral("# 我们的关系")));
         QVERIFY(!prompt.contains(QStringLiteral("- 称呼: 欧尼酱")));
         QVERIFY(!prompt.contains(QStringLiteral("桌宠私密回忆")));
-        QVERIFY(prompt.contains(QStringLiteral("开发者")));
+        QVERIFY(!prompt.contains(QStringLiteral("开发者")));   // 群聊不注入人员档案
+        QVERIFY(!prompt.contains(QStringLiteral("# 关于")));
         QVERIFY(prompt.contains(QStringLiteral("群里聊过的事")));
         QVERIFY(prompt.contains(QStringLiteral("公开设定")));
         QVERIFY(!prompt.contains(QStringLiteral("别的群的秘密")));
+    }
+
+
+    void nonMasterGroupUsesSpeakerAndHidesMasterInfo()
+    {
+        RequestMeta meta;
+        meta.channel = Channel::kQQGroup;
+        meta.sessionId = QStringLiteral("group:123");
+        meta.subject = QStringLiteral("qq:20002");
+        meta.speaker = QStringLiteral("小明");
+
+        PromptAssembler::MemoryContext context;
+        CharacterProfile masterProfile;
+        masterProfile.subject = QStringLiteral("user");
+        masterProfile.key = QStringLiteral("职业");
+        masterProfile.value = QStringLiteral("开发者");
+        context.userProfiles.append(masterProfile);
+
+        CharacterProfile friendProfile;
+        friendProfile.subject = QStringLiteral("qq:20002");
+        friendProfile.key = QStringLiteral("昵称");
+        friendProfile.value = QStringLiteral("小明");
+        context.userProfiles.append(friendProfile);
+
+        RelationshipState relationship;
+        relationship.dimension = QStringLiteral("intimacy");
+        relationship.value = 42.0;
+        context.relationships.append(relationship);
+
+        const QString prompt = PromptAssembler::buildSystemPrompt(
+            QStringLiteral("请你在称呼用户时，严格使用\"欧尼酱\"。"), meta, context);
+
+        QVERIFY(prompt.contains(QStringLiteral("不是主人")));
+        QVERIFY(prompt.contains(QStringLiteral("禁止使用“欧尼酱”")));
+        QVERIFY(!prompt.contains(QStringLiteral("严格使用\"欧尼酱\"")));
+        QVERIFY(!prompt.contains(QStringLiteral("开发者")));
+        QVERIFY(!prompt.contains(QStringLiteral("# 关于")));
+        QVERIFY(!prompt.contains(QStringLiteral("# 我们的关系")));
+        QVERIFY(!prompt.contains(QStringLiteral("亲密度: 42/100")));
+    }
+
+    void nonMasterPrivateUsesFriendProfile()
+    {
+        RequestMeta meta;
+        meta.channel = Channel::kQQPrivate;
+        meta.sessionId = QStringLiteral("20002");
+        meta.subject = QStringLiteral("qq:20002");
+        meta.speaker = QStringLiteral("阿伟");
+
+        PromptAssembler::MemoryContext context;
+        CharacterProfile friendProfile;
+        friendProfile.subject = QStringLiteral("qq:20002");
+        friendProfile.key = QStringLiteral("昵称");
+        friendProfile.value = QStringLiteral("阿伟");
+        context.userProfiles.append(friendProfile);
+
+        RelationshipState relationship;
+        relationship.dimension = QStringLiteral("intimacy");
+        relationship.value = 42.0;
+        context.relationships.append(relationship);
+
+        const QString prompt = PromptAssembler::buildSystemPrompt(
+            QStringLiteral("请你在称呼用户时，严格使用\"欧尼酱\"。"), meta, context);
+
+        QVERIFY(prompt.contains(QStringLiteral("# 关于阿伟")));
+        QVERIFY(prompt.contains(QStringLiteral("朋友「阿伟」")));
+        QVERIFY(!prompt.contains(QStringLiteral("# 关于欧尼酱")));
+        QVERIFY(!prompt.contains(QStringLiteral("# 我们的关系")));
+        QVERIFY(!prompt.contains(QStringLiteral("严格使用\"欧尼酱\"")));
+    }
+
+    void masterGroupKeepsAddressButHidesPrivateInfo()
+    {
+        RequestMeta meta;
+        meta.channel = Channel::kQQGroup;
+        meta.sessionId = QStringLiteral("group:123");
+        meta.subject = QStringLiteral("user");
+        meta.speaker = QStringLiteral("主人");
+
+        PromptAssembler::MemoryContext context;
+        CharacterProfile masterProfile;
+        masterProfile.subject = QStringLiteral("user");
+        masterProfile.key = QStringLiteral("职业");
+        masterProfile.value = QStringLiteral("开发者");
+        context.userProfiles.append(masterProfile);
+
+        RelationshipState relationship;
+        relationship.dimension = QStringLiteral("intimacy");
+        relationship.value = 42.0;
+        context.relationships.append(relationship);
+
+        const QString prompt = PromptAssembler::buildSystemPrompt(QStringLiteral("BASE"), meta, context);
+
+        QVERIFY(prompt.contains(QStringLiteral("可以称呼“欧尼酱”")));
+        QVERIFY(!prompt.contains(QStringLiteral("开发者")));
+        QVERIFY(!prompt.contains(QStringLiteral("# 关于")));
+        QVERIFY(!prompt.contains(QStringLiteral("# 我们的关系")));
     }
 
     void groupHistoryPrefixesSpeaker()

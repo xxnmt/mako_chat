@@ -47,12 +47,15 @@ void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> 
     // 角色档案 / 情景记忆 / 摘要 / 关系：PromptAssembler 统一按渠道与可见性组装（C3）
     PromptAssembler::MemoryContext context;
     if (m_memoryManager) {
-        context.userProfiles = m_memoryManager->getCharacterProfiles("user");
+        const QString profileSubject = m_currentMeta.subject.isEmpty()
+            ? QStringLiteral("user")
+            : m_currentMeta.subject;
+        context.userProfiles = m_memoryManager->getCharacterProfiles(profileSubject);
         context.makoProfiles = m_memoryManager->getCharacterProfiles("mako");
         context.memories = m_memoryManager->getActiveEpisodicMemories(0.2, 20);
         context.summaries = m_memoryManager->getLatestSummaries(5, m_currentMeta.channel, m_currentMeta.sessionId);
         context.relationships = m_memoryManager->getRelationshipStates(m_currentMeta.subject);
-        qDebug()<<"[LLM]角色档案: user="<<context.userProfiles.size()
+        qDebug()<<"[LLM]角色档案: subject="<<profileSubject<<context.userProfiles.size()
                 <<"mako="<<context.makoProfiles.size();
         qDebug()<<"[LLM]情景记忆数量:"<<context.memories.size();
         qDebug()<<"[LLM]摘要数量:"<<context.summaries.size();
