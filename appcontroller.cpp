@@ -47,6 +47,8 @@ AppController::AppController(QObject *parent)
 
     // 渠道装配（Phase 0：桌宠渠道接管气泡私有表现；QQ 为 Phase 1 占位）
     m_petChannel = new PetChannelAdapter(m_bubble, this);
+    // 批次 C：播放器归桌宠渠道；TTSService 只合成，sink 负责播放与气泡/立绘时序
+    m_ttsService->setAudioSink(m_petChannel->audioSink());
     m_qqChannel = new QQChannelAdapter(this);
     m_sessionRouter = new SessionRouter(m_memoryManager, this);
 

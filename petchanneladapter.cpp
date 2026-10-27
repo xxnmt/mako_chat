@@ -1,15 +1,22 @@
 #include "petchanneladapter.h"
+#include "petaudiosink.h"
 #include "bubblewidget.h"
 #include <QDebug>
 
 PetChannelAdapter::PetChannelAdapter(BubbleWidget *bubble, QObject *parent)
     : QObject(parent), m_bubble(bubble)
 {
+    m_audioSink = new PetAudioSink(this);
 }
 
 QString PetChannelAdapter::channelName() const
 {
     return Channel::kPet;
+}
+
+IAudioSink *PetChannelAdapter::audioSink() const
+{
+    return m_audioSink;
 }
 
 void PetChannelAdapter::sendUtterance(const Utterance &u)

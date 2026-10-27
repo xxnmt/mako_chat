@@ -41,6 +41,8 @@ qt_add_executable(Windows_AI
     apittsprovider.h apittsprovider.cpp
     mockttsprovider.h mockttsprovider.cpp
     ttsreferencemanager.h ttsreferencemanager.cpp
+    iaudiosink.h
+    petaudiosink.h petaudiosink.cpp
     ipcmplayer.h ipcmplayer.cpp
     streamplayer.h streamplayer.cpp
     fileplayer.h fileplayer.cpp
