@@ -344,8 +344,7 @@ Windows_AI/
 ├── docs/                    # 项目文档
 │   ├── ARCHITECTURE.md      # 架构设计文档
 │   ├── ROADMAP.md           # 开发路线图
-│   ├── project_tech_snapshot.md  # 技术快照
-│   ├── development_log.md   # 开发记录
+│   ├── HUMANIZATION_PLAN.md # 类人化升级方案
 │   └── OutDoc/              # 外部文档（API文档等）
 ├── app_data/                # 应用数据（运行时生成）
 │   ├── config/              # 配置文件

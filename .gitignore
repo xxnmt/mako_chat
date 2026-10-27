@@ -49,3 +49,10 @@ app_data/
 
 logs.txt
 scripts/cleanup_user_profile.py
+
+# 仅本地保留的开发文档（不发布到 GitHub）
+docs/project_tech_snapshot.md
+docs/PHASE0_IMPLEMENTATION.md
+docs/TEST_REPORT_PHASE0.md
+docs/development_log.md
+.trae/
