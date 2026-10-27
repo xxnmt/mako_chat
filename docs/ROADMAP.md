@@ -208,7 +208,7 @@
   - [x] identity 身份解析（`SessionRouter::senderId` + identity.json 启动加载）
   - [x] `PromptAssembler`（渠道可见性 C3、群聊说话人前缀、主动轮 assistant-only）
   - [x] v4 提取链路（`episodic.session_id`、提取带渠道/说话人/主体、档案三条准入规则）
-  - [ ] TTSService 合成/播放分离
+  - [x] TTSService 合成/播放分离（`IAudioSink` / `PetAudioSink`，播放器归桌宠；无 sink 只合成不播放）
   - [ ] GlobalMoodState（全局情绪 + D1）
 - [ ] **Phase 1 主体**：SnowLuma 部署 + `QQProtocolClient`/`QQChannelAdapter` 收发
 - [ ] **Phase 2**：`ChatPlanner` 发言门控 + `ProactiveScheduler` 主动对话
@@ -493,7 +493,7 @@ v0.5.0  ████████████████████ 100%  JSON�
 v0.6.0  ████████████████████   95%  流式TTS播放 & 播放器抽象 & 时间管理（剩外观/快捷键/托盘等）
 Phase 0   ████████████████████  100%  多渠道架构解耦（已提交 61f1767）
 Phase 0.5 ████████████████████  100%  记忆库 v3（已提交 8f24ae5）
-Phase 1 前置 ████████████░░░░░░░░   60%  身份/上下文/提取链路已完成（剩 TTS 分离、GlobalMoodState）
+Phase 1 前置 ████████████████░░░░   80%  身份/上下文/提取链路/TTS 分离已完成（剩 GlobalMoodState）
 Phase 1   ░░░░░░░░░░░░░░░░░░░░    0%  QQ 渠道接入（依赖 SnowLuma）
 v0.7.0  ░░░░░░░░░░░░░░░░░░░░   0%  架构改进 & 独立存档
 v0.8.0  ░░░░░░░░░░░░░░░░░░░░   0%  角色自定义 & 剧本系统
@@ -505,9 +505,8 @@ v0.9.0  ░░░░░░░░░░░░░░░░░░░░   0%  智�
 ## 近期任务（Next Up，2026-10-27 更新）
 
 1. **Phase 1 前置项（剩余）**
-   - TTSService 合成/播放分离（QQ 只合成不播放，播放器归桌宠）
    - GlobalMoodState（全局情绪 + D1 `followExternalMood`）
-   - 已完成：identity、PromptAssembler、v4 提取链路
+   - 已完成：identity、PromptAssembler、v4 提取链路、TTSService 合成/播放分离
 
 2. **Phase 1 主体**
    - SnowLuma 收发链路验证 → `QQProtocolClient` / `QQChannelAdapter`

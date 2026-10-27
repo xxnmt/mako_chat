@@ -34,19 +34,21 @@
 
 #### 架构设计
 
-采用**策略模式 + 双队列模型**：
+采用**策略模式 + 合成/播放分离**：TTSService 只负责合成，播放由渠道音频输出 `IAudioSink` 承担；桌宠渠道用 `PetAudioSink`（拥有播放器与播放队列），QQ 渠道不设 sink（只合成不播放）。
 
 ```
 LLM回复文本 → enqueueSentences() → m_ttsQueue(待合成) → ITTSProvider.synthesize()
                                                                     ↓
-                                    流式：pcmDataReady → StreamPlayer（随到随放，边合成边播）
-                                     首块PCM到达即起播，合成与播放并行
-                                    非流式：synthesisFinished → m_playQueue → FilePlayer
+                                    流式：pcmDataReady → IAudioSink::writePcm
+                                    非流式：synthesisFinished → IAudioSink::playFile
+                                                                    ↓
+                                    PetAudioSink（播放列队/播放器/首块起播）
 ```
 
 | 组件 | 职责 |
 |------|------|
-| `TTSService` | 管理双队列、协调合成与播放、清理临时文件 |
+| `TTSService` | 合成队列、Provider 管理、把音频交给 `IAudioSink` |
+| `IAudioSink` / `PetAudioSink` | 音频输出抽象 / 桌宠播放实现（播放器 + 播放队列 + 气泡时序） |
 | `ITTSProvider` | 抽象接口，支持多种 TTS 实现 |
 | `ApiTTSProvider` | 通过 HTTP API 调用 GPT-SoVITS 服务，流式合成时从 WAV 头读取真实采样率 |
 | `MockTTSProvider` | 模拟实现（开发测试用） |
@@ -377,7 +379,9 @@ Windows_AI/
 ├── petchanneladapter.h/cpp  # 桌宠渠道适配器（气泡/播放跟读）
 ├── qqchanneladapter.h/cpp   # QQ 渠道占位（Phase 1 接入 OneBot v11）
 ├── sessionrouter.h/cpp      # 输入路由（身份解析 + 双键历史组装）
-├── ttsservice.h/cpp         # TTS 语音服务（双队列+策略模式）
+├── ttsservice.h/cpp         # TTS 合成服务（策略模式；播放交 IAudioSink）
+├── iaudiosink.h             # 音频输出抽象接口
+├── petaudiosink.h/cpp       # 桌宠音频输出（播放器 + 播放队列）
 ├── ittsprovider.h           # TTS 抽象接口（策略模式基类）
 ├── apittsprovider.h/cpp    # GPT-SoVITS API 实现
 ├── mockttsprovider.h/cpp   # Mock 模拟实现

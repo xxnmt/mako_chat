@@ -172,22 +172,26 @@ rootObj["response_format"] = QJsonObject{{"type", "json_object"}};
 | 类型 | 名称 | 说明 |
 |------|------|------|
 | **私有变量** | `m_ttsQueue` | QQueue\<SentenceText\>，合成队列 |
-| | `m_playQueue` | QQueue\<PlayItem\>，播放队列 |
 | | `m_isSynthesizing` | bool，合成状态锁 |
-| | `m_isPlaying` | bool，播放状态锁 |
-| | `m_provider` | ITTSProvider*，TTS Provider接口 |
-| | `m_player` | IPcmPlayer*，当前播放器 |
-| | `m_pendingStreamPlayer` | IPcmPlayer*，流式合成中待播放的播放器 |
+| | `m_provider` | ITTSProvider*，TTS Provider 接口 |
+| | `m_audioSink` | IAudioSink*，渠道音频输出（非所有权） |
 | **函数签名** | `void enqueueSentences(const QList<SentenceText>& sentences)` | 入队多句话 |
-| | `void processTtsQueue()` | 合成生产者（流式：创建StreamPlayer并连接pcmDataReady） |
-| | `void processPlayQueue()` | 播放消费者（创建播放器+startPlayer） |
-| | `void onTtsFinished(const QString &audioPath, const SentenceText &sentence)` | 合成完成：入播放队列+setSynthesisDone |
-| | `void onTtsFailed(const QString &errorMsg, const SentenceText &sentence)` | 合成失败：跳过+继续 |
-| | `void onPcmPlayFinished()` | 播放完成：清理播放器+继续下一句 |
-| | `void onPcmPlayError(const QString &msg)` | 播放错误：直接调用onPcmPlayFinished |
-| | `void reloadProvider()` | 根据配置重新加载TTS Provider |
-| | `void switchModel(const QString& gptPath, const QString& sovitsPath)` | 切换GPT-SoVITS模型 |
-| **信号** | `void playAudioAction(const QString& zhText, const QMap<QString,QString>& tags)` | 播放同步信号 |
+| | `void setAudioSink(IAudioSink* sink)` | 注入桌宠音频输出；为空则只合成不播放 |
+| | `void processTtsQueue()` | 合成生产者（流式把 PCM 交给 sink） |
+| | `void onTtsFinished(...)` | 合成完成：`endStream` / `playFile`，继续合成 |
+| | `void onTtsFailed(...)` | 合成失败：中止流式缓冲 + 模拟播放 |
+| | `void reloadProvider()` | 根据配置重新加载 TTS Provider |
+| | `void switchModel(const QString& gptPath, const QString& sovitsPath)` | 切换 GPT-SoVITS 模型 |
+| **信号** | `void playAudioAction(const QString& zhText, const QMap<QString,QString>& tags)` | sink `sentenceStarted` 转发（同步气泡/立绘） |
+| | `void playbackQueueEmpty()` | 合成队列空且 sink 空闲 |
+
+### IAudioSink / PetAudioSink（音频输出，批次 C）
+
+| 类型 | 名称 | 说明 |
+|------|------|------|
+| **接口** | `IAudioSink` | `beginStream/writePcm/updateSampleRate/endStream/abortPendingStream/playFile/isIdle/stop` + `sentenceStarted` / `idle` |
+| **实现** | `PetAudioSink` | 桌宠渠道音频输出：拥有 `IPcmPlayer` 与播放队列；首句首块起播、后续句预缓冲、Mock 模拟 |
+| **装配** | `PetChannelAdapter::audioSink()` | 桌宠渠道创建并持有；AppController 注入 `TTSService::setAudioSink()` |
 
 **ITTSProvider 接口**：
 ```cpp
@@ -313,7 +317,7 @@ signals:
 | 类型 | 名称 | 说明 |
 |------|------|------|
 | **接口** | `channelName()` / `sendUtterance(const Utterance&)` | 纯虚接口，大脑侧不感知具体渠道 |
-| **PetChannelAdapter** | 持 `BubbleWidget*`（非所有权） | `sendUtterance` → `showMessage`；`onAudioReady` 槽保留播放跟读入口 |
+| **PetChannelAdapter** | 持 `BubbleWidget*`（非所有权） | `sendUtterance` → `showMessage`；持有 `PetAudioSink`（`audioSink()`），播放器归桌宠渠道 |
 | **QQChannelAdapter** | 占位 | `sendUtterance` 仅打印日志；Phase 1 接 OneBot v11（协议端选型见 HUMANIZATION_PLAN 3.2：SnowLuma） |
 
 ### SessionRouter（输入路由）
@@ -881,6 +885,7 @@ Windows_AI/
 
 | 日期 | 变更内容 |
 |------|----------|
+| 2026-10-27 | TTS 合成/播放分离（批次 C）：新增 `IAudioSink` / `PetAudioSink`；播放器与播放队列归桌宠渠道；TTSService 只合成，无 sink 时只合成不播放；人工听感回归通过 |
 | 2026-10-27 | v4 提取链路（提交 `1aa4436`）：`episodic_memory` + session_id；提取 prompt 带渠道/说话人/主体；档案三条准入规则；写入按本轮 meta 归属；信号回传 meta |
 | 2026-10-27 | PromptAssembler：上下文组装独立成类，群聊可见性过滤（C3）、说话人前缀、proactive assistant-only |
 | 2026-10-27 | identity 接线：`submitInput(senderId)`、`resolveSubject` 查 identity.json、启动时显式加载 |

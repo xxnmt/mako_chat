@@ -395,6 +395,12 @@
 - 内容：`episodic_memory` 增加 `session_id`；`extractMemoryAsync`/`memoryExtractionReady` 带 `RequestMeta`；提取 prompt 注入渠道/会话/说话人/主体，群聊对话带 uin；档案准入三条（长期有效/本人陈述/非敏感）；写入按本轮 meta 归属（origin/visibility/subject/session）；测试 4 套件 / 38 例全绿
 - 真实库：v3→v4 迁移成功，提取写入 4 条 episodic（origin=pet/visibility=private/subject=user/session=default）
 
+### M36: TTSService 合成/播放分离（已完成）
+
+- 日期：2026-10-27（批次 C）
+- 内容：新增 `IAudioSink` 抽象与 `PetAudioSink` 实现；播放器、播放队列、首块起播/后续句预缓冲/Mock 模拟整体迁入桌宠渠道；TTSService 只保留合成队列与 Provider 管理；`setAudioSink()` 注入，无 sink 时只合成不播放；`playAudioAction` 由 sink 的 `sentenceStarted` 转发
+- 验证：构建通过、4 套件 / 38 例通过；人工听感回归（多句流式、单句、起播/切换）正常，无残留 TTS 进程
+
 ---
 
 ## 技术债务
@@ -482,6 +488,7 @@
 | v0.7.0-alpha | 大脑/渠道解耦（Phase 0） | SessionRouter + IChannelAdapter + PetChannelAdapter + QQChannelAdapter(占位) + MemoryManager v2 + ConfigManager(identity.json) | 统一 Utterance/RequestMeta 协议、渠道适配器、输入路由、记忆按 channel+session 双键隔离、身份层配置预留、23 例自动化测试 |
 | v0.7.0-beta | 记忆库 v3（Phase 0.5） | MemoryManager v3 + LLMService 轮次渲染 | `raw_events` 原始事件流水、`chat_history` 轮次语义（user_input 可空/turn_kind/trigger_event_ids/subject）、`episodic` visibility/subject、`memory_cursor`、31 例自动化测试 |
 | v0.7.0-rc | Phase 1 前置项 | SessionRouter(identity) + PromptAssembler + MemoryManager v4 | 身份解析、渠道可见性上下文组装、提取带 meta、`episodic.session_id`、38 例自动化测试 |
+| v0.7.0-rc2 | TTS 合成/播放分离 | TTSService + IAudioSink + PetAudioSink | 播放器归桌宠渠道、无 sink 只合成不播放、人工听感回归通过 |
 
 ---
 

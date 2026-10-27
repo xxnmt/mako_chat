@@ -26,7 +26,8 @@
 | | ChatWidget | 聊天输入窗口、弹出跟随 | chatwidget.h/cpp |
 | **业务层** | LLMService | DeepSeek请求、JSON协议解析、句子拆分、记忆提取 | llmservice.h/cpp |
 | | PromptAssembler | 按渠道/可见性组装 system prompt 与短期记忆 messages（C3） | promptassembler.h/cpp |
-| | TTSService | 语音合成队列、播放队列、策略模式（ITTSProvider） | ttsservice.h/cpp, ittsprovider.h, apittsprovider.h/cpp |
+| | TTSService | TTS 合成队列、策略模式（ITTSProvider）；播放交给 IAudioSink | ttsservice.h/cpp, ittsprovider.h, apittsprovider.h/cpp |
+| | IAudioSink / PetAudioSink | 音频输出抽象 / 桌宠播放实现（播放器 + 播放队列） | iaudiosink.h, petaudiosink.h/cpp |
 | | ApiTTSProvider | GPT-SoVITS API 调用、流式 PCM 解析 | apittsprovider.h/cpp |
 | | TTSProcessManager | GPT-SoVITS 进程管理、孤儿进程清理（killProcessOnPort） | ttsprocessmanager.h/cpp |
 | | TTSReferenceManager | 按情绪加载参考音频映射（tts_map.json） | ttsreferencemanager.h/cpp |
@@ -398,50 +399,34 @@ rootObj["response_format"] = QJsonObject{{"type", "json_object"}};
 
 ### 2.6 TTSService
 
-**职责**：TTS语音合成与播放管理
+**职责**：TTS 语音合成（句子 → 音频/PCM），把音频交给渠道音频输出；不直接管理播放器
 
 **设计要点**：
 - **策略模式**：通过 `ITTSProvider` 抽象接口支持多种 TTS 实现
-- **双队列模型**：合成队列 `m_ttsQueue` → 播放队列 `m_playQueue`
-- **双状态锁**：`m_isSynthesizing` / `m_isPlaying` 控制并发
+- **合成队列**：`m_ttsQueue` + `m_isSynthesizing` 控制合成流水线
+- **合成/播放分离**：合成结果交给 `IAudioSink`；桌宠由 `PetAudioSink` 播放，QQ 不设置 sink（只合成不播放）
+- **播放器归桌宠**：播放器、播放队列、气泡/立绘时序都在 `PetAudioSink`，TTSService 只把 `sentenceStarted` 转成 `playAudioAction`
 - **流式合成**：`ApiTTSProvider` 调用 GPT-SoVITS HTTP API，`streaming_mode=true`，通过 `pcmDataReady` 信号实时推送 PCM 数据
 - **播放器抽象**：`IPcmPlayer` 接口统一 `StreamPlayer`（流式）和 `FilePlayer`（文件型）两种播放器
-- **预填充防吞开头**：`startPlayer` 时先把队列中已到达的 PCM 写入 QBuffer，再 `QAudioSink::start`，避免设备冷启动期间数据丢失
+- **预填充防吞开头**：`startPlayer` 时先把队列中已到达的 PCM 写入 QBuffer，再 `QAudioSink::start`
 - **播放完成检测**：`setSynthesisDone()` 标记合成结束，`onStateChanged(IdleState)` + `checkPlayEnd()` 兜底定时器双重检测
-- **模拟回退**：合成失败时走模拟播放（按字数估算时长）
+- **模拟回退**：合成失败时由 sink 走模拟播放（按字数估算时长）
 
 **架构图**：
 ```
-                    ┌──────────────────────────────────────────────────┐
-                    │                  TTSService                      │
-                    │                                                  │
-  SentenceText ───► │  m_ttsQueue (待合成)                             │
-  (enqueueSentences)│      │                                           │
-                    │      ▼                                           │
-                    │  processTtsQueue()                               │
-                    │      │ 流式：创建 StreamPlayer，连接 pcmDataReady │
-                    │      ▼                                           │
-                    │  ApiTTSProvider.synthesize() (HTTP POST /tts)    │
-                    │      │                                           │
-                    │      ├─ pcmDataReady(QByteArray) ─► StreamPlayer │
-                    │      │   (writePcm → m_queue)                    │
-                    │      ▼                                           │
-                    │  onTtsFinished()                                 │
-                    │      │ 流式：setSynthesisDone() 标记合成完成      │
-                    │      ▼                                           │
-                    │  m_playQueue (待播放)                             │
-                    │      │                                           │
-                    │      ▼                                           │
-                    │  processPlayQueue()                              │
-                    │      │                                           │
-                    │      ├──► playAudioAction(zhText, tags) ──► UI   │
-                    │      │                                           │
-                    │      └──► IPcmPlayer::startPlayer()              │
-                    │           ├─ StreamPlayer: 预填充+QAudioSink     │
-                    │           └─ FilePlayer: WAV头解析+预填充        │
-                    │                                                  │
-                    │  onPcmPlayFinished() → 清理+继续下一句            │
-                    └──────────────────────────────────────────────────┘
+  SentenceText ──► TTSService（只合成）
+                      │ enqueueSentences → m_ttsQueue → processTtsQueue
+                      ▼
+                  ApiTTSProvider.synthesize() (HTTP POST /tts)
+                      │
+                      ├─ 流式 pcmDataReady ──► IAudioSink::writePcm / updateSampleRate
+                      └─ synthesisFinished ──► IAudioSink::endStream / playFile
+
+  PetAudioSink（桌宠渠道，拥有播放器）
+      ├─ beginStream：创建 StreamPlayer，首句立即起播
+      ├─ 后续句：PCM 预缓冲，上一句播完后起播
+      ├─ sentenceStarted ──► TTSService::playAudioAction ──► 气泡 + 立绘
+      └─ 播放队列空 ──► idle ──► playbackQueueEmpty
 ```
 
 **ITTSProvider 接口**：
@@ -480,7 +465,17 @@ signals:
 };
 ```
 
-**依赖关系**：TTSService 只 include `ipcmplayer.h`，不依赖具体子类。`ipcmplayer.cpp` 实现工厂方法，include streamplayer.h/fileplayer.h（头文件不循环依赖）。
+**依赖关系**：TTSService 只依赖 `IAudioSink` 抽象；`PetAudioSink` 负责创建 `IPcmPlayer`（工厂方法），并 include streamplayer/fileplayer 的工厂实现。
+
+**音频输出接口（IAudioSink）**：
+| 方法/信号 | 作用 |
+|-----------|------|
+| `beginStream(sentence, sampleRate)` | 开始一句流式合成（sink 决定是否立即起播） |
+| `writePcm(pcm)` / `updateSampleRate(rate)` | 写入 PCM / 采样率校正 |
+| `endStream(sentence)` / `abortPendingStream()` | 合成结束 / 异常中止 |
+| `playFile(path, sentence, sampleRate)` | 文件型或模拟播放（空路径 = 模拟） |
+| `isIdle()` / `stop()` | 是否空闲 / 停止并清理 |
+| `sentenceStarted(sentence)` / `idle` | 开始播放某句（UI 同步） / 队列排空 |
 
 **关键方法**：
 | 方法 | 作用 | 参数 | 返回值 |
@@ -488,20 +483,19 @@ signals:
 | `enqueueSentences()` | 接收多句话，推入合成队列 | QList\<SentenceText\> | - |
 | `reloadProvider()` | 根据配置重新加载 TTS Provider | - | - |
 | `switchModel()` | 切换 GPT-SoVITS 模型 | gptPath, sovitsPath | - |
-| `processTtsQueue()` | 取出一句调用 Provider 合成 | - | - |
-| `onTtsFinished()` | 合成完成：入播放队列+setSynthesisDone+继续合成 | audioPath, sentence | - |
-| `onTtsFailed()` | 合成失败：跳过该句，继续合成 | errorMsg, sentence | - |
-| `processPlayQueue()` | 取出一句：发信号+创建播放器+startPlayer | - | - |
-| `onPcmPlayFinished()` | 播放完成：清理播放器+继续播放下一句 | - | - |
-| `onPcmPlayError()` | 播放错误：直接调用 onPcmPlayFinished | msg | - |
+| `setAudioSink()` | 注入渠道音频输出（桌宠 PetAudioSink；空=只合成不播放） | IAudioSink* | - |
+| `processTtsQueue()` | 取出一句调用 Provider 合成；流式把 PCM 转给 sink | - | - |
+| `onTtsFinished()` | 合成完成：流式 `endStream` / 文件 `playFile`，继续合成 | audioPath, sentence | - |
+| `onTtsFailed()` | 合成失败：中止流式缓冲并交 sink 模拟播放 | errorMsg, sentence | - |
 
 **信号**：
 | 信号 | 触发时机 | 参数 |
 |------|----------|------|
-| `playAudioAction(zhText, tags)` | 播放开始时，用于同步UI | QString, QMap\<QString,QString\> |
+| `playAudioAction(zhText, tags)` | sink 的 `sentenceStarted` 转发（桌宠播放开始时同步 UI） | QString, QMap\<QString,QString\> |
+| `playbackQueueEmpty()` | 合成队列空且 sink 空闲（本轮全部播完） | - |
 
 **StreamPlayer 播放完成检测机制**：
-- **setSynthesisDone()**：TTSService 在 onTtsFinished 中调用，标记所有 PCM 已到达
+- **setSynthesisDone()**：PetAudioSink 在 `endStream` 中调用，标记所有 PCM 已到达
 - **onStateChanged(IdleState)**：QAudioSink 状态变 Idle 时检查 `queueEmpty && bufferDone && synthesisDone`
 - **checkPlayEnd() 兜底定时器**：500ms 间隔，检测 `queueEmpty && bufferDone && deviceEmpty`，连续3次（1.5秒）满足则判定播放完
 - **finishAndEmit()**：统一停止定时器+emit PcmPlayerFinished
@@ -1179,10 +1173,11 @@ ChatWidget::textSubmitted(text)
    └── 继续取下一句
    │
    ▼
-9. 播放队列/流式播放（Consumer）
+9. 音频输出（PetAudioSink，桌宠渠道）
    │
-   ├── 流式：首块PCM到达 → playAudioAction信号 → StreamPlayer随到随放
-   └── 非流式：synthesisFinished入队 → FilePlayer读取文件播放
+   ├── 流式：beginStream/writePcm → 首块PCM到达 → sentenceStarted → playAudioAction
+   ├── 后续句：PCM预缓冲 → 上一句播完 → 起播并切换气泡
+   └── 非流式：playFile → FilePlayer读取文件播放
    │
    ▼
 10. AppController::onPlayAudioAction(zhText, tags)
@@ -1246,7 +1241,7 @@ image/
 |------|----------|------|
 | **单例模式** | ConfigManager | 全局配置唯一实例 |
 | **观察者模式** | 信号槽系统（AppController为中枢） | 模块间松耦合通信 |
-| **生产者-消费者** | TTSService（合成队列→播放队列） | TTS流水线解耦 |
+| **生产者-消费者** | TTSService（合成）→ PetAudioSink（播放队列） | 合成与播放解耦，渠道可替换输出 |
 | **策略模式** | TTSService（ITTSProvider接口） | 多种TTS实现可切换 |
 | **适配器模式** | IChannelAdapter（PetChannelAdapter/QQChannelAdapter） | 渠道表现可插拔，大脑不感知渠道 |
 | **上下文对象** | RequestMeta | 渠道/会话/主体元数据随轮次贯穿全链路 |

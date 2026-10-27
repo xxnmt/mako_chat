@@ -4,7 +4,7 @@
 > 类型：规划文档（分阶段实施中）
 > 版本：v0.9（Phase 1 前置项实施中，2026-10-27）
 > 制定日期：2026-10-19
-> 状态：Phase 0 / 0.5 已完成；Phase 1 前置项：identity、PromptAssembler、v4 提取链路已完成，剩 TTSService 拆分与 GlobalMoodState
+> 状态：Phase 0 / 0.5 已完成；Phase 1 前置项：identity、PromptAssembler、v4 提取链路、TTSService 合成/播放分离已完成，剩 GlobalMoodState
 > 关联文档：[ROADMAP.md](ROADMAP.md)、[ARCHITECTURE.md](ARCHITECTURE.md)
 
 ---
@@ -678,7 +678,7 @@ CREATE TABLE memory_cursor (
 
 #### 10.5.5 剩余前置项
 
-- [ ] TTSService 合成/播放分离（QQ 渠道只合成不播放，播放器归桌宠）
+- [x] TTSService 合成/播放分离（批次 C）：新增 `IAudioSink` / `PetAudioSink`，播放器与播放队列归桌宠渠道；`TTSService` 只负责合成；无 sink 时只合成不播放。人工回归：多句流式、单句、起播/切换时序正常
 - [ ] GlobalMoodState（全局情绪 + D1 `followExternalMood`）
 
 ---
