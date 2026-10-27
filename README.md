@@ -264,7 +264,8 @@ cmake --build . --config Release
   "identity": {
     "self":   { "qq": ["10001"] },
     "master": { "qq": ["20001"] }
-  }
+  },
+  "appearance": { "follow_external_mood": true }
 }
 ```
 
@@ -272,6 +273,7 @@ cmake --build . --config Release
 |------|------|
 | `identity.self.qq` | 她自己的 QQ（用于丢弃自触发消息） |
 | `identity.master.qq` | 主人的 QQ 列表（多账号都归一为 `subject='user'`） |
+| `appearance.follow_external_mood` | D1：外部渠道（未来 QQ）的情绪是否驱动桌宠立绘；默认 `true`，`false` 时只更新全局情绪 |
 
 规则：按 uin 绑定（与昵称无关）；`self` 消息直接丢弃、`master` → `user`、未知 QQ → `qq:<uin>`；应用启动时加载，日志输出 `identity.json 加载完成: self N 个 / master N 个`。
 
@@ -358,11 +360,12 @@ Windows_AI/
 │   ├── closer/              # 近景立绘
 │   ├── far/                 # 远景立绘
 │   └── default_config/      # 默认配置（prompt.txt）
-├── tests/                   # 单元测试（Qt Test + CTest，4 套件 / 38 例）
+├── tests/                   # 单元测试（Qt Test + CTest，5 套件 / 45 例）
 │   ├── tst_memorymanager.cpp
 │   ├── tst_configmanager.cpp
 │   ├── tst_sessionrouter.cpp
-│   └── tst_promptassembler.cpp
+│   ├── tst_promptassembler.cpp
+│   └── tst_globalmoodstate.cpp
 ├── image.qrc                # Qt 资源文件
 ├── CMakeLists.txt           # CMake 构建配置
 ├── main.cpp                 # 入口函数
@@ -382,6 +385,7 @@ Windows_AI/
 ├── ttsservice.h/cpp         # TTS 合成服务（策略模式；播放交 IAudioSink）
 ├── iaudiosink.h             # 音频输出抽象接口
 ├── petaudiosink.h/cpp       # 桌宠音频输出（播放器 + 播放队列）
+├── globalmoodstate.h/cpp    # 全局情绪（D2；外部情绪驱动立绘受 D1 控制）
 ├── ittsprovider.h           # TTS 抽象接口（策略模式基类）
 ├── apittsprovider.h/cpp    # GPT-SoVITS API 实现
 ├── mockttsprovider.h/cpp   # Mock 模拟实现

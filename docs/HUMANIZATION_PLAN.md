@@ -2,9 +2,9 @@
 
 > 项目：Windows_AI 桌面看板娘（桌宠）
 > 类型：规划文档（分阶段实施中）
-> 版本：v0.9（Phase 1 前置项实施中，2026-10-27）
+> 版本：v1.0（Phase 1 前置项完成，2026-10-27）
 > 制定日期：2026-10-19
-> 状态：Phase 0 / 0.5 已完成；Phase 1 前置项：identity、PromptAssembler、v4 提取链路、TTSService 合成/播放分离已完成，剩 GlobalMoodState
+> 状态：Phase 0 / 0.5 已完成；Phase 1 前置项（identity / PromptAssembler / v4 / TTS 分离 / GlobalMoodState）**全部完成**；下一步 Phase 1 主体（SnowLuma + QQ）
 > 关联文档：[ROADMAP.md](ROADMAP.md)、[ARCHITECTURE.md](ARCHITECTURE.md)
 
 ---
@@ -446,7 +446,7 @@ dsh 是一个**四层洋葱结构**，内核是 Cordis 插件框架（"Everythin
 |---|---|---|
 | **Phase 0** | 架构解耦（细则见 10.1）：`Utterance`/`RequestMeta` 统一协议 + `IChannelAdapter` 抽象 + `SessionRouter` 输入路由；记忆侧八项 ALTER + 读写扩参；identity/memory/proactive 配置解析 | **无**（零风险纯重构） |
 | **Phase 0.5** | 记忆预留收缩版（细则见 10.2）：v3 迁移仅加 `episodic_memory.visibility` 列 + `appendRawMessage`（不接线）；Percept/ChannelCapability/ToolRegistry 三空壳**缓建** | **无** |
-| **Phase 1** | SnowLuma 部署（小号）+ `QQProtocolClient` 收私聊/群聊 + 发文字/表情包/语音；届时完成 Percept 泛化与 raw_messages 接线。**前置项实施中**：identity / PromptAssembler / v4 提取链路已完成，剩 TTSService 拆分、GlobalMoodState（见 10.5） | SnowLuma |
+| **Phase 1** | SnowLuma 部署（小号）+ `QQProtocolClient` 收私聊/群聊 + 发文字/表情包/语音；届时完成 Percept 泛化与 raw_messages 接线。**前置项已全部完成**：identity / PromptAssembler / v4 提取链路 / TTSService 合成播放分离 / GlobalMoodState（见 10.5） | SnowLuma |
 | **Phase 2** | `ChatPlanner` 发言门控（frequency/dynamic）+ `ProactiveScheduler` 按配置主动开口 | 无 |
 | **Phase 3** | QQ 空间说说 + 高级互动（合并转发/戳一戳/表情回应）——**SnowLuma 内置空间互动（评论/点赞），无需换端** | SnowLuma |
 | **Phase 4** | 浏览器类经 dsh ACP（Playwright MCP）；评估 dsh 混合深度 | dsh（nightly） |
@@ -645,7 +645,7 @@ CREATE TABLE memory_cursor (
 
 ### 10.5 Phase 1 前置实施记录（2026-10-27）
 
-> 代码提交：`1aa4436`（identity + PromptAssembler + v4 提取链路）；测试：4 套件 / 38 例全绿；真实库 v3→v4 迁移验证通过。
+> 代码提交：`1aa4436`（identity + PromptAssembler + v4 提取链路）；测试：5 套件 / 45 例全绿；真实库 v3→v4 迁移验证通过。
 
 #### 10.5.1 identity 身份接入
 
@@ -676,10 +676,12 @@ CREATE TABLE memory_cursor (
 - 关系值按 subject 跨群共享；群聊 prompt 继续隐藏数值（先不改）
 - 摘要与情景记忆内容重叠的问题（summary 兼任蒸馏游标导致）**暂缓**，后续接 `memory_cursor` 时一并调整
 
-#### 10.5.5 剩余前置项
+#### 10.5.5 前置项完成情况
 
 - [x] TTSService 合成/播放分离（批次 C）：新增 `IAudioSink` / `PetAudioSink`，播放器与播放队列归桌宠渠道；`TTSService` 只负责合成；无 sink 时只合成不播放。人工回归：多句流式、单句、起播/切换时序正常
-- [ ] GlobalMoodState（全局情绪 + D1 `followExternalMood`）
+- [x] GlobalMoodState（批次 D）：`emotion/blush/distance` 提升为全局状态；桌宠侧 `applyPetTags()` 同步立绘与全局情绪；外部渠道情绪按 `followExternalMood`（D1，来自 `identity.json [appearance]`）决定是否驱动桌宠立绘；退火仍归桌宠渠道（D2）。自动化 5 例；桌宠人工回归通过
+
+至此 Phase 1 前置项全部完成，下一步进入 **Phase 1 主体**（SnowLuma 部署 + QQ 渠道接入）。
 
 ---
 

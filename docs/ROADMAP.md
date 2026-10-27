@@ -204,12 +204,12 @@
 - [x] **identity.json 配置解析**（self/master/盲区/立绘跟随/主动对话，Phase 0 只读、无调度）
 - [x] **Phase 0 单元测试 23 例**（memorymanager 10 / configmanager 8 / sessionrouter 5），修复 BUG-1 未摘要游标恒空、BUG-2 空标签误判
 - [x] **Phase 0.5 / 记忆库 v3**（提交 `8f24ae5`）：`chat_history` 轮次语义（`user_input` 可空 + `turn_kind`/`trigger_event_ids`/`subject`）、`raw_messages`→`raw_events`、`episodic_memory` 加 `visibility`/`subject`、新建 `memory_cursor`、`appendRawEvent`/游标/过滤 API
-- [ ] **Phase 1 前置项**（提交 `1aa4436`）：
+- [x] **Phase 1 前置项（全部完成）**：
   - [x] identity 身份解析（`SessionRouter::senderId` + identity.json 启动加载）
   - [x] `PromptAssembler`（渠道可见性 C3、群聊说话人前缀、主动轮 assistant-only）
   - [x] v4 提取链路（`episodic.session_id`、提取带渠道/说话人/主体、档案三条准入规则）
   - [x] TTSService 合成/播放分离（`IAudioSink` / `PetAudioSink`，播放器归桌宠；无 sink 只合成不播放）
-  - [ ] GlobalMoodState（全局情绪 + D1）
+  - [x] GlobalMoodState（全局情绪；外部情绪驱动立绘受 D1 控制，退火归桌宠 D2）
 - [ ] **Phase 1 主体**：SnowLuma 部署 + `QQProtocolClient`/`QQChannelAdapter` 收发
 - [ ] **Phase 2**：`ChatPlanner` 发言门控 + `ProactiveScheduler` 主动对话
 - [ ] **Phase 3**：QQ 空间说说/评论/点赞、合并转发/戳一戳/表情回应
@@ -493,7 +493,7 @@ v0.5.0  ████████████████████ 100%  JSON�
 v0.6.0  ████████████████████   95%  流式TTS播放 & 播放器抽象 & 时间管理（剩外观/快捷键/托盘等）
 Phase 0   ████████████████████  100%  多渠道架构解耦（已提交 61f1767）
 Phase 0.5 ████████████████████  100%  记忆库 v3（已提交 8f24ae5）
-Phase 1 前置 ████████████████░░░░   80%  身份/上下文/提取链路/TTS 分离已完成（剩 GlobalMoodState）
+Phase 1 前置 ████████████████████  100%  全部完成（identity/上下文/v4/TTS 分离/GlobalMoodState）
 Phase 1   ░░░░░░░░░░░░░░░░░░░░    0%  QQ 渠道接入（依赖 SnowLuma）
 v0.7.0  ░░░░░░░░░░░░░░░░░░░░   0%  架构改进 & 独立存档
 v0.8.0  ░░░░░░░░░░░░░░░░░░░░   0%  角色自定义 & 剧本系统
@@ -504,11 +504,9 @@ v0.9.0  ░░░░░░░░░░░░░░░░░░░░   0%  智�
 
 ## 近期任务（Next Up，2026-10-27 更新）
 
-1. **Phase 1 前置项（剩余）**
-   - GlobalMoodState（全局情绪 + D1 `followExternalMood`）
-   - 已完成：identity、PromptAssembler、v4 提取链路、TTSService 合成/播放分离
-
-2. **Phase 1 主体**
-   - SnowLuma 收发链路验证 → `QQProtocolClient` / `QQChannelAdapter`
+1. **Phase 1 主体**
+   - SnowLuma 部署 + 收发链路验证（私聊/群聊/图片/语音）
+   - `QQProtocolClient` / `QQChannelAdapter` 接入
+   > 前置项已全部完成（identity、PromptAssembler、v4 提取链路、TTSService 分离、GlobalMoodState）
 
 > 顺延（不影响主线）：LLM 错误重试、ShortcutManager、TTS 语速/温度、外观配置、历史导出、立绘过渡动画、系统托盘、右键菜单扩展、AppController 职责拆分（TD-013）、独立存档、插件化。

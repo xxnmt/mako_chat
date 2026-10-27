@@ -3,7 +3,7 @@
 > 项目：Windows_AI 桌面看板娘（桌宠）
 > 日期：2026-10-27
 > 版本：v0.6.0 + Phase 0/0.5 + Phase 1 前置（记忆库 v4）
-> 状态：开发中（Phase 0/0.5 已完成，Phase 1 待开始）
+> 状态：开发中（Phase 0/0.5 与 Phase 1 前置项已完成，Phase 1 主体待开始）
 
 ---
 
@@ -17,6 +17,7 @@
 | | `m_bubble` | BubbleWidget*，气泡组件 |
 | | `m_llmService` | LLMService*，AI服务 |
 | | `m_appearance` | AppearanceManager*，外观管理 |
+| | `m_globalMood` | GlobalMoodState*，全局情绪（D2；外部情绪驱动受 D1 控制） |
 | | `m_ttsService` | TTSService*，TTS服务 |
 | | `m_chatWidget` | ChatWidget*，聊天输入窗口 |
 | | `m_anchorManager` | AnchorManager*，位置锚点管理 |
@@ -30,6 +31,7 @@
 | | `void handleMakoReply(const QList<SentenceText>& sentences, const QString& rawReply)` | 处理AI回复，保存记忆+入队TTS+触发记忆提取 |
 | | `void handleSystemError(const QString& errorMsg)` | 统一错误处理 |
 | | `void onPlayAudioAction(const QString& zhText, const QMap<QString,QString>& tags)` | 播放同步：更新气泡+立绘 |
+| | `void applyPetTags(const QMap<QString,QString>& tags)` | 桌宠侧：立绘（含服装）+ 全局情绪同步 |
 | | `void initConnections()` | 集中初始化信号槽连接 |
 
 ### CharacterWidget
@@ -338,6 +340,17 @@ signals:
 | **函数** | `buildSystemPrompt(base, meta, context)` | 档案/情景/摘要/关系按渠道过滤后拼 system prompt（C3） |
 | **函数** | `buildHistoryMessages(history, meta)` | 短期记忆 messages；proactive/perception assistant-only；群聊说话人前缀 |
 | **函数** | `isEpisodicVisible()` / `isUserProfileVisible()` | 可见性规则：pet 全可见、public 全渠道、channel 需 origin+session、private 仅 pet；群聊过滤亲密档案 key |
+
+### GlobalMoodState（全局情绪，批次 D）
+
+| 类型 | 名称 | 说明 |
+|------|------|------|
+| **私有变量** | `m_emotion` / `m_blush` / `m_distance` | 全局情绪三维（默认 happyIdle / unblushing / far） |
+| | `m_followExternalMood` | D1 开关（默认 true，来自 identity.json） |
+| **函数** | `applyTags(tags, sourceChannel)` | 更新全局情绪；非桌宠且 D1 开启时发 `externalMoodApplied` |
+| | `setFollowExternalMood(bool)` / `followExternalMood()` | 设置/读取 D1 |
+| | `getCurrentStateDescription(clothing)` | 与 AppearanceManager 同格式的状态描述 |
+| **信号** | `externalMoodApplied(const QMap<QString,QString>&)` | 外部情绪驱动桌宠立绘（仅情绪三维，不含服装） |
 
 ### MemoryManager（AI记忆系统）
 
@@ -885,6 +898,7 @@ Windows_AI/
 
 | 日期 | 变更内容 |
 |------|----------|
+| 2026-10-27 | GlobalMoodState（批次 D）：情绪三维提升为全局状态；`applyPetTags()` 统一桌宠立绘+全局情绪；D1 `followExternalMood` 控制外部情绪是否驱动立绘；TimeManager 退火仍归桌宠（D2） |
 | 2026-10-27 | TTS 合成/播放分离（批次 C）：新增 `IAudioSink` / `PetAudioSink`；播放器与播放队列归桌宠渠道；TTSService 只合成，无 sink 时只合成不播放；人工听感回归通过 |
 | 2026-10-27 | v4 提取链路（提交 `1aa4436`）：`episodic_memory` + session_id；提取 prompt 带渠道/说话人/主体；档案三条准入规则；写入按本轮 meta 归属；信号回传 meta |
 | 2026-10-27 | PromptAssembler：上下文组装独立成类，群聊可见性过滤（C3）、说话人前缀、proactive assistant-only |

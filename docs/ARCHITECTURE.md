@@ -26,6 +26,7 @@
 | | ChatWidget | 聊天输入窗口、弹出跟随 | chatwidget.h/cpp |
 | **业务层** | LLMService | DeepSeek请求、JSON协议解析、句子拆分、记忆提取 | llmservice.h/cpp |
 | | PromptAssembler | 按渠道/可见性组装 system prompt 与短期记忆 messages（C3） | promptassembler.h/cpp |
+| | GlobalMoodState | 全局情绪（emotion/blush/distance）；D1 控制外部情绪是否驱动桌宠立绘 | globalmoodstate.h/cpp |
 | | TTSService | TTS 合成队列、策略模式（ITTSProvider）；播放交给 IAudioSink | ttsservice.h/cpp, ittsprovider.h, apittsprovider.h/cpp |
 | | IAudioSink / PetAudioSink | 音频输出抽象 / 桌宠播放实现（播放器 + 播放队列） | iaudiosink.h, petaudiosink.h/cpp |
 | | ApiTTSProvider | GPT-SoVITS API 调用、流式 PCM 解析 | apittsprovider.h/cpp |
@@ -122,10 +123,11 @@ SessionRouter::submitInput(channel, sessionId, speaker, text, senderId)   // 桌
                         ▼
         AppController::onPlayAudioAction
                 ├─ PetChannelAdapter::sendUtterance → BubbleWidget（渠道私有表现）
-                └─ AppearanceManager::applyTags（全局情绪层，D1 开关在 Phase 1 对 QQ 路径生效）
+                ├─ GlobalMoodState::applyTags(..., pet)（全局情绪，D2）
+                └─ AppearanceManager::applyTags（立绘表现；外部情绪经 D1 才驱动）
 ```
 
-**边界**：`QQChannelAdapter` 为占位；`resolveSubject` 恒返回 `'user'`；`raw_messages` 只建不写；`identity.json` 已解析但生产代码尚未调用（Phase 1 接线）。
+**边界**：`QQChannelAdapter` 为占位；identity 已接线（self→丢弃 / master→user / 未知→`qq:<uin>`）；`raw_messages` 只建不写；QQ 渠道尚未接入。
 
 ---
 
@@ -521,6 +523,7 @@ signals:
 - 路径变化时才发出 `characterPathChanged` 信号（防抖）
 - 路径格式与资源目录结构严格对应
 - **状态描述输出**：提供 `getCurrentStateDescription()` 用于AI状态同步
+- **与 GlobalMoodState 的关系**：情绪三维同时写入全局状态；桌宠侧由 AppController::applyPetTags() 统一同步，服装仍只属于外观层
 
 **状态机**：
 ```
@@ -1090,7 +1093,8 @@ ChatWidget::textSubmitted(text)
 ```
 
 **设计约束**：
-- 渠道私有表现（气泡/IM 发送/语音消息）只进适配器；情绪与立绘是全局层，不进任何渠道（D1 开关在 Phase 1 对 QQ 路径生效）
+- 渠道私有表现（气泡/IM 发送/语音消息）只进适配器；情绪是全局层（GlobalMoodState），立绘表现归桌宠（D2）
+- 外部渠道情绪是否驱动桌宠立绘由 D1 `followExternalMood` 控制（`identity.json [appearance]`）；退火仍只由桌宠渠道触发
 - 身份归属由宿主配置层决定（`SessionRouter::resolveSubject`），模型与渠道无权判定（C2）；`identity.json` 启动即加载
 - 记忆按 `channel + session_id` 双键隔离，摘要与未摘要游标同样按双键分桶（A1）
 
@@ -1108,6 +1112,24 @@ ChatWidget::textSubmitted(text)
 | `isUserProfileVisible()` | 群聊过滤含「关系/称呼/情感/依赖/性格」的档案 key |
 
 **记忆上下文结构**：`MemoryContext { userProfiles, makoProfiles, memories, summaries, relationships }`，由 `LLMService` 取数后传入。
+
+---
+
+### 2.18 GlobalMoodState（全局情绪）
+
+**职责**：保存跨渠道的 `emotion / blush / distance`（D2：情绪全局、立绘表现桌宠私有）。
+
+| 方法/信号 | 作用 |
+|-----------|------|
+| `applyTags(tags, sourceChannel)` | 更新全局情绪；服装不参与 |
+| `setFollowExternalMood(bool)` | D1：外部渠道情绪是否驱动桌宠立绘（来自 `identity.json [appearance]`） |
+| `getEmotion()/getBlush()/getDistance()` | 读取全局情绪 |
+| `getCurrentStateDescription(clothing)` | 与 AppearanceManager 同格式的状态描述（服装由外观层提供） |
+| `externalMoodApplied(moodTags)` | 仅当来源非桌宠且 D1 开启时发出；AppController 收到后应用到桌宠立绘（只三维，不含服装） |
+
+**接线**：
+- 桌宠：`AppController::applyPetTags()` → `AppearanceManager::applyTags()` + `GlobalMoodState::applyTags(..., pet)`
+- 外部渠道（未来 QQ）：`GlobalMoodState::applyTags(..., qq)` →（D1 开启）`AppearanceManager::applyTags(三维)`；不触发 TimeManager
 
 ---
 
@@ -1183,7 +1205,8 @@ ChatWidget::textSubmitted(text)
 10. AppController::onPlayAudioAction(zhText, tags)
     │
     ├── BubbleWidget::showMessage(zhText) → 打字机显示
-    └── AppearanceManager::applyTags(tags) → 立绘切换
+    ├── GlobalMoodState::applyTags(tags, pet) → 全局情绪同步
+└── AppearanceManager::applyTags(tags) → 立绘切换
 ```
 
 ### 3.2 历史记忆注入
