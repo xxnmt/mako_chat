@@ -158,7 +158,7 @@ POST /tts
 - **AI 服务**: DeepSeek API (deepseek-v4-flash)
 - **语音合成**: GPT-SoVITS（API 已接入，策略模式封装）
 - **音频播放**: IPcmPlayer 抽象（StreamPlayer 流式 / FilePlayer 文件，QAudioSink + QBuffer）
-- **数据库**: SQLite（v3 结构：原始事件流水 `raw_events` + 对话轮次 `chat_history` + 蒸馏记忆：角色档案、情景记忆、长期摘要、关系状态 + 蒸馏游标 `memory_cursor`）
+- **数据库**: SQLite（v4 结构：原始事件流水 `raw_events` + 对话轮次 `chat_history` + 蒸馏记忆：角色档案、情景记忆、长期摘要、关系状态 + 蒸馏游标 `memory_cursor`；情景记忆带 `origin/visibility/subject/session_id`）
 
 ## 📦 安装与构建
 
@@ -253,6 +253,26 @@ cmake --build . --config Release
 | `time.distance_lasting` | `15` | 距离退火时长（秒，1-3600） |
 | `tts.mode` | `api` | TTS 模式：`api`（真实API）或 `mock`（模拟实现） |
 
+### identity.json（身份绑定，Phase 1 前置，已实现）
+
+路径：`app_data/config/identity.json`（不存在时使用默认配置，桌宠行为不变）
+
+```json
+{
+  "identity": {
+    "self":   { "qq": ["10001"] },
+    "master": { "qq": ["20001"] }
+  }
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `identity.self.qq` | 她自己的 QQ（用于丢弃自触发消息） |
+| `identity.master.qq` | 主人的 QQ 列表（多账号都归一为 `subject='user'`） |
+
+规则：按 uin 绑定（与昵称无关）；`self` 消息直接丢弃、`master` → `user`、未知 QQ → `qq:<uin>`；应用启动时加载，日志输出 `identity.json 加载完成: self N 个 / master N 个`。
+
 ### 获取 DeepSeek API Key
 
 1. 访问 [DeepSeek Platform](https://platform.deepseek.com/api_keys)
@@ -307,7 +327,7 @@ cmake --build . --config Release
 
 **记忆提取机制**：当未摘要对话达到「长期记忆自动摘轮数」（默认 15 轮，可在设置界面或 `memory.summary_length` 配置）时，自动触发后台记忆提取，LLM 分析对话内容，传入已有档案做增量更新，生成角色档案、情景记忆、长期摘要和关系状态更新。
 
-**三层存储（v3）**：`raw_events` 存全量原始事件（QQ / B 站 / 窥屏 / 主动触发；`message_id` 去重，默认不进上下文）；`chat_history` 存对话轮次（`turn_kind` = reply/proactive/perception，`user_input` 可为 NULL，`trigger_event_ids` 关联原始事件，`subject` 标记对话对象）；`episodic_memory` / `long_term_summary` / `character_profile` / `relationship_state` 存蒸馏产物（情景记忆带 `origin` / `visibility` / `subject`）。`memory_cursor` 按 `channel + session_id` 记录蒸馏进度。多渠道双键隔离与 `relationship_state` 的 `UNIQUE(subject, dimension)` 保持 v2 设计。
+**三层存储（v4）**：`raw_events` 存全量原始事件（QQ / B 站 / 窥屏 / 主动触发；`message_id` 去重，默认不进上下文）；`chat_history` 存对话轮次（`turn_kind` = reply/proactive/perception，`user_input` 可为 NULL，`trigger_event_ids` 关联原始事件，`subject` 标记对话对象）；`episodic_memory` / `long_term_summary` / `character_profile` / `relationship_state` 存蒸馏产物（情景记忆带 `origin` / `visibility` / `subject` / `session_id`，按渠道+会话隔离）。`memory_cursor` 按 `channel + session_id` 记录蒸馏进度。提取时按「长期有效 / 本人明确陈述 / 非敏感」决定是否提升为角色档案。
 
 ## 📁 项目结构
 
@@ -322,9 +342,10 @@ Windows_AI/
 ├── app_data/                # 应用数据（运行时生成）
 │   ├── config/              # 配置文件
 │   │   ├── setting.json     # 配置文件（JSON格式）
+│   │   ├── identity.json    # 身份绑定（self/master QQ，可选）
 │   │   └── prompt.txt       # 系统提示词
 │   ├── memory/              # 记忆数据（SQLite数据库）
-│   │   └── QianDaoMoZi_memory.db  # 含 chat_history、character_profile、episodic_memory、long_term_summary、relationship_state 五张表
+│   │   └── QianDaoMoZi_memory.db  # 7 张表：chat_history/raw_events/episodic_memory/character_profile/long_term_summary/relationship_state/memory_cursor
 │   ├── reference_audio/    # 参考音频文件（GPT-SoVITS用）
 │   │   ├── happy_idle_01.wav
 │   │   ├── happy_more_01.wav
@@ -335,10 +356,11 @@ Windows_AI/
 │   ├── closer/              # 近景立绘
 │   ├── far/                 # 远景立绘
 │   └── default_config/      # 默认配置（prompt.txt）
-├── tests/                   # Phase 0 单元测试（Qt Test + CTest）
+├── tests/                   # 单元测试（Qt Test + CTest，4 套件 / 38 例）
 │   ├── tst_memorymanager.cpp
 │   ├── tst_configmanager.cpp
-│   └── tst_sessionrouter.cpp
+│   ├── tst_sessionrouter.cpp
+│   └── tst_promptassembler.cpp
 ├── image.qrc                # Qt 资源文件
 ├── CMakeLists.txt           # CMake 构建配置
 ├── main.cpp                 # 入口函数
@@ -349,6 +371,7 @@ Windows_AI/
 ├── anchormanager.h/cpp      # 位置锚点管理
 ├── anchorstrategy.h         # 锚点策略枚举
 ├── llmservice.h/cpp         # AI 服务模块
+├── promptassembler.h/cpp    # 上下文组装（渠道可见性 C3 / 轮次渲染）
 ├── utterance.h              # 统一输出协议（Utterance/RequestMeta/Channel 常量）
 ├── ichanneladapter.h        # 渠道抽象接口（IChannelAdapter）
 ├── petchanneladapter.h/cpp  # 桌宠渠道适配器（气泡/播放跟读）

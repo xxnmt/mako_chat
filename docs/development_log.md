@@ -9,6 +9,7 @@
 
 | 哈希 | 日期 | 类型 | 描述 | 关键变更 |
 |------|------|------|------|----------|
+| `1aa4436` | 2026-10-27 | feat | 新增提示词组装模块与身份解析逻辑 | identity 接线、PromptAssembler、v4 提取链路（episodic session_id / 提取 meta / 三条准入规则）、tst_promptassembler |
 | `8f24ae5` | 2026-10-27 | refactor | 升级记忆库结构至 v3 | `chat_history` 轮次语义、`raw_events`、`episodic` visibility/subject、`memory_cursor`、LLM 轮次渲染规则、15 例记忆测试 |
 | `1646ff4` | 2026-10-26 | docs | 更新 HUMANIZATION_PLAN 协议端选型与 Phase 规划 | SnowLuma 选型、Phase 0.5 收缩裁决、记忆 v2 设计 |
 | `b126180` | 2026-10-20 | docs | 补充 Phase 0 测试报告 | 人工异常回复校验、BUG-1/BUG-2 修复记录 |
@@ -378,6 +379,22 @@
   - **测试**：tst_memorymanager 10 → 15 例（v2→v3 迁移、proactive NULL、raw_events 去重、episodic 过滤、cursor），全量 31 例通过
   - **真实库验证**：v2 107 行 → v3 108 行，数据无损；对话/气泡/立绘/TTS 正常
 
+### M33: identity 身份接线（已完成）
+
+- 日期：2026-10-27（提交 `1aa4436`）
+- 内容：`SessionRouter::submitInput` 增加 `senderId` 并返回 bool；`resolveSubject` 查 identity.json（self 丢弃 / master→user / 未知→qq:<uin>）；`ConfigManager::loadIdentityConfig/reloadIdentity`；SessionRouter 构造时显式加载，启动日志可见
+
+### M34: PromptAssembler 上下文组装（已完成）
+
+- 日期：2026-10-27（提交 `1aa4436`）
+- 内容：新增 `PromptAssembler`；system prompt 的档案/情景/摘要/关系按渠道与 visibility 过滤（C3）；群聊不注入关系数值、过滤亲密档案 key；短期记忆 proactive/perception 只注入 assistant；群聊用户消息带说话人前缀
+
+### M35: v4 提取链路与会话隔离（已完成）
+
+- 日期：2026-10-27（提交 `1aa4436`）
+- 内容：`episodic_memory` 增加 `session_id`；`extractMemoryAsync`/`memoryExtractionReady` 带 `RequestMeta`；提取 prompt 注入渠道/会话/说话人/主体，群聊对话带 uin；档案准入三条（长期有效/本人陈述/非敏感）；写入按本轮 meta 归属（origin/visibility/subject/session）；测试 4 套件 / 38 例全绿
+- 真实库：v3→v4 迁移成功，提取写入 4 条 episodic（origin=pet/visibility=private/subject=user/session=default）
+
 ---
 
 ## 技术债务
@@ -464,6 +481,7 @@
 | v0.6.0 | 流式TTS播放与播放器抽象 & 时间管理 | TTSService + IPcmPlayer + StreamPlayer + FilePlayer + TimeManager + TTSProcessManager | 流式PCM播放（streaming_mode+pcmDataReady）、IPcmPlayer抽象接口（静态工厂方法）、播放完成检测（setSynthesisDone+IdleState+兜底定时器）、预填充防吞开头、FilePlayer WAV头解析完善、signals遮蔽bug修复、野指针崩溃修复、TimeManager QTimer singleShot 退火机制、TTSProcessManager 孤儿进程清理（killProcessOnPort） |
 | v0.7.0-alpha | 大脑/渠道解耦（Phase 0） | SessionRouter + IChannelAdapter + PetChannelAdapter + QQChannelAdapter(占位) + MemoryManager v2 + ConfigManager(identity.json) | 统一 Utterance/RequestMeta 协议、渠道适配器、输入路由、记忆按 channel+session 双键隔离、身份层配置预留、23 例自动化测试 |
 | v0.7.0-beta | 记忆库 v3（Phase 0.5） | MemoryManager v3 + LLMService 轮次渲染 | `raw_events` 原始事件流水、`chat_history` 轮次语义（user_input 可空/turn_kind/trigger_event_ids/subject）、`episodic` visibility/subject、`memory_cursor`、31 例自动化测试 |
+| v0.7.0-rc | Phase 1 前置项 | SessionRouter(identity) + PromptAssembler + MemoryManager v4 | 身份解析、渠道可见性上下文组装、提取带 meta、`episodic.session_id`、38 例自动化测试 |
 
 ---
 

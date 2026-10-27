@@ -1,7 +1,7 @@
 # 开发路线图
 
 > 项目：Windows_AI 桌面看板娘（桌宠）
-> 版本：v0.6.0（Phase 0 多渠道架构已完成）
+> 版本：v0.6.0（Phase 0/0.5 已完成，Phase 1 前置进行中）
 > 更新日期：2026-10-26
 
 ---
@@ -204,7 +204,13 @@
 - [x] **identity.json 配置解析**（self/master/盲区/立绘跟随/主动对话，Phase 0 只读、无调度）
 - [x] **Phase 0 单元测试 23 例**（memorymanager 10 / configmanager 8 / sessionrouter 5），修复 BUG-1 未摘要游标恒空、BUG-2 空标签误判
 - [x] **Phase 0.5 / 记忆库 v3**（提交 `8f24ae5`）：`chat_history` 轮次语义（`user_input` 可空 + `turn_kind`/`trigger_event_ids`/`subject`）、`raw_messages`→`raw_events`、`episodic_memory` 加 `visibility`/`subject`、新建 `memory_cursor`、`appendRawEvent`/游标/过滤 API
-- [ ] **Phase 1**：SnowLuma 部署 + `QQProtocolClient`/`QQChannelAdapter` 收发（前置：TTSService 合成/播放分离、`PromptAssembler`、`GlobalMoodState`）
+- [ ] **Phase 1 前置项**（提交 `1aa4436`）：
+  - [x] identity 身份解析（`SessionRouter::senderId` + identity.json 启动加载）
+  - [x] `PromptAssembler`（渠道可见性 C3、群聊说话人前缀、主动轮 assistant-only）
+  - [x] v4 提取链路（`episodic.session_id`、提取带渠道/说话人/主体、档案三条准入规则）
+  - [ ] TTSService 合成/播放分离
+  - [ ] GlobalMoodState（全局情绪 + D1）
+- [ ] **Phase 1 主体**：SnowLuma 部署 + `QQProtocolClient`/`QQChannelAdapter` 收发
 - [ ] **Phase 2**：`ChatPlanner` 发言门控 + `ProactiveScheduler` 主动对话
 - [ ] **Phase 3**：QQ 空间说说/评论/点赞、合并转发/戳一戳/表情回应
 - [ ] **Phase 4**：经 dsh ACP 接入浏览器类工具
@@ -487,6 +493,7 @@ v0.5.0  ████████████████████ 100%  JSON�
 v0.6.0  ████████████████████   95%  流式TTS播放 & 播放器抽象 & 时间管理（剩外观/快捷键/托盘等）
 Phase 0   ████████████████████  100%  多渠道架构解耦（已提交 61f1767）
 Phase 0.5 ████████████████████  100%  记忆库 v3（已提交 8f24ae5）
+Phase 1 前置 ████████████░░░░░░░░   60%  身份/上下文/提取链路已完成（剩 TTS 分离、GlobalMoodState）
 Phase 1   ░░░░░░░░░░░░░░░░░░░░    0%  QQ 渠道接入（依赖 SnowLuma）
 v0.7.0  ░░░░░░░░░░░░░░░░░░░░   0%  架构改进 & 独立存档
 v0.8.0  ░░░░░░░░░░░░░░░░░░░░   0%  角色自定义 & 剧本系统
@@ -497,8 +504,10 @@ v0.9.0  ░░░░░░░░░░░░░░░░░░░░   0%  智�
 
 ## 近期任务（Next Up，2026-10-27 更新）
 
-1. **Phase 1 前置项**
-   - TTSService 合成/播放分离、`GlobalMoodState`、`PromptAssembler`、`resolveSubject` 接 identity.json
+1. **Phase 1 前置项（剩余）**
+   - TTSService 合成/播放分离（QQ 只合成不播放，播放器归桌宠）
+   - GlobalMoodState（全局情绪 + D1 `followExternalMood`）
+   - 已完成：identity、PromptAssembler、v4 提取链路
 
 2. **Phase 1 主体**
    - SnowLuma 收发链路验证 → `QQProtocolClient` / `QQChannelAdapter`

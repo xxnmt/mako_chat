@@ -2,7 +2,7 @@
 
 > 项目：Windows_AI 桌面看板娘（桌宠）
 > 日期：2026-10-27
-> 版本：v0.6.0 + Phase 0/0.5（多渠道 + 记忆库 v3）
+> 版本：v0.6.0 + Phase 0/0.5 + Phase 1 前置（记忆库 v4）
 > 状态：开发中（Phase 0/0.5 已完成，Phase 1 待开始）
 
 ---
@@ -109,10 +109,10 @@
 | | `m_stateProvider` | std::function\<QString()\>，状态提供者回调 |
 | | `m_memoryManager` | MemoryManager*，AI记忆系统 |
 | **函数签名** | `LLMService(const QString& apiKey, QObject* parent)` | 构造函数，接收API Key参数 |
-| | `void askDeepSeek(const QString& userInput, const QList<HistoryTurn>& historyQA)` | 发起DeepSeek请求（JSON协议，含response_format），构建系统提示词注入 角色档案→情景记忆→长期摘要→关系状态 |
+| | `void askDeepSeek(const QString& userInput, const QList<HistoryTurn>& historyQA, const RequestMeta& meta = RequestMeta())` | 发起DeepSeek请求（JSON协议），记忆上下文交 PromptAssembler 按渠道组装 |
 | | `void onReplyFinished(QNetworkReply* reply)` | 解析JSON回复→拆句→标签校验→发信号 |
 | | `QPair<QList<SentenceText>, QString> parseJsonReply(const QString& replyText)` | 解析JSON回复，提取句子和标签 |
-| | `void extractMemoryAsync(const QList<HistoryTurn>& turns, qlonglong lastEndId, const QList<qlonglong>& sourceIds, const QList<CharacterProfile>& existingProfiles, const QList<EpisodicMemory>& existingMemories)` | 异步提取记忆（角色档案+情景记忆+长期摘要+关系状态），传入已有档案/记忆做增量更新，附带当前关系状态上下文 |
+| | `void extractMemoryAsync(turns, lastEndId, sourceIds, existingProfiles, existingMemories, const RequestMeta& meta = RequestMeta())` | 异步提取记忆；prompt 带渠道/会话/说话人/主体，结果按本轮 meta 归属 |
 | | `void registerStateProvider(std::function<QString()> provider)` | 注册状态提供者 |
 | | `void setMemoryManager(MemoryManager* manager)` | 设置MemoryManager实例 |
 | | `void initializePromptFile()` | 初始化提示词文件 |
@@ -120,7 +120,7 @@
 | | `void setApiKey(const QString& apiKey)` | 设置API Key |
 | **信号** | `void sentencesReady(const QList<SentenceText>& sentences, const QString& rawReply)` | 句子解析完成（复数形式，语义正确） |
 | | `void internetErrorSignal(const QString& errorMessage)` | 网络错误 |
-| | `void memoryExtractionReady(const QJsonObject& extractionResult, qlonglong lastEndId, const QString& sourceIdsJson)` | 记忆提取完成（extractionResult 含 character_updates/episodic_memories/working_summary/relationship_updates 四类字段） |
+| | `void memoryExtractionReady(const QJsonObject& extractionResult, qlonglong lastEndId, const QString& sourceIdsJson, const RequestMeta& meta)` | 记忆提取完成（四类字段；meta 为本轮渠道/会话/说话人/主体） |
 
 **JSON输出协议**：
 ```json
@@ -321,9 +321,19 @@ signals:
 | 类型 | 名称 | 说明 |
 |------|------|------|
 | **职责** | 输入归一化 → 身份解析 → 按会话桶组装历史 → 发 `requestReply` | - |
-| **函数** | `void submitInput(channel, sessionId, speaker, text)` | 空输入拦截；组装 `RequestMeta` |
-| **函数** | `QString resolveSubject(channel, senderId)` | Phase 0 恒返回 `'user'`；Phase 1 查 identity.json（self→丢弃 / master→'user' / 未知→`qq:<uin>`） |
+| **函数** | `bool submitInput(channel, sessionId, speaker, text, senderId = QString())` | 空输入/自身消息返回 false；组装 `RequestMeta` |
+| **函数** | `QString resolveSubject(channel, senderId)` | 桌宠/空→`user`；self→空串（丢弃）；master→`user`；未知 QQ→`qq:<uin>`；其他→`<channel>:<id>` |
+| **构造** | `SessionRouter(...)` | 启动时调用 `ConfigManager::loadIdentityConfig()` |
 | **信号** | `void requestReply(const QString&, const QList<HistoryTurn>&, const RequestMeta&)` | AppController 接收后写 `m_lastMeta` 并调用 askDeepSeek |
+
+### PromptAssembler（上下文组装）
+
+| 类型 | 名称 | 说明 |
+|------|------|------|
+| **结构** | `MemoryContext` | userProfiles / makoProfiles / memories / summaries / relationships |
+| **函数** | `buildSystemPrompt(base, meta, context)` | 档案/情景/摘要/关系按渠道过滤后拼 system prompt（C3） |
+| **函数** | `buildHistoryMessages(history, meta)` | 短期记忆 messages；proactive/perception assistant-only；群聊说话人前缀 |
+| **函数** | `isEpisodicVisible()` / `isUserProfileVisible()` | 可见性规则：pet 全可见、public 全渠道、channel 需 origin+session、private 仅 pet；群聊过滤亲密档案 key |
 
 ### MemoryManager（AI记忆系统）
 
@@ -344,8 +354,8 @@ signals:
 | | `bool upsertCharacterProfile(const QString& subject, const QString& key, const QString& value)` | 插入或更新角色档案（先 normalizeProfileKey 归一化 key，已存在则 mergeProfileValue 合并 value） |
 | | `QList<CharacterProfile> getCharacterProfiles(const QString& subject)` | 获取档案（subject 为空时返回全部） |
 | | `bool deleteCharacterProfile(qlonglong id)` | 删除档案 |
-| | `bool addEpisodicMemory(content, type, importance, eventTime = QDateTime(), sourceIds = QString(), origin = "pet", visibility = "private", subject = "user")` | 新增情景记忆（含渠道溯源/可见性/主体） |
-| | `QList<EpisodicMemory> getActiveEpisodicMemories(double minImportance = 0.2, int limit = 20, const QString& origin = QString(), const QString& visibility = QString())` | 获取活跃记忆（status='active' AND importance≥阈值，按 importance DESC 排序，更新 last_accessed；可按 origin/visibility 过滤，默认不过滤） |
+| | `bool addEpisodicMemory(content, type, importance, eventTime = QDateTime(), sourceIds = QString(), origin = "pet", visibility = "private", subject = "user", sessionId = "default")` | 新增情景记忆（含渠道溯源/可见性/主体/会话） |
+| | `QList<EpisodicMemory> getActiveEpisodicMemories(double minImportance = 0.2, int limit = 20, const QString& origin = QString(), const QString& visibility = QString(), const QString& sessionId = QString())` | 获取活跃记忆（status='active' AND importance≥阈值，按 importance DESC 排序，更新 last_accessed；可按 origin/visibility/sessionId 过滤） |
 | | `bool deleteEpisodicMemory(qlonglong id)` | 删除记忆 |
 | | `bool updateEpisodicMemoryStatus(qlonglong id, const QString& status)` | 更新记忆状态（promise 兑现→resolved / 失约→broken） |
 | | `int decayEpisodicMemory()` | 衰减扫描：importance≥0.8 不衰减；其余 -0.05/天；<0.1 删除（基于 last_decay_at） |
@@ -359,10 +369,10 @@ signals:
 | | `bool upsertRelationshipState(const QString& dimension, double delta, const QString& subject = "user")` | 按 subject 维度不存在时初始化为 clamp(30+delta,0,100)；存在时 clamp(oldVal+delta,0,100) |
 | | `QList<RelationshipState> getRelationshipStates(const QString& subject = "user")` | 获取指定主体的全部关系维度（按 dimension 排序） |
 | | `bool initRelationshipState()` | 若表为空，插入 intimacy=30、trust=30 |
-| | `void initDatabase(const QString& dbFilePath)` | 初始化数据库：v1 基础表 → v2 多渠道 → v3 记忆库调整（`user_version=3`，7 张表） |
+| | `void initDatabase(const QString& dbFilePath)` | 初始化数据库：v1 基础表 → v2 多渠道 → v3 记忆库调整 → v4 会话隔离（`user_version=4`，7 张表） |
 | **数据库路径** | `app_data/memory/QianDaoMoZi_memory.db` | - |
 
-**数据库结构**（`PRAGMA user_version = 3`；v1/v2 基础 + v3 记忆库调整，合计 7 张表）：
+**数据库结构**（`PRAGMA user_version = 4`；v1/v2 基础 + v3/v4 记忆库调整，合计 7 张表）：
 
 **表1：chat_history（对话历史）**
 | 字段 | 类型 | 说明 |
@@ -420,6 +430,7 @@ signals:
 | origin | TEXT NOT NULL DEFAULT 'pet' | 渠道溯源：pet / qq_private / qq_group / bilibili / screen（v2） |
 | visibility | TEXT NOT NULL DEFAULT 'private' | 可见性：private / channel / public（v3） |
 | subject | TEXT NOT NULL DEFAULT 'user' | 记忆所属主体（v3） |
+| session_id | TEXT NOT NULL DEFAULT 'default' | 会话（v4；QQ 群号/好友号，桌宠 default） |
 
 索引：`idx_episodic_importance`(importance)、`idx_episodic_type`(type)、`idx_episodic_status`(status)
 
@@ -479,6 +490,7 @@ struct HistoryTurn {
     QString rawReply;   // JSON对象: {"sentences": [...]}
     QString turnKind = "reply";  // reply / proactive / perception
     QString subject = "user";    // user / qq:<uin> / group:<群号>
+    QString speaker;               // 说话人显示名（群聊历史注入）
 };
 ```
 
@@ -507,6 +519,7 @@ struct EpisodicMemory {
     QString origin = "pet";          // 渠道溯源
     QString visibility = "private";  // private / channel / public
     QString subject = "user";        // 记忆所属主体
+    QString sessionId = "default";  // 会话（QQ 群号/好友号）
 };
 ```
 
@@ -578,6 +591,7 @@ struct SentenceText {
 | | `int getDistanceLasting() const` / `setDistanceLasting(int)` | 距离退火时长（秒） |
 | | `bool loadSetting()` | 从JSON文件加载配置 |
 | | `bool saveSetting()` | 保存配置到JSON文件 |
+| | `void loadIdentityConfig()` / `reloadIdentity()` | 显式加载/重载 identity.json（启动时由 SessionRouter 触发） |
 
 > ✅ 配置文件持久化已实现：`app_data/config/setting.json`
 
@@ -682,7 +696,7 @@ struct SentenceText {
 | SessionRouter | `requestReply(text, history, meta)` | AppController lambda | 写 `m_lastUserInput`/`m_lastMeta` → `notifyUserInputStarted` → `askDeepSeek` |
 | LLMService | `sentencesReady(sentences, rawReply)` | AppController | `handleMakoReply()` |
 | LLMService | `internetErrorSignal(msg)` | AppController | `handleSystemError()` |
-| LLMService | `memoryExtractionReady(extractionResult, lastEndId, sourceIdsJson)` | AppController lambda | 写入角色档案+情景记忆+长期摘要+关系状态 |
+| LLMService | `memoryExtractionReady(extractionResult, lastEndId, sourceIdsJson, meta)` | AppController lambda | 按本轮 meta 写入档案+情景记忆+摘要+关系状态 |
 | TTSService | `playAudioAction(zhText, tags)` | AppController | `onPlayAudioAction()` |
 | AppearanceManager | `characterPathChanged(path)` | CharacterWidget | `updatePath()` |
 | AppearanceManager | `characterPathChanged(path)` | AnchorManager | `updateAllAnchors()` |
@@ -867,6 +881,9 @@ Windows_AI/
 
 | 日期 | 变更内容 |
 |------|----------|
+| 2026-10-27 | v4 提取链路（提交 `1aa4436`）：`episodic_memory` + session_id；提取 prompt 带渠道/说话人/主体；档案三条准入规则；写入按本轮 meta 归属；信号回传 meta |
+| 2026-10-27 | PromptAssembler：上下文组装独立成类，群聊可见性过滤（C3）、说话人前缀、proactive assistant-only |
+| 2026-10-27 | identity 接线：`submitInput(senderId)`、`resolveSubject` 查 identity.json、启动时显式加载 |
 | 2026-10-27 | 记忆库 v3（提交 `8f24ae5`）：`chat_history` 轮次语义、`raw_events` 泛化、`episodic_memory` + visibility/subject、`memory_cursor`；真实库 v2→v3（107→108 行）迁移验证通过 |
 | 2026-10-26 | TD-034 退火轮次门控：`m_roundSeq`/`m_lastPlaybackRound`，`playbackQueueEmpty` 仅在最新一轮生效，旧轮收尾不再打断新一轮 |
 | 2026-10-26 | TD-037 设置界面接线：长期记忆摘轮数 + 夜晚时段 + 三档退火时长（ConfigManager 新增 `memory.summary_length`/`time.*` 读写与 6 组 getter/setter；SettingsWidget 三个保存槽；AppController `applyTimeSettings()` 启动与保存时应用；tst_configmanager 新增 3 例） |

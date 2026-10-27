@@ -2,9 +2,9 @@
 
 > 项目：Windows_AI 桌面看板娘（桌宠）
 > 类型：规划文档（分阶段实施中）
-> 版本：v0.8（记忆库 v3 已实施，2026-10-27）
+> 版本：v0.9（Phase 1 前置项实施中，2026-10-27）
 > 制定日期：2026-10-19
-> 状态：Phase 0 与记忆库 v3（Phase 0.5）已实施并通过验收（2026-10-27）；Phase 1 待开始
+> 状态：Phase 0 / 0.5 已完成；Phase 1 前置项：identity、PromptAssembler、v4 提取链路已完成，剩 TTSService 拆分与 GlobalMoodState
 > 关联文档：[ROADMAP.md](ROADMAP.md)、[ARCHITECTURE.md](ARCHITECTURE.md)
 
 ---
@@ -446,7 +446,7 @@ dsh 是一个**四层洋葱结构**，内核是 Cordis 插件框架（"Everythin
 |---|---|---|
 | **Phase 0** | 架构解耦（细则见 10.1）：`Utterance`/`RequestMeta` 统一协议 + `IChannelAdapter` 抽象 + `SessionRouter` 输入路由；记忆侧八项 ALTER + 读写扩参；identity/memory/proactive 配置解析 | **无**（零风险纯重构） |
 | **Phase 0.5** | 记忆预留收缩版（细则见 10.2）：v3 迁移仅加 `episodic_memory.visibility` 列 + `appendRawMessage`（不接线）；Percept/ChannelCapability/ToolRegistry 三空壳**缓建** | **无** |
-| **Phase 1** | SnowLuma 部署（小号）+ `QQProtocolClient` 收私聊/群聊 + 发文字/表情包/语音；届时完成 Percept 泛化与 raw_messages 接线 | SnowLuma |
+| **Phase 1** | SnowLuma 部署（小号）+ `QQProtocolClient` 收私聊/群聊 + 发文字/表情包/语音；届时完成 Percept 泛化与 raw_messages 接线。**前置项实施中**：identity / PromptAssembler / v4 提取链路已完成，剩 TTSService 拆分、GlobalMoodState（见 10.5） | SnowLuma |
 | **Phase 2** | `ChatPlanner` 发言门控（frequency/dynamic）+ `ProactiveScheduler` 按配置主动开口 | 无 |
 | **Phase 3** | QQ 空间说说 + 高级互动（合并转发/戳一戳/表情回应）——**SnowLuma 内置空间互动（评论/点赞），无需换端** | SnowLuma |
 | **Phase 4** | 浏览器类经 dsh ACP（Playwright MCP）；评估 dsh 混合深度 | dsh（nightly） |
@@ -640,6 +640,46 @@ CREATE TABLE memory_cursor (
 - 不接 QQ/B 站/窥屏数据源；不实现屏幕原始帧/OCR 存储。
 - 不改蒸馏逻辑本身（Phase 1 再让提取管道读 `raw_events` + 推进 `memory_cursor`）。
 - 不做 `chat_history` 的 UI 类型展示（设置界面历史表格 Phase 1 再适配）。
+
+> **2026-10-27 追加（v4）**：在 v3 基础上给 `episodic_memory` 增加 `session_id`（C3 跨群隔离），并把渠道/会话/说话人/主体带进提取链路；详见 10.5。
+
+### 10.5 Phase 1 前置实施记录（2026-10-27）
+
+> 代码提交：`1aa4436`（identity + PromptAssembler + v4 提取链路）；测试：4 套件 / 38 例全绿；真实库 v3→v4 迁移验证通过。
+
+#### 10.5.1 identity 身份接入
+
+- `SessionRouter::submitInput(channel, sessionId, speaker, text, senderId="")`：增加稳定身份参数，返回是否进入大脑
+- `resolveSubject()`：桌宠/空 senderId→`user`；QQ `self`→丢弃；`master`→`user`；未知→`qq:<uin>`；其他平台→`<channel>:<id>`
+- `ConfigManager::loadIdentityConfig()` / `reloadIdentity()`；`SessionRouter` 构造时显式加载，配置错误在启动日志暴露
+- 来源：`identity.json` 的 `identity.self / identity.master`（按 uin 绑定，与昵称无关）
+
+#### 10.5.2 PromptAssembler 上下文组装
+
+- 新增 `PromptAssembler`（纯格式化 + 过滤，不持有数据库）
+- `buildSystemPrompt()`：基础 prompt + 茉子人设 + 主人档案 + 情景记忆 + 摘要 + 关系状态
+  - 群聊：不注入关系数值；过滤含「关系/称呼/情感/依赖/性格」的主人档案 key
+  - 情景记忆：`private` 仅桌宠、`channel` 需 `origin + session_id` 匹配、`public` 全渠道；桌宠按主人特权可见全部
+- `buildHistoryMessages()`：短期记忆 messages；`proactive/perception` 只注入 assistant；群聊用户消息加说话人前缀（`小明：…`）
+
+#### 10.5.3 v4 提取链路（记忆库 v4）
+
+- `episodic_memory` 增加 `session_id TEXT NOT NULL DEFAULT 'default'` + `idx_episodic_origin_session`
+- `extractMemoryAsync(..., const RequestMeta &meta)`；提取 prompt 顶部注入「渠道/会话/说话人/主体」，群聊对话行格式 `阿伟(qq:10001): …`
+- 档案准入三条：长期有效 / 本人明确陈述 / 非敏感；时间性、情绪、隐私、纠纷只进 episodic；`subject` 支持 `user/mako/qq:<uin>/group:<群号>`
+- 写入链路按本轮 meta 归属：`origin=channel`、`visibility=pet?private:channel`、`subject`（模型给出，缺省 meta.subject）、`session_id=meta.sessionId`；摘要按渠道+会话分桶；关系按 meta.subject
+- `memoryExtractionReady(..., const RequestMeta &meta)` 随信号回传，替代全局 `m_lastMeta`，避免异步窗口漂移
+
+#### 10.5.4 已确认的策略
+
+- 桌宠采用**主人特权**：可见群聊事件（sensitive 仍按提取规则不进档案）
+- 关系值按 subject 跨群共享；群聊 prompt 继续隐藏数值（先不改）
+- 摘要与情景记忆内容重叠的问题（summary 兼任蒸馏游标导致）**暂缓**，后续接 `memory_cursor` 时一并调整
+
+#### 10.5.5 剩余前置项
+
+- [ ] TTSService 合成/播放分离（QQ 渠道只合成不播放，播放器归桌宠）
+- [ ] GlobalMoodState（全局情绪 + D1 `followExternalMood`）
 
 ---
 

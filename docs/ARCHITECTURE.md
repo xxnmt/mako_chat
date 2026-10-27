@@ -1,7 +1,7 @@
 # 架构设计文档
 
 > 项目：Windows_AI 桌面看板娘（桌宠）
-> 版本：v0.6.0 + Phase 0/0.5（多渠道 + 记忆库 v3）
+> 版本：v0.6.0 + Phase 0/0.5 + Phase 1 前置（记忆库 v4）
 > 更新日期：2026-10-27
 
 ---
@@ -25,6 +25,7 @@
 | | BubbleWidget | 气泡显示、打字机特效 | bubblewidget.h/cpp/ui |
 | | ChatWidget | 聊天输入窗口、弹出跟随 | chatwidget.h/cpp |
 | **业务层** | LLMService | DeepSeek请求、JSON协议解析、句子拆分、记忆提取 | llmservice.h/cpp |
+| | PromptAssembler | 按渠道/可见性组装 system prompt 与短期记忆 messages（C3） | promptassembler.h/cpp |
 | | TTSService | 语音合成队列、播放队列、策略模式（ITTSProvider） | ttsservice.h/cpp, ittsprovider.h, apittsprovider.h/cpp |
 | | ApiTTSProvider | GPT-SoVITS API 调用、流式 PCM 解析 | apittsprovider.h/cpp |
 | | TTSProcessManager | GPT-SoVITS 进程管理、孤儿进程清理（killProcessOnPort） | ttsprocessmanager.h/cpp |
@@ -104,8 +105,8 @@
 输入源（桌宠输入框 / 未来 QQ 私聊、群聊 / 未来定时触发）
         │
         ▼
-SessionRouter::submitInput(channel, sessionId, speaker, text)
-        ├─ resolveSubject(channel, speaker) → subject（Phase 0 恒 'user'；Phase 1：self→丢弃 / master→'user' / 未知→qq:<uin>）
+SessionRouter::submitInput(channel, sessionId, speaker, text, senderId)   // 桌宠 senderId 留空
+        ├─ resolveSubject(channel, senderId) → subject（self→丢弃 / master→'user' / 未知→qq:<uin>）
         ├─ MemoryManager::getHistoryTurn(N, channel, sessionId)   ← 双键隔离
         └─ emit requestReply(text, history, meta)
                 │
@@ -293,6 +294,8 @@ m_llmService->registerStateProvider([this](){return m_appearance->getCurrentStat
 - **状态提供者模式**：通过 `registerStateProvider()` 注册回调，实现AI状态同步
 - **提示词外部化**：`initializePromptFile()` 和 `loadSystemPrompt()` 已实现
 - **标签校验**：`TagValidator` 类实现标签合法性校验和编辑距离修正
+- **上下文组装**：交给 `PromptAssembler`（档案/情景/摘要/关系按渠道可见性过滤；短期记忆的 proactive/群聊格式也在此处理）
+- **提取带元数据**：`extractMemoryAsync` 接收 `RequestMeta`，信号原样回传；写入按本轮 meta 归属（渠道/会话/说话人/主体）
 
 **关键方法**：
 | 方法 | 作用 | 参数 | 返回值 |
@@ -300,7 +303,7 @@ m_llmService->registerStateProvider([this](){return m_appearance->getCurrentStat
 | `askDeepSeek()` | 发起DeepSeek API请求，构建系统提示词（基础prompt+角色档案+情景记忆+长期摘要+关系状态） | QString userInput, QList\<HistoryTurn\> historyQA | - |
 | `onReplyFinished()` | 解析JSON→拆句→标签校验→发信号 | QNetworkReply* | - |
 | `parseJsonReply()` | 解析JSON回复，提取句子和标签 | QString replyText | QPair\<QList\<SentenceText\>, QString\> |
-| `extractMemoryAsync()` | 后台异步提取记忆（角色档案+情景记忆+长期摘要+关系状态），传入已有档案/记忆/关系做增量更新 | QList\<HistoryTurn\> turns, qlonglong lastEndId, QList\<qlonglong\> sourceIds, QList\<CharacterProfile\> existingProfiles, QList\<EpisodicMemory\> existingMemories | - |
+| `extractMemoryAsync()` | 后台异步提取记忆（角色档案+情景记忆+长期摘要+关系状态），传入已有档案/记忆/关系做增量更新 | turns, lastEndId, sourceIds, existingProfiles, existingMemories, RequestMeta meta | - |
 | `registerStateProvider()` | 注册状态提供者回调 | std::function\<QString()\> | - |
 | `setMemoryManager()` | 设置MemoryManager实例 | MemoryManager* manager | - |
 | `initializePromptFile()` | 初始化提示词文件 | - | - |
@@ -312,7 +315,7 @@ m_llmService->registerStateProvider([this](){return m_appearance->getCurrentStat
 |------|----------|------|
 | `sentencesReady(sentences, rawReply)` | 回复解析完成 | QList\<SentenceText\>, QString |
 | `internetErrorSignal(msg)` | 网络错误 | QString |
-| `memoryExtractionReady(extractionResult, lastEndId, sourceIdsJson)` | 记忆提取完成（结果含 character_updates/episodic_memories/working_summary/relationship_updates 四类字段） | QJsonObject, qlonglong, QString |
+| `memoryExtractionReady(extractionResult, lastEndId, sourceIdsJson, meta)` | 记忆提取完成（结果含 character_updates/episodic_memories/working_summary/relationship_updates 四类字段；meta 为本轮渠道/会话/说话人/主体） | QJsonObject, qlonglong, QString, RequestMeta |
 
 **JSON输出协议**：
 ```json
@@ -723,7 +726,7 @@ LLMService::parseJsonReply() → TagValidator校验
 **职责**：管理AI对话历史记录、角色档案、情景记忆、长期摘要和关系状态
 
 **设计要点**：
-- 使用SQLite存储三层数据：原始事件流水（`raw_events`）+ 对话轮次（`chat_history`）+ 蒸馏记忆（档案/情景/摘要/关系）；数据库版本 `PRAGMA user_version = 3`
+- 使用SQLite存储三层数据：原始事件流水（`raw_events`）+ 对话轮次（`chat_history`）+ 蒸馏记忆（档案/情景/摘要/关系）；数据库版本 `PRAGMA user_version = 4`
 - 每次对话后保存用户输入、AI回复（JSON对象）
 - 对话前读取最近N轮历史作为短期记忆
 - 角色档案区分 `user` / `mako` 两个主体，长期稳定特质
@@ -733,7 +736,7 @@ LLMService::parseJsonReply() → TagValidator校验
 - 数据库路径：`app_data/memory/QianDaoMoZi_memory.db`
 - 注：旧的 `user_profile` 表已被 `character_profile` 表取代（通过 subject 字段区分 user/mako）
 
-**数据库结构**（`PRAGMA user_version = 3`；v1/v2 基础 + v3 记忆库调整，合计 7 张表）：
+**数据库结构**（`PRAGMA user_version = 4`；v1/v2 基础 + v3 记忆库调整 + v4 会话隔离，合计 7 张表）：
 
 **表1：chat_history（对话历史）**
 | 字段 | 类型 | 说明 |
@@ -791,6 +794,7 @@ LLMService::parseJsonReply() → TagValidator校验
 | origin | TEXT NOT NULL DEFAULT 'pet' | 渠道溯源：pet / qq_private / qq_group / bilibili / screen（v2） |
 | visibility | TEXT NOT NULL DEFAULT 'private' | 可见性：private / channel / public（v3） |
 | subject | TEXT NOT NULL DEFAULT 'user' | 记忆所属主体（v3） |
+| session_id | TEXT NOT NULL DEFAULT 'default' | 会话（QQ 群号/好友号；桌宠 default，v4） |
 
 索引：`idx_episodic_importance`(importance)、`idx_episodic_type`(type)、`idx_episodic_status`(status)
 
@@ -869,8 +873,8 @@ LLMService::parseJsonReply() → TagValidator校验
 **情景记忆 CRUD**：
 | 方法 | 作用 | 参数 | 返回值 |
 |------|------|------|--------|
-| `addEpisodicMemory()` | 新增情景记忆（eventTime 无效时用当前时间） | content, type, importance, eventTime, sourceIds, origin="pet", visibility="private", subject="user" | bool |
-| `getActiveEpisodicMemories()` | 获取活跃记忆（status='active' AND importance≥minImportance，按 importance DESC 排序，并更新 last_accessed；可按 origin/visibility 过滤） | minImportance=0.2, limit=20, origin="", visibility="" | QList\<EpisodicMemory\> |
+| `addEpisodicMemory()` | 新增情景记忆（eventTime 无效时用当前时间） | content, type, importance, eventTime, sourceIds, origin="pet", visibility="private", subject="user", sessionId="default" | bool |
+| `getActiveEpisodicMemories()` | 获取活跃记忆（status='active' AND importance≥minImportance，按 importance DESC 排序，并更新 last_accessed；可按 origin/visibility/sessionId 过滤） | minImportance=0.2, limit=20, origin="", visibility="", sessionId="" | QList\<EpisodicMemory\> |
 | `deleteEpisodicMemory()` | 删除记忆 | id | bool |
 | `updateEpisodicMemoryStatus()` | 更新记忆状态（如 promise 兑现 → resolved / 失约 → broken） | id, status | bool |
 | `decayEpisodicMemory()` | 衰减扫描：importance≥0.8 不衰减；其余 -0.05/天；<0.1 删除 | - | int（删除条数） |
@@ -951,13 +955,13 @@ struct RelationshipState {
 **记忆流程**：
 ```
 用户提交输入 → getHistoryTurn(N) 获取短期记忆
-    → askDeepSeek(userInput, historyQA) 发送请求
-        （system prompt 注入：角色档案 → 情景记忆 → 长期摘要 → 关系状态 → 当前状态）
-    → AI回复 → saveQATurn(userInput, rawReply, sentences) 保存记忆
+    → askDeepSeek(userInput, historyQA, meta) 发送请求
+        （PromptAssembler：按渠道可见性注入 角色档案 → 情景记忆 → 长期摘要 → 关系状态 → 当前状态）
+    → AI回复 → saveQATurn(userInput, rawReply, sentences, meta) 保存记忆
     → 判断未摘要对话数 >= 阈值
-        → getCharacterProfiles("user") + getActiveEpisodicMemories() 取已有上下文
-        → extractMemoryAsync(turns, lastEndId, sourceIds, existingProfiles, existingMemories)
-    → 提取结果 memoryExtractionReady：
+        → getCharacterProfiles(meta.subject)+mako + getActiveEpisodicMemories(origin, session) 取已有上下文
+        → extractMemoryAsync(turns, lastEndId, sourceIds, existingProfiles, existingMemories, meta)
+    → 提取结果 memoryExtractionReady(result, lastEndId, sourceIdsJson, meta)：
         ├── character_updates   → upsertCharacterProfile()
         ├── episodic_memories   → addEpisodicMemory()
         ├── working_summary     → addLongTermSummary()
@@ -1076,13 +1080,14 @@ struct RelationshipState {
 | `IChannelAdapter` | `channelName()` + `sendUtterance()` 纯虚接口 | 大脑侧不感知具体渠道 |
 | `PetChannelAdapter` | 桌宠渠道：气泡显示 | 持 `BubbleWidget*` 非所有权；立绘/情绪不在此层 |
 | `QQChannelAdapter` | QQ 渠道占位 | Phase 1 接 OneBot v11；当前 `sendUtterance` 仅打日志 |
-| `SessionRouter` | 输入路由：身份解析 → 双键历史组装 → `requestReply` | `resolveSubject` Phase 0 恒 `'user'`；空输入拦截 |
+| `SessionRouter` | 输入路由：身份解析 → 双键历史组装 → `requestReply` | `submitInput(..., senderId)`；self→丢弃、master→`user`、未知 QQ→`qq:<uin>`；启动时加载 identity.json |
 
 **调用时序**：
 ```
 ChatWidget::textSubmitted(text)
-  → SessionRouter::submitInput("pet", "default", "欧尼酱", text)
-      ├─ 组装 RequestMeta（subject='user'）
+  → SessionRouter::submitInput("pet", "default", "欧尼酱", text)   // senderId 留空 → 主人
+      ├─ resolveSubject → 'user'（QQ：self 丢弃 / master user / 未知 qq:<uin>）
+      ├─ 组装 RequestMeta（subject/channel/session/speaker）
       ├─ getHistoryTurn(memoryLength, "pet", "default")
       └─ emit requestReply(text, history, meta)
   → AppController lambda：m_lastMeta=meta → notifyUserInputStarted() → askDeepSeek(text, history, meta)
@@ -1092,8 +1097,23 @@ ChatWidget::textSubmitted(text)
 
 **设计约束**：
 - 渠道私有表现（气泡/IM 发送/语音消息）只进适配器；情绪与立绘是全局层，不进任何渠道（D1 开关在 Phase 1 对 QQ 路径生效）
-- 身份归属由宿主配置层决定（`SessionRouter::resolveSubject`），模型与渠道无权判定（C2）
+- 身份归属由宿主配置层决定（`SessionRouter::resolveSubject`），模型与渠道无权判定（C2）；`identity.json` 启动即加载
 - 记忆按 `channel + session_id` 双键隔离，摘要与未摘要游标同样按双键分桶（A1）
+
+---
+
+### 2.17 PromptAssembler（上下文组装）
+
+**职责**：把「取数据」与「拼上下文」分开；只做格式化与可见性过滤，不持有数据库。
+
+| 方法 | 作用 |
+|------|------|
+| `buildSystemPrompt(base, meta, MemoryContext)` | 基础 prompt + 茉子人设 + 主人档案 + 情景记忆 + 摘要 + 关系状态；群聊过滤关系数值与亲密档案 key |
+| `buildHistoryMessages(history, meta)` | 短期记忆 messages（含 history note）；proactive/perception 只发 assistant；群聊用户消息带说话人前缀 |
+| `isEpisodicVisible()` | 桌宠全可见（主人特权）；`public` 全渠道；`channel` 要求 `origin + sessionId` 匹配；`private` 仅桌宠 |
+| `isUserProfileVisible()` | 群聊过滤含「关系/称呼/情感/依赖/性格」的档案 key |
+
+**记忆上下文结构**：`MemoryContext { userProfiles, makoProfiles, memories, summaries, relationships }`，由 `LLMService` 取数后传入。
 
 ---
 
@@ -1110,7 +1130,7 @@ ChatWidget::textSubmitted(text)
    ▼
 3. SessionRouter::submitInput("pet", "default", "欧尼酱", input)   ← Phase 0
    │
-   ├── resolveSubject(channel, speaker) → 'user'
+   ├── resolveSubject(channel, senderId) → 'user'（self 丢弃 / master user / 未知 qq:<uin>）
    ├── 读取短期记忆: getHistoryTurn(memoryLength, channel, sessionId)
    └── emit requestReply(text, history, meta)
    │
@@ -1321,6 +1341,6 @@ image/
 | 新服装/表情 | 添加资源文件，AppearanceManager自动支持 |
 | 设置界面 | 连接 ConfigManager 的setter方法 |
 | 新交互方式 | 在CharacterWidget中添加新信号，连接到AppController |
-| 新消息渠道 | 实现 `IChannelAdapter`，输入经 `SessionRouter::submitInput(channel, sessionId, speaker, text)` 进入大脑 |
+| 新消息渠道 | 实现 `IChannelAdapter`，输入经 `SessionRouter::submitInput(channel, sessionId, speaker, text, senderId)` 进入大脑 |
 | 新记忆渠道隔离 | `RequestMeta.channel/sessionId` 随轮次传递，MemoryManager 按双键读写 |
 | 插件系统 | AppController中注册新模块，通过信号槽通信 |
