@@ -11,6 +11,7 @@
 #include <QPointer>
 #include <QPair>
 #include "memorymanager.h"
+#include "promptassembler.h"
 
 
 LLMService::LLMService(const QString &apiKey,QObject *parent)
@@ -43,74 +44,21 @@ void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> 
     request.setRawHeader("Authorization",aotuHeader.toUtf8());
     m_systemPromptCache=loadSystemPrompt();
 
-    //prompt
-    QString finalSystemPrompt = m_systemPromptCache;
-
-    // QJsonArray messagesArray;
-    // QJsonObject systemMessage;
-    // systemMessage["role"] = "system";
-    // systemMessage["content"] = finalSystemPrompt;
-    // messagesArray.append(systemMessage);
-    // 角色档案 + 情景记忆 + 摘要（v4 注入格式，Markdown）
+    // 角色档案 / 情景记忆 / 摘要 / 关系：PromptAssembler 统一按渠道与可见性组装（C3）
+    PromptAssembler::MemoryContext context;
     if (m_memoryManager) {
-        // 1. 角色档案（用户 + 角色）
-        QList<CharacterProfile> userProfiles = m_memoryManager->getCharacterProfiles("user");
-        QList<CharacterProfile> makoProfiles = m_memoryManager->getCharacterProfiles("mako");
-        qDebug()<<"[LLM]角色档案: user="<<userProfiles.size()<<"mako="<<makoProfiles.size();
-        if (!makoProfiles.isEmpty()) {
-            finalSystemPrompt += "\n\n# 茉子的人设\n";
-            for (const auto &p : makoProfiles) {
-                finalSystemPrompt += QString("- %1: %2\n").arg(p.key).arg(p.value);
-            }
-        }
-        if (!userProfiles.isEmpty()) {
-            finalSystemPrompt += "\n# 关于欧尼酱\n";
-            for (const auto &p : userProfiles) {
-                finalSystemPrompt += QString("- %1: %2\n").arg(p.key).arg(p.value);
-            }
-        }
-
-        // 2. 情景记忆
-        QList<EpisodicMemory> memories = m_memoryManager->getActiveEpisodicMemories(0.2, 20);
-        qDebug()<<"[LLM]情景记忆数量:"<<memories.size();
-        if (!memories.isEmpty()) {
-            finalSystemPrompt += "\n# 我们的回忆\n";
-            for (const auto &m : memories) {
-                QString typeLabel;
-                if (m.type == "promise") typeLabel = QString("（承诺·%1）").arg(m.status);
-                else if (m.type == "conflict") typeLabel = "（冲突）";
-                else if (m.type == "milestone") typeLabel = "（里程碑）";
-                else typeLabel = "";
-                finalSystemPrompt += QString("- [%1] %2%3\n")
-                                         .arg(m.eventTime.toString("yyyy-MM-dd"))
-                                         .arg(m.content)
-                                         .arg(typeLabel);
-            }
-        }
-
-        // 3. 长期摘要（保留兼容，按渠道分桶取）
-        QList<LongTermSummary> summaries = m_memoryManager->getLatestSummaries(5, m_currentMeta.channel, m_currentMeta.sessionId);
-        qDebug()<<"[LLM]摘要数量:"<<summaries.size();
-        if (!summaries.isEmpty()) {
-            finalSystemPrompt += "\n# 最近发生\n";
-            for (const auto &s : summaries) {
-                finalSystemPrompt += QString("- %1\n").arg(s.summaryText);
-            }
-        }
-
-        // 4. 关系状态（量化 user 与 AI 之间的关系维度，按当前对话主体取）
-        QList<RelationshipState> relStates = m_memoryManager->getRelationshipStates(m_currentMeta.subject);
-        if (!relStates.isEmpty()) {
-            finalSystemPrompt += "\n# 我们的关系\n";
-            for (const auto &r : relStates) {
-                QString label;
-                if (r.dimension == "intimacy") label = "亲密度";
-                else if (r.dimension == "trust") label = "信任度";
-                else label = r.dimension;
-                finalSystemPrompt += QString("- %1: %2/100\n").arg(label).arg(r.value, 0, 'f', 0);
-            }
-        }
+        context.userProfiles = m_memoryManager->getCharacterProfiles("user");
+        context.makoProfiles = m_memoryManager->getCharacterProfiles("mako");
+        context.memories = m_memoryManager->getActiveEpisodicMemories(0.2, 20);
+        context.summaries = m_memoryManager->getLatestSummaries(5, m_currentMeta.channel, m_currentMeta.sessionId);
+        context.relationships = m_memoryManager->getRelationshipStates(m_currentMeta.subject);
+        qDebug()<<"[LLM]角色档案: user="<<context.userProfiles.size()
+                <<"mako="<<context.makoProfiles.size();
+        qDebug()<<"[LLM]情景记忆数量:"<<context.memories.size();
+        qDebug()<<"[LLM]摘要数量:"<<context.summaries.size();
     }
+    QString finalSystemPrompt = PromptAssembler::buildSystemPrompt(
+        m_systemPromptCache, m_currentMeta, context);
 
     QJsonArray messagesArray;
     QJsonObject systemMessage;
@@ -118,52 +66,10 @@ void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> 
     systemMessage["content"] = finalSystemPrompt;
     messagesArray.append(systemMessage);
 
-    //短期记忆
-    if (!historyQA.isEmpty()) {
-        QJsonObject historyNote;
-        historyNote["role"] = "system";
-        historyNote["content"] = "以下内容为短期对话记录。！！！仅提供对话信息，请勿参考其输出格式！！！";
-        messagesArray.append(historyNote);
-    }
-    for (const HistoryTurn &turn : historyQA) {
-        // v3 轮次语义：proactive/perception（或没有用户输入）只注入 assistant，
-        // 不生成空的 user 消息（HUMANIZATION_PLAN 10.4.2）
-        const bool assistantOnly = turn.turnKind == QStringLiteral("proactive")
-                                   || turn.turnKind == QStringLiteral("perception")
-                                   || turn.userInput.isEmpty();
-        if (!assistantOnly) {
-            QJsonObject histUserMsg;
-            histUserMsg["role"] = "user";
-            histUserMsg["name"] = QString("用户 [%1]").arg(turn.timestamp.toString("yyyy-MM-dd HH:mm:ss"));
-            histUserMsg["content"] = turn.userInput;
-            messagesArray.append(histUserMsg);
-        }
-
-        // 历史茉子回复
-        QJsonObject histMakoMsg;
-        histMakoMsg["role"] = "assistant";
-        const QString makoName = assistantOnly ? QStringLiteral("茉子（主动/感知）")
-                                               : QStringLiteral("茉子");
-        histMakoMsg["name"] = QString("%1 [%2]").arg(makoName, turn.timestamp.toString("yyyy-MM-dd HH:mm:ss"));
-        // 从 JSON 提取中文文本作为历史回复
-        QString aiContent;
-        QJsonParseError parseError;
-        QJsonDocument doc = QJsonDocument::fromJson(turn.rawReply.toUtf8(), &parseError);
-        if (parseError.error == QJsonParseError::NoError && doc.isObject()) {
-            QStringList zhTexts;
-            QJsonArray sentences = doc.object()["sentences"].toArray();
-            for (const QJsonValue &sv : sentences) {
-                zhTexts.append(sv.toObject()["zh_text"].toString());
-            }
-            aiContent = zhTexts.join("");
-        }
-        else{
-            QString text = turn.rawReply;
-            text = text.remove(QRegularExpression("\\[[^\\]]+\\]"));
-            aiContent = text.trimmed();
-        }
-        histMakoMsg["content"] = aiContent;  // ← 使用自然语言文本
-        messagesArray.append(histMakoMsg);
+    // 短期记忆：PromptAssembler 统一处理（proactive/感知 assistant-only、群聊说话人前缀）
+    const QJsonArray historyMessages = PromptAssembler::buildHistoryMessages(historyQA, m_currentMeta);
+    for (const QJsonValue &historyMessage : historyMessages) {
+        messagesArray.append(historyMessage);
     }
 
     if (m_stateProvider) {
@@ -217,7 +123,8 @@ void LLMService::setMemoryManager(MemoryManager *manager)
 
 void LLMService::extractMemoryAsync(const QList<HistoryTurn> &turns, qlonglong lastEndId, const QList<qlonglong> &sourceIds,
                                     const QList<CharacterProfile> &existingProfiles,
-                                    const QList<EpisodicMemory> &existingMemories)
+                                    const QList<EpisodicMemory> &existingMemories,
+                                    const RequestMeta &meta)
 {
     if (turns.isEmpty()) {
         qDebug()<<"[LLM]待摘要turns为空";
@@ -255,7 +162,7 @@ void LLMService::extractMemoryAsync(const QList<HistoryTurn> &turns, qlonglong l
     // 构建当前关系状态上下文
     QString existingRelationshipText;
     if (m_memoryManager) {
-        QList<RelationshipState> relStates = m_memoryManager->getRelationshipStates(m_currentMeta.subject);
+        QList<RelationshipState> relStates = m_memoryManager->getRelationshipStates(meta.subject);
         if (!relStates.isEmpty()) {
             for (const RelationshipState &r : relStates) {
                 QString label;
@@ -276,7 +183,7 @@ void LLMService::extractMemoryAsync(const QList<HistoryTurn> &turns, qlonglong l
 
 ## 1. character_updates（角色档案更新）
 长期稳定的事实，跨月仍然成立。
-- subject: "user" 或 "mako"
+- subject: "user"(主人) / "mako"(茉子) / "qq:<uin>"(群友/好友) / "group:<群号>"(群整体)
 - key:
   - 优先复用"已有角色档案"中出现的 key（避免信息碎片化）
   - 若语义确实独立于所有已有 key，可新建维度；新 key 必须是长期稳定维度（非临时状态），且语义不与已有 key 重叠
@@ -316,14 +223,19 @@ void LLMService::extractMemoryAsync(const QList<HistoryTurn> &turns, qlonglong l
 # 当前关系状态（在此基础上叠加 delta）
 %3
 # 提取规则
-- character_updates 只提取"跨月仍然成立"的稳定事实，临时状态不要放入
+## character_updates（长期档案）准入条件：以下三条必须同时满足
+1. 长期有效：不依赖当前时间。职业/称呼/爱好/宠物可以；"下周出差""最近备考"等时间性、阶段性内容不行
+2. 本人明确陈述：只提取说话人本人明确说出的信息；猜测、他人转述都不提升
+3. 非敏感：健康、财务、家庭矛盾、感情状况、宗教政治、实时位置等一律不提升
+- 群聊中：关于某个人的事实用该人的 subject（qq:<uin>）；关于群整体的规则/氛围用 group:<群号>
 - key 优先复用已有档案的 key；若语义独立于所有已有 key，可新建维度
 - 禁止为同类信息创造近义词（如已有"性格"则不要产出"个性"/"性格特征"）
 - 注意"性格"与"基本性格"是两个独立维度，可共存：前者是当前心理状态，后者是稳定人格特质
 - 若对话揭示了已有档案的新信息，输出更新后的 value
 - 矛盾信息以对话中的新信息为准
 - 不要简单复制已有档案，只输出有更新或有新增的
-- episodic_memories 的 content 中不要包含"长期/短期"等层级标注
+- episodic_memories 的 content 中不要包含"长期/短期"等层级标注；每条 episodic 必须带 subject（事件涉及的人）
+- 时间性事件/情绪/隐私/纠纷 → 只放 episodic_memories，不要放 character_updates
 - relationship_updates 的 delta 要基于本轮对话的实际变化，避免无变化时输出 0
 
 # 输出格式
@@ -333,9 +245,9 @@ void LLMService::extractMemoryAsync(const QList<HistoryTurn> &turns, qlonglong l
     {"subject": "user", "key": "occupation", "value": "AI开发者"},
     {"subject": "mako", "key": "persona", "value": "温柔体贴的茉子"}
   ],
-  "episodic_memories": [
-    {"content": "答应下周完成TTS修复", "type": "promise", "importance": 0.9, "event_time": "2026-08-05 14:00:00"},
-    {"content": "第一次讨论画像重构方案", "type": "event", "importance": 0.6}
+    "episodic_memories": [
+    {"subject": "qq:10001", "content": "答应下周完成TTS修复", "type": "promise", "importance": 0.9, "event_time": "2026-08-05 14:00:00"},
+    {"subject": "qq:10001", "content": "第一次讨论画像重构方案", "type": "event", "importance": 0.6}
   ],
   "working_summary": "用户与茉子讨论了记忆系统的重构方案",
   "relationship_updates": [
@@ -343,6 +255,15 @@ void LLMService::extractMemoryAsync(const QList<HistoryTurn> &turns, qlonglong l
     {"dimension": "trust", "delta": 1.5}
   ]
 })").arg(existingProfilesText).arg(existingMemoriesText).arg(existingRelationshipText);
+
+    // 本轮元数据：让模型知道“谁在哪个渠道说的”，才能正确归属 subject 与判断跨群复用
+    extractionPrompt.prepend(QString(
+        "# 本轮元数据\n"
+        "- 渠道: %1\n"
+        "- 会话: %2\n"
+        "- 说话人: %3\n"
+        "- 说话人主体(subject): %4\n\n")
+        .arg(meta.channel, meta.sessionId, meta.speaker, meta.subject));
 
     QString conversationText;
     for (const HistoryTurn &turn : turns) {
@@ -361,6 +282,11 @@ void LLMService::extractMemoryAsync(const QList<HistoryTurn> &turns, qlonglong l
             conversationText += QString("茉子（主动）: %1\n---\n").arg(aiText);
         } else if (turn.turnKind == QStringLiteral("perception")) {
             conversationText += QString("茉子（因观察到某事而开口）: %1\n---\n").arg(aiText);
+        } else if (meta.channel == Channel::kQQGroup) {
+            const QString speaker = turn.speaker.isEmpty() ? meta.speaker : turn.speaker;
+            const QString subject = turn.subject.isEmpty() ? meta.subject : turn.subject;
+            conversationText += QString("%1(%2): %3\nAI: %4\n---\n")
+                                    .arg(speaker, subject, turn.userInput, aiText);
         } else {
             conversationText += QString("用户: %1\nAI: %2\n---\n")
                                     .arg(turn.userInput, aiText);
@@ -390,7 +316,7 @@ void LLMService::extractMemoryAsync(const QList<HistoryTurn> &turns, qlonglong l
 
     QPointer<LLMService> self(this);
 
-    connect(reply, &QNetworkReply::finished, this, [this,self, reply, lastEndId, sourceIdsJson]() {
+    connect(reply, &QNetworkReply::finished, this, [this,self, reply, lastEndId, sourceIdsJson, meta]() {
         if(self.isNull()) {
             reply->deleteLater();
             qDebug()<<"[LLM]摘要捕获异常";
@@ -408,7 +334,7 @@ void LLMService::extractMemoryAsync(const QList<HistoryTurn> &turns, qlonglong l
             if (resultDoc.isObject()) {
                 QJsonObject result = resultDoc.object();
                 qDebug()<<"[LLM]记忆提取成功:" << result;
-                emit memoryExtractionReady(result, lastEndId, sourceIdsJson);
+                emit memoryExtractionReady(result, lastEndId, sourceIdsJson, meta);
             } else {
                 qDebug()<<"[LLM]记忆提取返回的JSON格式解析失败:"<<replyText;
             }

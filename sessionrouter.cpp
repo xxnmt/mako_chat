@@ -6,30 +6,54 @@
 SessionRouter::SessionRouter(MemoryManager *memoryManager, QObject *parent)
     : QObject(parent), m_memoryManager(memoryManager)
 {
+    // 启动时显式加载 identity.json：配置错误尽早暴露，而不是等第一条 QQ 消息
+    ConfigManager::instance().loadIdentityConfig();
 }
 
 QString SessionRouter::resolveSubject(const QString &channel, const QString &senderId)
 {
-    // Phase 0：桌宠对话即主人（'user' 即主人，E2 决策）
-    // Phase 1：QQ 渠道接入后改为查 ConfigManager 的 identity 配置表
-    Q_UNUSED(channel);
-    Q_UNUSED(senderId);
-    return QStringLiteral("user");
+    // 桌宠 / 无稳定身份 → 主人（'user' 即主人，E2 决策）
+    if (channel == Channel::kPet || senderId.isEmpty()) {
+        return QStringLiteral("user");
+    }
+
+    ConfigManager &cfg = ConfigManager::instance();
+
+    // 自己的账号：丢弃，避免自触发
+    if (cfg.getSelfQQAccounts().contains(senderId)) {
+        return QString();
+    }
+    // 主人账号（多账号都归一到 'user'）
+    if (cfg.isMasterQQ(senderId)) {
+        return QStringLiteral("user");
+    }
+    // 未知主体：QQ 渠道用 qq:<uin>，其他平台用 <channel>:<id>
+    if (channel.startsWith(QStringLiteral("qq"))) {
+        return QStringLiteral("qq:%1").arg(senderId);
+    }
+    return QStringLiteral("%1:%2").arg(channel, senderId);
 }
 
-void SessionRouter::submitInput(const QString &channel, const QString &sessionId,
-                                const QString &speaker, const QString &text)
+bool SessionRouter::submitInput(const QString &channel, const QString &sessionId,
+                                const QString &speaker, const QString &text,
+                                const QString &senderId)
 {
     if (text.trimmed().isEmpty()) {
         qDebug() << "[SessionRouter]空输入，忽略";
-        return;
+        return false;
+    }
+
+    const QString subject = resolveSubject(channel, senderId);
+    if (subject.isEmpty()) {
+        qDebug() << "[SessionRouter]自身账号消息，丢弃:" << channel << senderId;
+        return false;
     }
 
     RequestMeta meta;
     meta.channel = channel;
     meta.sessionId = sessionId;
     meta.speaker = speaker;
-    meta.subject = resolveSubject(channel, speaker);
+    meta.subject = subject;
     // meta.sensitive 由渠道侧查盲区配置后设置（桌宠路径默认 false）
 
     // 组装短期上下文（channel+session_id 双键隔离，B1 决策）
@@ -37,6 +61,8 @@ void SessionRouter::submitInput(const QString &channel, const QString &sessionId
     QList<HistoryTurn> history = m_memoryManager->getHistoryTurn(memoryLength, channel, sessionId);
 
     qDebug() << "[SessionRouter]路由输入:" << channel << "/" << sessionId
-             << "speaker=" << speaker << "历史轮数:" << history.size();
+             << "speaker=" << speaker << "subject=" << subject
+             << "历史轮数:" << history.size();
     emit requestReply(text, history, meta);
+    return true;
 }

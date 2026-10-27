@@ -141,9 +141,13 @@ void AppController::handleMakoReply(const QList<SentenceText> &sentences, const 
     const int SUMMARY_THRESHOLD = ConfigManager::instance().getSummaryMemoryLength();
     if (unsummarizedTurns.size() >= SUMMARY_THRESHOLD) {
         qDebug()<<"[AppController]未摘要对话达到阈值，开始触发后台记忆提取...";
-        QList<CharacterProfile> existingProfiles = m_memoryManager->getCharacterProfiles("user");
-        QList<EpisodicMemory> existingMemories = m_memoryManager->getActiveEpisodicMemories(0.2, 20);
-        m_llmService->extractMemoryAsync(unsummarizedTurns, lastEndId, sourceIds, existingProfiles, existingMemories);
+        // 按本轮主体取已有档案（群聊=qq:<uin>；桌宠=user），并附上茉子人设
+        QList<CharacterProfile> existingProfiles = m_memoryManager->getCharacterProfiles(m_lastMeta.subject);
+        existingProfiles.append(m_memoryManager->getCharacterProfiles("mako"));
+        QList<EpisodicMemory> existingMemories = m_memoryManager->getActiveEpisodicMemories(
+            0.2, 20, m_lastMeta.channel, QString(), m_lastMeta.sessionId);
+        m_llmService->extractMemoryAsync(unsummarizedTurns, lastEndId, sourceIds,
+                                         existingProfiles, existingMemories, m_lastMeta);
     }
 }
 
@@ -235,12 +239,19 @@ void AppController::initConnections()
     connect(m_chatWidget,&ChatWidget::textSubmitted,this,[this](const QString &text){
         m_sessionRouter->submitInput(Channel::kPet, Channel::kDefaultSession, QStringLiteral("欧尼酱"), text);
     });
-    connect(m_llmService, &LLMService::memoryExtractionReady, this, [this](const QJsonObject &extractionResult, qlonglong lastEndId, const QString &sourceIdsJson) {
-        // 1. 角色档案更新
+    connect(m_llmService, &LLMService::memoryExtractionReady, this,
+            [this](const QJsonObject &extractionResult, qlonglong lastEndId,
+                   const QString &sourceIdsJson, const RequestMeta &meta) {
+        // v4：提取结果按“本轮 meta”归属，并记录 episodic 的渠道/会话/主体/可见性
+        const QString visibility = (meta.channel == Channel::kPet)
+                                       ? QStringLiteral("private")
+                                       : QStringLiteral("channel");
+
+        // 1. 角色档案更新（subject 由模型给出：user/mako/qq:<uin>/group:<群号>）
         QJsonArray charUpdates = extractionResult["character_updates"].toArray();
         for (const QJsonValue &val : charUpdates) {
             QJsonObject obj = val.toObject();
-            QString subject = obj["subject"].toString();
+            QString subject = obj["subject"].toString(meta.subject);
             QString key = obj["key"].toString();
             QString value = obj["value"].toString();
             if (!subject.isEmpty() && !key.isEmpty() && !value.isEmpty()) {
@@ -248,35 +259,38 @@ void AppController::initConnections()
             }
         }
 
-        // 2. 情景记忆写入
+        // 2. 情景记忆写入（带 origin/session/subject/visibility）
         QJsonArray episodicMemories = extractionResult["episodic_memories"].toArray();
         for (const QJsonValue &val : episodicMemories) {
             QJsonObject obj = val.toObject();
             QString content = obj["content"].toString();
             QString type = obj["type"].toString("event");
             double importance = obj["importance"].toDouble(0.5);
+            QString subject = obj["subject"].toString(meta.subject);
             QString eventTimeStr = obj["event_time"].toString();
             QDateTime eventTime = QDateTime::fromString(eventTimeStr, "yyyy-MM-dd HH:mm:ss");
             if (!content.isEmpty()) {
-                m_memoryManager->addEpisodicMemory(content, type, importance, eventTime, sourceIdsJson);
+                m_memoryManager->addEpisodicMemory(content, type, importance, eventTime,
+                                                   sourceIdsJson, meta.channel, visibility,
+                                                   subject, meta.sessionId);
             }
         }
 
-        // 3. 工作摘要 → 写入长期记忆摘要表（保留兼容，按渠道分桶写入）
+        // 3. 工作摘要 → 按本轮渠道+会话分桶
         QString summary = extractionResult["working_summary"].toString();
         if (!summary.isEmpty()) {
             m_memoryManager->addLongTermSummary(summary, lastEndId, sourceIdsJson,
-                                                m_lastMeta.channel, m_lastMeta.sessionId);
+                                                meta.channel, meta.sessionId);
         }
 
-        // 4. 关系状态更新（subject 隔离：'user' 即主人）
+        // 4. 关系状态更新（主体=本轮说话人）
         QJsonArray relUpdates = extractionResult["relationship_updates"].toArray();
         for (const QJsonValue &val : relUpdates) {
             QJsonObject obj = val.toObject();
             QString dimension = obj["dimension"].toString();
             double delta = obj["delta"].toDouble(0.0);
             if (!dimension.isEmpty() && delta != 0.0) {
-                m_memoryManager->upsertRelationshipState(dimension, delta, m_lastMeta.subject);
+                m_memoryManager->upsertRelationshipState(dimension, delta, meta.subject);
             }
         }
 

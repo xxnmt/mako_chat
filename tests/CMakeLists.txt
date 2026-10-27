@@ -48,3 +48,9 @@ add_phase0_test(tst_sessionrouter
     tst_sessionrouter.cpp
     ${PHASE0_CORE_SOURCES}
 )
+
+add_phase0_test(tst_promptassembler
+    tst_promptassembler.cpp
+    ${PROJECT_SOURCE_DIR}/promptassembler.h
+    ${PROJECT_SOURCE_DIR}/promptassembler.cpp
+)

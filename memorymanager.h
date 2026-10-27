@@ -61,10 +61,12 @@ public:
                            const QDateTime &eventTime = QDateTime(), const QString &sourceIds = QString(),
                            const QString &origin = QStringLiteral("pet"),
                            const QString &visibility = QStringLiteral("private"),
-                           const QString &subject = QStringLiteral("user"));
+                           const QString &subject = QStringLiteral("user"),
+                           const QString &sessionId = QStringLiteral("default"));
     QList<EpisodicMemory> getActiveEpisodicMemories(double minImportance = 0.2, int limit = 20,
                                                    const QString &origin = QString(),
-                                                   const QString &visibility = QString());
+                                                   const QString &visibility = QString(),
+                                                   const QString &sessionId = QString());
     bool deleteEpisodicMemory(qlonglong id);
     bool updateEpisodicMemoryStatus(qlonglong id, const QString &status);
     int decayEpisodicMemory();

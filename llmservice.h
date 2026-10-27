@@ -26,7 +26,8 @@ public:
     //Extract
     void extractMemoryAsync(const QList<HistoryTurn> &turns, qlonglong lastEndId, const QList<qlonglong> &sourceIds,
                             const QList<CharacterProfile> &existingProfiles = {},
-                            const QList<EpisodicMemory> &existingMemories = {});
+                            const QList<EpisodicMemory> &existingMemories = {},
+                            const RequestMeta &meta = RequestMeta());
 
 signals:
     //chat
@@ -35,7 +36,8 @@ signals:
     //chat 回复内容异常（空/乱码/缺中文/缺日文/缺标签），不入库不走TTS
     void replyAbnormal(const QString &reason);
     //Extract
-    void memoryExtractionReady(const QJsonObject &extractionResult, qlonglong lastEndId, const QString &sourceIdsJson);
+    void memoryExtractionReady(const QJsonObject &extractionResult, qlonglong lastEndId,
+                               const QString &sourceIdsJson, const RequestMeta &meta);
 private slots:
     //finish AI 回复
     void onReplyFinished(QNetworkReply* reply);

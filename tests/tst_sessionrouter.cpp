@@ -2,7 +2,11 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QTemporaryDir>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 
 #include "sessionrouter.h"
 #include "memorymanager.h"
@@ -102,6 +106,72 @@ private slots:
         QCOMPARE(count, 0);
     }
 
+    void identityResolvesSubjectAndDropsSelf()
+    {
+        const QString identityPath = QCoreApplication::applicationDirPath()
+                                     + "/app_data/config/identity.json";
+        QVERIFY(QDir().mkpath(QFileInfo(identityPath).absolutePath()));
+
+        QJsonObject selfObj;
+        selfObj.insert("qq", QJsonArray{"10001"});
+        QJsonObject masterObj;
+        masterObj.insert("qq", QJsonArray{"20001", "20002"});
+        QJsonObject identityObj;
+        identityObj.insert("self", selfObj);
+        identityObj.insert("master", masterObj);
+        QJsonObject rootObj;
+        rootObj.insert("identity", identityObj);
+
+        QFile file(identityPath);
+        QVERIFY2(file.open(QIODevice::WriteOnly | QIODevice::Truncate), "无法写入 identity.json");
+        file.write(QJsonDocument(rootObj).toJson(QJsonDocument::Indented));
+        file.close();
+
+        ConfigManager::instance().reloadIdentity();
+
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager mm(dir.filePath("identity.db"));
+        SessionRouter router(&mm);
+
+        struct Captured {
+            int count = 0;
+            RequestMeta meta;
+        } captured;
+        connect(&router, &SessionRouter::requestReply, this,
+                [&captured](const QString &, const QList<HistoryTurn> &, const RequestMeta &meta) {
+                    ++captured.count;
+                    captured.meta = meta;
+                });
+
+        // 自己的账号：丢弃，不发请求
+        QVERIFY(!router.submitInput(Channel::kQQGroup, "group:1", QStringLiteral("茉子"),
+                                    QStringLiteral("自己"), QStringLiteral("10001")));
+        QCOMPARE(captured.count, 0);
+
+        // 主人账号：归一到 'user'
+        QVERIFY(router.submitInput(Channel::kQQGroup, "group:1", QStringLiteral("主人"),
+                                   QStringLiteral("在吗"), QStringLiteral("20001")));
+        QCOMPARE(captured.count, 1);
+        QCOMPARE(captured.meta.subject, QStringLiteral("user"));
+
+        // 未知群友：qq:<uin>
+        QVERIFY(router.submitInput(Channel::kQQGroup, "group:1", QStringLiteral("小明"),
+                                   QStringLiteral("hi"), QStringLiteral("30001")));
+        QCOMPARE(captured.count, 2);
+        QCOMPARE(captured.meta.subject, QStringLiteral("qq:30001"));
+
+        // 桌宠（无 senderId）：恒为主人
+        QVERIFY(router.submitInput(Channel::kPet, Channel::kDefaultSession,
+                                   QStringLiteral("欧尼酱"), QStringLiteral("你好")));
+        QCOMPARE(captured.count, 3);
+        QCOMPARE(captured.meta.subject, QStringLiteral("user"));
+
+        // 还原默认身份配置，避免影响后续用例
+        QFile::remove(identityPath);
+        ConfigManager::instance().reloadIdentity();
+    }
+
     void identityConfigFallsBackToDefaults()
     {
         ConfigManager &cfg = ConfigManager::instance();
@@ -118,6 +188,12 @@ private slots:
         QCOMPARE(proactive.idleSeconds, 1800);
         QCOMPARE(proactive.quietStart, QStringLiteral("23:00"));
         QCOMPARE(proactive.quietEnd, QStringLiteral("08:00"));
+    }
+
+    void cleanupTestCase()
+    {
+        QFile::remove(QCoreApplication::applicationDirPath()
+                      + "/app_data/config/identity.json");
     }
 };
 

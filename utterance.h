@@ -2,6 +2,7 @@
 #define UTTERANCE_H
 
 #include <QString>
+#include <QMetaType>
 #include <QMap>
 
 // 渠道常量（与 DB 的 channel 列、config 的 [memory] blindZones 取值保持一致）
@@ -23,6 +24,8 @@ struct RequestMeta {
     QString turnKind = QStringLiteral("reply"); // 轮次类型：reply / proactive / perception
     QString triggerEventIds;                    // 触发事件 id 列表（JSON 数组，指向 raw_events.id）
 };
+
+Q_DECLARE_METATYPE(RequestMeta)
 
 // 输出侧：一句话 + 路由元数据（由 SentenceText 在大脑侧一次映射，渠道层协议）
 struct Utterance {

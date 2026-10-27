@@ -18,9 +18,11 @@ public:
     explicit SessionRouter(MemoryManager *memoryManager, QObject *parent = nullptr);
 
     // 渠道上报用户输入
-    // speaker 为显示名（气泡/记忆展示用）；QQ 渠道 Phase 1 另传 senderId 做身份解析
-    void submitInput(const QString &channel, const QString &sessionId,
-                     const QString &speaker, const QString &text);
+    // speaker 为显示名（气泡/记忆展示用）；senderId 为平台稳定身份（QQ uin 等，桌宠留空）
+    // 返回 false 表示未进入大脑（空输入 / 自身账号消息被丢弃）
+    bool submitInput(const QString &channel, const QString &sessionId,
+                     const QString &speaker, const QString &text,
+                     const QString &senderId = QString());
 
 signals:
     // 交给大脑侧（AppController → LLMService::askDeepSeek）
@@ -30,7 +32,7 @@ signals:
 
 private:
     // 身份解析（C2 决策：归属权在宿主配置层，渠道/模型无权判定）
-    // Phase 0：桌宠对话恒 'user'；Phase 1 查 identity 配置（self→丢弃 / master→'user' / 未知→'qq:<uin>'）
+    // 空 senderId / 桌宠 → 'user'；QQ：self→空串（丢弃）/ master→'user' / 未知→'qq:<uin>'
     QString resolveSubject(const QString &channel, const QString &senderId);
 
     MemoryManager *m_memoryManager;   // 非所有权

@@ -494,3 +494,19 @@ ProactiveConfig ConfigManager::getProactiveConfig()
     ensureIdentityLoaded();
     return m_proactive;
 }
+
+void ConfigManager::reloadIdentity()
+{
+    m_identityLoaded = false;
+    m_selfQQ.clear();
+    m_masterQQ.clear();
+    m_blindZones.clear();
+    m_followExternalMood = true;
+    m_proactive = ProactiveConfig();
+    ensureIdentityLoaded();
+}
+
+void ConfigManager::loadIdentityConfig()
+{
+    ensureIdentityLoaded();
+}

@@ -148,7 +148,7 @@ private slots:
             QVERIFY(raw.open());
 
             // 版本推进到 v3
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 3);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 4);
 
             // 列扩展（v2 渠道 + v3 轮次）
             const QStringList historyCols = raw.columns("chat_history");
@@ -171,10 +171,13 @@ private slots:
             QVERIFY(episodicCols.contains("origin"));
             QVERIFY(episodicCols.contains("visibility"));
             QVERIFY(episodicCols.contains("subject"));
+            QVERIFY(episodicCols.contains("session_id"));
             QCOMPARE(raw.scalar("SELECT visibility FROM episodic_memory LIMIT 1").toString(),
                      QStringLiteral("private"));
             QCOMPARE(raw.scalar("SELECT subject FROM episodic_memory LIMIT 1").toString(),
                      QStringLiteral("user"));
+            QCOMPARE(raw.scalar("SELECT session_id FROM episodic_memory LIMIT 1").toString(),
+                     QStringLiteral("default"));
 
             // 存量行按默认值归入 pet/default，数据不丢
             QCOMPARE(raw.scalar("SELECT user_input FROM chat_history LIMIT 1").toString(),
@@ -238,14 +241,14 @@ private slots:
             MemoryManager second(dbPath);
             RawDb raw(dbPath, "verify2");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 3);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 4);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM chat_history").toInt(), 1);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM relationship_state").toInt(), 2);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM long_term_summary").toInt(), 1);
         }
     }
 
-    void freshDatabaseIsV3()
+    void freshDatabaseIsV4()
     {
         QTemporaryDir dir;
         QVERIFY(dir.isValid());
@@ -255,7 +258,7 @@ private slots:
             MemoryManager mm(dbPath);
             RawDb raw(dbPath, "fresh");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 3);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 4);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('raw_events')").toInt() > 0);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('memory_cursor')").toInt() > 0);
 
@@ -462,7 +465,7 @@ private slots:
         Q_UNUSED(mm);
         RawDb raw(dbPath, "v2verify");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 3);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 4);
         QCOMPARE(raw.scalar("SELECT user_input FROM chat_history").toString(), QStringLiteral("旧输入"));
         QCOMPARE(raw.scalar("SELECT turn_kind FROM chat_history").toString(), QStringLiteral("reply"));
         QCOMPARE(raw.scalar("SELECT subject FROM chat_history").toString(), QStringLiteral("user"));
@@ -537,18 +540,33 @@ private slots:
 
         QVERIFY(mm.addEpisodicMemory(QStringLiteral("桌宠私密"), QStringLiteral("event"), 0.5,
                                      QDateTime(), QString(), QStringLiteral("pet"),
-                                     QStringLiteral("private"), QStringLiteral("user")));
-        QVERIFY(mm.addEpisodicMemory(QStringLiteral("群聊记忆"), QStringLiteral("event"), 0.6,
+                                     QStringLiteral("private"), QStringLiteral("user"),
+                                     QStringLiteral("default")));
+        QVERIFY(mm.addEpisodicMemory(QStringLiteral("群A记忆"), QStringLiteral("event"), 0.6,
                                      QDateTime(), QString(), QStringLiteral("qq_group"),
-                                     QStringLiteral("channel"), QStringLiteral("qq:10001")));
+                                     QStringLiteral("channel"), QStringLiteral("qq:10001"),
+                                     QStringLiteral("group:123")));
+        QVERIFY(mm.addEpisodicMemory(QStringLiteral("群B记忆"), QStringLiteral("event"), 0.7,
+                                     QDateTime(), QString(), QStringLiteral("qq_group"),
+                                     QStringLiteral("channel"), QStringLiteral("qq:10001"),
+                                     QStringLiteral("group:999")));
 
-        QCOMPARE(mm.getActiveEpisodicMemories().size(), 2);
-        QCOMPARE(mm.getActiveEpisodicMemories(0.2, 20, QStringLiteral("qq_group")).size(), 1);
+        QCOMPARE(mm.getActiveEpisodicMemories().size(), 3);
+        QCOMPARE(mm.getActiveEpisodicMemories(0.2, 20, QStringLiteral("qq_group")).size(), 2);
         QCOMPARE(mm.getActiveEpisodicMemories(0.2, 20, QString(), QStringLiteral("private")).size(), 1);
-        QCOMPARE(mm.getActiveEpisodicMemories(0.2, 20, QStringLiteral("qq_group"),
-                                              QStringLiteral("channel")).size(), 1);
         QCOMPARE(mm.getActiveEpisodicMemories(0.2, 20, QStringLiteral("pet"),
                                               QStringLiteral("channel")).size(), 0);
+
+        // v4 会话隔离：同渠道不同群互不可见
+        QCOMPARE(mm.getActiveEpisodicMemories(0.2, 20, QStringLiteral("qq_group"), QString(),
+                                              QStringLiteral("group:123")).size(), 1);
+        QCOMPARE(mm.getActiveEpisodicMemories(0.2, 20, QStringLiteral("qq_group"), QString(),
+                                              QStringLiteral("group:999")).size(), 1);
+        QCOMPARE(mm.getActiveEpisodicMemories(0.2, 20, QStringLiteral("qq_group"), QString(),
+                                              QStringLiteral("group:000")).size(), 0);
+        QCOMPARE(mm.getActiveEpisodicMemories(0.2, 20, QStringLiteral("qq_group"),
+                                              QStringLiteral("channel"),
+                                              QStringLiteral("group:123")).size(), 1);
     }
 
     void memoryCursorUpsert()

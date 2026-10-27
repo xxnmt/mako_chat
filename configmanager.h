@@ -100,6 +100,8 @@ public:
     bool isBlindZone(const QString &channel, const QString &sessionId);
     bool getFollowExternalMood();         // D1：外部渠道情绪是否驱动桌设立绘（默认 true）
     ProactiveConfig getProactiveConfig();
+    void reloadIdentity();                // 重新读取 identity.json（配置热更新/测试用）
+    void loadIdentityConfig();            // 启动时显式加载 identity.json（触发校验与日志）
 
 private:
     ConfigManager();
