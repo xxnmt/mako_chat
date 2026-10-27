@@ -85,6 +85,17 @@ bool ConfigManager::loadSetting()
         m_emotionLasting = qBound(1, timeObj.value("emotion_lasting").toInt(15), 3600);
         m_distanceLasting = qBound(1, timeObj.value("distance_lasting").toInt(15), 3600);
     }
+    // QQ 协议端（OneBot WS）
+    m_qqEnabled = false;
+    m_qqWsUrl = QStringLiteral("ws://127.0.0.1:3001");
+    m_qqAccessToken.clear();
+    if (rootObj.contains("qq") && rootObj["qq"].isObject()) {
+        QJsonObject qqObj = rootObj["qq"].toObject();
+        m_qqEnabled = qqObj.value("enabled").toBool(false);
+        m_qqWsUrl = qqObj.value("ws_url").toString(QStringLiteral("ws://127.0.0.1:3001"));
+        m_qqAccessToken = qqObj.value("access_token").toString();
+    }
+
     //tts
     if (rootObj.contains("tts") && rootObj["tts"].isObject()) {
         QJsonObject ttsObj = rootObj["tts"].toObject();
@@ -129,10 +140,16 @@ bool ConfigManager::saveSetting()
     timeObj.insert("emotion_lasting", m_emotionLasting);
     timeObj.insert("distance_lasting", m_distanceLasting);
 
+    QJsonObject qqObj;
+    qqObj.insert("enabled", m_qqEnabled);
+    qqObj.insert("ws_url", m_qqWsUrl);
+    qqObj.insert("access_token", m_qqAccessToken);
+
     QJsonObject rootObj;
     rootObj.insert("api", apiObj);
     rootObj.insert("memory", memoryObj);
     rootObj.insert("time", timeObj);
+    rootObj.insert("qq", qqObj);
 
     QJsonObject ttsObj;
     ttsObj.insert("mode", m_ttsMode);
@@ -493,6 +510,15 @@ ProactiveConfig ConfigManager::getProactiveConfig()
 {
     ensureIdentityLoaded();
     return m_proactive;
+}
+
+QQConfig ConfigManager::getQQConfig() const
+{
+    QQConfig config;
+    config.enabled = m_qqEnabled;
+    config.wsUrl = m_qqWsUrl;
+    config.accessToken = m_qqAccessToken;
+    return config;
 }
 
 void ConfigManager::reloadIdentity()

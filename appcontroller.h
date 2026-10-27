@@ -23,6 +23,7 @@ class TimeManager;
 class PetChannelAdapter;
 class QQChannelAdapter;
 class SessionRouter;
+class QQProtocolClient;
 
 class AppController : public QObject
 {
@@ -61,6 +62,7 @@ private:
     TimeManager *m_timeManager;
     PetChannelAdapter *m_petChannel;    // 渠道：桌宠（气泡私有表现）
     QQChannelAdapter *m_qqChannel;      // 渠道：QQ（Phase 1 启用）
+    QQProtocolClient *m_qqClient;       // OneBot WS 传输（入站暂只落 raw_events）
     SessionRouter *m_sessionRouter;     // 输入路由（渠道→大脑）
     RequestMeta m_lastMeta;             // 最近一轮请求元数据（回复入库时随存）
     quint64 m_roundSeq = 0;             // 对话轮次序号：每次用户输入 +1（TD-034）

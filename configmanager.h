@@ -7,6 +7,13 @@
 #include <QTime>
 #include "ttsreference.h"
 
+// QQ 协议端连接配置（setting.json 的 qq 段）
+struct QQConfig {
+    bool enabled = false;
+    QString wsUrl = QStringLiteral("ws://127.0.0.1:3001");
+    QString accessToken;
+};
+
 // 记忆盲区（该渠道会话产生的对话不入长期记忆）
 struct BlindZone {
     QString channel;
@@ -100,6 +107,7 @@ public:
     bool isBlindZone(const QString &channel, const QString &sessionId);
     bool getFollowExternalMood();         // D1：外部渠道情绪是否驱动桌设立绘（默认 true）
     ProactiveConfig getProactiveConfig();
+    QQConfig getQQConfig() const;
     void reloadIdentity();                // 重新读取 identity.json（配置热更新/测试用）
     void loadIdentityConfig();            // 启动时显式加载 identity.json（触发校验与日志）
 
@@ -120,6 +128,9 @@ private:
     QString m_pythonPath;
 
     int m_shortMemoryLength=15;
+    bool m_qqEnabled=false;
+    QString m_qqWsUrl=QStringLiteral("ws://127.0.0.1:3001");
+    QString m_qqAccessToken;
     int m_summaryMemoryLength=15;          // 长期记忆自动摘轮数（未摘要轮次阈值）
     QTime m_nightStart{22, 0};             // 夜晚开始
     QTime m_nightEnd{7, 0};                // 夜晚结束（支持跨零点）

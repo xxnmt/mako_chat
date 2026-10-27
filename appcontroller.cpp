@@ -16,6 +16,8 @@
 #include "petchanneladapter.h"
 #include "qqchanneladapter.h"
 #include "sessionrouter.h"
+#include "qqprotocolclient.h"
+#include "qqmessageparser.h"
 
 #include <QDebug>
 #include <QJsonArray>
@@ -54,6 +56,39 @@ AppController::AppController(QObject *parent)
     m_ttsService->setAudioSink(m_petChannel->audioSink());
     m_qqChannel = new QQChannelAdapter(this);
     m_sessionRouter = new SessionRouter(m_memoryManager, this);
+    m_qqClient = new QQProtocolClient(this);
+    m_qqClient->setConfig(ConfigManager::instance().getQQConfig());
+    m_qqChannel->setClient(m_qqClient);
+    connect(m_qqClient, &QQProtocolClient::messageEvent, this,
+            [this](const QJsonObject &event) {
+        if (QQMessageParser::isSelfMessage(event)) {
+            return;
+        }
+        const QQInboundMessage message = QQMessageParser::parse(event);
+        if (!message.valid) {
+            return;
+        }
+        // 本批只落原始事件，不接大脑/不回复（下一批再接 SessionRouter）
+        m_memoryManager->appendRawEvent(QStringLiteral("qq"), message.channel,
+                                        message.sessionId, QStringLiteral("message"),
+                                        message.text, message.messageId,
+                                        QStringLiteral("in"), message.senderId,
+                                        message.speaker, message.rawJson,
+                                        message.occurredAt, false,
+                                        QStringLiteral("channel"));
+        qDebug() << "[QQ]收到消息:" << message.channel << message.sessionId
+                 << message.speaker << message.text;
+        // 群聊默认只响应 @ 机器人（避免刷屏和风控）；私聊始终响应
+        if (message.channel == Channel::kQQGroup && !message.mentionedSelf) {
+            qDebug() << "[QQ]群消息未@我，已记录但不回复";
+            return;
+        }
+        m_sessionRouter->submitInput(message.channel, message.sessionId,
+                                     message.speaker, message.text, message.senderId);
+    });
+    if (ConfigManager::instance().getQQConfig().enabled) {
+        m_qqClient->start();
+    }
 
     m_anchorManager = new AnchorManager(m_character, this);
     //ui绑定
@@ -118,6 +153,10 @@ AppController::~AppController()
         m_memoryManager = nullptr;
     }
 
+    if (m_qqClient) {
+        m_qqClient->stop();
+    }
+
     qDebug()<<"[AppController]:所有中枢资源已安全清理完毕";
 }
 
@@ -134,7 +173,23 @@ void AppController::handleMakoReply(const QList<SentenceText> &sentences, const 
     // TD-034：本轮回复入队 TTS，记下它属于哪一轮（退火门控用）
     m_lastPlaybackRound = m_roundSeq;
     m_memoryManager->saveQATurn(m_lastUserInput,rawReply,sentences,m_lastMeta);
-    m_ttsService->enqueueSentences(sentences);
+    if (m_lastMeta.channel == Channel::kPet) {
+        m_ttsService->enqueueSentences(sentences);
+    } else {
+        // QQ：文字回复走 QQ 渠道；情绪写入全局（D1 控制是否驱动桌宠立绘），
+        // 不触发桌宠气泡/TTS（D2：播放与退火归桌宠渠道）。
+        QStringList replyParts;
+        for (const SentenceText &sentence : sentences) {
+            replyParts << sentence.zhText;
+            m_globalMood->applyTags(sentence.rawTags, m_lastMeta.channel);
+        }
+        Utterance utterance;
+        utterance.channel = m_lastMeta.channel;
+        utterance.sessionId = m_lastMeta.sessionId;
+        utterance.speaker = m_lastMeta.speaker;
+        utterance.text = replyParts.join(QString());
+        m_qqChannel->sendUtterance(utterance);
+    }
 
     qlonglong lastEndId = -1;
     QList<qlonglong> sourceIds;

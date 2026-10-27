@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.19)
 project(Windows_AI LANGUAGES CXX)
 enable_language(RC)
 
-find_package(Qt6 6.5 REQUIRED COMPONENTS Core Widgets Network Sql REQUIRED Multimedia)
+find_package(Qt6 6.5 REQUIRED COMPONENTS Core Widgets Network Sql Multimedia WebSockets)
 
 qt_standard_project_setup()
 
@@ -37,6 +37,8 @@ qt_add_executable(Windows_AI
     qqchanneladapter.cpp
     sessionrouter.h
     sessionrouter.cpp
+    qqmessageparser.h qqmessageparser.cpp
+    qqprotocolclient.h qqprotocolclient.cpp
     ttsreference.h
     ittsprovider.h
     apittsprovider.h apittsprovider.cpp
@@ -60,6 +62,7 @@ target_link_libraries(Windows_AI
         Qt::Network
         Qt::Sql
         Qt::Multimedia
+        Qt::WebSockets
 )
 
 install(TARGETS Windows_AI

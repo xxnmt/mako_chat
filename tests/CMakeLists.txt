@@ -55,6 +55,12 @@ add_phase0_test(tst_promptassembler
     ${PROJECT_SOURCE_DIR}/promptassembler.cpp
 )
 
+add_phase0_test(tst_qqmessageparser
+    tst_qqmessageparser.cpp
+    ${PROJECT_SOURCE_DIR}/qqmessageparser.h
+    ${PROJECT_SOURCE_DIR}/qqmessageparser.cpp
+)
+
 add_phase0_test(tst_globalmoodstate
     tst_globalmoodstate.cpp
     ${PROJECT_SOURCE_DIR}/globalmoodstate.h
