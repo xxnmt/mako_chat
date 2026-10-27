@@ -11,6 +11,8 @@ class CharacterWidget;
 class BubbleWidget;
 class LLMService;
 class AppearanceManager;
+class GlobalMoodState;
+class GlobalMoodState;
 class TTSService;
 class ChatWidget;
 class AnchorManager;
@@ -41,6 +43,7 @@ signals:
 private:
     void initConnections();
     void applyTimeSettings();   // 把 ConfigManager 的时间/退火配置应用到 TimeManager
+    void applyPetTags(const QMap<QString, QString> &tags); // 桌宠：立绘 + 全局情绪同步
 
     QString m_lastUserInput;
 
@@ -48,6 +51,7 @@ private:
     BubbleWidget *m_bubble;
     LLMService *m_llmService;
     AppearanceManager *m_appearance;
+    GlobalMoodState *m_globalMood;   // 全局情绪（D2；外部情绪驱动桌宠受 D1 控制）
     TTSService *m_ttsService;
     ChatWidget *m_chatWidget;
     AnchorManager *m_anchorManager;

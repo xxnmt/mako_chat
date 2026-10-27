@@ -3,6 +3,7 @@
 #include "bubblewidget.h"
 #include "llmservice.h"
 #include "appearancemanager.h"
+#include "globalmoodstate.h"
 #include "ttsservice.h"
 #include "chatwidget.h"
 #include "anchormanager.h"
@@ -29,6 +30,8 @@ AppController::AppController(QObject *parent)
     m_bubble = new BubbleWidget;
     m_llmService = new LLMService(ConfigManager::instance().getApiKey());
     m_appearance = new AppearanceManager;
+    m_globalMood = new GlobalMoodState(this);
+    m_globalMood->setFollowExternalMood(ConfigManager::instance().getFollowExternalMood());
     m_ttsService = new TTSService;
     m_chatWidget = new ChatWidget;
     m_memoryManager = new MemoryManager(ConfigManager::instance().getMemoryPath());
@@ -161,7 +164,7 @@ void AppController::handleSystemError(const QString &errorMsg)
     QMap<QString, QString> errorTags;
     errorTags.insert("emotion", "sad");
     errorTags.insert("blush", "unblushing");
-    m_appearance->applyTags(errorTags);
+    applyPetTags(errorTags);
     //按最终状态启动退火：sad 表情 15 秒后自动恢复 happyIdle
     m_timeManager->notifyRoundEnded(errorTags);
 }
@@ -173,7 +176,7 @@ void AppController::handleAbnormalReply(const QString &reason)
     QMap<QString, QString> errorTags;
     errorTags.insert("emotion", "sad");
     errorTags.insert("blush", "unblushing");
-    m_appearance->applyTags(errorTags);
+    applyPetTags(errorTags);
 
     //反馈后按最终状态启动退火：sad≠happyIdle → 15秒后自动恢复
     m_timeManager->notifyRoundEnded(errorTags);
@@ -188,7 +191,7 @@ void AppController::onPlayAudioAction(const QString &zhText, const QMap<QString,
     m_petChannel->sendUtterance(u);
 
     // 全局情绪层：立绘四维状态不随渠道拆分（D1 开关 Phase 1 在 QQ 渠道路径生效）
-    m_appearance->applyTags(tags);
+    applyPetTags(tags);
 
     qDebug()<<"[AppController] 当前播放文本:" << zhText;
     qDebug()<<"[AppController] 当前立绘路径:" << m_appearance->getPath();
@@ -205,10 +208,22 @@ void AppController::applyTimeSettings()
     m_timeManager->setDistanceTime(cfg.getDistanceLasting());
 }
 
+void AppController::applyPetTags(const QMap<QString, QString> &tags)
+{
+    // 桌宠渠道：立绘（含服装）+ 全局情绪同步
+    m_appearance->applyTags(tags);
+    m_globalMood->applyTags(tags, Channel::kPet);
+}
+
 void AppController::initConnections()
 {
     connect(m_ttsService, &TTSService::playAudioAction, this, &AppController::onPlayAudioAction);
     connect(m_appearance, &AppearanceManager::characterPathChanged, m_character, &CharacterWidget::updatePath);
+    // D1：外部渠道情绪驱动桌宠立绘（只带情绪三维；服装仍由时间/桌宠控制）
+    connect(m_globalMood, &GlobalMoodState::externalMoodApplied, this,
+            [this](const QMap<QString, QString> &moodTags) {
+                m_appearance->applyTags(moodTags);
+            });
     connect(m_llmService, &LLMService::internetErrorSignal, this, &AppController::handleSystemError);
     connect(m_llmService, &LLMService::replyAbnormal, this, &AppController::handleAbnormalReply);
 
@@ -309,25 +324,25 @@ void AppController::initConnections()
     connect(m_timeManager, &TimeManager::clotheChanged,m_appearance, [this](const QString &clothing) {
                 QMap<QString, QString> tags;
                 tags["clothing"] = clothing;
-                m_appearance->applyTags(tags);
+                applyPetTags(tags);
             });
 
     connect(m_timeManager, &TimeManager::blushingReset,m_appearance, [this]() {
                 QMap<QString, QString> tags;
                 tags["blush"] = "unblushing";
-                m_appearance->applyTags(tags);
+                applyPetTags(tags);
             });
 
     connect(m_timeManager, &TimeManager::emotionReset,m_appearance, [this]() {
                 QMap<QString, QString> tags;
                 tags["emotion"] = "happyIdle";
-                m_appearance->applyTags(tags);
+                applyPetTags(tags);
             });
 
     connect(m_timeManager, &TimeManager::distanceReset,m_appearance, [this]() {
                 QMap<QString, QString> tags;
                 tags["distance"] = "far";
-                m_appearance->applyTags(tags);
+                applyPetTags(tags);
             });
 
     // 每轮对话结束：以最终视觉状态驱动退火（脸红/非默认表情/closer 各自开定时器）

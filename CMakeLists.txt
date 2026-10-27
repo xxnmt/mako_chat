@@ -22,6 +22,7 @@ qt_add_executable(Windows_AI
     appcontroller.h appcontroller.cpp
     sentencedata.h
     appearancemanager.h appearancemanager.cpp
+    globalmoodstate.h globalmoodstate.cpp
     ttsservice.h ttsservice.cpp
     chatwidget.h chatwidget.cpp
     anchorstrategy.h
