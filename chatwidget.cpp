@@ -1,5 +1,7 @@
 #include "chatwidget.h"
+#include "debuglog.h"
 #include <QVBoxLayout>
+#include <QDebug>
 
 ChatWidget::ChatWidget(QWidget *parent)
     : QWidget{parent}
@@ -18,7 +20,10 @@ ChatWidget::ChatWidget(QWidget *parent)
     connect(m_lineEdit,&QLineEdit::returnPressed,this,[this](){
         QString text = m_lineEdit->text().trimmed();
 
-        qDebug()<<"[user]:"<<text;
+        qDebug() << "[user] 输入长度:" << text.size();
+        if (debugFullLogsEnabled()) {
+            qDebug() << "[user][debug]:" << text;
+        }
 
         if(!text.isEmpty()){
         emit textSubmitted(text);

@@ -1,4 +1,5 @@
 #include "qqchanneladapter.h"
+#include "debuglog.h"
 #include "qqprotocolclient.h"
 
 #include <QJsonArray>
@@ -58,5 +59,9 @@ void QQChannelAdapter::sendUtterance(const Utterance &u)
     params["message"] = buildTextMessage(u.text);
     // 群聊场景可带 auto_escape，保持纯文本
     m_client->sendAction(action, params);
-    qDebug() << "[QQChannel]发送:" << u.channel << u.sessionId << u.text;
+    qDebug() << "[QQChannel]发送:" << u.channel << u.sessionId
+             << "chars=" << u.text.size();
+    if (debugFullLogsEnabled()) {
+        qDebug().noquote() << "[QQChannel][debug] 发送:" << u.text;
+    }
 }

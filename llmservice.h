@@ -4,6 +4,7 @@
 #include <QObject>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
+#include <QJsonArray>
 
 #include "sentencedata.h"
 #include "historyturn.h"
@@ -48,6 +49,8 @@ private:
     //处理提示词的两个函数
     void initializePromptFile();
     QString loadSystemPrompt();
+    void sendChatRequest(const QJsonArray &messages);
+    void sendSafeRetry();
 
     QPair<QList<SentenceText>, QString> parseJsonReply(const QString &replyText);
 
@@ -67,6 +70,8 @@ private:
 
     MemoryManager *m_memoryManager = nullptr;
     RequestMeta m_currentMeta;   // 当前轮次元数据（askDeepSeek 设置，prompt 组装与记忆注入使用）
+    QJsonArray m_lastRequestMessages;
+    int m_outputRetryCount = 0;
 };
 
 class TagValidator{

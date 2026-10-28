@@ -1,4 +1,5 @@
 #include "configmanager.h"
+#include "debuglog.h"
 #include "utterance.h"
 
 #include <QCoreApplication>
@@ -64,12 +65,14 @@ bool ConfigManager::loadSetting()
     }
 
     m_memoryPolicy = MemoryPolicyConfig{};
+    m_debugFullLogs = false;
     m_shortMemoryLength = 15;
     m_summaryMemoryLength = 15;
     if (rootObj.contains("memory") && rootObj["memory"].isObject()) {
         QJsonObject memoryObj = rootObj["memory"].toObject();
         m_shortMemoryLength = memoryObj.value("short_term_length").toInt(15);
         m_summaryMemoryLength = memoryObj.value("summary_length").toInt(15);
+        m_debugFullLogs = memoryObj.value("debug_full_logs").toBool(false);
 
         m_memoryPolicy.shortContextEnabled =
             memoryObj.value("short_context_enabled").toBool(true);
@@ -115,6 +118,7 @@ bool ConfigManager::loadSetting()
     if (m_summaryMemoryLength < 1) {
         m_summaryMemoryLength = 15;
     }
+    setDebugFullLogsEnabled(m_debugFullLogs);
 
     // 时间管理（TD-037；缺省值与 TimeManager 构造默认值保持一致）
     m_nightStart = QTime(22, 0);
@@ -227,6 +231,7 @@ bool ConfigManager::saveSetting()
     memoryObj.insert("summary_length", m_summaryMemoryLength);
     memoryObj.insert("short_context_enabled", m_memoryPolicy.shortContextEnabled);
     memoryObj.insert("long_term_memory_enabled", m_memoryPolicy.longTermMemoryEnabled);
+    memoryObj.insert("debug_full_logs", m_debugFullLogs);
     memoryObj.insert("privacy_policy_version", m_memoryPolicy.policyVersion);
     QJsonArray privacyRules;
     for (const PrivacyRule &rule : m_memoryPolicy.privacyRules) {
@@ -455,6 +460,11 @@ int ConfigManager::getSummaryMemoryLength() const
 void ConfigManager::setSummaryMemoryLength(int length)
 {
     m_summaryMemoryLength = qBound(1, length, 999);
+}
+
+bool ConfigManager::getDebugFullLogs() const
+{
+    return m_debugFullLogs;
 }
 
 QTime ConfigManager::getNightStartTime() const

@@ -12,6 +12,8 @@
 #include <QPair>
 #include "memorymanager.h"
 #include "promptassembler.h"
+#include "memoryoutputguard.h"
+#include "debuglog.h"
 
 
 LLMService::LLMService(const QString &apiKey,QObject *parent)
@@ -35,13 +37,6 @@ void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> 
 {
     m_currentMeta = meta;   // 本轮元数据（渠道/会话/主体），供 prompt 组装与记忆注入使用
 
-    QUrl url("https://api.deepseek.com/chat/completions");
-    QNetworkRequest request(url);
-
-    request.setHeader(QNetworkRequest::ContentTypeHeader,"application/json");
-    //define YOUR_API_KEY into AI api key
-    QString aotuHeader="Bearer "+m_apiKey;
-    request.setRawHeader("Authorization",aotuHeader.toUtf8());
     m_systemPromptCache=loadSystemPrompt();
 
     // 角色档案 / 情景记忆 / 摘要 / 关系：PromptAssembler 统一按渠道与可见性组装（C3）
@@ -63,7 +58,7 @@ void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> 
         qDebug()<<"[LLM]情景记忆数量:"<<context.memories.size();
         qDebug()<<"[LLM]摘要数量:"<<context.summaries.size();
     }
-    QString finalSystemPrompt = PromptAssembler::buildSystemPrompt(
+    const QString finalSystemPrompt = PromptAssembler::buildSystemPrompt(
         m_systemPromptCache, m_currentMeta, context);
 
     QJsonArray messagesArray;
@@ -79,7 +74,7 @@ void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> 
     }
 
     if (m_stateProvider) {
-        QString currentUiState = m_stateProvider();
+        const QString currentUiState = m_stateProvider();
         QJsonObject envMsg;
         envMsg["role"] = "system";
         envMsg["content"] = QString(
@@ -91,31 +86,75 @@ void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> 
                                      QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss"));
         messagesArray.append(envMsg);
     }
+
+    // 检索记忆属于不可信资料，不得拼进 system。
+    const QJsonObject memoryData =
+        PromptAssembler::buildMemoryDataMessage(m_currentMeta, context);
+    if (!memoryData.isEmpty()) {
+        messagesArray.append(memoryData);
+    }
+
     QJsonObject userMessage;
     userMessage["role"] = "user";
-    QString enhancedInput = userInput + "\n\n【输出要求】请直接输出符合约定格式的JSON，不要输出任何其他文本、解释或思考内容。";
+    const QString enhancedInput = userInput + "\n\n【输出要求】请直接输出符合约定格式的JSON，不要输出任何其他文本、解释或思考内容。";
     userMessage["content"] = enhancedInput;
     messagesArray.append(userMessage);
+
     qDebug() << "[LLM]消息组装完成: messages=" << messagesArray.size()
              << "systemLen=" << finalSystemPrompt.size()
+             << "memoryData=" << !memoryData.isEmpty()
              << "userLen=" << enhancedInput.size();
+    if (debugFullLogsEnabled()) {
+        qDebug().noquote() << "[LLM][debug] messages:"
+                           << QString::fromUtf8(
+                                  QJsonDocument(messagesArray).toJson(QJsonDocument::Indented));
+    }
+
+    m_lastRequestMessages = messagesArray;
+    m_outputRetryCount = 0;
+    sendChatRequest(messagesArray);
+
+    qDebug() << "[LLM]茉子带着"<<historyQA.size()<<"轮短期记忆正在思考......";
+}
+
+void LLMService::sendChatRequest(const QJsonArray &messages)
+{
+    QUrl url("https://api.deepseek.com/chat/completions");
+    QNetworkRequest request(url);
+    request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    request.setRawHeader("Authorization", ("Bearer " + m_apiKey).toUtf8());
 
     QJsonObject rootObj;
     rootObj["model"] = "deepseek-v4-flash";
-    rootObj["messages"] = messagesArray;
+    rootObj["messages"] = messages;
     rootObj["temperature"] = 0.7;
     rootObj["max_tokens"] = 8192;
     rootObj["response_format"] = QJsonObject{{"type", "json_object"}};
-
-    // QJsonObject thinkingObj;
-    // thinkingObj["type"] = "disabled";
     rootObj["reasoning_effort"] = "low";
-    // rootObj["thinking"] = thinkingObj;
 
-    QByteArray postData = QJsonDocument(rootObj).toJson();
-    m_networkManager->post(request, postData);
+    m_networkManager->post(request, QJsonDocument(rootObj).toJson());
+}
 
-    qDebug() << "[LLM]茉子带着"<<historyQA.size()<<"轮短期记忆正在思考......";
+void LLMService::sendSafeRetry()
+{
+    if (m_lastRequestMessages.isEmpty()) {
+        emit replyAbnormal(QStringLiteral("output_guard"));
+        return;
+    }
+
+    QJsonObject retryMessage;
+    retryMessage["role"] = "system";
+    retryMessage["content"] = QStringLiteral(
+        "【安全重试】上一次生成触发了隐私/安全规则。请重新回答最后一条用户消息；"
+        "不得输出任何隐私规则命中的原文、第三方私聊信息、其他群身份信息或来源标识。"
+        "若不能安全回答，简短拒绝，不要解释规则。");
+
+    QJsonArray retryMessages = m_lastRequestMessages;
+    const int insertAt = qMax(0, retryMessages.size() - 1);
+    retryMessages.insert(insertAt, retryMessage);
+
+    qDebug() << "[LLM]输出保护命中，发起一次安全重试";
+    sendChatRequest(retryMessages);
 }
 
 void LLMService::registerStateProvider(std::function<QString ()> provider)
@@ -342,6 +381,11 @@ void LLMService::extractMemoryAsync(const QList<HistoryTurn> &turns, qlonglong l
                 QJsonObject result = resultDoc.object();
                 qDebug() << "[LLM]记忆提取成功: keys=" << result.size()
                          << "chars=" << replyText.size();
+                if (debugFullLogsEnabled()) {
+                    qDebug().noquote() << "[LLM][debug] extraction:"
+                                       << QString::fromUtf8(
+                                              QJsonDocument(result).toJson(QJsonDocument::Indented));
+                }
                 emit memoryExtractionReady(result, lastEndId, sourceIdsJson, meta);
             } else {
                 qDebug() << "[LLM]记忆提取返回的JSON格式解析失败: chars="
@@ -375,24 +419,48 @@ void LLMService::onReplyFinished(QNetworkReply *reply)
             if (replyText.trimmed().isEmpty()) {
                 QString reasoning = messageObj["reasoning_content"].toString();
                 qDebug() << "[LLM]content为空！reasoning_content长度:" << reasoning.length();
-                if (!reasoning.isEmpty()) {
-                    qDebug() << "[LLM]reasoning_content前200字:" << reasoning.left(200);
-                }
                 qDebug() << "[LLM]message字段长度:" << messageObj.size();
             }
 //---------------
             qDebug() << "[LLM]茉子回复(未处理)长度:" << replyText.size();
+            if (debugFullLogsEnabled()) {
+                qDebug().noquote() << "[LLM][debug] raw reply:" << replyText;
+            }
 
             QPair<QList<SentenceText>, QString> parseResult=parseJsonReply(replyText);
             QList<SentenceText> parsedSentences = parseResult.first;
             QString correctedReply = parseResult.second;
+
+            if (!parsedSentences.isEmpty()) {
+                QStringList guardTexts;
+                guardTexts << correctedReply;
+                for (const SentenceText &sentence : parsedSentences) {
+                    guardTexts << sentence.zhText << sentence.jaText;
+                }
+                const MemoryPolicyConfig policy =
+                    ConfigManager::instance().getMemoryPolicyConfig();
+                const OutputGuardResult guard = MemoryOutputGuard::check(
+                    guardTexts.join('\n'), m_currentMeta, policy.privacyRules);
+                if (guard.blocked) {
+                    qDebug() << "[LLM]输出保护命中:" << guard.reason
+                             << "rules=" << guard.ruleIds;
+                    if (m_outputRetryCount == 0 && !m_lastRequestMessages.isEmpty()) {
+                        m_outputRetryCount = 1;
+                        sendSafeRetry();
+                    } else {
+                        emit replyAbnormal(QStringLiteral("output_guard"));
+                    }
+                    reply->deleteLater();
+                    return;
+                }
+            }
 
             // 异常回复拦截（空/解析失败/缺中文/缺日文/缺标签）
             // parseJsonReply 的所有异常路径统一返回空 sentences，以此作为唯一判据
             if (parsedSentences.isEmpty()) {
                 qDebug() << "[LLM]回复内容异常，抛弃本次回复（不入库，不走TTS）: chars="
                          << replyText.size();
-                emit replyAbnormal(replyText);
+                emit replyAbnormal(QStringLiteral("invalid_reply"));
             }
             else {
                 qDebug()<<"[LLM]成功拆分为"<<parsedSentences.size()<<"个段落";
@@ -551,7 +619,10 @@ QPair<QList<SentenceText>, QString> LLMService::parseJsonReply(const QString &re
 
     // 保存修正后的 JSON（用于存储和历史记忆）
     currentReply = QJsonDocument(rootObj).toJson(QJsonDocument::Compact);
-    qDebug() << "[LLM] 修正后回复:" << currentReply;
+    qDebug() << "[LLM] 修正后回复长度:" << currentReply.size();
+    if (debugFullLogsEnabled()) {
+        qDebug().noquote() << "[LLM][debug] corrected reply:" << currentReply;
+    }
 
     return qMakePair(result,currentReply);
 }

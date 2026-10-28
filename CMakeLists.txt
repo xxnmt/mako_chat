@@ -18,6 +18,7 @@ qt_add_executable(Windows_AI
     bubblewidget.h bubblewidget.cpp bubblewidget.ui
     configmanager.h configmanager.cpp
     memorypolicy.h memorypolicy.cpp
+    memoryoutputguard.h memoryoutputguard.cpp
     llmservice.h llmservice.cpp
     promptassembler.h promptassembler.cpp
     appcontroller.h appcontroller.cpp

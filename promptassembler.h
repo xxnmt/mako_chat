@@ -4,6 +4,7 @@
 #include <QString>
 #include <QList>
 #include <QJsonArray>
+#include <QJsonObject>
 
 #include "historyturn.h"
 #include "utterance.h"
@@ -28,6 +29,11 @@ public:
     static QString buildSystemPrompt(const QString &basePrompt,
                                      const RequestMeta &meta,
                                      const MemoryContext &context);
+
+    // 检索到的记忆（档案/情景/摘要/关系）作为独立不可信数据消息。
+    // 无可披露内容时返回空对象。
+    static QJsonObject buildMemoryDataMessage(const RequestMeta &meta,
+                                               const MemoryContext &context);
 
     // 短期记忆 messages（含 history note；proactive/perception 不生成空 user 消息）
     static QJsonArray buildHistoryMessages(const QList<HistoryTurn> &history,

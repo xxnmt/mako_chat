@@ -8,6 +8,7 @@
 #include <QTime>
 
 #include "configmanager.h"
+#include "debuglog.h"
 #include "utterance.h"
 
 class TestConfigManager : public QObject
@@ -207,6 +208,8 @@ private slots:
         QVERIFY(policy.longTermMemoryEnabled);
         QCOMPARE(policy.policyVersion, QStringLiteral("r3"));
         QVERIFY(policy.privacyRules.isEmpty());
+        QVERIFY(!cfg.getDebugFullLogs());
+        QVERIFY(!debugFullLogsEnabled());
 
         const QQGroupMemoryConfig groups = cfg.getQQGroupMemoryConfig();
         QVERIFY(!groups.enabled);
@@ -220,6 +223,7 @@ private slots:
         QJsonObject memory;
         memory.insert("short_context_enabled", false);
         memory.insert("long_term_memory_enabled", false);
+        memory.insert("debug_full_logs", true);
         memory.insert("privacy_policy_version", QStringLiteral("test-r3"));
 
         QJsonObject rule;
@@ -256,6 +260,8 @@ private slots:
         const MemoryPolicyConfig policy = cfg.getMemoryPolicyConfig();
         QVERIFY(!policy.shortContextEnabled);
         QVERIFY(!policy.longTermMemoryEnabled);
+        QVERIFY(cfg.getDebugFullLogs());
+        QVERIFY(debugFullLogsEnabled());
         QCOMPARE(policy.policyVersion, QStringLiteral("test-r3"));
         QCOMPARE(policy.privacyRules.size(), 2);
         QCOMPARE(policy.privacyRules.at(0).id, QStringLiteral("phone"));

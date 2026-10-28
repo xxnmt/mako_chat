@@ -89,6 +89,7 @@ public:
     // ===== 长期记忆 / 时间管理（TD-037：设置界面接线）=====
     int getSummaryMemoryLength() const;
     void setSummaryMemoryLength(int length);
+    bool getDebugFullLogs() const;
     QTime getNightStartTime() const;
     void setNightStartTime(const QTime &time);
     QTime getNightEndTime() const;
@@ -141,6 +142,7 @@ private:
     QQReplyPolicy m_qqReply;
     QQGroupMemoryConfig m_qqGroupMemory;
     MemoryPolicyConfig m_memoryPolicy;
+    bool m_debugFullLogs = false;
     int m_summaryMemoryLength=15;          // 长期记忆自动摘轮数（未摘要轮次阈值）
     QTime m_nightStart{22, 0};             // 夜晚开始
     QTime m_nightEnd{7, 0};                // 夜晚结束（支持跨零点）

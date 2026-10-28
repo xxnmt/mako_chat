@@ -20,6 +20,7 @@
 #include "qqmessageparser.h"
 #include "qqreplypolicy.h"
 #include "memorypolicy.h"
+#include "debuglog.h"
 
 #include <QDebug>
 #include <QJsonArray>
@@ -163,6 +164,9 @@ AppController::AppController(QObject *parent)
                  << "persistRaw=" << decision.persistRaw
                  << "persistChat=" << decision.persistChat
                  << "reply=" << decision.allowReply;
+        if (debugFullLogsEnabled()) {
+            qDebug() << "[QQ][debug] sanitized:" << sanitized.text;
+        }
 
         if (!decision.allowReply) {
             qDebug() << "[QQ]记录但不回复";

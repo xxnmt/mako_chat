@@ -40,15 +40,25 @@ private slots:
         relationship.value = 42.0;
         context.relationships.append(relationship);
 
-        const QString prompt = PromptAssembler::buildSystemPrompt(
+        const QString systemPrompt = PromptAssembler::buildSystemPrompt(
             QStringLiteral("BASE"), meta, context);
+        const QJsonObject dataMessage =
+            PromptAssembler::buildMemoryDataMessage(meta, context);
+        const QString dataText = dataMessage.value("content").toString();
 
-        QVERIFY(prompt.startsWith(QStringLiteral("BASE")));
-        QVERIFY(prompt.contains(QStringLiteral("# 茉子的人设")));
-        QVERIFY(prompt.contains(QStringLiteral("# 关于欧尼酱")));
-        QVERIFY(prompt.contains(QStringLiteral("只有主人知道的事")));
-        QVERIFY(prompt.contains(QStringLiteral("# 我们的关系")));
-        QVERIFY(prompt.contains(QStringLiteral("亲密度: 42/100")));
+        QVERIFY(systemPrompt.startsWith(QStringLiteral("BASE")));
+        QVERIFY(systemPrompt.contains(QStringLiteral("# 茉子的人设")));
+        QVERIFY(systemPrompt.contains(QStringLiteral("# 资料边界")));
+        QVERIFY(!systemPrompt.contains(QStringLiteral("# 关于欧尼酱")));
+        QVERIFY(!systemPrompt.contains(QStringLiteral("只有主人知道的事")));
+        QVERIFY(!systemPrompt.contains(QStringLiteral("# 我们的关系")));
+
+        QCOMPARE(dataMessage.value("role").toString(), QStringLiteral("user"));
+        QVERIFY(dataText.contains(QStringLiteral("MEMORY_DATA")));
+        QVERIFY(dataText.contains(QStringLiteral("只有主人知道的事")));
+        QVERIFY(dataText.contains(QStringLiteral("称呼")));
+        QVERIFY(dataText.contains(QStringLiteral("relationship")));
+        QVERIFY(dataText.contains(QStringLiteral("42")));
     }
 
     void petOnlySeesPetOriginEpisodic()
@@ -82,13 +92,16 @@ private slots:
         qqPublic.visibility = QStringLiteral("public");
         context.memories.append(qqPublic);
 
-        const QString prompt = PromptAssembler::buildSystemPrompt(
+        const QString systemPrompt = PromptAssembler::buildSystemPrompt(
             QStringLiteral("BASE"), meta, context);
+        const QString dataText = PromptAssembler::buildMemoryDataMessage(meta, context)
+                                     .value("content").toString();
 
-        QVERIFY(prompt.contains(QStringLiteral("桌宠私密回忆")));
-        QVERIFY(!prompt.contains(QStringLiteral("QQ私聊秘密")));
-        QVERIFY(!prompt.contains(QStringLiteral("QQ群聊秘密")));
-        QVERIFY(!prompt.contains(QStringLiteral("QQ公开内容")));
+        QVERIFY(!systemPrompt.contains(QStringLiteral("桌宠私密回忆")));
+        QVERIFY(dataText.contains(QStringLiteral("桌宠私密回忆")));
+        QVERIFY(!dataText.contains(QStringLiteral("QQ私聊秘密")));
+        QVERIFY(!dataText.contains(QStringLiteral("QQ群聊秘密")));
+        QVERIFY(!dataText.contains(QStringLiteral("QQ公开内容")));
     }
 
     void groupPromptFiltersSensitiveSections()
@@ -141,17 +154,22 @@ private slots:
         relationship.value = 42.0;
         context.relationships.append(relationship);
 
-        const QString prompt = PromptAssembler::buildSystemPrompt(
+        const QString systemPrompt = PromptAssembler::buildSystemPrompt(
             QStringLiteral("BASE"), meta, context);
+        const QString dataText = PromptAssembler::buildMemoryDataMessage(meta, context)
+                                     .value("content").toString();
 
-        QVERIFY(!prompt.contains(QStringLiteral("# 我们的关系")));
-        QVERIFY(!prompt.contains(QStringLiteral("- 称呼: 欧尼酱")));
-        QVERIFY(!prompt.contains(QStringLiteral("桌宠私密回忆")));
-        QVERIFY(!prompt.contains(QStringLiteral("开发者")));   // 群聊不注入人员档案
-        QVERIFY(!prompt.contains(QStringLiteral("# 关于")));
-        QVERIFY(prompt.contains(QStringLiteral("群里聊过的事")));
-        QVERIFY(prompt.contains(QStringLiteral("公开设定")));
-        QVERIFY(!prompt.contains(QStringLiteral("别的群的秘密")));
+        QVERIFY(!systemPrompt.contains(QStringLiteral("# 我们的关系")));
+        QVERIFY(!systemPrompt.contains(QStringLiteral("- 称呼: 欧尼酱")));
+        QVERIFY(!systemPrompt.contains(QStringLiteral("桌宠私密回忆")));
+        QVERIFY(!systemPrompt.contains(QStringLiteral("开发者")));
+        QVERIFY(!systemPrompt.contains(QStringLiteral("# 关于")));
+        QVERIFY(dataText.contains(QStringLiteral("群里聊过的事")));
+        QVERIFY(dataText.contains(QStringLiteral("公开设定")));
+        QVERIFY(!dataText.contains(QStringLiteral("别的群的秘密")));
+        QVERIFY(!dataText.contains(QStringLiteral("桌宠私密回忆")));
+        QVERIFY(!dataText.contains(QStringLiteral("开发者")));
+        QVERIFY(!dataText.contains(QStringLiteral("relationship")));
     }
 
 
@@ -181,16 +199,20 @@ private slots:
         relationship.value = 42.0;
         context.relationships.append(relationship);
 
-        const QString prompt = PromptAssembler::buildSystemPrompt(
+        const QString systemPrompt = PromptAssembler::buildSystemPrompt(
             QStringLiteral("请你在称呼用户时，严格使用\"欧尼酱\"。"), meta, context);
+        const QString dataText = PromptAssembler::buildMemoryDataMessage(meta, context)
+                                     .value("content").toString();
 
-        QVERIFY(prompt.contains(QStringLiteral("不是主人")));
-        QVERIFY(prompt.contains(QStringLiteral("禁止使用“欧尼酱”")));
-        QVERIFY(!prompt.contains(QStringLiteral("严格使用\"欧尼酱\"")));
-        QVERIFY(!prompt.contains(QStringLiteral("开发者")));
-        QVERIFY(!prompt.contains(QStringLiteral("# 关于")));
-        QVERIFY(!prompt.contains(QStringLiteral("# 我们的关系")));
-        QVERIFY(!prompt.contains(QStringLiteral("亲密度: 42/100")));
+        QVERIFY(systemPrompt.contains(QStringLiteral("不是主人")));
+        QVERIFY(systemPrompt.contains(QStringLiteral("禁止使用“欧尼酱”")));
+        QVERIFY(!systemPrompt.contains(QStringLiteral("严格使用\"欧尼酱\"")));
+        QVERIFY(!systemPrompt.contains(QStringLiteral("开发者")));
+        QVERIFY(!systemPrompt.contains(QStringLiteral("# 关于")));
+        QVERIFY(!systemPrompt.contains(QStringLiteral("# 我们的关系")));
+        QVERIFY(!dataText.contains(QStringLiteral("开发者")));
+        QVERIFY(!dataText.contains(QStringLiteral("小明")));
+        QVERIFY(!dataText.contains(QStringLiteral("relationship")));
     }
 
     void nonMasterPrivateUsesFriendProfile()
@@ -213,14 +235,18 @@ private slots:
         relationship.value = 42.0;
         context.relationships.append(relationship);
 
-        const QString prompt = PromptAssembler::buildSystemPrompt(
+        const QString systemPrompt = PromptAssembler::buildSystemPrompt(
             QStringLiteral("请你在称呼用户时，严格使用\"欧尼酱\"。"), meta, context);
+        const QString dataText = PromptAssembler::buildMemoryDataMessage(meta, context)
+                                     .value("content").toString();
 
-        QVERIFY(prompt.contains(QStringLiteral("# 关于阿伟")));
-        QVERIFY(prompt.contains(QStringLiteral("朋友「阿伟」")));
-        QVERIFY(!prompt.contains(QStringLiteral("# 关于欧尼酱")));
-        QVERIFY(!prompt.contains(QStringLiteral("# 我们的关系")));
-        QVERIFY(!prompt.contains(QStringLiteral("严格使用\"欧尼酱\"")));
+        QVERIFY(systemPrompt.contains(QStringLiteral("朋友「阿伟」")));
+        QVERIFY(!systemPrompt.contains(QStringLiteral("# 关于阿伟")));
+        QVERIFY(!systemPrompt.contains(QStringLiteral("# 关于欧尼酱")));
+        QVERIFY(!systemPrompt.contains(QStringLiteral("# 我们的关系")));
+        QVERIFY(!systemPrompt.contains(QStringLiteral("严格使用\"欧尼酱\"")));
+        QVERIFY(dataText.contains(QStringLiteral("阿伟")));
+        QVERIFY(!dataText.contains(QStringLiteral("relationship")));
     }
 
     void masterGroupKeepsAddressButHidesPrivateInfo()
@@ -243,12 +269,26 @@ private slots:
         relationship.value = 42.0;
         context.relationships.append(relationship);
 
-        const QString prompt = PromptAssembler::buildSystemPrompt(QStringLiteral("BASE"), meta, context);
+        const QString systemPrompt = PromptAssembler::buildSystemPrompt(
+            QStringLiteral("BASE"), meta, context);
+        const QString dataText = PromptAssembler::buildMemoryDataMessage(meta, context)
+                                     .value("content").toString();
 
-        QVERIFY(prompt.contains(QStringLiteral("可以称呼“欧尼酱”")));
-        QVERIFY(!prompt.contains(QStringLiteral("开发者")));
-        QVERIFY(!prompt.contains(QStringLiteral("# 关于")));
-        QVERIFY(!prompt.contains(QStringLiteral("# 我们的关系")));
+        QVERIFY(systemPrompt.contains(QStringLiteral("可以称呼“欧尼酱”")));
+        QVERIFY(!systemPrompt.contains(QStringLiteral("开发者")));
+        QVERIFY(!systemPrompt.contains(QStringLiteral("# 关于")));
+        QVERIFY(!systemPrompt.contains(QStringLiteral("# 我们的关系")));
+        QVERIFY(!dataText.contains(QStringLiteral("开发者")));
+        QVERIFY(!dataText.contains(QStringLiteral("relationship")));
+    }
+
+    void emptyContextHasNoMemoryDataMessage()
+    {
+        RequestMeta meta;
+        meta.channel = Channel::kPet;
+        PromptAssembler::MemoryContext context;
+        const QJsonObject data = PromptAssembler::buildMemoryDataMessage(meta, context);
+        QVERIFY(data.isEmpty());
     }
 
     void groupHistoryPrefixesSpeaker()

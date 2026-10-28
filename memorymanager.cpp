@@ -1,4 +1,5 @@
 #include "memorymanager.h"
+#include "debuglog.h"
 
 #include <QStandardPaths>
 #include <QDir>
@@ -294,7 +295,8 @@ bool MemoryManager::upsertCharacterProfile(const QString &subject, const QString
             qDebug() << "[MemoryManager]新增角色档案失败:" << query.lastError();
             return false;
         }
-        qDebug() << "[MemoryManager]角色档案已新增:" << subject << normalizedKey << value;
+        qDebug() << "[MemoryManager]角色档案已新增:" << subject << normalizedKey
+                 << "valueLen=" << value.size();
         return true;
     }
 }
@@ -378,9 +380,13 @@ bool MemoryManager::addEpisodicMemory(const QString &content, const QString &typ
         qDebug() << "[MemoryManager]新增情景记忆失败:" << query.lastError();
         return false;
     }
-    qDebug() << "[MemoryManager]情景记忆已新增:" << content << "type=" << type
-             << "importance=" << importance << "origin=" << origin
-             << "visibility=" << visibility << "subject=" << subject;
+    qDebug() << "[MemoryManager]情景记忆已新增: chars=" << content.size()
+             << "type=" << type << "importance=" << importance
+             << "origin=" << origin << "visibility=" << visibility
+             << "subject=" << subject;
+    if (debugFullLogsEnabled()) {
+        qDebug().noquote() << "[MemoryManager][debug] episodic:" << content;
+    }
     return true;
 }
 
@@ -903,6 +909,10 @@ bool MemoryManager::appendRawEvent(const RawEventWrite &event)
     qDebug() << "[MemoryManager]raw_events写入: platform=" << event.platform
              << "channel=" << event.channel << "session=" << event.sessionId
              << "type=" << event.eventType << "affected=" << query.numRowsAffected();
+    if (debugFullLogsEnabled()) {
+        qDebug().noquote() << "[MemoryManager][debug] raw content:" << event.content
+                           << "payload:" << event.payloadJson;
+    }
     return true;
 }
 

@@ -1,6 +1,6 @@
 # 记忆系统 v5 R3 实施基线
 
-> 状态：**PR-1a 已落地，待手工验收；PR-1b 未开始**
+> 状态：**PR-1a / PR-1b 已通过手工验收；PR-2 未开始**
 > 日期：2026-10-28
 > 冻结：`blocked` 默认不回复；`group_authorized` 下非白名单成员只记录、不回复、不写 `chat_history`。
 > 取代：[MEMORY_V5_DESIGN.md](MEMORY_V5_DESIGN.md) 的历史草案
@@ -150,6 +150,7 @@
   "memory": {
     "short_context_enabled": true,
     "long_term_memory_enabled": true,
+    "debug_full_logs": false,
     "privacy_policy_version": "r3",
     "privacy_rules": [
       {"id": "phone", "type": "pattern", "value": "\\b1\\d{10}\\b", "action": "redact"},
@@ -447,6 +448,8 @@ user: 当前输入
 
 验收：最终发送文本不包含测试 secret/forbidden fact；记忆中的“忽略规则”不改变 system 权限。
 
+实现说明：PR-1b 已把用户档案/episodic/summary/relationship 移入独立 `MEMORY_DATA` user 消息，system 只保留人设、身份和资料边界；`MemoryOutputGuard` 已覆盖隐私规则、显式 `forbiddenFacts` 与群聊 `qq:` 身份格式，并支持一次安全重试。claim 级第三方私聊/跨群事实的 `forbiddenFacts` 数据源留到 PR-3 接入。
+
 ### PR-2：raw_events 消费链路
 
 - `getRawEventsAfter` / `markRawEventsProcessed` / cursor 接线。
@@ -537,3 +540,26 @@ user: 当前输入
 - Qt 目标 SQLite 是否带 FTS5；不带则用兼容关键词查询。
 - 加密/保留期/删除传播的具体实现方式。
 - 未来“安全行为投影”是否进入后续版本；R3 首版不做。
+
+---
+
+## 10. 调试日志
+
+默认只记录长度、渠道、sender hash、rule id 等元数据，不记录完整消息/prompt/回复。
+
+需要本地排查时，在 `setting.json` 的 `memory` 段设置：
+
+```json
+"debug_full_logs": true
+```
+
+重启应用后生效。启用后会额外输出：
+
+- QQ/pet 输入；
+- 最终 LLM messages；
+- 原始回复与修正回复；
+- 记忆提取 JSON；
+- raw event / episodic 正文；
+- 外发气泡/QQ 文本。
+
+调试完成后改回 `false` 并重启，避免隐私内容进入日志。

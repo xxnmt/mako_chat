@@ -1,4 +1,5 @@
 #include "petchanneladapter.h"
+#include "debuglog.h"
 #include "petaudiosink.h"
 #include "bubblewidget.h"
 #include <QDebug>
@@ -25,7 +26,10 @@ void PetChannelAdapter::sendUtterance(const Utterance &u)
     if (m_bubble) {
         m_bubble->showMessage(u.text);
     }
-    qDebug() << "[PetChannel]气泡显示:" << u.text;
+    qDebug() << "[PetChannel]气泡显示: chars=" << u.text.size();
+    if (debugFullLogsEnabled()) {
+        qDebug().noquote() << "[PetChannel][debug] 气泡:" << u.text;
+    }
 }
 
 void PetChannelAdapter::onAudioReady(const QString &zhText, const QMap<QString, QString> &tags)
@@ -34,5 +38,8 @@ void PetChannelAdapter::onAudioReady(const QString &zhText, const QMap<QString, 
     if (m_bubble) {
         m_bubble->showMessage(zhText);
     }
-    qDebug() << "[PetChannel]播放跟随气泡:" << zhText;
+    qDebug() << "[PetChannel]播放跟随气泡: chars=" << zhText.size();
+    if (debugFullLogsEnabled()) {
+        qDebug().noquote() << "[PetChannel][debug] 播放:" << zhText;
+    }
 }
