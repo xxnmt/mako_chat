@@ -1,6 +1,6 @@
 # 记忆系统 v5 R3 实施基线
 
-> 状态：**PR-1a / PR-1b 已通过手工验收；PR-2 未开始**
+> 状态：**PR-1a / PR-1b 已通过手工验收；PR-2 已落地，待手工验收**
 > 日期：2026-10-28
 > 冻结：`blocked` 默认不回复；`group_authorized` 下非白名单成员只记录、不回复、不写 `chat_history`。
 > 取代：[MEMORY_V5_DESIGN.md](MEMORY_V5_DESIGN.md) 的历史草案
@@ -151,6 +151,11 @@
     "short_context_enabled": true,
     "long_term_memory_enabled": true,
     "debug_full_logs": false,
+    "qq_group_idle_minutes": 15,
+    "qq_group_batch_size": 50,
+    "interaction_gap_seconds": 90,
+    "interaction_max_events": 20,
+    "interaction_max_minutes": 10,
     "privacy_policy_version": "r3",
     "privacy_rules": [
       {"id": "phone", "type": "pattern", "value": "\\b1\\d{10}\\b", "action": "redact"},

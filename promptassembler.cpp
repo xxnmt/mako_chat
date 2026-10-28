@@ -133,6 +133,14 @@ QJsonArray buildMemoryItems(const RequestMeta &meta,
         items.append(item);
     }
 
+    for (const InteractionSummary &summary : context.interactionSummaries) {
+        QJsonObject item;
+        item["kind"] = "interaction_summary";
+        item["time"] = summary.endedAt.toString("yyyy-MM-dd HH:mm:ss");
+        item["text"] = summary.summaryText;
+        items.append(item);
+    }
+
     for (const LongTermSummary &summary : context.summaries) {
         QJsonObject item;
         item["kind"] = "summary";

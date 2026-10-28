@@ -11,6 +11,40 @@
 #include <QDebug>
 
 #include "historyturn.h"
+
+namespace {
+
+RawEvent rawEventFromQuery(const QSqlQuery &query)
+{
+    RawEvent event;
+    event.id = query.value("id").toLongLong();
+    event.platform = query.value("platform").toString();
+    event.channel = query.value("channel").toString();
+    event.sessionId = query.value("session_id").toString();
+    event.messageId = query.value("message_id").toString();
+    event.direction = query.value("direction").toString();
+    event.senderId = query.value("sender_id").toString();
+    event.senderName = query.value("sender_name").toString();
+    event.eventType = query.value("event_type").toString();
+    event.content = query.value("content").toString();
+    event.payloadJson = query.value("payload").toString();
+    event.occurredAt = query.value("occurred_at").toDateTime();
+    event.sensitive = query.value("sensitive").toInt() != 0;
+    event.visibility = query.value("visibility").toString();
+    event.processed = query.value("processed").toInt();
+    return event;
+}
+
+QString rawEventColumns()
+{
+    return QStringLiteral(
+        "id, platform, channel, session_id, message_id, direction, sender_id, "
+        "sender_name, event_type, content, payload, occurred_at, sensitive, "
+        "visibility, processed");
+}
+
+} // namespace
+
 MemoryManager::MemoryManager(const QString &dbFilePath,QObject *parent)
     : QObject{parent}
 {
@@ -981,6 +1015,326 @@ bool MemoryManager::appendPrivacyBlockedEvent(const QString &platform,
     return appendRawEvent(event);
 }
 
+QList<RawEvent> MemoryManager::getUnprocessedGroupEvents(const QString &sessionId, int limit)
+{
+    QList<RawEvent> events;
+    if (!m_db.isOpen() && !m_db.open()) {
+        return events;
+    }
+    QSqlQuery query(m_db);
+    query.prepare(QStringLiteral("SELECT %1 FROM raw_events "
+                                 "WHERE channel='qq_group' AND session_id=? "
+                                 "AND processed=0 AND event_type='message' "
+                                 "ORDER BY id ASC LIMIT ?")
+                      .arg(rawEventColumns()));
+    query.addBindValue(sessionId);
+    query.addBindValue(qMax(1, limit));
+    if (!query.exec()) {
+        qDebug() << "[MemoryManager]查询未处理群事件失败:" << query.lastError();
+        return events;
+    }
+    while (query.next()) {
+        events.append(rawEventFromQuery(query));
+    }
+    return events;
+}
+
+QList<QString> MemoryManager::getPendingGroupSessions()
+{
+    QList<QString> sessions;
+    if (!m_db.isOpen() && !m_db.open()) {
+        return sessions;
+    }
+    QSqlQuery query(m_db);
+    if (!query.exec("SELECT DISTINCT session_id FROM raw_events "
+                    "WHERE channel='qq_group' AND processed=0 "
+                    "AND event_type='message'")) {
+        qDebug() << "[MemoryManager]查询待消费群会话失败:" << query.lastError();
+        return sessions;
+    }
+    while (query.next()) {
+        sessions.append(query.value(0).toString());
+    }
+    return sessions;
+}
+
+int MemoryManager::countUnprocessedGroupEvents(const QString &sessionId)
+{
+    if (!m_db.isOpen() && !m_db.open()) {
+        return 0;
+    }
+    QSqlQuery query(m_db);
+    query.prepare("SELECT COUNT(*) FROM raw_events "
+                  "WHERE channel='qq_group' AND session_id=? "
+                  "AND processed=0 AND event_type='message'");
+    query.addBindValue(sessionId);
+    if (query.exec() && query.next()) {
+        return query.value(0).toInt();
+    }
+    return 0;
+}
+
+QDateTime MemoryManager::latestUnprocessedGroupEventTime(const QString &sessionId)
+{
+    if (!m_db.isOpen() && !m_db.open()) {
+        return QDateTime();
+    }
+    QSqlQuery query(m_db);
+    query.prepare("SELECT MAX(occurred_at) FROM raw_events "
+                  "WHERE channel='qq_group' AND session_id=? "
+                  "AND processed=0 AND event_type='message'");
+    query.addBindValue(sessionId);
+    if (query.exec() && query.next()) {
+        return query.value(0).toDateTime();
+    }
+    return QDateTime();
+}
+
+qlonglong MemoryManager::createInteractionBatch(const InteractionDraft &draft,
+                                                const QList<qlonglong> &eventIds)
+{
+    if (!m_db.isOpen() && !m_db.open()) {
+        return -1;
+    }
+    if (eventIds.isEmpty()) {
+        return -1;
+    }
+
+    QJsonArray sourceIds;
+    for (qlonglong id : eventIds) {
+        sourceIds.append(static_cast<double>(id));
+    }
+    const QString sourceIdsJson = QString::fromUtf8(
+        QJsonDocument(sourceIds).toJson(QJsonDocument::Compact));
+
+    m_db.transaction();
+    QSqlQuery insert(m_db);
+    insert.prepare("INSERT INTO interactions "
+                   "(channel, session_id, started_at, ended_at, source_event_ids, "
+                   " segmentation_method, confidence, summary_status, summary_attempts) "
+                   "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0)");
+    insert.addBindValue(draft.channel);
+    insert.addBindValue(draft.sessionId);
+    insert.addBindValue((draft.startedAt.isValid() ? draft.startedAt
+                                                   : QDateTime::currentDateTime())
+                            .toString("yyyy-MM-dd HH:mm:ss"));
+    insert.addBindValue((draft.endedAt.isValid() ? draft.endedAt
+                                                 : QDateTime::currentDateTime())
+                            .toString("yyyy-MM-dd HH:mm:ss"));
+    insert.addBindValue(sourceIdsJson);
+    insert.addBindValue(draft.segmentationMethod);
+    insert.addBindValue(draft.confidence);
+    if (!insert.exec()) {
+        qDebug() << "[MemoryManager]创建 interaction 失败:" << insert.lastError();
+        m_db.rollback();
+        return -1;
+    }
+    const qlonglong interactionId = insert.lastInsertId().toLongLong();
+
+    for (const auto &participant : draft.participants) {
+        QSqlQuery p(m_db);
+        p.prepare("INSERT OR IGNORE INTO interaction_participants "
+                  "(interaction_id, user_id, display_name_at_time) "
+                  "VALUES (?, ?, ?)");
+        p.addBindValue(interactionId);
+        p.addBindValue(participant.first);
+        p.addBindValue(participant.second);
+        if (!p.exec()) {
+            qDebug() << "[MemoryManager]写入 interaction participant 失败:" << p.lastError();
+            m_db.rollback();
+            return -1;
+        }
+    }
+
+    QStringList placeholders;
+    for (int i = 0; i < eventIds.size(); ++i) {
+        placeholders.append(QStringLiteral("?"));
+    }
+    QSqlQuery mark(m_db);
+    mark.prepare(QStringLiteral("UPDATE raw_events SET processed=1 WHERE id IN (%1)")
+                     .arg(placeholders.join(',')));
+    for (qlonglong id : eventIds) {
+        mark.addBindValue(id);
+    }
+    if (!mark.exec()) {
+        qDebug() << "[MemoryManager]标记 raw_events processed 失败:" << mark.lastError();
+        m_db.rollback();
+        return -1;
+    }
+
+    const qlonglong lastEventId = eventIds.last();
+    QSqlQuery cursor(m_db);
+    cursor.prepare("INSERT OR IGNORE INTO memory_cursor "
+                   "(channel, session_id, last_event_id, last_turn_id, updated_at) "
+                   "VALUES (?, ?, 0, 0, datetime('now','localtime'))");
+    cursor.addBindValue(draft.channel);
+    cursor.addBindValue(draft.sessionId);
+    if (!cursor.exec()) {
+        qDebug() << "[MemoryManager]初始化 memory_cursor 失败:" << cursor.lastError();
+        m_db.rollback();
+        return -1;
+    }
+    QSqlQuery updateCursor(m_db);
+    updateCursor.prepare("UPDATE memory_cursor SET last_event_id=?, "
+                         "updated_at=datetime('now','localtime') "
+                         "WHERE channel=? AND session_id=?");
+    updateCursor.addBindValue(lastEventId);
+    updateCursor.addBindValue(draft.channel);
+    updateCursor.addBindValue(draft.sessionId);
+    if (!updateCursor.exec()) {
+        qDebug() << "[MemoryManager]推进 memory_cursor 失败:" << updateCursor.lastError();
+        m_db.rollback();
+        return -1;
+    }
+
+    if (!m_db.commit()) {
+        qDebug() << "[MemoryManager]提交 interaction 事务失败:" << m_db.lastError();
+        m_db.rollback();
+        return -1;
+    }
+    return interactionId;
+}
+
+QList<RawEvent> MemoryManager::getRawEventsByIds(const QList<qlonglong> &ids)
+{
+    QList<RawEvent> events;
+    if (ids.isEmpty() || (!m_db.isOpen() && !m_db.open())) {
+        return events;
+    }
+    QStringList placeholders;
+    for (int i = 0; i < ids.size(); ++i) {
+        placeholders.append(QStringLiteral("?"));
+    }
+    QSqlQuery query(m_db);
+    query.prepare(QStringLiteral("SELECT %1 FROM raw_events WHERE id IN (%2) ORDER BY id ASC")
+                      .arg(rawEventColumns(), placeholders.join(',')));
+    for (qlonglong id : ids) {
+        query.addBindValue(id);
+    }
+    if (!query.exec()) {
+        qDebug() << "[MemoryManager]按 id 查询 raw_events 失败:" << query.lastError();
+        return events;
+    }
+    while (query.next()) {
+        events.append(rawEventFromQuery(query));
+    }
+    return events;
+}
+
+QList<qlonglong> MemoryManager::getPendingInteractionIds(int limit)
+{
+    QList<qlonglong> ids;
+    if (!m_db.isOpen() && !m_db.open()) {
+        return ids;
+    }
+    QSqlQuery query(m_db);
+    query.prepare("SELECT id FROM interactions "
+                  "WHERE summary_status='pending' AND summary_attempts < 3 "
+                  "ORDER BY id ASC LIMIT ?");
+    query.addBindValue(qMax(1, limit));
+    if (!query.exec()) {
+        qDebug() << "[MemoryManager]查询待摘要 interaction 失败:" << query.lastError();
+        return ids;
+    }
+    while (query.next()) {
+        ids.append(query.value(0).toLongLong());
+    }
+    return ids;
+}
+
+QList<RawEvent> MemoryManager::getInteractionSourceEvents(qlonglong interactionId)
+{
+    if (!m_db.isOpen() && !m_db.open()) {
+        return {};
+    }
+    QSqlQuery query(m_db);
+    query.prepare("SELECT source_event_ids FROM interactions WHERE id=?");
+    query.addBindValue(interactionId);
+    if (!query.exec() || !query.next()) {
+        return {};
+    }
+    const QJsonArray ids = QJsonDocument::fromJson(
+        query.value(0).toString().toUtf8()).array();
+    QList<qlonglong> eventIds;
+    for (const QJsonValue &value : ids) {
+        eventIds.append(static_cast<qlonglong>(value.toDouble()));
+    }
+    return getRawEventsByIds(eventIds);
+}
+
+bool MemoryManager::saveInteractionSummary(qlonglong id, const QString &summary,
+                                           const QString &status)
+{
+    if (!m_db.isOpen() && !m_db.open()) {
+        return false;
+    }
+    QSqlQuery query(m_db);
+    query.prepare("UPDATE interactions SET safe_summary=?, summary_status=?, "
+                  "summary_attempts=CASE WHEN ?='ready' THEN 0 ELSE summary_attempts END "
+                  "WHERE id=?");
+    query.addBindValue(summary.isEmpty()
+                           ? QVariant(QMetaType(QMetaType::QString))
+                           : QVariant(summary));
+    query.addBindValue(status);
+    query.addBindValue(status);
+    query.addBindValue(id);
+    if (!query.exec()) {
+        qDebug() << "[MemoryManager]保存 interaction summary 失败:" << query.lastError();
+        return false;
+    }
+    return true;
+}
+
+bool MemoryManager::markInteractionSummaryFailed(qlonglong id)
+{
+    if (!m_db.isOpen() && !m_db.open()) {
+        return false;
+    }
+    QSqlQuery query(m_db);
+    query.prepare("UPDATE interactions SET "
+                  "summary_attempts=summary_attempts+1, "
+                  "summary_status=CASE WHEN summary_attempts+1 >= 3 "
+                  "THEN 'failed' ELSE 'pending' END "
+                  "WHERE id=?");
+    query.addBindValue(id);
+    if (!query.exec()) {
+        qDebug() << "[MemoryManager]标记 interaction summary 失败失败:" << query.lastError();
+        return false;
+    }
+    return true;
+}
+
+QList<InteractionSummary> MemoryManager::getRecentInteractionSummaries(
+    const QString &channel, const QString &sessionId, int limit)
+{
+    QList<InteractionSummary> summaries;
+    if (!m_db.isOpen() && !m_db.open()) {
+        return summaries;
+    }
+    QSqlQuery query(m_db);
+    query.prepare("SELECT id, channel, session_id, safe_summary, ended_at "
+                  "FROM interactions "
+                  "WHERE summary_status='ready' AND channel=? AND session_id=? "
+                  "ORDER BY ended_at DESC LIMIT ?");
+    query.addBindValue(channel);
+    query.addBindValue(sessionId);
+    query.addBindValue(qMax(1, limit));
+    if (!query.exec()) {
+        qDebug() << "[MemoryManager]查询 interaction summary 失败:" << query.lastError();
+        return summaries;
+    }
+    while (query.next()) {
+        InteractionSummary summary;
+        summary.id = query.value(0).toLongLong();
+        summary.channel = query.value(1).toString();
+        summary.sessionId = query.value(2).toString();
+        summary.summaryText = query.value(3).toString();
+        summary.endedAt = query.value(4).toDateTime();
+        summaries.append(summary);
+    }
+    return summaries;
+}
+
 bool MemoryManager::updateMemoryCursor(const QString &channel, const QString &sessionId,
                                        qlonglong lastEventId, qlonglong lastTurnId)
 {
@@ -1359,6 +1713,57 @@ void MemoryManager::initDatabase(const QString &dbFilePath)
             qDebug() << "[MemoryManager]数据库结构升级完成,版本:" << currentVersion;
         }
 
+        // ============== v6: interactions（PR-2） ==============
+        if (currentVersion < 6) {
+            qDebug() << "[MemoryManager]正在升级数据库结构至 v6(interactions):";
+            const QString createInteractions = R"(
+                CREATE TABLE IF NOT EXISTS interactions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    started_at DATETIME NOT NULL,
+                    ended_at DATETIME NOT NULL,
+                    source_event_ids TEXT NOT NULL,
+                    segmentation_method TEXT NOT NULL,
+                    confidence REAL NOT NULL DEFAULT 0.0,
+                    safe_summary TEXT,
+                    summary_status TEXT NOT NULL DEFAULT 'pending',
+                    summary_attempts INTEGER NOT NULL DEFAULT 0,
+                    created_at DATETIME DEFAULT (datetime('now','localtime'))
+                );
+            )";
+            if (!query.exec(createInteractions)) {
+                throw query.lastError();
+            }
+            if (!query.exec("CREATE INDEX IF NOT EXISTS idx_interactions_session_time "
+                            "ON interactions(channel, session_id, started_at)")) {
+                throw query.lastError();
+            }
+            if (!query.exec("CREATE INDEX IF NOT EXISTS idx_interactions_summary_status "
+                            "ON interactions(summary_status, summary_attempts)")) {
+                throw query.lastError();
+            }
+
+            const QString createParticipants = R"(
+                CREATE TABLE IF NOT EXISTS interaction_participants (
+                    interaction_id INTEGER NOT NULL,
+                    user_id TEXT NOT NULL,
+                    display_name_at_time TEXT,
+                    participation_kind TEXT NOT NULL DEFAULT 'message',
+                    PRIMARY KEY(interaction_id, user_id),
+                    FOREIGN KEY(interaction_id) REFERENCES interactions(id) ON DELETE CASCADE
+                );
+            )";
+            if (!query.exec(createParticipants)) {
+                throw query.lastError();
+            }
+            if (!query.exec("CREATE INDEX IF NOT EXISTS idx_interaction_participants_user "
+                            "ON interaction_participants(user_id, interaction_id)")) {
+                throw query.lastError();
+            }
+
+        }
+
         // ============== v5: raw event 脱敏审计（PR-1a） ==============
         if (currentVersion < 5) {
             qDebug() << "[MemoryManager]正在升级数据库结构至 v5(raw event 脱敏审计):";
@@ -1378,6 +1783,14 @@ void MemoryManager::initDatabase(const QString &dbFilePath)
                 qDebug() << "[MemoryManager]设置数据库版本异常:" << query.lastError();
             }
             currentVersion = 5;
+            qDebug() << "[MemoryManager]数据库结构升级完成,版本:" << currentVersion;
+        }
+
+        if (currentVersion < 6) {
+            if (!query.exec("PRAGMA user_version = 6")) {
+                qDebug() << "[MemoryManager]设置数据库版本异常:" << query.lastError();
+            }
+            currentVersion = 6;
             qDebug() << "[MemoryManager]数据库结构升级完成,版本:" << currentVersion;
         }
 

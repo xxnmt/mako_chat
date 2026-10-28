@@ -282,6 +282,31 @@ private slots:
         QVERIFY(!dataText.contains(QStringLiteral("relationship")));
     }
 
+    void interactionSummaryEntersMemoryData()
+    {
+        RequestMeta meta;
+        meta.channel = Channel::kQQGroup;
+        meta.sessionId = QStringLiteral("30001");
+
+        PromptAssembler::MemoryContext context;
+        InteractionSummary summary;
+        summary.id = 1;
+        summary.channel = Channel::kQQGroup;
+        summary.sessionId = QStringLiteral("30001");
+        summary.summaryText = QStringLiteral("群友在聊晚饭");
+        summary.endedAt = QDateTime(QDate(2026, 10, 28), QTime(12, 0));
+        context.interactionSummaries.append(summary);
+
+        const QString systemPrompt = PromptAssembler::buildSystemPrompt(
+            QStringLiteral("BASE"), meta, context);
+        const QString dataText = PromptAssembler::buildMemoryDataMessage(meta, context)
+                                     .value("content").toString();
+
+        QVERIFY(!systemPrompt.contains(QStringLiteral("群友在聊晚饭")));
+        QVERIFY(dataText.contains(QStringLiteral("interaction_summary")));
+        QVERIFY(dataText.contains(QStringLiteral("群友在聊晚饭")));
+    }
+
     void emptyContextHasNoMemoryDataMessage()
     {
         RequestMeta meta;

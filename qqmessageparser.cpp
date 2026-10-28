@@ -108,6 +108,10 @@ QQInboundMessage QQMessageParser::parse(const QJsonObject &event)
         const QJsonArray segments = messageValue.toArray();
         for (const QJsonValue &segmentValue : segments) {
             const QJsonObject segment = segmentValue.toObject();
+            if (segment.value("type").toString() == QStringLiteral("reply")) {
+                message.replyToMessageId =
+                    idToString(segment.value("data").toObject().value("id"));
+            }
             if (segment.value("type").toString() == QStringLiteral("at")) {
                 const QJsonValue atValue = segment.value("data").toObject().value("qq");
                 const QString atQq = atValue.isDouble()

@@ -30,6 +30,10 @@ public:
                             const QList<EpisodicMemory> &existingMemories = {},
                             const RequestMeta &meta = RequestMeta());
 
+    // PR-2: 为一条 interaction 生成同群 safe summary
+    void summarizeInteractionAsync(qlonglong interactionId,
+                                   const QList<RawEvent> &events);
+
 signals:
     //chat
     void sentencesReady(const QList<SentenceText> &sentences,const QString &rawReply);
@@ -39,6 +43,8 @@ signals:
     //Extract
     void memoryExtractionReady(const QJsonObject &extractionResult, qlonglong lastEndId,
                                const QString &sourceIdsJson, const RequestMeta &meta);
+    void interactionSummaryReady(qlonglong interactionId, const QString &summary);
+    void interactionSummaryFailed(qlonglong interactionId, const QString &reason);
 private slots:
     //finish AI 回复
     void onReplyFinished(QNetworkReply* reply);
@@ -62,6 +68,7 @@ private:
 
     QNetworkAccessManager* m_networkManager;
     QNetworkAccessManager* m_extractManager;
+    QNetworkAccessManager* m_interactionManager;
     QString m_apiKey;
 
     QString m_localPromptPath;

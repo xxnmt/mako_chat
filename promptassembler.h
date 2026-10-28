@@ -21,6 +21,7 @@ public:
         QList<CharacterProfile> userProfiles;
         QList<CharacterProfile> makoProfiles;
         QList<EpisodicMemory> memories;
+        QList<InteractionSummary> interactionSummaries;
         QList<LongTermSummary> summaries;
         QList<RelationshipState> relationships;
     };

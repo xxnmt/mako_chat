@@ -21,6 +21,7 @@
 #include "qqreplypolicy.h"
 #include "memorypolicy.h"
 #include "debuglog.h"
+#include "raweventprocessor.h"
 
 #include <QDebug>
 #include <QJsonArray>
@@ -84,6 +85,8 @@ AppController::AppController(QObject *parent)
 
     m_memoryManager->decayEpisodicMemory();        // 启动时执行一次情景记忆衰减
     m_llmService->setMemoryManager(m_memoryManager);
+    m_rawEventProcessor = new RawEventProcessor(m_memoryManager, m_llmService, this);
+    m_rawEventProcessor->start();
 
     m_timeManager =new TimeManager(this);
     applyTimeSettings();   // TD-037：启动时应用用户配置（夜晚时段/退火时长）
@@ -156,6 +159,9 @@ AppController::AppController(QObject *parent)
             rawEvent.redactionRules = privacyRulesJson(sanitized.ruleIds);
             rawEvent.policyVersion = memoryPolicy.policyVersion;
             m_memoryManager->appendRawEvent(rawEvent);
+            if (m_rawEventProcessor) {
+                m_rawEventProcessor->notifyNewEvent();
+            }
         }
 
         qDebug() << "[QQ]收到消息:" << message.channel << message.sessionId

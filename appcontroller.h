@@ -24,6 +24,7 @@ class PetChannelAdapter;
 class QQChannelAdapter;
 class SessionRouter;
 class QQProtocolClient;
+class RawEventProcessor;
 
 class AppController : public QObject
 {
@@ -64,6 +65,7 @@ private:
     QQChannelAdapter *m_qqChannel;      // 渠道：QQ（Phase 1 启用）
     QQProtocolClient *m_qqClient;       // OneBot WS 传输（入站暂只落 raw_events）
     SessionRouter *m_sessionRouter;     // 输入路由（渠道→大脑）
+    RawEventProcessor *m_rawEventProcessor; // raw_events → interactions → summary
     RequestMeta m_lastMeta;             // 最近一轮请求元数据（回复入库时随存）
     quint64 m_roundSeq = 0;             // 对话轮次序号：每次用户输入 +1（TD-034）
     quint64 m_lastPlaybackRound = 0;    // 最近一次入队 TTS 的轮次（退火门控用）

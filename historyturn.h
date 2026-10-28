@@ -1,7 +1,10 @@
 #ifndef HISTORYTURN_H
 #define HISTORYTURN_H
 #include <QString>
+#include <QStringList>
 #include <QDateTime>
+#include <QList>
+#include <QPair>
 
 //聊天记录
 struct HistoryTurn {
@@ -58,5 +61,44 @@ struct RelationshipState {
     QDateTime updatedAt;
 };
 
+// 原始事件（PR-2 消费用）
+struct RawEvent {
+    qlonglong id = -1;
+    QString platform;
+    QString channel;
+    QString sessionId;
+    QString messageId;
+    QString direction;
+    QString senderId;
+    QString senderName;
+    QString eventType;
+    QString content;
+    QString payloadJson;
+    QDateTime occurredAt;
+    bool sensitive = false;
+    QString visibility;
+    int processed = 0;
+};
+
+// 交互片段（同一群内一次连续交流）
+struct InteractionDraft {
+    QString channel;
+    QString sessionId;
+    QDateTime startedAt;
+    QDateTime endedAt;
+    QStringList sourceEventIds;
+    QString segmentationMethod = QStringLiteral("time_window");
+    double confidence = 0.0;
+    QList<QPair<QString, QString>> participants; // user_id, display_name
+};
+
+// 可召回的群聊摘要
+struct InteractionSummary {
+    qlonglong id = -1;
+    QString channel;
+    QString sessionId;
+    QString summaryText;
+    QDateTime endedAt;
+};
 
 #endif // HISTORYTURN_H

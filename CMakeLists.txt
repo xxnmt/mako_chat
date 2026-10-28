@@ -19,6 +19,8 @@ qt_add_executable(Windows_AI
     configmanager.h configmanager.cpp
     memorypolicy.h memorypolicy.cpp
     memoryoutputguard.h memoryoutputguard.cpp
+    interactionsegmenter.h interactionsegmenter.cpp
+    raweventprocessor.h raweventprocessor.cpp
     llmservice.h llmservice.cpp
     promptassembler.h promptassembler.cpp
     appcontroller.h appcontroller.cpp

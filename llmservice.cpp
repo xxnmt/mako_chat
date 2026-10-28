@@ -21,6 +21,7 @@ LLMService::LLMService(const QString &apiKey,QObject *parent)
     m_networkManager = new QNetworkAccessManager(this);
     connect(m_networkManager, &QNetworkAccessManager::finished, this, &LLMService::onReplyFinished);
     m_extractManager=new QNetworkAccessManager(this);
+    m_interactionManager=new QNetworkAccessManager(this);
 
     qRegisterMetaType<QList<SentenceText>>("QList<SentenceText>");
     m_apiKey=apiKey;
@@ -51,11 +52,15 @@ void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> 
             (m_currentMeta.channel == Channel::kPet) ? QStringLiteral("pet") : QString();
         context.memories = m_memoryManager->getActiveEpisodicMemories(
             0.2, 20, episodicOrigin);
+        context.interactionSummaries =
+            m_memoryManager->getRecentInteractionSummaries(
+                m_currentMeta.channel, m_currentMeta.sessionId, 5);
         context.summaries = m_memoryManager->getLatestSummaries(5, m_currentMeta.channel, m_currentMeta.sessionId);
         context.relationships = m_memoryManager->getRelationshipStates(m_currentMeta.subject);
         qDebug()<<"[LLM]角色档案: subject="<<profileSubject<<context.userProfiles.size()
                 <<"mako="<<context.makoProfiles.size();
         qDebug()<<"[LLM]情景记忆数量:"<<context.memories.size();
+        qDebug()<<"[LLM]群聊片段摘要数量:"<<context.interactionSummaries.size();
         qDebug()<<"[LLM]摘要数量:"<<context.summaries.size();
     }
     const QString finalSystemPrompt = PromptAssembler::buildSystemPrompt(
@@ -396,6 +401,132 @@ void LLMService::extractMemoryAsync(const QList<HistoryTurn> &turns, qlonglong l
         }
         reply->deleteLater();
     });
+}
+
+void LLMService::summarizeInteractionAsync(qlonglong interactionId,
+                                           const QList<RawEvent> &events)
+{
+    if (events.isEmpty()) {
+        emit interactionSummaryFailed(interactionId, QStringLiteral("empty_events"));
+        return;
+    }
+
+    QString transcript;
+    QStringList participantNames;
+    for (const RawEvent &event : events) {
+        QString name = event.senderName.isEmpty()
+                           ? event.senderId
+                           : event.senderName;
+        if (QRegularExpression(QStringLiteral("^\\d{5,}$")).match(name).hasMatch()) {
+            name = QStringLiteral("某位成员");
+        }
+        if (!name.isEmpty() && !participantNames.contains(name)) {
+            participantNames.append(name);
+        }
+        QString content = event.content;
+        content.replace(QRegularExpression(QStringLiteral("@\\d{5,}")),
+                        QStringLiteral("@某位成员"));
+        content.replace(QRegularExpression(QStringLiteral("\\bqq:\\d{5,}\\b"),
+                                            QRegularExpression::CaseInsensitiveOption),
+                        QStringLiteral("某位成员"));
+        content.replace(QRegularExpression(QStringLiteral("\\b\\d{5,}\\b")),
+                        QStringLiteral("[成员]"));
+        transcript += QString("- %1: %2\n").arg(name, content);
+    }
+
+    const QString prompt = QStringLiteral(
+        "你是群聊记忆整理器。仅根据下面的群聊片段生成客观摘要，不要编造。\n"
+        "要求：\n"
+        "1. 不超过 200 字；\n"
+        "2. 只描述群内公开交流；\n"
+        "3. 不输出任何隐私规则命中的原文、第三方私聊内容或其他群信息；\n"
+        "4. **必须保留说话人昵称**：每个事实写成「昵称：内容」；"
+        "禁止用“有人”“某成员”“另一人”“一名成员”等匿名指代；\n"
+        "5. 严格输出 JSON：{\"summary\":\"...\"}。\n\n"
+        "本段参与者：%1\n群聊片段：\n%2")
+        .arg(participantNames.join(QStringLiteral("、")), transcript);
+
+    if (debugFullLogsEnabled()) {
+        qDebug().noquote() << "[LLM][debug] interaction prompt:"
+                           << interactionId << prompt;
+    }
+
+    QJsonObject userMessage;
+    userMessage["role"] = "user";
+    userMessage["content"] = prompt;
+    QJsonArray messages;
+    messages.append(userMessage);
+
+    QJsonObject rootObj;
+    rootObj["model"] = "deepseek-v4-flash";
+    rootObj["messages"] = messages;
+    rootObj["temperature"] = 0.3;
+    rootObj["max_tokens"] = 512;
+    rootObj["response_format"] = QJsonObject{{"type", "json_object"}};
+    rootObj["reasoning_effort"] = "low";
+
+    QUrl url("https://api.deepseek.com/chat/completions");
+    QNetworkRequest request(url);
+    request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    request.setRawHeader("Authorization", ("Bearer " + m_apiKey).toUtf8());
+
+    QNetworkReply *reply = m_interactionManager->post(
+        request, QJsonDocument(rootObj).toJson());
+    QPointer<LLMService> self(this);
+    connect(reply, &QNetworkReply::finished, this,
+            [this, self, reply, interactionId]() {
+        if (self.isNull()) {
+            reply->deleteLater();
+            return;
+        }
+        if (reply->error() != QNetworkReply::NoError) {
+            qDebug() << "[LLM]interaction summary 网络错误:"
+                     << interactionId << reply->errorString();
+            emit interactionSummaryFailed(interactionId, QStringLiteral("network"));
+            reply->deleteLater();
+            return;
+        }
+
+        const QByteArray data = reply->readAll();
+        const QJsonDocument doc = QJsonDocument::fromJson(data);
+        const QJsonArray choices = doc.object()["choices"].toArray();
+        if (choices.isEmpty()) {
+            qDebug() << "[LLM]interaction summary choices 为空:" << interactionId;
+            emit interactionSummaryFailed(interactionId, QStringLiteral("empty_choices"));
+            reply->deleteLater();
+            return;
+        }
+        QString content = choices[0]
+                              .toObject()["message"].toObject()["content"]
+                              .toString();
+        content.replace(QRegularExpression("```json|```",
+                                           QRegularExpression::CaseInsensitiveOption),
+                        "");
+        content = content.trimmed();
+
+        const QJsonDocument resultDoc = QJsonDocument::fromJson(content.toUtf8());
+        const QString summary = resultDoc.object().value("summary").toString().trimmed();
+        if (summary.isEmpty()) {
+            qDebug() << "[LLM]interaction summary 为空:" << interactionId
+                     << "chars=" << content.size();
+            emit interactionSummaryFailed(interactionId, QStringLiteral("empty_summary"));
+            reply->deleteLater();
+            return;
+        }
+
+        if (debugFullLogsEnabled()) {
+            qDebug().noquote() << "[LLM][debug] interaction summary:"
+                               << interactionId << summary;
+        }
+        qDebug() << "[LLM]interaction summary 成功:" << interactionId
+                 << "chars=" << summary.size();
+        emit interactionSummaryReady(interactionId, summary);
+        reply->deleteLater();
+    });
+
+    qDebug() << "[LLM]interaction summary 请求:" << interactionId
+             << "events=" << events.size()
+             << "promptChars=" << prompt.size();
 }
 
 void LLMService::setApiKey(const QString &apiKey)

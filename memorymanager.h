@@ -79,6 +79,22 @@ public:
                                    const QStringList &ruleIds,
                                    const QString &policyVersion);
 
+    // PR-2: raw_events 消费与 interactions
+    QList<RawEvent> getUnprocessedGroupEvents(const QString &sessionId, int limit);
+    QList<QString> getPendingGroupSessions();
+    int countUnprocessedGroupEvents(const QString &sessionId);
+    QDateTime latestUnprocessedGroupEventTime(const QString &sessionId);
+    qlonglong createInteractionBatch(const InteractionDraft &draft,
+                                     const QList<qlonglong> &eventIds);
+    QList<RawEvent> getRawEventsByIds(const QList<qlonglong> &ids);
+    QList<qlonglong> getPendingInteractionIds(int limit);
+    QList<RawEvent> getInteractionSourceEvents(qlonglong interactionId);
+    bool saveInteractionSummary(qlonglong id, const QString &summary, const QString &status);
+    bool markInteractionSummaryFailed(qlonglong id);
+    QList<InteractionSummary> getRecentInteractionSummaries(const QString &channel,
+                                                            const QString &sessionId,
+                                                            int limit);
+
 //蒸馏游标（memory_cursor）：每 channel+session 一条；Phase 1 蒸馏接线时使用
     bool updateMemoryCursor(const QString &channel, const QString &sessionId,
                             qlonglong lastEventId, qlonglong lastTurnId);

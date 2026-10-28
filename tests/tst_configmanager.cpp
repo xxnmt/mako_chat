@@ -210,6 +210,11 @@ private slots:
         QVERIFY(policy.privacyRules.isEmpty());
         QVERIFY(!cfg.getDebugFullLogs());
         QVERIFY(!debugFullLogsEnabled());
+        QCOMPARE(policy.interaction.groupIdleMinutes, 15);
+        QCOMPARE(policy.interaction.groupBatchSize, 50);
+        QCOMPARE(policy.interaction.gapSeconds, 90);
+        QCOMPARE(policy.interaction.maxEvents, 20);
+        QCOMPARE(policy.interaction.maxMinutes, 10);
 
         const QQGroupMemoryConfig groups = cfg.getQQGroupMemoryConfig();
         QVERIFY(!groups.enabled);
@@ -224,6 +229,11 @@ private slots:
         memory.insert("short_context_enabled", false);
         memory.insert("long_term_memory_enabled", false);
         memory.insert("debug_full_logs", true);
+        memory.insert("qq_group_idle_minutes", 7);
+        memory.insert("qq_group_batch_size", 12);
+        memory.insert("interaction_gap_seconds", 45);
+        memory.insert("interaction_max_events", 8);
+        memory.insert("interaction_max_minutes", 3);
         memory.insert("privacy_policy_version", QStringLiteral("test-r3"));
 
         QJsonObject rule;
@@ -262,6 +272,11 @@ private slots:
         QVERIFY(!policy.longTermMemoryEnabled);
         QVERIFY(cfg.getDebugFullLogs());
         QVERIFY(debugFullLogsEnabled());
+        QCOMPARE(policy.interaction.groupIdleMinutes, 7);
+        QCOMPARE(policy.interaction.groupBatchSize, 12);
+        QCOMPARE(policy.interaction.gapSeconds, 45);
+        QCOMPARE(policy.interaction.maxEvents, 8);
+        QCOMPARE(policy.interaction.maxMinutes, 3);
         QCOMPARE(policy.policyVersion, QStringLiteral("test-r3"));
         QCOMPARE(policy.privacyRules.size(), 2);
         QCOMPARE(policy.privacyRules.at(0).id, QStringLiteral("phone"));
@@ -284,6 +299,22 @@ private slots:
         QVERIFY(cfg.loadSetting());
         QCOMPARE(cfg.getMemoryPolicyConfig().privacyRules.size(), 2);
         QCOMPARE(cfg.getQQGroupMemoryConfig().retentionDays, 7);
+    }
+
+    void corruptSettingIsPreserved()
+    {
+        const QByteArray broken("{ \"api\": ");
+        QFile file(m_configDir + "/setting.json");
+        QVERIFY2(file.open(QIODevice::WriteOnly | QIODevice::Truncate), "无法写入损坏配置");
+        file.write(broken);
+        file.close();
+
+        ConfigManager &cfg = ConfigManager::instance();
+        QVERIFY(!cfg.loadSetting());
+
+        QFile check(m_configDir + "/setting.json");
+        QVERIFY2(check.open(QIODevice::ReadOnly), "无法读取配置");
+        QCOMPARE(check.readAll(), broken);
     }
 
 private:

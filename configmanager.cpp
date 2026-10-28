@@ -35,8 +35,8 @@ bool ConfigManager::loadSetting()
     }
 
     if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        qDebug()<<"[ConfigManger]配置文件损坏，已初始化";
-        return saveSetting();
+        qDebug()<<"[ConfigManger]配置文件无法读取，保留原文件";
+        return false;
     }
 
     QByteArray fileData=file.readAll();
@@ -45,8 +45,8 @@ bool ConfigManager::loadSetting()
     QJsonParseError parseError;
     QJsonDocument doc = QJsonDocument::fromJson(fileData, &parseError);
     if (parseError.error != QJsonParseError::NoError) {
-        qDebug()<<"[ConfigManager]配置文件损坏，已初始化";
-        return saveSetting();
+        qDebug()<<"[ConfigManager]配置文件 JSON 损坏，保留原文件，不自动覆盖";
+        return false;
     }
 
     QJsonObject rootObj = doc.object();
@@ -78,6 +78,16 @@ bool ConfigManager::loadSetting()
             memoryObj.value("short_context_enabled").toBool(true);
         m_memoryPolicy.longTermMemoryEnabled =
             memoryObj.value("long_term_memory_enabled").toBool(true);
+        m_memoryPolicy.interaction.groupIdleMinutes =
+            qBound(1, memoryObj.value("qq_group_idle_minutes").toInt(15), 1440);
+        m_memoryPolicy.interaction.groupBatchSize =
+            qBound(1, memoryObj.value("qq_group_batch_size").toInt(50), 500);
+        m_memoryPolicy.interaction.gapSeconds =
+            qBound(10, memoryObj.value("interaction_gap_seconds").toInt(90), 3600);
+        m_memoryPolicy.interaction.maxEvents =
+            qBound(1, memoryObj.value("interaction_max_events").toInt(20), 100);
+        m_memoryPolicy.interaction.maxMinutes =
+            qBound(1, memoryObj.value("interaction_max_minutes").toInt(10), 120);
         m_memoryPolicy.policyVersion =
             memoryObj.value("privacy_policy_version").toString(QStringLiteral("r3"));
         if (m_memoryPolicy.policyVersion.isEmpty()) {
@@ -232,6 +242,11 @@ bool ConfigManager::saveSetting()
     memoryObj.insert("short_context_enabled", m_memoryPolicy.shortContextEnabled);
     memoryObj.insert("long_term_memory_enabled", m_memoryPolicy.longTermMemoryEnabled);
     memoryObj.insert("debug_full_logs", m_debugFullLogs);
+    memoryObj.insert("qq_group_idle_minutes", m_memoryPolicy.interaction.groupIdleMinutes);
+    memoryObj.insert("qq_group_batch_size", m_memoryPolicy.interaction.groupBatchSize);
+    memoryObj.insert("interaction_gap_seconds", m_memoryPolicy.interaction.gapSeconds);
+    memoryObj.insert("interaction_max_events", m_memoryPolicy.interaction.maxEvents);
+    memoryObj.insert("interaction_max_minutes", m_memoryPolicy.interaction.maxMinutes);
     memoryObj.insert("privacy_policy_version", m_memoryPolicy.policyVersion);
     QJsonArray privacyRules;
     for (const PrivacyRule &rule : m_memoryPolicy.privacyRules) {

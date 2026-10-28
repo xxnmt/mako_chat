@@ -62,6 +62,15 @@ add_phase0_test(tst_memorypolicy
     ${PROJECT_SOURCE_DIR}/qqmessageparser.cpp
 )
 
+add_phase0_test(tst_interactionsegmenter
+    tst_interactionsegmenter.cpp
+    ${PROJECT_SOURCE_DIR}/interactionsegmenter.h
+    ${PROJECT_SOURCE_DIR}/interactionsegmenter.cpp
+    ${PROJECT_SOURCE_DIR}/memorypolicy.h
+    ${PROJECT_SOURCE_DIR}/qqmessageparser.h
+    ${PROJECT_SOURCE_DIR}/qqmessageparser.cpp
+)
+
 add_phase0_test(tst_memoryoutputguard
     tst_memoryoutputguard.cpp
     ${PROJECT_SOURCE_DIR}/memoryoutputguard.h

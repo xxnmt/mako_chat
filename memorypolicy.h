@@ -24,11 +24,20 @@ struct PrivacyRule {
     QString action;     // redact / block
 };
 
+struct InteractionConfig {
+    int groupIdleMinutes = 15;
+    int groupBatchSize = 50;
+    int gapSeconds = 90;
+    int maxEvents = 20;
+    int maxMinutes = 10;
+};
+
 struct MemoryPolicyConfig {
     bool shortContextEnabled = true;
     bool longTermMemoryEnabled = true;
     QList<PrivacyRule> privacyRules;
     QString policyVersion = QStringLiteral("r3");
+    InteractionConfig interaction;
 };
 
 struct QQGroupMemoryConfig {

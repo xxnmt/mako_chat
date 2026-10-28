@@ -63,6 +63,23 @@ private slots:
         QVERIFY(message.mentionedSelf);
     }
 
+    void parsesReplyTarget()
+    {
+        const QJsonObject event = parseJson(R"({
+            "post_type":"message","message_type":"group",
+            "self_id":10001,"group_id":30001,"message_id":11,"time":1770000000,
+            "sender":{"user_id":20002,"nickname":"B"},
+            "message":[
+                {"type":"reply","data":{"id":"10"}},
+                {"type":"text","data":{"text":"回复你"}}
+            ]
+        })");
+        const QQInboundMessage message = QQMessageParser::parse(event);
+        QVERIFY(message.valid);
+        QCOMPARE(message.replyToMessageId, QStringLiteral("10"));
+        QCOMPARE(message.text, QStringLiteral("回复你"));
+    }
+
     void groupWithoutMentionIsNotMentioned()
     {
         const QJsonObject event = parseJson(R"({
