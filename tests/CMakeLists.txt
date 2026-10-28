@@ -10,6 +10,10 @@ set(PHASE0_CORE_SOURCES
     ${PROJECT_SOURCE_DIR}/memorypolicy.cpp
     ${PROJECT_SOURCE_DIR}/qqreplypolicy.h
     ${PROJECT_SOURCE_DIR}/qqreplypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/recentcontext.h
+    ${PROJECT_SOURCE_DIR}/recentcontext.cpp
+    ${PROJECT_SOURCE_DIR}/qqmessageparser.h
+    ${PROJECT_SOURCE_DIR}/qqmessageparser.cpp
     ${PROJECT_SOURCE_DIR}/sessionrouter.h
     ${PROJECT_SOURCE_DIR}/sessionrouter.cpp
 )
@@ -40,6 +44,10 @@ add_phase0_test(tst_memorymanager
     tst_memorymanager.cpp
     ${PROJECT_SOURCE_DIR}/memorymanager.h
     ${PROJECT_SOURCE_DIR}/memorymanager.cpp
+    ${PROJECT_SOURCE_DIR}/recentcontext.h
+    ${PROJECT_SOURCE_DIR}/recentcontext.cpp
+    ${PROJECT_SOURCE_DIR}/qqmessageparser.h
+    ${PROJECT_SOURCE_DIR}/qqmessageparser.cpp
 )
 
 add_phase0_test(tst_configmanager
@@ -60,6 +68,12 @@ add_phase0_test(tst_memorypolicy
     ${PROJECT_SOURCE_DIR}/qqreplypolicy.cpp
     ${PROJECT_SOURCE_DIR}/qqmessageparser.h
     ${PROJECT_SOURCE_DIR}/qqmessageparser.cpp
+)
+
+add_phase0_test(tst_recentcontext
+    tst_recentcontext.cpp
+    ${PROJECT_SOURCE_DIR}/recentcontext.h
+    ${PROJECT_SOURCE_DIR}/recentcontext.cpp
 )
 
 add_phase0_test(tst_interactionsegmenter

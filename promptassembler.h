@@ -8,6 +8,7 @@
 
 #include "historyturn.h"
 #include "utterance.h"
+#include "recentcontext.h"
 
 // 提示词/上下文组装（HUMANIZATION_PLAN 10.4 / Phase 1 前置项）
 // 职责：
@@ -35,6 +36,10 @@ public:
     // 无可披露内容时返回空对象。
     static QJsonObject buildMemoryDataMessage(const RequestMeta &meta,
                                                const MemoryContext &context);
+
+    // PR-2.1：近期原始群消息作为独立不可信数据消息。
+    static QJsonObject buildRecentContextMessage(const RequestMeta &meta,
+                                                 const RecentContextBundle &bundle);
 
     // 短期记忆 messages（含 history note；proactive/perception 不生成空 user 消息）
     static QJsonArray buildHistoryMessages(const QList<HistoryTurn> &history,

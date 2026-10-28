@@ -88,6 +88,30 @@ bool ConfigManager::loadSetting()
             qBound(1, memoryObj.value("interaction_max_events").toInt(20), 100);
         m_memoryPolicy.interaction.maxMinutes =
             qBound(1, memoryObj.value("interaction_max_minutes").toInt(10), 120);
+
+        const QJsonObject recentObj =
+            memoryObj.value("recent_group_context").toObject();
+        m_memoryPolicy.recentContext.enabled =
+            recentObj.value("enabled").toBool(true);
+        m_memoryPolicy.recentContext.maxAgeMinutes =
+            qBound(1, recentObj.value("max_age_minutes").toInt(30), 1440);
+        m_memoryPolicy.recentContext.candidateLimitPerGroup =
+            qBound(1, recentObj.value("candidate_limit_per_group").toInt(50), 500);
+        m_memoryPolicy.recentContext.maxOwnerGroups =
+            qBound(1, recentObj.value("max_owner_groups").toInt(2), 20);
+        m_memoryPolicy.recentContext.targetedItemLimit =
+            qBound(1, recentObj.value("targeted_item_limit").toInt(10), 100);
+        m_memoryPolicy.recentContext.targetedCharBudget =
+            qBound(100, recentObj.value("targeted_char_budget").toInt(1200), 8000);
+        m_memoryPolicy.recentContext.overviewItemLimit =
+            qBound(1, recentObj.value("overview_item_limit").toInt(50), 500);
+        m_memoryPolicy.recentContext.overviewCharBudget =
+            qBound(100, recentObj.value("overview_char_budget").toInt(2200), 12000);
+        m_memoryPolicy.recentContext.hotWindowItems =
+            qBound(1, recentObj.value("hot_window_items").toInt(10), 100);
+        m_memoryPolicy.recentContext.warmLineMaxChars =
+            qBound(8, recentObj.value("warm_line_max_chars").toInt(24), 200);
+
         m_memoryPolicy.policyVersion =
             memoryObj.value("privacy_policy_version").toString(QStringLiteral("r3"));
         if (m_memoryPolicy.policyVersion.isEmpty()) {
@@ -247,6 +271,25 @@ bool ConfigManager::saveSetting()
     memoryObj.insert("interaction_gap_seconds", m_memoryPolicy.interaction.gapSeconds);
     memoryObj.insert("interaction_max_events", m_memoryPolicy.interaction.maxEvents);
     memoryObj.insert("interaction_max_minutes", m_memoryPolicy.interaction.maxMinutes);
+    QJsonObject recentContextObj;
+    recentContextObj.insert("enabled", m_memoryPolicy.recentContext.enabled);
+    recentContextObj.insert("max_age_minutes", m_memoryPolicy.recentContext.maxAgeMinutes);
+    recentContextObj.insert("candidate_limit_per_group",
+                            m_memoryPolicy.recentContext.candidateLimitPerGroup);
+    recentContextObj.insert("max_owner_groups", m_memoryPolicy.recentContext.maxOwnerGroups);
+    recentContextObj.insert("targeted_item_limit",
+                            m_memoryPolicy.recentContext.targetedItemLimit);
+    recentContextObj.insert("targeted_char_budget",
+                            m_memoryPolicy.recentContext.targetedCharBudget);
+    recentContextObj.insert("overview_item_limit",
+                            m_memoryPolicy.recentContext.overviewItemLimit);
+    recentContextObj.insert("overview_char_budget",
+                            m_memoryPolicy.recentContext.overviewCharBudget);
+    recentContextObj.insert("hot_window_items",
+                            m_memoryPolicy.recentContext.hotWindowItems);
+    recentContextObj.insert("warm_line_max_chars",
+                            m_memoryPolicy.recentContext.warmLineMaxChars);
+    memoryObj.insert("recent_group_context", recentContextObj);
     memoryObj.insert("privacy_policy_version", m_memoryPolicy.policyVersion);
     QJsonArray privacyRules;
     for (const PrivacyRule &rule : m_memoryPolicy.privacyRules) {

@@ -11,6 +11,7 @@
 #include "sentencedata.h"
 #include "historyturn.h"
 #include "utterance.h"
+#include "recentcontext.h"
 
 struct RawEventWrite
 {
@@ -94,6 +95,12 @@ public:
     QList<InteractionSummary> getRecentInteractionSummaries(const QString &channel,
                                                             const QString &sessionId,
                                                             int limit);
+
+    // PR-2.1: 只读近期群聊上下文检索
+    QStringList getRecentGroupIds(const QStringList &allowedGroupIds,
+                                  int maxGroups,
+                                  const QDateTime &since);
+    RecentContextBundle searchRecentGroupContext(const RecentContextQuery &query);
 
 //蒸馏游标（memory_cursor）：每 channel+session 一条；Phase 1 蒸馏接线时使用
     bool updateMemoryCursor(const QString &channel, const QString &sessionId,

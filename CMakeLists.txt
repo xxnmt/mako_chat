@@ -20,6 +20,7 @@ qt_add_executable(Windows_AI
     memorypolicy.h memorypolicy.cpp
     memoryoutputguard.h memoryoutputguard.cpp
     interactionsegmenter.h interactionsegmenter.cpp
+    recentcontext.h recentcontext.cpp
     raweventprocessor.h raweventprocessor.cpp
     llmservice.h llmservice.cpp
     promptassembler.h promptassembler.cpp

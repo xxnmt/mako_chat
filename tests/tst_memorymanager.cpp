@@ -733,6 +733,180 @@ private slots:
         QCOMPARE(mm.getPendingInteractionIds(10).size(), 0);
     }
 
+    void recentGroupContextFindsUnprocessedMessage()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString dbPath = dir.filePath("recent_context.db");
+        MemoryManager mm(dbPath);
+
+        const QDateTime now = QDateTime::currentDateTime();
+        QVERIFY(mm.appendRawEvent(QStringLiteral("qq"), Channel::kQQGroup,
+                                  QStringLiteral("30009"), QStringLiteral("message"),
+                                  QStringLiteral("日常闲聊"), QStringLiteral("rc-1"),
+                                  QStringLiteral("in"), QStringLiteral("20002"),
+                                  QStringLiteral("小明"), QString(),
+                                  now.addSecs(-120)));
+        QVERIFY(mm.appendRawEvent(QStringLiteral("qq"), Channel::kQQGroup,
+                                  QStringLiteral("30009"), QStringLiteral("message"),
+                                  QStringLiteral("我提议吃火锅"), QStringLiteral("rc-2"),
+                                  QStringLiteral("in"), QStringLiteral("20002"),
+                                  QStringLiteral("小明"), QString(),
+                                  now.addSecs(-60)));
+
+        RecentContextQuery query;
+        query.allowedGroupIds = {QStringLiteral("30009")};
+        query.queryText = QStringLiteral("谁提议吃火锅");
+        query.mode = RecentContextMode::TargetedLookup;
+        query.since = now.addSecs(-3600);
+        query.perGroupCandidateLimit = 50;
+        query.itemLimit = 10;
+        query.charBudget = 1200;
+
+        const RecentContextBundle bundle = mm.searchRecentGroupContext(query);
+        QVERIFY(!bundle.items.isEmpty());
+        bool found = false;
+        for (const RecentContextItem &item : bundle.items) {
+            if (item.sanitizedText.contains(QStringLiteral("火锅"))) {
+                found = true;
+            }
+        }
+        QVERIFY(found);
+    }
+
+    void recentContextIsReadOnlyAndFiltersBlocked()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString dbPath = dir.filePath("recent_readonly.db");
+        MemoryManager mm(dbPath);
+
+        const QDateTime now = QDateTime::currentDateTime();
+        RawEventWrite redacted;
+        redacted.platform = QStringLiteral("qq");
+        redacted.channel = Channel::kQQGroup;
+        redacted.sessionId = QStringLiteral("30010");
+        redacted.eventType = QStringLiteral("message");
+        redacted.content = QStringLiteral("@770951546 这是 [REDACTED] 内容");
+        redacted.messageId = QStringLiteral("rc-redacted");
+        redacted.senderId = QStringLiteral("20002");
+        redacted.senderName = QStringLiteral("小明");
+        redacted.occurredAt = now.addSecs(-60);
+        redacted.sensitive = true;
+        redacted.redactionStatus = QStringLiteral("redacted");
+        QVERIFY(mm.appendRawEvent(redacted));
+
+        QVERIFY(mm.appendPrivacyBlockedEvent(
+            QStringLiteral("qq"), Channel::kQQGroup, QStringLiteral("30010"),
+            QStringLiteral("rc-blocked"), QStringLiteral("20002"),
+            QStringLiteral("小明"), now.addSecs(-30),
+            {QStringLiteral("rule")}, QStringLiteral("r3")));
+
+        const int beforeUnprocessed = mm.countUnprocessedGroupEvents(
+            QStringLiteral("30010"));
+        const qlonglong beforeCursor = mm.getMemoryCursorEventId(
+            Channel::kQQGroup, QStringLiteral("30010"));
+        const QList<qlonglong> beforePending = mm.getPendingInteractionIds(10);
+
+        RecentContextQuery query;
+        query.allowedGroupIds = {QStringLiteral("30010")};
+        query.viewerIds = {QStringLiteral("20002")};
+        query.queryText = QStringLiteral("刚才群里聊什么了");
+        query.mode = RecentContextMode::RecentOverview;
+        query.since = now.addSecs(-3600);
+        query.perGroupCandidateLimit = 50;
+        query.itemLimitOverview = 50;
+        query.overviewCharBudget = 2200;
+        const RecentContextBundle bundle = mm.searchRecentGroupContext(query);
+
+        QCOMPARE(bundle.items.size(), 1);
+        QVERIFY(bundle.items.first().isViewer);
+        QVERIFY(bundle.items.first().sanitizedText.contains(QStringLiteral("[REDACTED]")));
+        QVERIFY(!bundle.items.first().sanitizedText.contains(QStringLiteral("770951546")));
+        QCOMPARE(mm.countUnprocessedGroupEvents(QStringLiteral("30010")),
+                 beforeUnprocessed);
+        QCOMPARE(mm.getMemoryCursorEventId(Channel::kQQGroup,
+                                           QStringLiteral("30010")),
+                 beforeCursor);
+        QCOMPARE(mm.getPendingInteractionIds(10), beforePending);
+    }
+
+    void recentContextDoesNotCrossGroups()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString dbPath = dir.filePath("recent_scope.db");
+        MemoryManager mm(dbPath);
+
+        const QDateTime now = QDateTime::currentDateTime();
+        QVERIFY(mm.appendRawEvent(QStringLiteral("qq"), Channel::kQQGroup,
+                                  QStringLiteral("30011"), QStringLiteral("message"),
+                                  QStringLiteral("A群消息"), QStringLiteral("rg-a"),
+                                  QStringLiteral("in"), QStringLiteral("20002"),
+                                  QStringLiteral("小明"), QString(),
+                                  now.addSecs(-60)));
+        QVERIFY(mm.appendRawEvent(QStringLiteral("qq"), Channel::kQQGroup,
+                                  QStringLiteral("30012"), QStringLiteral("message"),
+                                  QStringLiteral("B群消息"), QStringLiteral("rg-b"),
+                                  QStringLiteral("in"), QStringLiteral("20003"),
+                                  QStringLiteral("小红"), QString(),
+                                  now.addSecs(-30)));
+
+        RecentContextQuery query;
+        query.allowedGroupIds = {QStringLiteral("30011")};
+        query.queryText = QStringLiteral("刚才群里聊什么了");
+        query.mode = RecentContextMode::RecentOverview;
+        query.since = now.addSecs(-3600);
+        const RecentContextBundle bundle = mm.searchRecentGroupContext(query);
+
+        QCOMPARE(bundle.items.size(), 1);
+        QCOMPARE(bundle.items.first().sourceGroupId, QStringLiteral("30011"));
+        QCOMPARE(bundle.items.first().sanitizedText, QStringLiteral("A群消息"));
+    }
+
+    void recentContextIgnoresSummaryState()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString dbPath = dir.filePath("recent_states.db");
+        MemoryManager mm(dbPath);
+
+        const QDateTime now = QDateTime::currentDateTime();
+        QVERIFY(mm.appendRawEvent(QStringLiteral("qq"), Channel::kQQGroup,
+                                  QStringLiteral("30013"), QStringLiteral("message"),
+                                  QStringLiteral("状态测试消息"), QStringLiteral("rs-1"),
+                                  QStringLiteral("in"), QStringLiteral("20002"),
+                                  QStringLiteral("小明"), QString(),
+                                  now.addSecs(-60)));
+        const QList<RawEvent> events = mm.getUnprocessedGroupEvents(
+            QStringLiteral("30013"), 10);
+        QCOMPARE(events.size(), 1);
+
+        InteractionDraft draft;
+        draft.channel = Channel::kQQGroup;
+        draft.sessionId = QStringLiteral("30013");
+        draft.startedAt = events.first().occurredAt;
+        draft.endedAt = events.first().occurredAt;
+        const qlonglong id = mm.createInteractionBatch(draft, {events.first().id});
+        QVERIFY(id > 0);
+
+        RecentContextQuery query;
+        query.allowedGroupIds = {QStringLiteral("30013")};
+        query.queryText = QStringLiteral("刚才群里聊什么了");
+        query.mode = RecentContextMode::RecentOverview;
+        query.since = now.addSecs(-3600);
+        QCOMPARE(mm.searchRecentGroupContext(query).items.size(), 1); // pending
+
+        QVERIFY(mm.markInteractionSummaryFailed(id));
+        QCOMPARE(mm.searchRecentGroupContext(query).items.size(), 1); // pending after retry
+        QVERIFY(mm.markInteractionSummaryFailed(id));
+        QVERIFY(mm.markInteractionSummaryFailed(id));
+        QCOMPARE(mm.searchRecentGroupContext(query).items.size(), 1); // failed
+
+        QVERIFY(mm.saveInteractionSummary(id, QStringLiteral("ok"), QStringLiteral("ready")));
+        QCOMPARE(mm.searchRecentGroupContext(query).items.size(), 1); // ready
+    }
+
     void memoryCursorUpsert()
     {
         QTemporaryDir dir;

@@ -8,7 +8,9 @@
 #include <QDebug>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QRegularExpression>
 #include <QDebug>
+#include "qqmessageparser.h"
 
 #include "historyturn.h"
 
@@ -1333,6 +1335,127 @@ QList<InteractionSummary> MemoryManager::getRecentInteractionSummaries(
         summaries.append(summary);
     }
     return summaries;
+}
+
+QStringList MemoryManager::getRecentGroupIds(const QStringList &allowedGroupIds,
+                                             int maxGroups,
+                                             const QDateTime &since)
+{
+    QStringList groups;
+    if (allowedGroupIds.isEmpty() || (!m_db.isOpen() && !m_db.open())) {
+        return groups;
+    }
+
+    QStringList placeholders;
+    for (int i = 0; i < allowedGroupIds.size(); ++i) {
+        placeholders.append(QStringLiteral("?"));
+    }
+
+    QString sql = QStringLiteral(
+        "SELECT session_id, MAX(occurred_at) AS latest FROM raw_events "
+        "WHERE channel='qq_group' AND event_type='message' "
+        "AND content IS NOT NULL "
+        "AND COALESCE(redaction_status, 'none') <> 'blocked' "
+        "AND session_id IN (%1)").arg(placeholders.join(','));
+    if (since.isValid()) {
+        sql += QStringLiteral(" AND occurred_at >= ?");
+    }
+    sql += QStringLiteral(" GROUP BY session_id ORDER BY latest DESC LIMIT ?");
+
+    QSqlQuery query(m_db);
+    query.prepare(sql);
+    for (const QString &groupId : allowedGroupIds) {
+        query.addBindValue(groupId);
+    }
+    if (since.isValid()) {
+        query.addBindValue(since.toString("yyyy-MM-dd HH:mm:ss"));
+    }
+    query.addBindValue(qMax(1, maxGroups));
+    if (!query.exec()) {
+        qDebug() << "[MemoryManager]查询近期群组失败:" << query.lastError();
+        return groups;
+    }
+    while (query.next()) {
+        groups.append(query.value(0).toString());
+    }
+    return groups;
+}
+
+RecentContextBundle MemoryManager::searchRecentGroupContext(
+    const RecentContextQuery &query)
+{
+    RecentContextBundle bundle;
+    bundle.mode = query.mode;
+    if (!m_db.isOpen() && !m_db.open()) {
+        return bundle;
+    }
+    if (query.allowedGroupIds.isEmpty()) {
+        return bundle;
+    }
+
+    const QStringList groups = getRecentGroupIds(
+        query.allowedGroupIds, query.maxGroups, query.since);
+    QList<RecentContextItem> candidates;
+    for (const QString &groupId : groups) {
+        QString sql = QStringLiteral(
+            "SELECT id, session_id, message_id, sender_id, sender_name, "
+            "content, payload, occurred_at "
+            "FROM raw_events "
+            "WHERE channel='qq_group' AND session_id=? "
+            "AND event_type='message' AND content IS NOT NULL "
+            "AND COALESCE(redaction_status, 'none') <> 'blocked'");
+        if (query.since.isValid()) {
+            sql += QStringLiteral(" AND occurred_at >= ?");
+        }
+        sql += QStringLiteral(" ORDER BY occurred_at DESC, id DESC LIMIT ?");
+
+        QSqlQuery eventQuery(m_db);
+        eventQuery.prepare(sql);
+        eventQuery.addBindValue(groupId);
+        if (query.since.isValid()) {
+            eventQuery.addBindValue(query.since.toString("yyyy-MM-dd HH:mm:ss"));
+        }
+        eventQuery.addBindValue(qMax(1, query.perGroupCandidateLimit));
+        if (!eventQuery.exec()) {
+            qDebug() << "[MemoryManager]查询近期群消息失败:" << eventQuery.lastError();
+            continue;
+        }
+        while (eventQuery.next()) {
+            RecentContextItem item;
+            item.rawEventId = eventQuery.value(0).toLongLong();
+            item.sourceGroupId = eventQuery.value(1).toString();
+            item.messageId = eventQuery.value(2).toString();
+            item.senderId = eventQuery.value(3).toString();
+            item.isViewer = query.viewerIds.contains(item.senderId);
+            item.senderDisplayName = eventQuery.value(4).toString();
+            if (item.senderDisplayName.isEmpty()
+                || QRegularExpression(QStringLiteral("^\\d{5,}$"))
+                       .match(item.senderDisplayName).hasMatch()) {
+                item.senderDisplayName = QStringLiteral("群友");
+            }
+            item.sanitizedText = eventQuery.value(5).toString();
+            item.sanitizedText.replace(
+                QRegularExpression(QStringLiteral("@\\d{5,}")),
+                QStringLiteral("@某位成员"));
+            item.sanitizedText.replace(
+                QRegularExpression(QStringLiteral("\\bqq:\\d{5,}\\b"),
+                                    QRegularExpression::CaseInsensitiveOption),
+                QStringLiteral("某位成员"));
+            const QString payload = eventQuery.value(6).toString();
+            if (!payload.isEmpty()) {
+                const QJsonDocument doc = QJsonDocument::fromJson(payload.toUtf8());
+                if (doc.isObject()) {
+                    item.replyToMessageId =
+                        QQMessageParser::parse(doc.object()).replyToMessageId;
+                }
+            }
+            item.occurredAt = eventQuery.value(7).toDateTime();
+            candidates.append(item);
+        }
+    }
+
+    bundle = RecentContextPlanner::build(candidates, query);
+    return bundle;
 }
 
 bool MemoryManager::updateMemoryCursor(const QString &channel, const QString &sessionId,

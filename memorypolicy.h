@@ -32,12 +32,26 @@ struct InteractionConfig {
     int maxMinutes = 10;
 };
 
+struct RecentContextConfig {
+    bool enabled = true;
+    int maxAgeMinutes = 30;
+    int candidateLimitPerGroup = 50;
+    int maxOwnerGroups = 2;
+    int targetedItemLimit = 10;
+    int targetedCharBudget = 1200;
+    int overviewItemLimit = 50;
+    int overviewCharBudget = 2200;
+    int hotWindowItems = 10;
+    int warmLineMaxChars = 24;
+};
+
 struct MemoryPolicyConfig {
     bool shortContextEnabled = true;
     bool longTermMemoryEnabled = true;
     QList<PrivacyRule> privacyRules;
     QString policyVersion = QStringLiteral("r3");
     InteractionConfig interaction;
+    RecentContextConfig recentContext;
 };
 
 struct QQGroupMemoryConfig {

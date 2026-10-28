@@ -1,6 +1,6 @@
 # 记忆系统 v5 R3 实施基线
 
-> 状态：**PR-1a / PR-1b 已通过手工验收；PR-2 已落地，待手工验收**
+> 状态：**PR-1a / PR-1b 已通过手工验收；PR-2 已落地；PR-2.1 已实现并通过单测，待手工验收**
 > 日期：2026-10-28
 > 冻结：`blocked` 默认不回复；`group_authorized` 下非白名单成员只记录、不回复、不写 `chat_history`。
 > 取代：[MEMORY_V5_DESIGN.md](MEMORY_V5_DESIGN.md) 的历史草案
@@ -465,6 +465,20 @@ user: 当前输入
 
 验收：允许群普通消息可追溯地形成 interaction；重启/失败不丢事件；跨群不可见。
 
+### PR-2.1：Recent Group Context
+
+- 新增只读 `searchRecentGroupContext()`；按时间窗查询，不依赖 `processed=0`。
+- 候选窗口与注入预算分离：每群最多 50 条候选，定向 10 条/1200 字符，泛问 50 条压缩/2200 字符。
+- 定向模式使用关键词/子串 + reply 链；泛问使用 hot window + warm window，不要求 summary ready。
+- Owner 私聊/pet 可读取获准群，最多 2 个最近活跃群；当前群只读当前群；非 Owner 跨群等待 PR-3。
+- 查询只读：不推进 cursor、不改 processed、不改 summary 状态。
+- blocked 不进入；redacted 只使用脱敏 content，不读 payload 原文。
+- 失败时回退到已有短期上下文/summary；无结果不编造。
+
+验收：R21-1 第 35 条定向命中；R21-2 第 35 条泛问可见；R21-3 processed/summary 状态正交；R21-4 预算独立；R21-5 Owner 范围；R21-6 当前群隔离；R21-7 blocked/redacted；R21-8 不推进后台状态；R21-9 泛问触发；R21-10 无结果不编造。
+
+实现说明：当前代码已增加 `RecentContextPlanner`、`MemoryManager::searchRecentGroupContext()`、`PromptAssembler::buildRecentContextMessage()` 与 `LLMService` 注入；单测覆盖定向命中、泛问覆盖、预算与无结果。非 Owner 共同群仍等待 PR-3。
+
 ### PR-3：成员关系、claims 与跨群授权
 
 - `group_membership_periods`。
@@ -516,6 +530,16 @@ user: 当前输入
 | A19 | 群级授权，非白名单成员合规消息 | 写脱敏 `raw_events`；不回复；不建 `chat_history`；可进入 interaction 蒸馏 |
 | A20 | 群级授权，非白名单成员 @ bot | 仍不获得回复资格 |
 | A21 | 长期记忆开关 vs 短期上下文开关 | 两者独立；A6/A7 分别验证，不能互相推导 |
+| R21-1 | 第 35 条定向命中 | 关键词命中进入候选；不要求 summary ready |
+| R21-2 | 第 35 条泛问可见 | hot/warm window 覆盖旧于最近 10 条的目标；不得只答“不记得” |
+| R21-3 | processed 与 summary 状态正交 | 0/无、1/pending、1/failed、1/quarantine、1/ready 均可按时间窗检索 |
+| R21-4 | 候选预算 vs 注入预算 | 候选 50 条；定向 ≤10 条/1200 字符；泛问 ≤50 条/2200 字符 |
+| R21-5 | Owner 私聊/pet 范围 | 只查获准群，最多 2 个；非获准群/私聊不进入 |
+| R21-6 | 当前群隔离 | 群聊只查当前群 |
+| R21-7 | blocked / redacted | blocked 不进入；redacted 只用脱敏 content |
+| R21-8 | 不推进后台状态 | cursor/processed/summary_status 不变 |
+| R21-9 | 泛问触发 | “刚才/前面/聊什么”走 overview；无稳定关键词不走定向空搜索 |
+| R21-10 | 无结果不编造 | 无可靠候选时明确未找到 |
 
 ---
 

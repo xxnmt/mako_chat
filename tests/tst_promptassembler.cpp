@@ -282,6 +282,40 @@ private slots:
         QVERIFY(!dataText.contains(QStringLiteral("relationship")));
     }
 
+    void recentContextUsesSeparateUntrustedMessage()
+    {
+        RequestMeta meta;
+        meta.channel = Channel::kQQGroup;
+        meta.sessionId = QStringLiteral("30001");
+
+        RecentContextBundle bundle;
+        bundle.mode = RecentContextMode::RecentOverview;
+        RecentContextItem item;
+        item.rawEventId = 35;
+        item.sourceGroupId = QStringLiteral("30001");
+        item.senderDisplayName = QStringLiteral("群友");
+        item.occurredAt = QDateTime(QDate(2026, 10, 28), QTime(12, 0));
+        item.sanitizedText = QStringLiteral("提议吃火锅");
+        item.isViewer = true;
+        bundle.items.append(item);
+
+        const QJsonObject message =
+            PromptAssembler::buildRecentContextMessage(meta, bundle);
+        QCOMPARE(message.value("role").toString(), QStringLiteral("user"));
+        QVERIFY(message.value("content").toString()
+                    .contains(QStringLiteral("RECENT_GROUP_CONTEXT")));
+        QVERIFY(message.value("content").toString()
+                    .contains(QStringLiteral("sender")));
+        QVERIFY(message.value("content").toString()
+                    .contains(QStringLiteral("提议吃火锅")));
+        QVERIFY(message.value("content").toString()
+                    .contains(QStringLiteral("禁止用“有人")));
+        QVERIFY(message.value("content").toString()
+                    .contains(QStringLiteral("\"is_viewer\":true")));
+        QVERIFY(message.value("content").toString()
+                    .contains(QStringLiteral("当前对话用户本人")));
+    }
+
     void interactionSummaryEntersMemoryData()
     {
         RequestMeta meta;

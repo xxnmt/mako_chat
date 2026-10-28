@@ -13,6 +13,7 @@
 #include "memorymanager.h"
 #include "promptassembler.h"
 #include "memoryoutputguard.h"
+#include "recentcontext.h"
 #include "debuglog.h"
 
 
@@ -63,6 +64,81 @@ void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> 
         qDebug()<<"[LLM]群聊片段摘要数量:"<<context.interactionSummaries.size();
         qDebug()<<"[LLM]摘要数量:"<<context.summaries.size();
     }
+    RecentContextBundle recentBundle;
+    const MemoryPolicyConfig memoryPolicy =
+        ConfigManager::instance().getMemoryPolicyConfig();
+    if (m_memoryManager && memoryPolicy.recentContext.enabled
+        && !RecentContextPlanner::isHistoricalCue(userInput)) {
+        const QQGroupMemoryConfig groups =
+            ConfigManager::instance().getQQGroupMemoryConfig();
+        const bool isGroup = m_currentMeta.channel == Channel::kQQGroup;
+        const bool ownerPrivateOrPet =
+            (m_currentMeta.channel == Channel::kPet
+             || m_currentMeta.channel == Channel::kQQPrivate)
+            && m_currentMeta.subject == QStringLiteral("user");
+        const QStringList allowedGroups =
+            RecentContextPlanner::allowedGroupIdsForRequest(
+                isGroup, ownerPrivateOrPet, m_currentMeta.sessionId,
+                groups.enabled, groups.groupAllow);
+
+        QStringList viewerIds;
+        if (m_currentMeta.subject == QStringLiteral("user")) {
+            viewerIds = ConfigManager::instance().getMasterQQAccounts();
+            if (m_currentMeta.channel == Channel::kQQPrivate
+                && !m_currentMeta.sessionId.isEmpty()) {
+                viewerIds << m_currentMeta.sessionId;
+            }
+        } else if (m_currentMeta.subject.startsWith(QStringLiteral("qq:"))) {
+            viewerIds << m_currentMeta.subject.mid(3);
+        }
+        viewerIds.removeDuplicates();
+
+        if (!allowedGroups.isEmpty()) {
+            RecentContextQuery query;
+            query.viewerId = m_currentMeta.subject;
+            query.viewerIds = viewerIds;
+            query.locationChannel = m_currentMeta.channel;
+            query.locationSessionId = m_currentMeta.sessionId;
+            query.allowedGroupIds = allowedGroups;
+            query.queryText = userInput;
+            query.mode = RecentContextPlanner::detectMode(userInput);
+            query.since = QDateTime::currentDateTime().addSecs(
+                -memoryPolicy.recentContext.maxAgeMinutes * 60);
+            query.perGroupCandidateLimit =
+                memoryPolicy.recentContext.candidateLimitPerGroup;
+            query.maxGroups = memoryPolicy.recentContext.maxOwnerGroups;
+            query.itemLimit = memoryPolicy.recentContext.targetedItemLimit;
+            query.itemLimitOverview = memoryPolicy.recentContext.overviewItemLimit;
+            query.charBudget = memoryPolicy.recentContext.targetedCharBudget;
+            query.overviewCharBudget = memoryPolicy.recentContext.overviewCharBudget;
+            query.hotWindowItems = memoryPolicy.recentContext.hotWindowItems;
+            query.warmLineMaxChars = memoryPolicy.recentContext.warmLineMaxChars;
+            recentBundle = m_memoryManager->searchRecentGroupContext(query);
+
+            // “今晚吃了什么”这类问题不一定会命中群消息里的词。
+            // Owner 私聊/pet 和群聊在定向检索为空时，回退到最近窗口，
+            // 否则刚在群里说过、私聊却回答不知道。
+            if (RecentContextPlanner::shouldFallbackToOverview(
+                    query.mode, recentBundle.items.isEmpty(),
+                    isGroup, ownerPrivateOrPet)) {
+                query.mode = RecentContextMode::RecentOverview;
+                recentBundle = m_memoryManager->searchRecentGroupContext(query);
+                qDebug() << "[LLM]定向近期检索为空，回退 overview:"
+                         << "items=" << recentBundle.items.size();
+            }
+
+            if (!recentBundle.items.isEmpty()) {
+                // 近期原始上下文优先，避免同一时段 raw 与 summary 重复注入。
+                context.interactionSummaries.clear();
+            }
+        }
+    }
+    qDebug() << "[LLM]近期群聊上下文:" << recentBundle.items.size()
+             << "mode=" << (recentBundle.mode == RecentContextMode::TargetedLookup
+                                ? "targeted"
+                                : "overview")
+             << "truncated=" << recentBundle.truncated;
+
     const QString finalSystemPrompt = PromptAssembler::buildSystemPrompt(
         m_systemPromptCache, m_currentMeta, context);
 
@@ -90,6 +166,13 @@ void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> 
                                 ).arg(currentUiState,
                                      QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss"));
         messagesArray.append(envMsg);
+    }
+
+    // 近期原始群消息是独立不可信资料，优先于长期摘要。
+    const QJsonObject recentContextMessage =
+        PromptAssembler::buildRecentContextMessage(m_currentMeta, recentBundle);
+    if (!recentContextMessage.isEmpty()) {
+        messagesArray.append(recentContextMessage);
     }
 
     // 检索记忆属于不可信资料，不得拼进 system。

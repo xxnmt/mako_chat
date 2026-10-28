@@ -215,6 +215,12 @@ private slots:
         QCOMPARE(policy.interaction.gapSeconds, 90);
         QCOMPARE(policy.interaction.maxEvents, 20);
         QCOMPARE(policy.interaction.maxMinutes, 10);
+        QVERIFY(policy.recentContext.enabled);
+        QCOMPARE(policy.recentContext.maxAgeMinutes, 30);
+        QCOMPARE(policy.recentContext.candidateLimitPerGroup, 50);
+        QCOMPARE(policy.recentContext.maxOwnerGroups, 2);
+        QCOMPARE(policy.recentContext.targetedCharBudget, 1200);
+        QCOMPARE(policy.recentContext.overviewCharBudget, 2200);
 
         const QQGroupMemoryConfig groups = cfg.getQQGroupMemoryConfig();
         QVERIFY(!groups.enabled);
@@ -234,6 +240,18 @@ private slots:
         memory.insert("interaction_gap_seconds", 45);
         memory.insert("interaction_max_events", 8);
         memory.insert("interaction_max_minutes", 3);
+        QJsonObject recent;
+        recent.insert("enabled", false);
+        recent.insert("max_age_minutes", 12);
+        recent.insert("candidate_limit_per_group", 7);
+        recent.insert("max_owner_groups", 3);
+        recent.insert("targeted_item_limit", 4);
+        recent.insert("targeted_char_budget", 500);
+        recent.insert("overview_item_limit", 20);
+        recent.insert("overview_char_budget", 900);
+        recent.insert("hot_window_items", 5);
+        recent.insert("warm_line_max_chars", 18);
+        memory.insert("recent_group_context", recent);
         memory.insert("privacy_policy_version", QStringLiteral("test-r3"));
 
         QJsonObject rule;
@@ -277,6 +295,12 @@ private slots:
         QCOMPARE(policy.interaction.gapSeconds, 45);
         QCOMPARE(policy.interaction.maxEvents, 8);
         QCOMPARE(policy.interaction.maxMinutes, 3);
+        QVERIFY(!policy.recentContext.enabled);
+        QCOMPARE(policy.recentContext.maxAgeMinutes, 12);
+        QCOMPARE(policy.recentContext.candidateLimitPerGroup, 7);
+        QCOMPARE(policy.recentContext.maxOwnerGroups, 3);
+        QCOMPARE(policy.recentContext.targetedCharBudget, 500);
+        QCOMPARE(policy.recentContext.overviewCharBudget, 900);
         QCOMPARE(policy.policyVersion, QStringLiteral("test-r3"));
         QCOMPARE(policy.privacyRules.size(), 2);
         QCOMPARE(policy.privacyRules.at(0).id, QStringLiteral("phone"));
