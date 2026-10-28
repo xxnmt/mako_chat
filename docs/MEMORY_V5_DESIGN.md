@@ -1,6 +1,7 @@
-# 记忆系统 v5 设计草案
+# 记忆系统 v5 设计草案（历史）
 
-> 状态：**草案，待评审**。本文只做设计，不涉及代码改动。
+> **已被 [MEMORY_V5_R3_BASELINE.md](MEMORY_V5_R3_BASELINE.md) 取代（2026-10-28）。**
+> 状态：历史草案，仅保留设计背景；实施以 R3 基线为准。
 > 日期：2026-10-27
 > 关联：[HUMANIZATION_PLAN.md](HUMANIZATION_PLAN.md) 第 8 节、[ARCHITECTURE.md](ARCHITECTURE.md) 2.17/2.18、[SurfCore MEMORY_CARD.md](https://github.com/Mieksido/surfcore/blob/main/docs/guides/MEMORY_CARD.md)
 
