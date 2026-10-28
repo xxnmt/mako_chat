@@ -51,6 +51,46 @@ private slots:
         QVERIFY(prompt.contains(QStringLiteral("亲密度: 42/100")));
     }
 
+    void petOnlySeesPetOriginEpisodic()
+    {
+        RequestMeta meta;
+        meta.channel = Channel::kPet;
+
+        PromptAssembler::MemoryContext context;
+
+        EpisodicMemory petMemory;
+        petMemory.content = QStringLiteral("桌宠私密回忆");
+        petMemory.origin = QStringLiteral("pet");
+        petMemory.visibility = QStringLiteral("private");
+        context.memories.append(petMemory);
+
+        EpisodicMemory qqPrivate;
+        qqPrivate.content = QStringLiteral("QQ私聊秘密");
+        qqPrivate.origin = QStringLiteral("qq_private");
+        qqPrivate.visibility = QStringLiteral("private");
+        context.memories.append(qqPrivate);
+
+        EpisodicMemory qqGroup;
+        qqGroup.content = QStringLiteral("QQ群聊秘密");
+        qqGroup.origin = QStringLiteral("qq_group");
+        qqGroup.visibility = QStringLiteral("channel");
+        context.memories.append(qqGroup);
+
+        EpisodicMemory qqPublic;
+        qqPublic.content = QStringLiteral("QQ公开内容");
+        qqPublic.origin = QStringLiteral("qq_group");
+        qqPublic.visibility = QStringLiteral("public");
+        context.memories.append(qqPublic);
+
+        const QString prompt = PromptAssembler::buildSystemPrompt(
+            QStringLiteral("BASE"), meta, context);
+
+        QVERIFY(prompt.contains(QStringLiteral("桌宠私密回忆")));
+        QVERIFY(!prompt.contains(QStringLiteral("QQ私聊秘密")));
+        QVERIFY(!prompt.contains(QStringLiteral("QQ群聊秘密")));
+        QVERIFY(!prompt.contains(QStringLiteral("QQ公开内容")));
+    }
+
     void groupPromptFiltersSensitiveSections()
     {
         RequestMeta meta;

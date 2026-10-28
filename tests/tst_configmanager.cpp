@@ -196,6 +196,90 @@ private slots:
         QCOMPARE(cfg.getDistanceLasting(), 1);
     }
 
+    void memoryPolicyDefaultsAreConservative()
+    {
+        writeSettingFile(QJsonObject{});
+
+        ConfigManager &cfg = ConfigManager::instance();
+        QVERIFY(cfg.loadSetting());
+        const MemoryPolicyConfig policy = cfg.getMemoryPolicyConfig();
+        QVERIFY(policy.shortContextEnabled);
+        QVERIFY(policy.longTermMemoryEnabled);
+        QCOMPARE(policy.policyVersion, QStringLiteral("r3"));
+        QVERIFY(policy.privacyRules.isEmpty());
+
+        const QQGroupMemoryConfig groups = cfg.getQQGroupMemoryConfig();
+        QVERIFY(!groups.enabled);
+        QVERIFY(groups.groupAllow.isEmpty());
+        QVERIFY(groups.senderAllowByGroup.isEmpty());
+        QCOMPARE(groups.retentionDays, 30);
+    }
+
+    void parsesMemoryPolicyAndGroupMemory()
+    {
+        QJsonObject memory;
+        memory.insert("short_context_enabled", false);
+        memory.insert("long_term_memory_enabled", false);
+        memory.insert("privacy_policy_version", QStringLiteral("test-r3"));
+
+        QJsonObject rule;
+        rule.insert("id", QStringLiteral("phone"));
+        rule.insert("type", QStringLiteral("pattern"));
+        rule.insert("value", QStringLiteral("\\b1\\d{10}\\b"));
+        rule.insert("action", QStringLiteral("redact"));
+        QJsonObject blockRule;
+        blockRule.insert("id", QStringLiteral("real-name"));
+        blockRule.insert("type", QStringLiteral("exact"));
+        blockRule.insert("value", QStringLiteral("张三"));
+        blockRule.insert("action", QStringLiteral("block"));
+        memory.insert("privacy_rules", QJsonArray{rule, blockRule});
+
+        QJsonObject qq;
+        qq.insert("group_memory_enabled", true);
+        qq.insert("group_memory_allow", QJsonArray{30001});
+        qq.insert("group_retention_days", 7);
+        QJsonObject modes;
+        modes.insert("30001", QStringLiteral("group_authorized"));
+        qq.insert("group_memory_mode", modes);
+        QJsonObject senderAllow;
+        senderAllow.insert("30001", QJsonArray{20002, 20003});
+        qq.insert("group_sender_allowlist", senderAllow);
+
+        QJsonObject root;
+        root.insert("memory", memory);
+        root.insert("qq", qq);
+        writeSettingFile(root);
+
+        ConfigManager &cfg = ConfigManager::instance();
+        QVERIFY(cfg.loadSetting());
+
+        const MemoryPolicyConfig policy = cfg.getMemoryPolicyConfig();
+        QVERIFY(!policy.shortContextEnabled);
+        QVERIFY(!policy.longTermMemoryEnabled);
+        QCOMPARE(policy.policyVersion, QStringLiteral("test-r3"));
+        QCOMPARE(policy.privacyRules.size(), 2);
+        QCOMPARE(policy.privacyRules.at(0).id, QStringLiteral("phone"));
+        QCOMPARE(policy.privacyRules.at(1).action, QStringLiteral("block"));
+
+        const QQGroupMemoryConfig groups = cfg.getQQGroupMemoryConfig();
+        QVERIFY(groups.enabled);
+        QCOMPARE(groups.groupAllow, (QList<qlonglong>{30001}));
+        QCOMPARE(groups.retentionDays, 7);
+        QCOMPARE(groups.modeByGroup.value(QStringLiteral("30001")),
+                 QQGroupMemoryMode::GroupAuthorized);
+        QCOMPARE(groups.senderAllowByGroup.value(QStringLiteral("30001")).size(), 2);
+
+        const QQConfig qqConfig = cfg.getQQConfig();
+        QVERIFY(qqConfig.groupMemory.enabled);
+        QCOMPARE(qqConfig.groupMemory.groupAllow, (QList<qlonglong>{30001}));
+
+        // save/reload 双向一致
+        QVERIFY(cfg.saveSetting());
+        QVERIFY(cfg.loadSetting());
+        QCOMPARE(cfg.getMemoryPolicyConfig().privacyRules.size(), 2);
+        QCOMPARE(cfg.getQQGroupMemoryConfig().retentionDays, 7);
+    }
+
 private:
     void writeSettingFile(const QJsonObject &root)
     {

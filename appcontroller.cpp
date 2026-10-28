@@ -19,12 +19,48 @@
 #include "qqprotocolclient.h"
 #include "qqmessageparser.h"
 #include "qqreplypolicy.h"
+#include "memorypolicy.h"
 
 #include <QDebug>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QJsonDocument>
+
+namespace {
+
+bool isAllowedExtractionSubject(const QString &subject, const RequestMeta &meta)
+{
+    if (subject.isEmpty()) {
+        return false;
+    }
+    if (subject == QStringLiteral("mako")) {
+        return true;
+    }
+    if (!meta.subject.isEmpty() && subject == meta.subject) {
+        return true;
+    }
+    if (subject == QStringLiteral("user")
+        && (meta.channel == Channel::kPet || meta.subject == QStringLiteral("user"))) {
+        return true;
+    }
+    if (meta.channel == Channel::kQQGroup
+        && subject == QStringLiteral("group:%1").arg(meta.sessionId)) {
+        return true;
+    }
+    return false;
+}
+
+QString privacyRulesJson(const QStringList &ruleIds)
+{
+    QJsonArray rules;
+    for (const QString &ruleId : ruleIds) {
+        rules.append(ruleId);
+    }
+    return QString::fromUtf8(QJsonDocument(rules).toJson(QJsonDocument::Compact));
+}
+
+} // namespace
 
 AppController::AppController(QObject *parent)
     : QObject{parent}
@@ -69,31 +105,73 @@ AppController::AppController(QObject *parent)
         if (!message.valid) {
             return;
         }
-        const QQReplyDecision decision = QQReplyPolicyEngine::decide(
-            message, ConfigManager::instance().getQQConfig().reply,
+        const QQConfig qqConfig = ConfigManager::instance().getQQConfig();
+        const MemoryPolicyConfig memoryPolicy =
+            ConfigManager::instance().getMemoryPolicyConfig();
+        const QQInboundDecision decision = QQInboundPolicyEngine::decide(
+            message, qqConfig.reply, qqConfig.groupMemory, memoryPolicy,
             ConfigManager::instance().getMasterQQAccounts());
-        if (decision == QQReplyDecision::Drop) {
-            qDebug() << "[QQ]未通过白名单，已忽略（不记录）:"
-                     << message.channel << message.sessionId << message.senderId;
+        if (!decision.persistRaw && !decision.persistChat && !decision.allowReply) {
+            qDebug() << "[QQ]未通过发送者/记忆策略，已忽略（不记录）:"
+                     << message.channel << message.sessionId
+                     << "senderHash=" << qHash(message.senderId);
             return;
         }
 
-        m_memoryManager->appendRawEvent(QStringLiteral("qq"), message.channel,
-                                        message.sessionId, QStringLiteral("message"),
-                                        message.text, message.messageId,
-                                        QStringLiteral("in"), message.senderId,
-                                        message.speaker, message.rawJson,
-                                        message.occurredAt, false,
-                                        QStringLiteral("channel"));
-        qDebug() << "[QQ]收到消息:" << message.channel << message.sessionId
-                 << message.speaker << message.text;
+        const SanitizeResult sanitized = SensitiveContentFilter::sanitize(
+            message.text, message.rawJson, memoryPolicy.privacyRules);
+        if (sanitized.blocked) {
+            m_memoryManager->appendPrivacyBlockedEvent(
+                QStringLiteral("qq"), message.channel, message.sessionId,
+                message.messageId, message.senderId, message.speaker,
+                message.occurredAt, sanitized.ruleIds, memoryPolicy.policyVersion);
+            qDebug() << "[QQ]消息触发隐私拦截，已丢弃（不回复/不入上下文）:"
+                     << message.channel << message.sessionId
+                     << "senderHash=" << qHash(message.senderId);
+            return;
+        }
 
-        if (decision == QQReplyDecision::RecordOnly) {
-            qDebug() << "[QQ]群消息未@我，已记录但不回复";
+        if (decision.persistRaw) {
+            RawEventWrite rawEvent;
+            rawEvent.platform = QStringLiteral("qq");
+            rawEvent.channel = message.channel;
+            rawEvent.sessionId = message.sessionId;
+            rawEvent.eventType = QStringLiteral("message");
+            rawEvent.content = sanitized.text;
+            rawEvent.messageId = message.messageId;
+            rawEvent.direction = QStringLiteral("in");
+            rawEvent.senderId = message.senderId;
+            rawEvent.senderName = message.speaker;
+            rawEvent.payloadJson = sanitized.payload;
+            rawEvent.payloadNull = sanitized.payloadDropped;
+            rawEvent.occurredAt = message.occurredAt;
+            rawEvent.sensitive = sanitized.redacted;
+            rawEvent.visibility = message.channel == Channel::kQQGroup
+                                      ? QStringLiteral("channel")
+                                      : QStringLiteral("private");
+            rawEvent.redactionStatus = sanitized.redacted
+                                           ? QStringLiteral("redacted")
+                                           : QStringLiteral("none");
+            rawEvent.redactionRules = privacyRulesJson(sanitized.ruleIds);
+            rawEvent.policyVersion = memoryPolicy.policyVersion;
+            m_memoryManager->appendRawEvent(rawEvent);
+        }
+
+        qDebug() << "[QQ]收到消息:" << message.channel << message.sessionId
+                 << "senderHash=" << qHash(message.senderId)
+                 << "len=" << sanitized.text.size()
+                 << "persistRaw=" << decision.persistRaw
+                 << "persistChat=" << decision.persistChat
+                 << "reply=" << decision.allowReply;
+
+        if (!decision.allowReply) {
+            qDebug() << "[QQ]记录但不回复";
             return;
         }
         m_sessionRouter->submitInput(message.channel, message.sessionId,
-                                     message.speaker, message.text, message.senderId);
+                                     message.speaker, sanitized.text, message.senderId,
+                                     decision.persistChat, decision.persistRaw,
+                                     sanitized.redacted);
     });
     if (ConfigManager::instance().getQQConfig().enabled) {
         m_qqClient->start();
@@ -181,7 +259,9 @@ void AppController::handleMakoReply(const QList<SentenceText> &sentences, const 
 {
     // TD-034：本轮回复入队 TTS，记下它属于哪一轮（退火门控用）
     m_lastPlaybackRound = m_roundSeq;
-    m_memoryManager->saveQATurn(m_lastUserInput,rawReply,sentences,m_lastMeta);
+    if (m_lastMeta.persistTurn) {
+        m_memoryManager->saveQATurn(m_lastUserInput, rawReply, sentences, m_lastMeta);
+    }
     if (m_lastMeta.channel == Channel::kPet) {
         m_ttsService->enqueueSentences(sentences);
     } else {
@@ -198,6 +278,10 @@ void AppController::handleMakoReply(const QList<SentenceText> &sentences, const 
         utterance.speaker = m_lastMeta.speaker;
         utterance.text = replyParts.join(QString());
         m_qqChannel->sendUtterance(utterance);
+    }
+
+    if (!m_lastMeta.persistTurn || !m_lastMeta.longTermMemoryEnabled) {
+        return;
     }
 
     qlonglong lastEndId = -1;
@@ -257,7 +341,7 @@ void AppController::onPlayAudioAction(const QString &zhText, const QMap<QString,
     // 全局情绪层：立绘四维状态不随渠道拆分（D1 开关 Phase 1 在 QQ 渠道路径生效）
     applyPetTags(tags);
 
-    qDebug()<<"[AppController] 当前播放文本:" << zhText;
+    qDebug() << "[AppController] 当前播放文本长度:" << zhText.size();
     qDebug()<<"[AppController] 当前立绘路径:" << m_appearance->getPath();
 
 }
@@ -318,7 +402,19 @@ void AppController::initConnections()
         m_llmService->askDeepSeek(userText, history, meta);
     });
     connect(m_chatWidget,&ChatWidget::textSubmitted,this,[this](const QString &text){
-        m_sessionRouter->submitInput(Channel::kPet, Channel::kDefaultSession, QStringLiteral("欧尼酱"), text);
+        const MemoryPolicyConfig memoryPolicy =
+            ConfigManager::instance().getMemoryPolicyConfig();
+        const SanitizeResult sanitized = SensitiveContentFilter::sanitize(
+            text, QString(), memoryPolicy.privacyRules);
+        if (sanitized.blocked) {
+            qDebug() << "[Pet]消息触发隐私拦截，已丢弃（不回复/不入上下文）";
+            return;
+        }
+        m_sessionRouter->submitInput(Channel::kPet, Channel::kDefaultSession,
+                                     QStringLiteral("欧尼酱"), sanitized.text, QString(),
+                                     memoryPolicy.shortContextEnabled,
+                                     memoryPolicy.longTermMemoryEnabled,
+                                     sanitized.redacted);
     });
     connect(m_llmService, &LLMService::memoryExtractionReady, this,
             [this](const QJsonObject &extractionResult, qlonglong lastEndId,
@@ -335,6 +431,10 @@ void AppController::initConnections()
             QString subject = obj["subject"].toString(meta.subject);
             QString key = obj["key"].toString();
             QString value = obj["value"].toString();
+            if (!isAllowedExtractionSubject(subject, meta)) {
+                qDebug() << "[AppController]拒绝越权 profile subject:" << subject;
+                continue;
+            }
             if (!subject.isEmpty() && !key.isEmpty() && !value.isEmpty()) {
                 m_memoryManager->upsertCharacterProfile(subject, key, value);
             }
@@ -350,6 +450,10 @@ void AppController::initConnections()
             QString subject = obj["subject"].toString(meta.subject);
             QString eventTimeStr = obj["event_time"].toString();
             QDateTime eventTime = QDateTime::fromString(eventTimeStr, "yyyy-MM-dd HH:mm:ss");
+            if (!isAllowedExtractionSubject(subject, meta)) {
+                qDebug() << "[AppController]拒绝越权 episodic subject:" << subject;
+                continue;
+            }
             if (!content.isEmpty()) {
                 m_memoryManager->addEpisodicMemory(content, type, importance, eventTime,
                                                    sourceIdsJson, meta.channel, visibility,
@@ -376,7 +480,7 @@ void AppController::initConnections()
         }
 
         qDebug()<<"[AppController]本次记忆提取流程已全部完成: 档案更新"<<charUpdates.size()
-                <<"条, 情景记忆"<<episodicMemories.size()<<"条, 摘要:"<<summary
+                <<"条, 情景记忆"<<episodicMemories.size()<<"条, 摘要长度:"<<summary.size()
                 <<", 关系更新"<<relUpdates.size()<<"条";
     });
 

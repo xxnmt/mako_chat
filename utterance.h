@@ -20,7 +20,9 @@ struct RequestMeta {
     QString sessionId = Channel::kDefaultSession; // 桌宠恒 default；QQ=对方QQ号/群号
     QString speaker;                            // 桌宠="欧尼酱"；群聊=对方昵称
     QString subject = QStringLiteral("user");   // 身份解析结果（'user' 即主人，IdentityResolver 产出）
-    bool sensitive = false;                     // 记忆盲区标记（渠道侧查配置后设置，MemoryManager 保持中立）
+    bool sensitive = false;                     // 记忆盲区/已脱敏标记（渠道侧查配置后设置）
+    bool persistTurn = true;                    // 是否写 chat_history（短期上下文开关）
+    bool longTermMemoryEnabled = true;          // 是否允许触发长期提取
     QString turnKind = QStringLiteral("reply"); // 轮次类型：reply / proactive / perception
     QString triggerEventIds;                    // 触发事件 id 列表（JSON 数组，指向 raw_events.id）
 };

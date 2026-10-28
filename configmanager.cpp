@@ -8,6 +8,21 @@
 #include <QJsonObject>
 #include <QJsonArray>
 
+namespace {
+
+QList<qlonglong> readIdArray(const QJsonArray &array)
+{
+    QList<qlonglong> ids;
+    for (const QJsonValue &value : array) {
+        ids.append(value.isDouble()
+                       ? static_cast<qlonglong>(value.toDouble())
+                       : value.toString().toLongLong());
+    }
+    return ids;
+}
+
+} // namespace
+
 bool ConfigManager::loadSetting()
 {
     QFile file(m_configFilePath);
@@ -48,16 +63,54 @@ bool ConfigManager::loadSetting()
         m_ttsUrl = "http://127.0.0.1:9880";
     }
 
+    m_memoryPolicy = MemoryPolicyConfig{};
+    m_shortMemoryLength = 15;
+    m_summaryMemoryLength = 15;
     if (rootObj.contains("memory") && rootObj["memory"].isObject()) {
         QJsonObject memoryObj = rootObj["memory"].toObject();
         m_shortMemoryLength = memoryObj.value("short_term_length").toInt(15);
         m_summaryMemoryLength = memoryObj.value("summary_length").toInt(15);
+
+        m_memoryPolicy.shortContextEnabled =
+            memoryObj.value("short_context_enabled").toBool(true);
+        m_memoryPolicy.longTermMemoryEnabled =
+            memoryObj.value("long_term_memory_enabled").toBool(true);
+        m_memoryPolicy.policyVersion =
+            memoryObj.value("privacy_policy_version").toString(QStringLiteral("r3"));
+        if (m_memoryPolicy.policyVersion.isEmpty()) {
+            m_memoryPolicy.policyVersion = QStringLiteral("r3");
+        }
+
+        const QJsonArray rules = memoryObj.value("privacy_rules").toArray();
+        int index = 0;
+        for (const QJsonValue &value : rules) {
+            if (!value.isObject()) {
+                continue;
+            }
+            const QJsonObject ruleObj = value.toObject();
+            PrivacyRule rule;
+            rule.type = ruleObj.value("type").toString().toLower();
+            rule.value = ruleObj.value("value").toString();
+            rule.action = ruleObj.value("action").toString(QStringLiteral("redact")).toLower();
+            rule.id = ruleObj.value("id").toString(
+                QStringLiteral("rule-%1").arg(index));
+            ++index;
+
+            if (rule.value.isEmpty()
+                || (rule.type != QStringLiteral("exact")
+                    && rule.type != QStringLiteral("keyword")
+                    && rule.type != QStringLiteral("pattern"))
+                || (rule.action != QStringLiteral("redact")
+                    && rule.action != QStringLiteral("block"))) {
+                qDebug() << "[ConfigManager]忽略无效隐私规则:" << rule.id;
+                continue;
+            }
+            m_memoryPolicy.privacyRules.append(rule);
+        }
     }
     else
     {
         qDebug()<<"[ConfigManger]:memory配置缺失，使用默认值";
-        m_shortMemoryLength = 15;
-        m_summaryMemoryLength = 15;
     }
     if (m_summaryMemoryLength < 1) {
         m_summaryMemoryLength = 15;
@@ -89,29 +142,50 @@ bool ConfigManager::loadSetting()
     m_qqEnabled = false;
     m_qqWsUrl = QStringLiteral("ws://127.0.0.1:3001");
     m_qqAccessToken.clear();
+    m_qqReply = QQReplyPolicy{};
+    m_qqGroupMemory = QQGroupMemoryConfig{};
     if (rootObj.contains("qq") && rootObj["qq"].isObject()) {
         QJsonObject qqObj = rootObj["qq"].toObject();
         m_qqEnabled = qqObj.value("enabled").toBool(false);
         m_qqWsUrl = qqObj.value("ws_url").toString(QStringLiteral("ws://127.0.0.1:3001"));
         m_qqAccessToken = qqObj.value("access_token").toString();
 
-        m_qqReply = QQReplyPolicy{};
         if (qqObj.contains("reply") && qqObj.value("reply").isObject()) {
             const QJsonObject replyObj = qqObj.value("reply").toObject();
             m_qqReply.privateMode = replyObj.value("private").toString(m_qqReply.privateMode);
             m_qqReply.groupMode = replyObj.value("group").toString(m_qqReply.groupMode);
             m_qqReply.masterAnyGroup = replyObj.value("master_any_group").toBool(false);
-            auto readIds = [](const QJsonArray &array) {
-                QList<qlonglong> ids;
-                for (const QJsonValue &value : array) {
-                    ids.append(value.isDouble()
-                                    ? static_cast<qlonglong>(value.toDouble())
-                                    : value.toString().toLongLong());
-                }
-                return ids;
-            };
-            m_qqReply.privateAllow = readIds(replyObj.value("private_allow").toArray());
-            m_qqReply.groupAllow = readIds(replyObj.value("group_allow").toArray());
+            m_qqReply.privateAllow = readIdArray(replyObj.value("private_allow").toArray());
+            m_qqReply.groupAllow = readIdArray(replyObj.value("group_allow").toArray());
+        }
+
+        m_qqGroupMemory.enabled = qqObj.value("group_memory_enabled").toBool(false);
+        m_qqGroupMemory.groupAllow =
+            readIdArray(qqObj.value("group_memory_allow").toArray());
+        m_qqGroupMemory.retentionDays =
+            qBound(1, qqObj.value("group_retention_days").toInt(30), 3650);
+
+        const QJsonObject modes = qqObj.value("group_memory_mode").toObject();
+        for (auto it = modes.constBegin(); it != modes.constEnd(); ++it) {
+            bool ok = false;
+            const QQGroupMemoryMode mode =
+                qqGroupMemoryModeFromString(it.value().toString(), &ok);
+            if (!ok) {
+                qDebug() << "[ConfigManager]忽略无效群记忆模式:" << it.key()
+                         << it.value().toString();
+                continue;
+            }
+            m_qqGroupMemory.modeByGroup.insert(it.key(), mode);
+        }
+
+        const QJsonObject senderAllow =
+            qqObj.value("group_sender_allowlist").toObject();
+        for (auto it = senderAllow.constBegin(); it != senderAllow.constEnd(); ++it) {
+            if (!it.value().isArray()) {
+                continue;
+            }
+            m_qqGroupMemory.senderAllowByGroup.insert(
+                it.key(), readIdArray(it.value().toArray()));
         }
     }
 
@@ -151,6 +225,19 @@ bool ConfigManager::saveSetting()
     QJsonObject memoryObj;
     memoryObj.insert("short_term_length", m_shortMemoryLength);
     memoryObj.insert("summary_length", m_summaryMemoryLength);
+    memoryObj.insert("short_context_enabled", m_memoryPolicy.shortContextEnabled);
+    memoryObj.insert("long_term_memory_enabled", m_memoryPolicy.longTermMemoryEnabled);
+    memoryObj.insert("privacy_policy_version", m_memoryPolicy.policyVersion);
+    QJsonArray privacyRules;
+    for (const PrivacyRule &rule : m_memoryPolicy.privacyRules) {
+        QJsonObject ruleObj;
+        ruleObj.insert("id", rule.id);
+        ruleObj.insert("type", rule.type);
+        ruleObj.insert("value", rule.value);
+        ruleObj.insert("action", rule.action);
+        privacyRules.append(ruleObj);
+    }
+    memoryObj.insert("privacy_rules", privacyRules);
 
     QJsonObject timeObj;
     timeObj.insert("night_start", m_nightStart.toString("HH:mm"));
@@ -179,6 +266,32 @@ bool ConfigManager::saveSetting()
     replyObj.insert("private_allow", privateAllow);
     replyObj.insert("group_allow", groupAllow);
     qqObj.insert("reply", replyObj);
+
+    qqObj.insert("group_memory_enabled", m_qqGroupMemory.enabled);
+    QJsonArray groupMemoryAllow;
+    for (qlonglong id : m_qqGroupMemory.groupAllow) {
+        groupMemoryAllow.append(static_cast<double>(id));
+    }
+    qqObj.insert("group_memory_allow", groupMemoryAllow);
+    qqObj.insert("group_retention_days", m_qqGroupMemory.retentionDays);
+
+    QJsonObject groupModes;
+    for (auto it = m_qqGroupMemory.modeByGroup.constBegin();
+         it != m_qqGroupMemory.modeByGroup.constEnd(); ++it) {
+        groupModes.insert(it.key(), qqGroupMemoryModeToString(it.value()));
+    }
+    qqObj.insert("group_memory_mode", groupModes);
+
+    QJsonObject senderAllowMap;
+    for (auto it = m_qqGroupMemory.senderAllowByGroup.constBegin();
+         it != m_qqGroupMemory.senderAllowByGroup.constEnd(); ++it) {
+        QJsonArray ids;
+        for (qlonglong id : it.value()) {
+            ids.append(static_cast<double>(id));
+        }
+        senderAllowMap.insert(it.key(), ids);
+    }
+    qqObj.insert("group_sender_allowlist", senderAllowMap);
 
     QJsonObject rootObj;
     rootObj.insert("api", apiObj);
@@ -554,7 +667,18 @@ QQConfig ConfigManager::getQQConfig() const
     config.wsUrl = m_qqWsUrl;
     config.accessToken = m_qqAccessToken;
     config.reply = m_qqReply;
+    config.groupMemory = m_qqGroupMemory;
     return config;
+}
+
+MemoryPolicyConfig ConfigManager::getMemoryPolicyConfig() const
+{
+    return m_memoryPolicy;
+}
+
+QQGroupMemoryConfig ConfigManager::getQQGroupMemoryConfig() const
+{
+    return m_qqGroupMemory;
 }
 
 void ConfigManager::reloadIdentity()

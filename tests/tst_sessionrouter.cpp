@@ -86,6 +86,36 @@ private slots:
         QCOMPARE(captured.meta.subject, QStringLiteral("user"));
     }
 
+    void ephemeralInputSkipsHistoryAndPersistence()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager mm(dir.filePath("ephemeral.db"));
+
+        RequestMeta meta;
+        meta.channel = Channel::kPet;
+        meta.sessionId = Channel::kDefaultSession;
+        QVERIFY(mm.saveQATurn(QStringLiteral("旧历史"), "[]", {}, meta));
+
+        SessionRouter router(&mm);
+        RequestMeta capturedMeta;
+        QList<HistoryTurn> capturedHistory;
+        connect(&router, &SessionRouter::requestReply, this,
+                [&capturedMeta, &capturedHistory](const QString &, const QList<HistoryTurn> &history,
+                                                  const RequestMeta &requestMeta) {
+                    capturedHistory = history;
+                    capturedMeta = requestMeta;
+                });
+
+        QVERIFY(router.submitInput(Channel::kPet, Channel::kDefaultSession,
+                                   QStringLiteral("欧尼酱"), QStringLiteral("临时消息"),
+                                   QString(), false, true, true));
+        QVERIFY(capturedHistory.isEmpty());
+        QVERIFY(!capturedMeta.persistTurn);
+        QVERIFY(capturedMeta.longTermMemoryEnabled);
+        QVERIFY(capturedMeta.sensitive);
+    }
+
     void emptyInputDoesNotEmit()
     {
         QTemporaryDir dir;

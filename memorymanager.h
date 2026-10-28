@@ -6,10 +6,34 @@
 #include <QSqlDatabase>
 #include <QVariantMap>
 #include <QList>
+#include <QDateTime>
+#include <QStringList>
 #include "sentencedata.h"
 #include "historyturn.h"
 #include "utterance.h"
 
+struct RawEventWrite
+{
+    QString platform;
+    QString channel;
+    QString sessionId;
+    QString eventType;
+    QString content;
+    QString messageId;
+    QString direction = QStringLiteral("in");
+    QString senderId;
+    QString senderName;
+    QString payloadJson;
+    QDateTime occurredAt;
+    bool sensitive = false;
+    QString visibility = QStringLiteral("private");
+    QString redactionStatus = QStringLiteral("none");
+    QString redactionRules;
+    QString policyVersion;
+    bool contentNull = false;
+    bool payloadNull = false;
+    bool processed = false;
+};
 
 class MemoryManager : public QObject
 {
@@ -43,6 +67,17 @@ public:
                         const QDateTime &occurredAt = QDateTime(),
                         bool sensitive = false,
                         const QString &visibility = QStringLiteral("private"));
+
+    bool appendRawEvent(const RawEventWrite &event);
+    bool appendPrivacyBlockedEvent(const QString &platform,
+                                   const QString &channel,
+                                   const QString &sessionId,
+                                   const QString &messageId,
+                                   const QString &senderId,
+                                   const QString &senderName,
+                                   const QDateTime &occurredAt,
+                                   const QStringList &ruleIds,
+                                   const QString &policyVersion);
 
 //蒸馏游标（memory_cursor）：每 channel+session 一条；Phase 1 蒸馏接线时使用
     bool updateMemoryCursor(const QString &channel, const QString &sessionId,

@@ -1,6 +1,6 @@
 # 记忆系统 v5 R3 实施基线
 
-> 状态：**产品边界已冻结，待实施**
+> 状态：**PR-1a 已落地，待手工验收；PR-1b 未开始**
 > 日期：2026-10-28
 > 冻结：`blocked` 默认不回复；`group_authorized` 下非白名单成员只记录、不回复、不写 `chat_history`。
 > 取代：[MEMORY_V5_DESIGN.md](MEMORY_V5_DESIGN.md) 的历史草案
@@ -142,6 +142,35 @@
 **能力边界：**
 
 `exact_term / keyword / pattern` 只能识别已配置规则能匹配的内容，不能保证发现所有语义隐私。首版提供动态规则配置与可验证脱敏，不宣称“绝对识别所有 secret”。
+
+### 1.5 PR-1a 配置形状
+
+```json
+{
+  "memory": {
+    "short_context_enabled": true,
+    "long_term_memory_enabled": true,
+    "privacy_policy_version": "r3",
+    "privacy_rules": [
+      {"id": "phone", "type": "pattern", "value": "\\b1\\d{10}\\b", "action": "redact"},
+      {"id": "real-name", "type": "exact", "value": "张三", "action": "block"}
+    ]
+  },
+  "qq": {
+    "group_memory_enabled": false,
+    "group_memory_allow": [],
+    "group_memory_mode": {"123456": "strict_whitelist"},
+    "group_sender_allowlist": {"123456": ["20002"]},
+    "group_retention_days": 30
+  }
+}
+```
+
+- `qq.reply` 仍是回复策略；`group_memory_*` 是长期记忆策略。
+- 群模式缺省为 `strict_whitelist`；`group_authorized` 必须显式配置并配合群内告知。
+- `group_sender_allowlist` 为空时，strict 模式只有 owner 能记录/回复。
+- `privateMode=all` 保留显式兼容语义：非白名单私聊可回复，但按 ephemeral 处理，不写 `chat_history` / `raw_events`。
+- PR-1a 暂无设置界面；以上字段需手工写入 `setting.json`。
 
 ---
 

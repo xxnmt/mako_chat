@@ -5,6 +5,7 @@
 #include <QStringList>
 
 #include "qqreplypolicy.h"
+#include "memorypolicy.h"
 #include <QSettings>
 #include <QTime>
 #include "ttsreference.h"
@@ -15,6 +16,7 @@ struct QQConfig {
     QString wsUrl = QStringLiteral("ws://127.0.0.1:3001");
     QString accessToken;
     QQReplyPolicy reply;
+    QQGroupMemoryConfig groupMemory;
 };
 
 // 记忆盲区（该渠道会话产生的对话不入长期记忆）
@@ -111,6 +113,8 @@ public:
     bool getFollowExternalMood();         // D1：外部渠道情绪是否驱动桌设立绘（默认 true）
     ProactiveConfig getProactiveConfig();
     QQConfig getQQConfig() const;
+    MemoryPolicyConfig getMemoryPolicyConfig() const;
+    QQGroupMemoryConfig getQQGroupMemoryConfig() const;
     void reloadIdentity();                // 重新读取 identity.json（配置热更新/测试用）
     void loadIdentityConfig();            // 启动时显式加载 identity.json（触发校验与日志）
 
@@ -135,6 +139,8 @@ private:
     QString m_qqWsUrl=QStringLiteral("ws://127.0.0.1:3001");
     QString m_qqAccessToken;
     QQReplyPolicy m_qqReply;
+    QQGroupMemoryConfig m_qqGroupMemory;
+    MemoryPolicyConfig m_memoryPolicy;
     int m_summaryMemoryLength=15;          // 长期记忆自动摘轮数（未摘要轮次阈值）
     QTime m_nightStart{22, 0};             // 夜晚开始
     QTime m_nightEnd{7, 0};                // 夜晚结束（支持跨零点）

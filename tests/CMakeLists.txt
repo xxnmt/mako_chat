@@ -6,6 +6,10 @@ set(PHASE0_CORE_SOURCES
     ${PROJECT_SOURCE_DIR}/memorymanager.cpp
     ${PROJECT_SOURCE_DIR}/configmanager.h
     ${PROJECT_SOURCE_DIR}/configmanager.cpp
+    ${PROJECT_SOURCE_DIR}/memorypolicy.h
+    ${PROJECT_SOURCE_DIR}/memorypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/qqreplypolicy.h
+    ${PROJECT_SOURCE_DIR}/qqreplypolicy.cpp
     ${PROJECT_SOURCE_DIR}/sessionrouter.h
     ${PROJECT_SOURCE_DIR}/sessionrouter.cpp
 )
@@ -42,6 +46,20 @@ add_phase0_test(tst_configmanager
     tst_configmanager.cpp
     ${PROJECT_SOURCE_DIR}/configmanager.h
     ${PROJECT_SOURCE_DIR}/configmanager.cpp
+    ${PROJECT_SOURCE_DIR}/memorypolicy.h
+    ${PROJECT_SOURCE_DIR}/memorypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/qqreplypolicy.h
+    ${PROJECT_SOURCE_DIR}/qqreplypolicy.cpp
+)
+
+add_phase0_test(tst_memorypolicy
+    tst_memorypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/memorypolicy.h
+    ${PROJECT_SOURCE_DIR}/memorypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/qqreplypolicy.h
+    ${PROJECT_SOURCE_DIR}/qqreplypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/qqmessageparser.h
+    ${PROJECT_SOURCE_DIR}/qqmessageparser.cpp
 )
 
 add_phase0_test(tst_sessionrouter

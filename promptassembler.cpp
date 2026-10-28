@@ -87,9 +87,9 @@ bool PromptAssembler::isUserProfileVisible(const CharacterProfile &profile, cons
 
 bool PromptAssembler::isEpisodicVisible(const EpisodicMemory &memory, const RequestMeta &meta)
 {
-    // 桌宠是主人私域：保留既有行为（全部可见）
+    // 桌宠只加载 owner 自己的 pet 记忆；QQ 来源不能因为渠道是 pet 就全部注入。
     if (meta.channel == Channel::kPet) {
-        return true;
+        return memory.origin == QStringLiteral("pet");
     }
     if (memory.visibility == QStringLiteral("public")) {
         return true;

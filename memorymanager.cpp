@@ -827,6 +827,25 @@ bool MemoryManager::appendRawEvent(const QString &platform, const QString &chann
                                    const QDateTime &occurredAt, bool sensitive,
                                    const QString &visibility)
 {
+    RawEventWrite event;
+    event.platform = platform;
+    event.channel = channel;
+    event.sessionId = sessionId;
+    event.eventType = eventType;
+    event.content = content;
+    event.messageId = messageId;
+    event.direction = direction;
+    event.senderId = senderId;
+    event.senderName = senderName;
+    event.payloadJson = payloadJson;
+    event.occurredAt = occurredAt;
+    event.sensitive = sensitive;
+    event.visibility = visibility;
+    return appendRawEvent(event);
+}
+
+bool MemoryManager::appendRawEvent(const RawEventWrite &event)
+{
     if (!m_db.isOpen() && !m_db.open()) {
         qDebug() << "[MemoryManager]数据库打开失败:" << m_db.lastError();
         return false;
@@ -834,30 +853,122 @@ bool MemoryManager::appendRawEvent(const QString &platform, const QString &chann
     QSqlQuery query(m_db);
     query.prepare("INSERT OR IGNORE INTO raw_events "
                   "(platform, channel, session_id, message_id, direction, sender_id, sender_name, "
-                  " event_type, content, payload, occurred_at, sensitive, visibility, processed) "
-                  "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)");
-    query.addBindValue(platform);
-    query.addBindValue(channel);
-    query.addBindValue(sessionId);
-    query.addBindValue(messageId.isEmpty() ? QVariant(QMetaType(QMetaType::QString)) : QVariant(messageId));
-    query.addBindValue(direction.isEmpty() ? QStringLiteral("in") : direction);
-    query.addBindValue(senderId.isEmpty() ? QVariant(QMetaType(QMetaType::QString)) : QVariant(senderId));
-    query.addBindValue(senderName.isEmpty() ? QVariant(QMetaType(QMetaType::QString)) : QVariant(senderName));
-    query.addBindValue(eventType);
-    query.addBindValue(content);
-    query.addBindValue(payloadJson.isEmpty() ? QVariant(QMetaType(QMetaType::QString)) : QVariant(payloadJson));
-    query.addBindValue((occurredAt.isValid() ? occurredAt : QDateTime::currentDateTime())
+                  " event_type, content, payload, occurred_at, sensitive, visibility, processed, "
+                  " redaction_status, redaction_rules, policy_version) "
+                  "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    query.addBindValue(event.platform);
+    query.addBindValue(event.channel);
+    query.addBindValue(event.sessionId);
+    query.addBindValue(event.messageId.isEmpty()
+                           ? QVariant(QMetaType(QMetaType::QString))
+                           : QVariant(event.messageId));
+    query.addBindValue(event.direction.isEmpty()
+                           ? QStringLiteral("in")
+                           : event.direction);
+    query.addBindValue(event.senderId.isEmpty()
+                           ? QVariant(QMetaType(QMetaType::QString))
+                           : QVariant(event.senderId));
+    query.addBindValue(event.senderName.isEmpty()
+                           ? QVariant(QMetaType(QMetaType::QString))
+                           : QVariant(event.senderName));
+    query.addBindValue(event.eventType);
+    query.addBindValue(event.contentNull
+                           ? QVariant(QMetaType(QMetaType::QString))
+                           : QVariant(event.content));
+    query.addBindValue(event.payloadNull || event.payloadJson.isEmpty()
+                           ? QVariant(QMetaType(QMetaType::QString))
+                           : QVariant(event.payloadJson));
+    query.addBindValue((event.occurredAt.isValid()
+                            ? event.occurredAt
+                            : QDateTime::currentDateTime())
                            .toString("yyyy-MM-dd HH:mm:ss"));
-    query.addBindValue(sensitive ? 1 : 0);
-    query.addBindValue(visibility.isEmpty() ? QStringLiteral("private") : visibility);
+    query.addBindValue(event.sensitive ? 1 : 0);
+    query.addBindValue(event.visibility.isEmpty()
+                           ? QStringLiteral("private")
+                           : event.visibility);
+    query.addBindValue(event.processed ? 1 : 0);
+    query.addBindValue(event.redactionStatus.isEmpty()
+                           ? QStringLiteral("none")
+                           : event.redactionStatus);
+    query.addBindValue(event.redactionRules.isEmpty()
+                           ? QVariant(QMetaType(QMetaType::QString))
+                           : QVariant(event.redactionRules));
+    query.addBindValue(event.policyVersion.isEmpty()
+                           ? QVariant(QMetaType(QMetaType::QString))
+                           : QVariant(event.policyVersion));
     if (!query.exec()) {
         qDebug() << "[MemoryManager]写入raw_events失败:" << query.lastError();
         return false;
     }
-    qDebug() << "[MemoryManager]raw_events写入: platform=" << platform
-             << "channel=" << channel << "session=" << sessionId
-             << "type=" << eventType << "affected=" << query.numRowsAffected();
+    qDebug() << "[MemoryManager]raw_events写入: platform=" << event.platform
+             << "channel=" << event.channel << "session=" << event.sessionId
+             << "type=" << event.eventType << "affected=" << query.numRowsAffected();
     return true;
+}
+
+bool MemoryManager::appendPrivacyBlockedEvent(const QString &platform,
+                                              const QString &channel,
+                                              const QString &sessionId,
+                                              const QString &messageId,
+                                              const QString &senderId,
+                                              const QString &senderName,
+                                              const QDateTime &occurredAt,
+                                              const QStringList &ruleIds,
+                                              const QString &policyVersion)
+{
+    QJsonArray rulesArray;
+    for (const QString &ruleId : ruleIds) {
+        rulesArray.append(ruleId);
+    }
+    const QString rulesJson = QString::fromUtf8(
+        QJsonDocument(rulesArray).toJson(QJsonDocument::Compact));
+
+    if (!m_db.isOpen() && !m_db.open()) {
+        qDebug() << "[MemoryManager]数据库打开失败:" << m_db.lastError();
+        return false;
+    }
+
+    // 同一 message_id 之前可能已以 clean 状态入库；命中 blocked 后必须清空旧原文。
+    if (!messageId.isEmpty()) {
+        QSqlQuery update(m_db);
+        update.prepare("UPDATE raw_events SET event_type='privacy_blocked', "
+                       "content=NULL, payload=NULL, sensitive=1, "
+                       "redaction_status='blocked', redaction_rules=?, "
+                       "policy_version=?, processed=1 "
+                       "WHERE channel=? AND message_id=?");
+        update.addBindValue(rulesJson);
+        update.addBindValue(policyVersion);
+        update.addBindValue(channel);
+        update.addBindValue(messageId);
+        if (!update.exec()) {
+            qDebug() << "[MemoryManager]清理旧 raw_events 失败:" << update.lastError();
+            return false;
+        }
+        if (update.numRowsAffected() > 0) {
+            qDebug() << "[MemoryManager]raw_events 已转为 privacy_blocked:"
+                     << channel << sessionId;
+            return true;
+        }
+    }
+
+    RawEventWrite event;
+    event.platform = platform;
+    event.channel = channel;
+    event.sessionId = sessionId;
+    event.eventType = QStringLiteral("privacy_blocked");
+    event.messageId = messageId;
+    event.senderId = senderId;
+    event.senderName = senderName;
+    event.occurredAt = occurredAt;
+    event.sensitive = true;
+    event.visibility = QStringLiteral("private");
+    event.redactionStatus = QStringLiteral("blocked");
+    event.redactionRules = rulesJson;
+    event.policyVersion = policyVersion;
+    event.contentNull = true;
+    event.payloadNull = true;
+    event.processed = true;
+    return appendRawEvent(event);
 }
 
 bool MemoryManager::updateMemoryCursor(const QString &channel, const QString &sessionId,
@@ -1235,6 +1346,28 @@ void MemoryManager::initDatabase(const QString &dbFilePath)
                 qDebug() << "[MemoryManager]设置数据库版本异常:" << query.lastError();
             }
             currentVersion = 4;
+            qDebug() << "[MemoryManager]数据库结构升级完成,版本:" << currentVersion;
+        }
+
+        // ============== v5: raw event 脱敏审计（PR-1a） ==============
+        if (currentVersion < 5) {
+            qDebug() << "[MemoryManager]正在升级数据库结构至 v5(raw event 脱敏审计):";
+            if (!ensureColumn(query, "raw_events", "redaction_status",
+                              "ALTER TABLE raw_events ADD COLUMN redaction_status TEXT NOT NULL DEFAULT 'none'")) {
+                throw query.lastError();
+            }
+            if (!ensureColumn(query, "raw_events", "redaction_rules",
+                              "ALTER TABLE raw_events ADD COLUMN redaction_rules TEXT")) {
+                throw query.lastError();
+            }
+            if (!ensureColumn(query, "raw_events", "policy_version",
+                              "ALTER TABLE raw_events ADD COLUMN policy_version TEXT")) {
+                throw query.lastError();
+            }
+            if (!query.exec("PRAGMA user_version = 5")) {
+                qDebug() << "[MemoryManager]设置数据库版本异常:" << query.lastError();
+            }
+            currentVersion = 5;
             qDebug() << "[MemoryManager]数据库结构升级完成,版本:" << currentVersion;
         }
 

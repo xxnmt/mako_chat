@@ -52,7 +52,10 @@ void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> 
             : m_currentMeta.subject;
         context.userProfiles = m_memoryManager->getCharacterProfiles(profileSubject);
         context.makoProfiles = m_memoryManager->getCharacterProfiles("mako");
-        context.memories = m_memoryManager->getActiveEpisodicMemories(0.2, 20);
+        const QString episodicOrigin =
+            (m_currentMeta.channel == Channel::kPet) ? QStringLiteral("pet") : QString();
+        context.memories = m_memoryManager->getActiveEpisodicMemories(
+            0.2, 20, episodicOrigin);
         context.summaries = m_memoryManager->getLatestSummaries(5, m_currentMeta.channel, m_currentMeta.sessionId);
         context.relationships = m_memoryManager->getRelationshipStates(m_currentMeta.subject);
         qDebug()<<"[LLM]角色档案: subject="<<profileSubject<<context.userProfiles.size()
@@ -93,8 +96,9 @@ void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> 
     QString enhancedInput = userInput + "\n\n【输出要求】请直接输出符合约定格式的JSON，不要输出任何其他文本、解释或思考内容。";
     userMessage["content"] = enhancedInput;
     messagesArray.append(userMessage);
-    qDebug().noquote()<<"[LLM]最终注入的Message:"<<QJsonDocument(messagesArray)
-                                                           .toJson(QJsonDocument::Indented);
+    qDebug() << "[LLM]消息组装完成: messages=" << messagesArray.size()
+             << "systemLen=" << finalSystemPrompt.size()
+             << "userLen=" << enhancedInput.size();
 
     QJsonObject rootObj;
     rootObj["model"] = "deepseek-v4-flash";
@@ -336,10 +340,12 @@ void LLMService::extractMemoryAsync(const QList<HistoryTurn> &turns, qlonglong l
             QJsonDocument resultDoc = QJsonDocument::fromJson(replyText.toUtf8());
             if (resultDoc.isObject()) {
                 QJsonObject result = resultDoc.object();
-                qDebug()<<"[LLM]记忆提取成功:" << result;
+                qDebug() << "[LLM]记忆提取成功: keys=" << result.size()
+                         << "chars=" << replyText.size();
                 emit memoryExtractionReady(result, lastEndId, sourceIdsJson, meta);
             } else {
-                qDebug()<<"[LLM]记忆提取返回的JSON格式解析失败:"<<replyText;
+                qDebug() << "[LLM]记忆提取返回的JSON格式解析失败: chars="
+                         << replyText.size();
             }
         } else {
             qDebug()<<"[LLM]记忆提取网络错误:"<<reply->errorString();
@@ -372,10 +378,10 @@ void LLMService::onReplyFinished(QNetworkReply *reply)
                 if (!reasoning.isEmpty()) {
                     qDebug() << "[LLM]reasoning_content前200字:" << reasoning.left(200);
                 }
-                qDebug() << "[LLM]完整message字段:" << messageObj;
+                qDebug() << "[LLM]message字段长度:" << messageObj.size();
             }
 //---------------
-            qDebug()<<"[LLM]茉子回复(未处理):"<<replyText;
+            qDebug() << "[LLM]茉子回复(未处理)长度:" << replyText.size();
 
             QPair<QList<SentenceText>, QString> parseResult=parseJsonReply(replyText);
             QList<SentenceText> parsedSentences = parseResult.first;
@@ -384,18 +390,12 @@ void LLMService::onReplyFinished(QNetworkReply *reply)
             // 异常回复拦截（空/解析失败/缺中文/缺日文/缺标签）
             // parseJsonReply 的所有异常路径统一返回空 sentences，以此作为唯一判据
             if (parsedSentences.isEmpty()) {
-                qDebug()<<"[LLM]回复内容异常，抛弃本次回复（不入库，不走TTS）:"<<replyText;
+                qDebug() << "[LLM]回复内容异常，抛弃本次回复（不入库，不走TTS）: chars="
+                         << replyText.size();
                 emit replyAbnormal(replyText);
             }
             else {
-                qDebug()<<"[LLM]成功拆分为"<<parsedSentences.size()<<"个段落：";
-                for (int i=0;i<parsedSentences.size();i++) {
-                    const auto &s = parsedSentences[i];
-                    qDebug()<<QString("--------- [第 %1 句] ---------").arg(i + 1);
-                    qDebug()<<"[LLM]中文气泡:"<<s.zhText;
-                    qDebug()<<"[LLM]日文音频目标:"<<s.jaText;
-                    qDebug()<<"[LLM]四维状态变更:"<<s.rawTags;
-                }
+                qDebug()<<"[LLM]成功拆分为"<<parsedSentences.size()<<"个段落";
                 //拆完传信号
                 emit sentencesReady(parsedSentences,correctedReply);
             }

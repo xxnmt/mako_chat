@@ -22,7 +22,10 @@ public:
     // 返回 false 表示未进入大脑（空输入 / 自身账号消息被丢弃）
     bool submitInput(const QString &channel, const QString &sessionId,
                      const QString &speaker, const QString &text,
-                     const QString &senderId = QString());
+                     const QString &senderId = QString(),
+                     bool useShortContext = true,
+                     bool longTermMemory = true,
+                     bool sensitive = false);
 
 signals:
     // 交给大脑侧（AppController → LLMService::askDeepSeek）

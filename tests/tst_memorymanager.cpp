@@ -148,7 +148,7 @@ private slots:
             QVERIFY(raw.open());
 
             // 版本推进到 v3
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 4);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 5);
 
             // 列扩展（v2 渠道 + v3 轮次）
             const QStringList historyCols = raw.columns("chat_history");
@@ -210,11 +210,11 @@ private slots:
                              "VALUES ('qq:10001', 'intimacy', 10.0)"));
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM relationship_state").toInt(), 3);
 
-            // raw_messages → raw_events（旧表删除，新表 15 列）
+            // raw_messages → raw_events（旧表删除，v5 后 18 列）
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
                                 "AND name='raw_messages'").toInt(), 0);
             const QStringList rawCols = raw.columns("raw_events");
-            QCOMPARE(rawCols.size(), 15);
+            QCOMPARE(rawCols.size(), 18);
             QVERIFY(rawCols.contains("message_id"));
             QVERIFY(rawCols.contains("sender_id"));
             QVERIFY(rawCols.contains("event_type"));
@@ -237,11 +237,11 @@ private slots:
             MemoryManager first(dbPath);
         }
         {
-            // 二次启动：user_version 已是 3，不再执行迁移，数据不重复
+            // 二次启动：user_version 已是 5，不再执行迁移，数据不重复
             MemoryManager second(dbPath);
             RawDb raw(dbPath, "verify2");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 4);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 5);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM chat_history").toInt(), 1);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM relationship_state").toInt(), 2);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM long_term_summary").toInt(), 1);
@@ -258,7 +258,7 @@ private slots:
             MemoryManager mm(dbPath);
             RawDb raw(dbPath, "fresh");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 4);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 5);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('raw_events')").toInt() > 0);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('memory_cursor')").toInt() > 0);
 
@@ -465,7 +465,7 @@ private slots:
         Q_UNUSED(mm);
         RawDb raw(dbPath, "v2verify");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 4);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 5);
         QCOMPARE(raw.scalar("SELECT user_input FROM chat_history").toString(), QStringLiteral("旧输入"));
         QCOMPARE(raw.scalar("SELECT turn_kind FROM chat_history").toString(), QStringLiteral("reply"));
         QCOMPARE(raw.scalar("SELECT subject FROM chat_history").toString(), QStringLiteral("user"));
@@ -567,6 +567,77 @@ private slots:
         QCOMPARE(mm.getActiveEpisodicMemories(0.2, 20, QStringLiteral("qq_group"),
                                               QStringLiteral("channel"),
                                               QStringLiteral("group:123")).size(), 1);
+    }
+
+    void appendPrivacyBlockedScrubsExistingRow()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString dbPath = dir.filePath("blocked.db");
+        MemoryManager mm(dbPath);
+
+        QVERIFY(mm.appendRawEvent(QStringLiteral("qq"), Channel::kQQGroup,
+                                  QStringLiteral("30001"), QStringLiteral("message"),
+                                  QStringLiteral("原始秘密"), QStringLiteral("m-blocked"),
+                                  QStringLiteral("in"), QStringLiteral("20002"),
+                                  QStringLiteral("小明"), QString::fromUtf8(R"({"raw":"秘密"})"),
+                                  QDateTime::currentDateTime(), false,
+                                  QStringLiteral("channel")));
+
+        QVERIFY(mm.appendPrivacyBlockedEvent(
+            QStringLiteral("qq"), Channel::kQQGroup, QStringLiteral("30001"),
+            QStringLiteral("m-blocked"), QStringLiteral("20002"),
+            QStringLiteral("小明"), QDateTime::currentDateTime(),
+            {QStringLiteral("phone")}, QStringLiteral("r3")));
+
+        RawDb raw(dbPath, "blocked");
+        QVERIFY(raw.open());
+        QCOMPARE(raw.scalar("SELECT COUNT(*) FROM raw_events").toInt(), 1);
+        QCOMPARE(raw.scalar("SELECT content IS NULL FROM raw_events").toInt(), 1);
+        QCOMPARE(raw.scalar("SELECT payload IS NULL FROM raw_events").toInt(), 1);
+        QCOMPARE(raw.scalar("SELECT event_type FROM raw_events").toString(),
+                 QStringLiteral("privacy_blocked"));
+        QCOMPARE(raw.scalar("SELECT redaction_status FROM raw_events").toString(),
+                 QStringLiteral("blocked"));
+        QCOMPARE(raw.scalar("SELECT processed FROM raw_events").toInt(), 1);
+        QVERIFY(raw.scalar("SELECT redaction_rules FROM raw_events").toString()
+                    .contains(QStringLiteral("phone")));
+        QCOMPARE(raw.scalar("SELECT policy_version FROM raw_events").toString(),
+                 QStringLiteral("r3"));
+    }
+
+    void appendRawEventWritesRedactionFields()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString dbPath = dir.filePath("redacted.db");
+        MemoryManager mm(dbPath);
+
+        RawEventWrite event;
+        event.platform = QStringLiteral("qq");
+        event.channel = Channel::kQQGroup;
+        event.sessionId = QStringLiteral("30001");
+        event.eventType = QStringLiteral("message");
+        event.content = QStringLiteral("有人提到 [REDACTED]");
+        event.messageId = QStringLiteral("m-redacted");
+        event.senderId = QStringLiteral("20002");
+        event.senderName = QStringLiteral("小明");
+        event.payloadJson = QString::fromUtf8(R"({"text":"[REDACTED]"})");
+        event.occurredAt = QDateTime::currentDateTime();
+        event.sensitive = true;
+        event.visibility = QStringLiteral("channel");
+        event.redactionStatus = QStringLiteral("redacted");
+        event.redactionRules = QString::fromUtf8(R"(["phone"])");
+        event.policyVersion = QStringLiteral("r3");
+        QVERIFY(mm.appendRawEvent(event));
+
+        RawDb raw(dbPath, "redacted");
+        QVERIFY(raw.open());
+        QCOMPARE(raw.scalar("SELECT redaction_status FROM raw_events").toString(),
+                 QStringLiteral("redacted"));
+        QCOMPARE(raw.scalar("SELECT sensitive FROM raw_events").toInt(), 1);
+        QCOMPARE(raw.scalar("SELECT policy_version FROM raw_events").toString(),
+                 QStringLiteral("r3"));
     }
 
     void memoryCursorUpsert()
