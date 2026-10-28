@@ -4,6 +4,7 @@
 #include <QSqlQuery>
 #include <QSqlError>
 #include <QVariant>
+#include <QFile>
 
 #include "memorymanager.h"
 #include "utterance.h"
@@ -148,7 +149,7 @@ private slots:
             QVERIFY(raw.open());
 
             // 版本推进到 v3
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 6);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 8);
 
             // 列扩展（v2 渠道 + v3 轮次）
             const QStringList historyCols = raw.columns("chat_history");
@@ -214,12 +215,19 @@ private slots:
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
                                 "AND name='raw_messages'").toInt(), 0);
             const QStringList rawCols = raw.columns("raw_events");
-            QCOMPARE(rawCols.size(), 18);
+            QCOMPARE(rawCols.size(), 19);
             QVERIFY(rawCols.contains("message_id"));
             QVERIFY(rawCols.contains("sender_id"));
             QVERIFY(rawCols.contains("event_type"));
             QVERIFY(rawCols.contains("visibility"));
+            QVERIFY(rawCols.contains("person_id"));
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM raw_events").toInt(), 0);
+            QCOMPARE(raw.scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+                                "AND name='persons'").toInt(), 1);
+            QCOMPARE(raw.scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+                                "AND name='person_identities'").toInt(), 1);
+            QCOMPARE(raw.scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+                                "AND name='memory_claims'").toInt(), 1);
 
             // 蒸馏游标表
             QVERIFY(raw.columns("memory_cursor").contains("last_event_id"));
@@ -241,7 +249,7 @@ private slots:
             MemoryManager second(dbPath);
             RawDb raw(dbPath, "verify2");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 6);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 8);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM chat_history").toInt(), 1);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM relationship_state").toInt(), 2);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM long_term_summary").toInt(), 1);
@@ -258,7 +266,7 @@ private slots:
             MemoryManager mm(dbPath);
             RawDb raw(dbPath, "fresh");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 6);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 8);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('raw_events')").toInt() > 0);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('memory_cursor')").toInt() > 0);
 
@@ -465,7 +473,7 @@ private slots:
         Q_UNUSED(mm);
         RawDb raw(dbPath, "v2verify");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 6);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 8);
         QCOMPARE(raw.scalar("SELECT user_input FROM chat_history").toString(), QStringLiteral("旧输入"));
         QCOMPARE(raw.scalar("SELECT turn_kind FROM chat_history").toString(), QStringLiteral("reply"));
         QCOMPARE(raw.scalar("SELECT subject FROM chat_history").toString(), QStringLiteral("user"));
@@ -811,6 +819,7 @@ private slots:
         RecentContextQuery query;
         query.allowedGroupIds = {QStringLiteral("30010")};
         query.viewerIds = {QStringLiteral("20002")};
+        query.viewerPersonId = QStringLiteral("qq:20002");
         query.queryText = QStringLiteral("刚才群里聊什么了");
         query.mode = RecentContextMode::RecentOverview;
         query.since = now.addSecs(-3600);
@@ -905,6 +914,116 @@ private slots:
 
         QVERIFY(mm.saveInteractionSummary(id, QStringLiteral("ok"), QStringLiteral("ready")));
         QCOMPARE(mm.searchRecentGroupContext(query).items.size(), 1); // ready
+    }
+
+    void personIdentitySeededAndBackfilled()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager mm(dir.filePath("identity.db"));
+
+        QVERIFY(mm.appendRawEvent(QStringLiteral("qq"), Channel::kQQGroup,
+                                  QStringLiteral("30020"), QStringLiteral("message"),
+                                  QStringLiteral("老板消息"), QStringLiteral("id-1"),
+                                  QStringLiteral("in"), QStringLiteral("20001"),
+                                  QStringLiteral("群主"), QString(), QDateTime::currentDateTime()));
+        QVERIFY(mm.appendRawEvent(QStringLiteral("qq"), Channel::kQQGroup,
+                                  QStringLiteral("30020"), QStringLiteral("message"),
+                                  QStringLiteral("成员消息"), QStringLiteral("id-2"),
+                                  QStringLiteral("in"), QStringLiteral("20002"),
+                                  QStringLiteral("小明"), QString(), QDateTime::currentDateTime()));
+
+        mm.seedIdentity({QStringLiteral("20001")});
+        const QList<RawEvent> events =
+            mm.getUnprocessedGroupEvents(QStringLiteral("30020"), 10);
+        QCOMPARE(events.size(), 2);
+        QHash<QString, QString> persons;
+        for (const RawEvent &event : events) {
+            persons.insert(event.senderId, event.personId);
+        }
+        QCOMPARE(persons.value(QStringLiteral("20001")), QStringLiteral("owner"));
+        QCOMPARE(persons.value(QStringLiteral("20002")), QStringLiteral("qq:20002"));
+
+        const QStringList aliases =
+            mm.getPersonAliases(QStringLiteral("owner"), QStringLiteral("30020"), 10);
+        QVERIFY(aliases.contains(QStringLiteral("群主")));
+        QCOMPARE(mm.resolvePersonId(QStringLiteral("qq"), QStringLiteral("20001")),
+                 QStringLiteral("owner"));
+        QCOMPARE(mm.resolvePersonId(QStringLiteral("qq"), QStringLiteral("20002")),
+                 QStringLiteral("qq:20002"));
+    }
+
+    void seedRealDatabaseCopy()
+    {
+        const QString source = qEnvironmentVariable("MAKO_REAL_DB");
+        if (source.isEmpty() || !QFile::exists(source)) {
+            QSKIP("MAKO_REAL_DB not set");
+        }
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString copy = dir.filePath("real.db");
+        QVERIFY(QFile::copy(source, copy));
+
+        MemoryManager mm(copy);
+        mm.seedIdentity({QStringLiteral("2014366825")});
+        RawDb raw(copy, "real_verify");
+        QVERIFY(raw.open());
+        QCOMPARE(raw.scalar("SELECT COUNT(*) FROM raw_events WHERE person_id IS NULL").toInt(), 0);
+        QCOMPARE(raw.scalar("SELECT COUNT(*) FROM interaction_participants "
+                            "WHERE person_id IS NULL").toInt(), 0);
+        QVERIFY(raw.scalar("SELECT COUNT(*) FROM person_identities").toInt() > 0);
+    }
+
+    void summarySegmentsAndClaimsUsePersonIds()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager mm(dir.filePath("claims.db"));
+        mm.seedIdentity({QStringLiteral("20001")});
+
+        QVERIFY(mm.appendRawEvent(QStringLiteral("qq"), Channel::kQQGroup,
+                                  QStringLiteral("30021"), QStringLiteral("message"),
+                                  QStringLiteral("吃了烤肉拌饭"), QStringLiteral("id-1"),
+                                  QStringLiteral("in"), QStringLiteral("20001"),
+                                  QStringLiteral("群主"), QString(), QDateTime::currentDateTime()));
+        const QList<RawEvent> events =
+            mm.getUnprocessedGroupEvents(QStringLiteral("30021"), 10);
+        QCOMPARE(events.size(), 1);
+
+        InteractionDraft draft;
+        draft.channel = Channel::kQQGroup;
+        draft.sessionId = QStringLiteral("30021");
+        draft.startedAt = events.first().occurredAt;
+        draft.endedAt = events.first().occurredAt;
+        draft.participants = {{QStringLiteral("20001"), QStringLiteral("群主")}};
+        const qlonglong id = mm.createInteractionBatch(draft, {events.first().id});
+        QVERIFY(id > 0);
+
+        const QString segments = QStringLiteral(
+            "[{\"person_id\":\"owner\",\"display_name\":\"群主\","
+            "\"text\":\"吃了烤肉拌饭\"}]");
+        ClaimDraft claim;
+        claim.assertedByPersonId = QStringLiteral("owner");
+        claim.aboutPersonId = QStringLiteral("owner");
+        claim.privacyOwnerPersonId = QStringLiteral("owner");
+        claim.statement = QStringLiteral("主人吃了烤肉拌饭");
+        QVERIFY(mm.saveInteractionSummaryWithClaims(
+            id, QStringLiteral("群主：吃了烤肉拌饭"), QStringLiteral("person_refs"),
+            segments, {claim}, QStringLiteral("ready")));
+
+        const QList<InteractionSummary> summaries =
+            mm.getRecentInteractionSummaries(Channel::kQQGroup,
+                                             QStringLiteral("30021"), 5);
+        QCOMPARE(summaries.size(), 1);
+        QCOMPARE(summaries.first().summaryFormat, QStringLiteral("person_refs"));
+        QCOMPARE(summaries.first().summarySegments, segments);
+
+        const QList<ClaimDraft> claims = mm.getClaimsForInteraction(id);
+        QCOMPARE(claims.size(), 1);
+        QCOMPARE(claims.first().assertedByPersonId, QStringLiteral("owner"));
+        QCOMPARE(claims.first().aboutPersonId, QStringLiteral("owner"));
+        QCOMPARE(claims.first().privacyOwnerPersonId, QStringLiteral("owner"));
+        QCOMPARE(claims.first().claimStatus, QStringLiteral("quarantine"));
     }
 
     void memoryCursorUpsert()

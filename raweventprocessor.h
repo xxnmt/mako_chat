@@ -3,6 +3,7 @@
 
 #include <QObject>
 #include <QList>
+#include <QJsonArray>
 
 #include "historyturn.h"
 #include "memorypolicy.h"
@@ -27,7 +28,10 @@ public:
 
 private slots:
     void tick();
-    void onSummaryReady(qlonglong interactionId, const QString &summary);
+    void onSummaryReady(qlonglong interactionId, const QString &summary,
+                        const QString &summaryFormat,
+                        const QString &segmentsJson,
+                        const QJsonArray &claims);
     void onSummaryFailed(qlonglong interactionId, const QString &reason);
 
 private:

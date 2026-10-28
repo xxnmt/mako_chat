@@ -76,6 +76,7 @@ AppController::AppController(QObject *parent)
     m_ttsService = new TTSService;
     m_chatWidget = new ChatWidget;
     m_memoryManager = new MemoryManager(ConfigManager::instance().getMemoryPath());
+    m_memoryManager->seedIdentity(ConfigManager::instance().getMasterQQAccounts());
     // m_settingsWidget = new SettingsWidget;
     // m_settingsWidget->setMemoryManager(m_memoryManager);
     // m_settingsWidget->setMemoryLength(ConfigManager::instance().getShortMemoryLength());

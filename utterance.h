@@ -19,7 +19,9 @@ struct RequestMeta {
     QString channel = Channel::kPet;            // 渠道
     QString sessionId = Channel::kDefaultSession; // 桌宠恒 default；QQ=对方QQ号/群号
     QString speaker;                            // 桌宠="欧尼酱"；群聊=对方昵称
-    QString subject = QStringLiteral("user");   // 身份解析结果（'user' 即主人，IdentityResolver 产出）
+    QString subject = QStringLiteral("user");   // 兼容旧数据的主体标识
+    QString actorId;                            // 平台稳定发送者 ID
+    QString personId;                           // 服务端解析后的 person_id
     bool sensitive = false;                     // 记忆盲区/已脱敏标记（渠道侧查配置后设置）
     bool persistTurn = true;                    // 是否写 chat_history（短期上下文开关）
     bool longTermMemoryEnabled = true;          // 是否允许触发长期提取

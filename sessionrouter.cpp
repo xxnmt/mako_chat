@@ -57,6 +57,7 @@ bool SessionRouter::submitInput(const QString &channel, const QString &sessionId
     meta.sessionId = sessionId;
     meta.speaker = speaker;
     meta.subject = subject;
+    meta.actorId = senderId;
     meta.sensitive = sensitive;
     meta.persistTurn = useShortContext;
     meta.longTermMemoryEnabled = longTermMemory;

@@ -13,7 +13,8 @@ enum class RecentContextMode {
 
 struct RecentContextQuery {
     QString viewerId;
-    QStringList viewerIds; // 服务端解析出的当前用户平台 ID，用于标记“你”
+    QStringList viewerIds; // 兼容旧调用：当前用户平台 ID
+    QString viewerPersonId; // 服务端解析后的当前用户 person_id
     QString locationChannel;
     QString locationSessionId;
     QStringList allowedGroupIds;
@@ -35,6 +36,7 @@ struct RecentContextItem {
     QString sourceGroupId;
     QString senderId;
     QString senderDisplayName;
+    QString personId;
     QDateTime occurredAt;
     QString sanitizedText;
     QString messageId;

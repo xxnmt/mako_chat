@@ -287,6 +287,8 @@ private slots:
         RequestMeta meta;
         meta.channel = Channel::kQQGroup;
         meta.sessionId = QStringLiteral("30001");
+        meta.speaker = QStringLiteral("在线蹲个网名");
+        meta.personId = QStringLiteral("owner");
 
         RecentContextBundle bundle;
         bundle.mode = RecentContextMode::RecentOverview;
@@ -309,11 +311,18 @@ private slots:
         QVERIFY(message.value("content").toString()
                     .contains(QStringLiteral("提议吃火锅")));
         QVERIFY(message.value("content").toString()
-                    .contains(QStringLiteral("禁止用“有人")));
-        QVERIFY(message.value("content").toString()
                     .contains(QStringLiteral("\"is_viewer\":true")));
-        QVERIFY(message.value("content").toString()
-                    .contains(QStringLiteral("当前对话用户本人")));
+
+        const QString identity =
+            PromptAssembler::buildViewerIdentityBlock(meta, bundle);
+        QVERIFY(identity.contains(QStringLiteral("服务端事实")));
+        QVERIFY(identity.contains(QStringLiteral("在线蹲个网名")));
+        QVERIFY(identity.contains(QStringLiteral("person_id：owner")));
+        QVERIFY(identity.contains(QStringLiteral("已知显示名")));
+        QVERIFY(identity.contains(QStringLiteral("is_viewer=true")));
+        QVERIFY(!identity.contains(QStringLiteral("必须回答")));
+        QVERIFY(!identity.contains(QStringLiteral("禁止使用")));
+        QVERIFY(!identity.contains(QStringLiteral("直接回答")));
     }
 
     void interactionSummaryEntersMemoryData()
@@ -339,6 +348,33 @@ private slots:
         QVERIFY(!systemPrompt.contains(QStringLiteral("群友在聊晚饭")));
         QVERIFY(dataText.contains(QStringLiteral("interaction_summary")));
         QVERIFY(dataText.contains(QStringLiteral("群友在聊晚饭")));
+    }
+
+    void structuredSummaryRendersViewerAsYou()
+    {
+        RequestMeta meta;
+        meta.channel = Channel::kQQPrivate;
+        meta.sessionId = QStringLiteral("20001");
+        meta.subject = QStringLiteral("user");
+        meta.personId = QStringLiteral("owner");
+
+        PromptAssembler::MemoryContext context;
+        InteractionSummary summary;
+        summary.id = 1;
+        summary.channel = Channel::kQQGroup;
+        summary.sessionId = QStringLiteral("30001");
+        summary.summaryText = QStringLiteral("群主：吃了烤肉拌饭");
+        summary.summaryFormat = QStringLiteral("person_refs");
+        summary.summarySegments = QStringLiteral(
+            "[{\"person_id\":\"owner\",\"display_name\":\"群主\","
+            "\"text\":\"吃了烤肉拌饭\"}]");
+        summary.endedAt = QDateTime(QDate(2026, 10, 28), QTime(12, 0));
+        context.interactionSummaries.append(summary);
+
+        const QString dataText = PromptAssembler::buildMemoryDataMessage(meta, context)
+                                     .value("content").toString();
+        QVERIFY(dataText.contains(QStringLiteral("你：吃了烤肉拌饭")));
+        QVERIFY(!dataText.contains(QStringLiteral("群主：吃了烤肉拌饭")));
     }
 
     void emptyContextHasNoMemoryDataMessage()

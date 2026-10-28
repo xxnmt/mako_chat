@@ -1,6 +1,6 @@
 # 记忆系统 v5 R3 实施基线
 
-> 状态：**PR-1a / PR-1b 已通过手工验收；PR-2 已落地；PR-2.1 已实现并通过单测，待手工验收**
+> 状态：**PR-1a / PR-1b 已通过手工验收；PR-2 / PR-2.1 / PR-2.2 / PR-3.0 / PR-3.1 已实现并通过单测，待手工验收**
 > 日期：2026-10-28
 > 冻结：`blocked` 默认不回复；`group_authorized` 下非白名单成员只记录、不回复、不写 `chat_history`。
 > 取代：[MEMORY_V5_DESIGN.md](MEMORY_V5_DESIGN.md) 的历史草案
@@ -479,13 +479,35 @@ user: 当前输入
 
 实现说明：当前代码已增加 `RecentContextPlanner`、`MemoryManager::searchRecentGroupContext()`、`PromptAssembler::buildRecentContextMessage()` 与 `LLMService` 注入；单测覆盖定向命中、泛问覆盖、预算与无结果。非 Owner 共同群仍等待 PR-3。
 
-### PR-3：成员关系、claims 与跨群授权
+### PR-2.2：Viewer Identity Facts
+
+- 服务端生成 `VIEWER_IDENTITY` system 区块，只提供 `person_id`、显示名、`is_viewer` 事实。
+- 不写“用户问某昵称时必须回答是你”等结果导向话术。
+- 定向检索同时匹配 `senderDisplayName`，支持“某昵称是谁”类问题。
+- 完整 `person / person_identity` 见 PR-3.0。
+
+### PR-3.0：Person / Person Identity
+
+- v7：`persons`、`person_identities`；`raw_events.person_id`、`interaction_participants.person_id`。
+- owner/master QQ 统一映射到 `owner`；普通 QQ 映射到 `qq:<uin>`。
+- `seedIdentity()` 回填历史 raw/participants 与群昵称。
+- `RequestMeta.actorId/personId`；recent context 按 `viewerPersonId` 标记 `is_viewer`。
+- 不按昵称反查身份；同名不同 ID 不合并。
+
+### PR-3.1：Summary / Claims Person IDs
+
+- v8：`interactions.summary_format/summary_segments`；`memory_claims` 使用 `asserted_by_person_id`、`about_person_id`、`privacy_owner_person_id`。
+- 新 summary 用 `P1/P2` 标签生成 segments，服务端映射回 person_id。
+- viewer-aware 渲染：当前用户段显示“你”，其他段显示昵称；legacy summary 保持原文。
+- claims 默认 `quarantine`，本批不进入检索。
+
+### PR-3.2：成员关系、claims 授权与跨群
 
 - `group_membership_periods`。
-- `memory_claims` 三主体。
 - 动态隐私规则。
 - 查询时 `MemoryAccessPolicy` 四态。
 - Owner 特权、共同群资格、群 B 匿名化。
+- claims 检索与披露。
 
 验收：A→B 跨群只呈现 U 可披露表达；A1 隐私不出现；成员快照失败 fail closed；模式切换后旧非白名单 claim 隐藏/清理。
 
@@ -524,7 +546,7 @@ user: 当前输入
 | A13 | Output Guard | 已知 secret/forbidden fact 不发送；失败回退 |
 | A14 | claims 三主体含混 | `quarantine`，不进入检索 |
 | A15 | 成员快照失败 | 跨群返回空/拒绝 |
-| A16 | v4 → v5/v6 迁移 | 旧表/行保留；失败回滚 |
+| A16 | v4 → v8 迁移 | 旧表/行保留；失败回滚 |
 | A17 | `blocked` 消息 | 不回复、不解释、不写 chat_history；不进入蒸馏/摘要/claim/prompt；仅审计行 |
 | A18 | 群记忆关闭 | 不写 `raw_events` / interactions / claims；短期上下文按 D2 |
 | A19 | 群级授权，非白名单成员合规消息 | 写脱敏 `raw_events`；不回复；不建 `chat_history`；可进入 interaction 蒸馏 |
@@ -540,6 +562,17 @@ user: 当前输入
 | R21-8 | 不推进后台状态 | cursor/processed/summary_status 不变 |
 | R21-9 | 泛问触发 | “刚才/前面/聊什么”走 overview；无稳定关键词不走定向空搜索 |
 | R21-10 | 无结果不编造 | 无可靠候选时明确未找到 |
+| R22-1 | Owner 群昵称身份 | `VIEWER_IDENTITY` 提供 person_id/显示名事实，不含结果导向回答要求 |
+| R22-2 | 昵称定向检索 | “某昵称是谁”能命中 sender，不只匹配正文 |
+| R30-1 | v6 → v7/v8 迁移 | 旧表/行保留；persons/identities/claims 建表成功 |
+| R30-2 | owner 多 master QQ | 全部映射到 owner；普通用户映射到 qq:<uin> |
+| R30-3 | 同名不同 ID | 不合并；按 platform_user_id 解析 |
+| R30-4 | 群昵称历史 | 改名保留 valid_from/valid_to；当前别名可查 |
+| R30-5 | recent viewer | `is_viewer` 由 `viewerPersonId` 比较得出 |
+| R31-1 | summary segments | P 标签映射到 person_id；viewer 段渲染为“你” |
+| R31-2 | claims 主体 | 三主体使用 person_id；unknown 进入 quarantine |
+| R31-3 | summary/claims 事务 | 任一写入失败回滚，不产生半成品 |
+| R31-4 | legacy summary | 保持原文，不伪造 person 映射 |
 
 ---
 

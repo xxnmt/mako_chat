@@ -5,6 +5,7 @@
 #include <QDateTime>
 #include <QList>
 #include <QPair>
+#include <QHash>
 
 //聊天记录
 struct HistoryTurn {
@@ -71,6 +72,7 @@ struct RawEvent {
     QString direction;
     QString senderId;
     QString senderName;
+    QString personId;
     QString eventType;
     QString content;
     QString payloadJson;
@@ -90,6 +92,7 @@ struct InteractionDraft {
     QString segmentationMethod = QStringLiteral("time_window");
     double confidence = 0.0;
     QList<QPair<QString, QString>> participants; // user_id, display_name
+    QHash<QString, QString> participantPersonIds; // user_id -> person_id
 };
 
 // 可召回的群聊摘要
@@ -98,7 +101,20 @@ struct InteractionSummary {
     QString channel;
     QString sessionId;
     QString summaryText;
+    QString summaryFormat = QStringLiteral("legacy");
+    QString summarySegments; // JSON: [{person_id, display_name, text}]
     QDateTime endedAt;
+};
+
+// 尚未经过授权判定的 claim 草稿；主体只使用 person_id。
+struct ClaimDraft {
+    QString assertedByPersonId = QStringLiteral("unknown");
+    QString aboutPersonId = QStringLiteral("unknown");
+    QString privacyOwnerPersonId = QStringLiteral("unknown");
+    QString counterpartPersonId;
+    QString statement;
+    int privacyLevel = 1;
+    QString claimStatus = QStringLiteral("quarantine");
 };
 
 #endif // HISTORYTURN_H

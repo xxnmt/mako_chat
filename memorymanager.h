@@ -8,6 +8,7 @@
 #include <QList>
 #include <QDateTime>
 #include <QStringList>
+#include <QSet>
 #include "sentencedata.h"
 #include "historyturn.h"
 #include "utterance.h"
@@ -24,6 +25,7 @@ struct RawEventWrite
     QString direction = QStringLiteral("in");
     QString senderId;
     QString senderName;
+    QString personId;
     QString payloadJson;
     QDateTime occurredAt;
     bool sensitive = false;
@@ -91,7 +93,14 @@ public:
     QList<qlonglong> getPendingInteractionIds(int limit);
     QList<RawEvent> getInteractionSourceEvents(qlonglong interactionId);
     bool saveInteractionSummary(qlonglong id, const QString &summary, const QString &status);
+    bool saveInteractionSummaryWithClaims(qlonglong id,
+                                          const QString &summary,
+                                          const QString &summaryFormat,
+                                          const QString &segmentsJson,
+                                          const QList<ClaimDraft> &claims,
+                                          const QString &status);
     bool markInteractionSummaryFailed(qlonglong id);
+    QList<ClaimDraft> getClaimsForInteraction(qlonglong interactionId);
     QList<InteractionSummary> getRecentInteractionSummaries(const QString &channel,
                                                             const QString &sessionId,
                                                             int limit);
@@ -101,6 +110,22 @@ public:
                                   int maxGroups,
                                   const QDateTime &since);
     RecentContextBundle searchRecentGroupContext(const RecentContextQuery &query);
+    QStringList getKnownDisplayNamesForUserIds(const QStringList &userIds, int limit);
+
+    // PR-3.0: person / person_identity
+    void seedIdentity(const QStringList &masterUserIds);
+    QString resolvePersonId(const QString &platform,
+                            const QString &platformUserId,
+                            const QString &groupId = QString());
+    bool ensurePersonIdentity(const QString &platform,
+                              const QString &platformUserId,
+                              const QString &groupId,
+                              const QString &displayName,
+                              const QDateTime &occurredAt,
+                              const QString &source = QStringLiteral("message"));
+    QStringList getPersonAliases(const QString &personId,
+                                 const QString &groupId,
+                                 int limit);
 
 //蒸馏游标（memory_cursor）：每 channel+session 一条；Phase 1 蒸馏接线时使用
     bool updateMemoryCursor(const QString &channel, const QString &sessionId,
@@ -148,7 +173,11 @@ public:
 
 private:
     void initDatabase(const QString &dbFilePath);
+    bool ensurePerson(const QString &personId,
+                      const QString &role,
+                      const QString &canonicalName);
     QSqlDatabase m_db;
+    QSet<QString> m_masterUserIds;
 };
 
 #endif // MEMORYMANAGER_H

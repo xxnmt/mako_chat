@@ -7,6 +7,9 @@
 #include <QDateTime>
 #include <QDebug>
 #include <QRegularExpression>
+#include <QJsonDocument>
+#include <QJsonArray>
+#include <QJsonObject>
 #include <QTimer>
 
 RawEventProcessor::RawEventProcessor(MemoryManager *memoryManager,
@@ -140,7 +143,10 @@ void RawEventProcessor::processPendingSummaries()
 }
 
 void RawEventProcessor::onSummaryReady(qlonglong interactionId,
-                                       const QString &summary)
+                                       const QString &summary,
+                                       const QString &summaryFormat,
+                                       const QString &segmentsJson,
+                                       const QJsonArray &claims)
 {
     const MemoryPolicyConfig policy =
         ConfigManager::instance().getMemoryPolicyConfig();
@@ -148,8 +154,12 @@ void RawEventProcessor::onSummaryReady(qlonglong interactionId,
         summary, QString(), policy.privacyRules);
 
     if (sanitized.blocked) {
-        m_memoryManager->saveInteractionSummary(
-            interactionId, QString(), QStringLiteral("quarantine"));
+        if (!m_memoryManager->saveInteractionSummaryWithClaims(
+                interactionId, QString(), QStringLiteral("legacy"), QString(),
+                {}, QStringLiteral("quarantine"))) {
+            qDebug() << "[RawEventProcessor] interaction summary 隔离保存失败:"
+                     << interactionId;
+        }
         qDebug() << "[RawEventProcessor] interaction summary 隔离:"
                  << interactionId << "rules=" << sanitized.ruleIds;
     } else {
@@ -158,10 +168,71 @@ void RawEventProcessor::onSummaryReady(qlonglong interactionId,
                             QStringLiteral("@某位成员"));
         safeSummary.replace(QRegularExpression(QStringLiteral("\\b\\d{5,}\\b")),
                             QStringLiteral("[成员]"));
-        m_memoryManager->saveInteractionSummary(
-            interactionId, safeSummary, QStringLiteral("ready"));
-        qDebug() << "[RawEventProcessor] interaction summary 已保存:"
-                 << interactionId << "chars=" << safeSummary.size();
+
+        QJsonArray safeSegments;
+        const QJsonArray rawSegments = QJsonDocument::fromJson(
+            segmentsJson.toUtf8()).array();
+        for (const QJsonValue &value : rawSegments) {
+            QJsonObject segment = value.toObject();
+            const SanitizeResult segmentSanitized = SensitiveContentFilter::sanitize(
+                segment.value("text").toString(), QString(), policy.privacyRules);
+            if (segmentSanitized.blocked) {
+                continue;
+            }
+            QString text = segmentSanitized.text;
+            text.replace(QRegularExpression(QStringLiteral("@\\d{5,}")),
+                         QStringLiteral("@某位成员"));
+            text.replace(QRegularExpression(QStringLiteral("\\b\\d{5,}\\b")),
+                         QStringLiteral("[成员]"));
+            if (text.trimmed().isEmpty()) {
+                continue;
+            }
+            segment["text"] = text;
+            safeSegments.append(segment);
+        }
+
+        QList<ClaimDraft> safeClaims;
+        for (const QJsonValue &value : claims) {
+            const QJsonObject obj = value.toObject();
+            const SanitizeResult claimSanitized = SensitiveContentFilter::sanitize(
+                obj.value("statement").toString(), QString(), policy.privacyRules);
+            if (claimSanitized.blocked || claimSanitized.text.trimmed().isEmpty()) {
+                continue;
+            }
+            ClaimDraft claim;
+            claim.assertedByPersonId =
+                obj.value("asserted_by_person_id").toString();
+            claim.aboutPersonId = obj.value("about_person_id").toString();
+            claim.privacyOwnerPersonId =
+                obj.value("privacy_owner_person_id").toString();
+            claim.counterpartPersonId =
+                obj.value("counterpart_person_id").toString();
+            claim.statement = claimSanitized.text;
+            claim.privacyLevel = qBound(1, obj.value("privacy_level").toInt(1), 5);
+            claim.claimStatus = obj.value("claim_status").toString(
+                QStringLiteral("quarantine"));
+            safeClaims.append(claim);
+        }
+
+        const bool hasSegments = !safeSegments.isEmpty();
+        const QString safeSegmentsJson = hasSegments
+                                             ? QString::fromUtf8(
+                                                   QJsonDocument(safeSegments)
+                                                       .toJson(QJsonDocument::Compact))
+                                             : QString();
+        if (!m_memoryManager->saveInteractionSummaryWithClaims(
+                interactionId, safeSummary,
+                hasSegments ? QStringLiteral("person_refs") : summaryFormat,
+                safeSegmentsJson, safeClaims, QStringLiteral("ready"))) {
+            qDebug() << "[RawEventProcessor] interaction summary 保存失败:"
+                     << interactionId;
+            m_memoryManager->markInteractionSummaryFailed(interactionId);
+        } else {
+            qDebug() << "[RawEventProcessor] interaction summary 已保存:"
+                     << interactionId << "chars=" << safeSummary.size()
+                     << "segments=" << safeSegments.size()
+                     << "claims=" << safeClaims.size();
+        }
     }
 
     m_summaryInFlight = false;

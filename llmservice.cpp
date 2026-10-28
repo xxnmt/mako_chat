@@ -3,6 +3,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
+#include <QHash>
 #include <QRegularExpression>
 #include <QRegularExpressionMatch>
 #include <QDebug>
@@ -65,38 +66,68 @@ void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> 
         qDebug()<<"[LLM]摘要数量:"<<context.summaries.size();
     }
     RecentContextBundle recentBundle;
+    QString viewerIdentity;
     const MemoryPolicyConfig memoryPolicy =
         ConfigManager::instance().getMemoryPolicyConfig();
+    const bool isGroup = m_currentMeta.channel == Channel::kQQGroup;
+    const bool ownerPrivateOrPet =
+        (m_currentMeta.channel == Channel::kPet
+         || m_currentMeta.channel == Channel::kQQPrivate)
+        && m_currentMeta.subject == QStringLiteral("user");
+
+    QStringList viewerIds;
+    if (m_currentMeta.subject == QStringLiteral("user")) {
+        viewerIds = ConfigManager::instance().getMasterQQAccounts();
+        if (m_currentMeta.channel == Channel::kQQPrivate
+            && !m_currentMeta.sessionId.isEmpty()) {
+            viewerIds << m_currentMeta.sessionId;
+        }
+    } else if (m_currentMeta.subject.startsWith(QStringLiteral("qq:"))) {
+        viewerIds << m_currentMeta.subject.mid(3);
+    }
+    viewerIds.removeDuplicates();
+
+    QString viewerPersonId;
+    QStringList knownAliases;
+    if (m_memoryManager) {
+        if (m_currentMeta.channel == Channel::kPet) {
+            viewerPersonId = QStringLiteral("owner");
+        } else if (!m_currentMeta.actorId.isEmpty()) {
+            viewerPersonId = m_memoryManager->resolvePersonId(
+                QStringLiteral("qq"), m_currentMeta.actorId,
+                isGroup ? m_currentMeta.sessionId : QString());
+        } else if (!m_currentMeta.sessionId.isEmpty()
+                   && m_currentMeta.channel == Channel::kQQPrivate) {
+            viewerPersonId = m_memoryManager->resolvePersonId(
+                QStringLiteral("qq"), m_currentMeta.sessionId, QString());
+        }
+        if (viewerPersonId.isEmpty()
+            && m_currentMeta.subject == QStringLiteral("user")) {
+            viewerPersonId = QStringLiteral("owner");
+        }
+        m_currentMeta.personId = viewerPersonId;
+        knownAliases = m_memoryManager->getPersonAliases(
+            viewerPersonId, isGroup ? m_currentMeta.sessionId : QString(), 20);
+        if (knownAliases.isEmpty()) {
+            knownAliases =
+                m_memoryManager->getKnownDisplayNamesForUserIds(viewerIds, 20);
+        }
+    }
+
     if (m_memoryManager && memoryPolicy.recentContext.enabled
         && !RecentContextPlanner::isHistoricalCue(userInput)) {
         const QQGroupMemoryConfig groups =
             ConfigManager::instance().getQQGroupMemoryConfig();
-        const bool isGroup = m_currentMeta.channel == Channel::kQQGroup;
-        const bool ownerPrivateOrPet =
-            (m_currentMeta.channel == Channel::kPet
-             || m_currentMeta.channel == Channel::kQQPrivate)
-            && m_currentMeta.subject == QStringLiteral("user");
         const QStringList allowedGroups =
             RecentContextPlanner::allowedGroupIdsForRequest(
                 isGroup, ownerPrivateOrPet, m_currentMeta.sessionId,
                 groups.enabled, groups.groupAllow);
 
-        QStringList viewerIds;
-        if (m_currentMeta.subject == QStringLiteral("user")) {
-            viewerIds = ConfigManager::instance().getMasterQQAccounts();
-            if (m_currentMeta.channel == Channel::kQQPrivate
-                && !m_currentMeta.sessionId.isEmpty()) {
-                viewerIds << m_currentMeta.sessionId;
-            }
-        } else if (m_currentMeta.subject.startsWith(QStringLiteral("qq:"))) {
-            viewerIds << m_currentMeta.subject.mid(3);
-        }
-        viewerIds.removeDuplicates();
-
         if (!allowedGroups.isEmpty()) {
             RecentContextQuery query;
             query.viewerId = m_currentMeta.subject;
             query.viewerIds = viewerIds;
+            query.viewerPersonId = viewerPersonId;
             query.locationChannel = m_currentMeta.channel;
             query.locationSessionId = m_currentMeta.sessionId;
             query.allowedGroupIds = allowedGroups;
@@ -133,6 +164,8 @@ void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> 
             }
         }
     }
+    viewerIdentity = PromptAssembler::buildViewerIdentityBlock(
+        m_currentMeta, recentBundle, knownAliases);
     qDebug() << "[LLM]近期群聊上下文:" << recentBundle.items.size()
              << "mode=" << (recentBundle.mode == RecentContextMode::TargetedLookup
                                 ? "targeted"
@@ -166,6 +199,15 @@ void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> 
                                 ).arg(currentUiState,
                                      QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss"));
         messagesArray.append(envMsg);
+    }
+
+    // 身份是服务端可信事实，放在接近当前输入的位置，避免被历史中的
+    // “会不会/可能”旧猜测带偏。
+    if (!viewerIdentity.isEmpty()) {
+        QJsonObject identityMessage;
+        identityMessage["role"] = "system";
+        identityMessage["content"] = viewerIdentity;
+        messagesArray.append(identityMessage);
     }
 
     // 近期原始群消息是独立不可信资料，优先于长期摘要。
@@ -495,7 +537,11 @@ void LLMService::summarizeInteractionAsync(qlonglong interactionId,
     }
 
     QString transcript;
-    QStringList participantNames;
+    QStringList participantLabels;
+    QHash<QString, QString> labelToPerson;
+    QHash<QString, QString> labelToDisplay;
+    QHash<QString, QString> nameToPerson;
+    int nextLabel = 1;
     for (const RawEvent &event : events) {
         QString name = event.senderName.isEmpty()
                            ? event.senderId
@@ -503,8 +549,26 @@ void LLMService::summarizeInteractionAsync(qlonglong interactionId,
         if (QRegularExpression(QStringLiteral("^\\d{5,}$")).match(name).hasMatch()) {
             name = QStringLiteral("某位成员");
         }
-        if (!name.isEmpty() && !participantNames.contains(name)) {
-            participantNames.append(name);
+        QString personId = event.personId;
+        if (personId.isEmpty() && m_memoryManager && !event.senderId.isEmpty()) {
+            personId = m_memoryManager->resolvePersonId(
+                event.platform.isEmpty() ? QStringLiteral("qq") : event.platform,
+                event.senderId,
+                event.channel == Channel::kQQGroup ? event.sessionId : QString());
+        }
+        if (personId.isEmpty()) {
+            personId = QStringLiteral("unknown");
+        }
+        QString label = labelToPerson.key(personId);
+        if (label.isEmpty()) {
+            label = QStringLiteral("P%1").arg(nextLabel++);
+            labelToPerson.insert(label, personId);
+            labelToDisplay.insert(label, name);
+            participantLabels.append(
+                QStringLiteral("%1=%2(%3)").arg(label, name, personId));
+        }
+        if (!name.isEmpty()) {
+            nameToPerson.insert(name, personId);
         }
         QString content = event.content;
         content.replace(QRegularExpression(QStringLiteral("@\\d{5,}")),
@@ -514,7 +578,7 @@ void LLMService::summarizeInteractionAsync(qlonglong interactionId,
                         QStringLiteral("某位成员"));
         content.replace(QRegularExpression(QStringLiteral("\\b\\d{5,}\\b")),
                         QStringLiteral("[成员]"));
-        transcript += QString("- %1: %2\n").arg(name, content);
+        transcript += QString("- %1 [%2]: %3\n").arg(label, name, content);
     }
 
     const QString prompt = QStringLiteral(
@@ -523,11 +587,14 @@ void LLMService::summarizeInteractionAsync(qlonglong interactionId,
         "1. 不超过 200 字；\n"
         "2. 只描述群内公开交流；\n"
         "3. 不输出任何隐私规则命中的原文、第三方私聊内容或其他群信息；\n"
-        "4. **必须保留说话人昵称**：每个事实写成「昵称：内容」；"
-        "禁止用“有人”“某成员”“另一人”“一名成员”等匿名指代；\n"
-        "5. 严格输出 JSON：{\"summary\":\"...\"}。\n\n"
+        "4. 每个片段使用 speaker 标签（P1/P2...），不要用“有人/某成员/另一人”；\n"
+        "5. 严格输出 JSON：\n"
+        "{\"summary\":\"...\",\"segments\":[{\"speaker\":\"P1\",\"text\":\"...\"}],"
+        "\"claims\":[{\"asserted_by\":\"P1\",\"about\":\"P1\","
+        "\"privacy_owner\":\"P1\",\"statement\":\"...\"}]}\n"
+        "6. claims 只写可独立陈述的事实；主体不确定时填 unknown。\n\n"
         "本段参与者：%1\n群聊片段：\n%2")
-        .arg(participantNames.join(QStringLiteral("、")), transcript);
+        .arg(participantLabels.join(QStringLiteral("；")), transcript);
 
     if (debugFullLogsEnabled()) {
         qDebug().noquote() << "[LLM][debug] interaction prompt:"
@@ -544,7 +611,7 @@ void LLMService::summarizeInteractionAsync(qlonglong interactionId,
     rootObj["model"] = "deepseek-v4-flash";
     rootObj["messages"] = messages;
     rootObj["temperature"] = 0.3;
-    rootObj["max_tokens"] = 512;
+    rootObj["max_tokens"] = 768;
     rootObj["response_format"] = QJsonObject{{"type", "json_object"}};
     rootObj["reasoning_effort"] = "low";
 
@@ -557,7 +624,8 @@ void LLMService::summarizeInteractionAsync(qlonglong interactionId,
         request, QJsonDocument(rootObj).toJson());
     QPointer<LLMService> self(this);
     connect(reply, &QNetworkReply::finished, this,
-            [this, self, reply, interactionId]() {
+            [this, self, reply, interactionId, labelToPerson, labelToDisplay,
+             nameToPerson]() {
         if (self.isNull()) {
             reply->deleteLater();
             return;
@@ -597,13 +665,81 @@ void LLMService::summarizeInteractionAsync(qlonglong interactionId,
             return;
         }
 
+        auto resolveSpeaker = [&](const QString &speaker) -> QString {
+            const QString key = speaker.trimmed();
+            if (labelToPerson.contains(key)) {
+                return labelToPerson.value(key);
+            }
+            if (nameToPerson.contains(key)) {
+                return nameToPerson.value(key);
+            }
+            if (!key.isEmpty() && (key.startsWith(QStringLiteral("qq:"))
+                                   || key == QStringLiteral("owner"))) {
+                return key;
+            }
+            return QStringLiteral("unknown");
+        };
+
+        QJsonArray segmentArray;
+        const QJsonArray rawSegments = resultDoc.object().value("segments").toArray();
+        for (const QJsonValue &value : rawSegments) {
+            const QJsonObject obj = value.toObject();
+            const QString text = obj.value("text").toString().trimmed();
+            if (text.isEmpty()) {
+                continue;
+            }
+            const QString speaker = obj.value("speaker").toString();
+            QJsonObject segment;
+            segment["person_id"] = resolveSpeaker(speaker);
+            segment["display_name"] = labelToDisplay.value(
+                speaker.trimmed(),
+                speaker.trimmed().isEmpty() ? QStringLiteral("群友")
+                                             : speaker.trimmed());
+            segment["text"] = text;
+            segmentArray.append(segment);
+        }
+
+        QJsonArray claimArray;
+        const QJsonArray rawClaims = resultDoc.object().value("claims").toArray();
+        for (const QJsonValue &value : rawClaims) {
+            const QJsonObject obj = value.toObject();
+            const QString statement = obj.value("statement").toString().trimmed();
+            if (statement.isEmpty()) {
+                continue;
+            }
+            QJsonObject claim;
+            claim["asserted_by_person_id"] = resolveSpeaker(
+                obj.value("asserted_by").toString());
+            claim["about_person_id"] = resolveSpeaker(
+                obj.value("about").toString());
+            claim["privacy_owner_person_id"] = resolveSpeaker(
+                obj.value("privacy_owner").toString());
+            claim["counterpart_person_id"] = resolveSpeaker(
+                obj.value("counterpart").toString());
+            claim["statement"] = statement;
+            claim["privacy_level"] = qBound(1, obj.value("privacy_level").toInt(1), 5);
+            claim["claim_status"] = QStringLiteral("quarantine");
+            claimArray.append(claim);
+        }
+
+        const QString summaryFormat = segmentArray.isEmpty()
+                                          ? QStringLiteral("legacy")
+                                          : QStringLiteral("person_refs");
+        const QString segmentsJson = QString::fromUtf8(
+            QJsonDocument(segmentArray).toJson(QJsonDocument::Compact));
+
         if (debugFullLogsEnabled()) {
             qDebug().noquote() << "[LLM][debug] interaction summary:"
-                               << interactionId << summary;
+                               << interactionId << summary
+                               << "segments=" << segmentArray.size()
+                               << "claims=" << claimArray.size();
         }
         qDebug() << "[LLM]interaction summary 成功:" << interactionId
-                 << "chars=" << summary.size();
-        emit interactionSummaryReady(interactionId, summary);
+                 << "chars=" << summary.size()
+                 << "segments=" << segmentArray.size()
+                 << "claims=" << claimArray.size();
+        emit interactionSummaryReady(interactionId, summary, summaryFormat,
+                                     segmentsJson, claimArray);
         reply->deleteLater();
     });
 

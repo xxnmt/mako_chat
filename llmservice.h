@@ -43,7 +43,10 @@ signals:
     //Extract
     void memoryExtractionReady(const QJsonObject &extractionResult, qlonglong lastEndId,
                                const QString &sourceIdsJson, const RequestMeta &meta);
-    void interactionSummaryReady(qlonglong interactionId, const QString &summary);
+    void interactionSummaryReady(qlonglong interactionId, const QString &summary,
+                                 const QString &summaryFormat,
+                                 const QString &segmentsJson,
+                                 const QJsonArray &claims);
     void interactionSummaryFailed(qlonglong interactionId, const QString &reason);
 private slots:
     //finish AI 回复

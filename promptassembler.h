@@ -41,6 +41,11 @@ public:
     static QJsonObject buildRecentContextMessage(const RequestMeta &meta,
                                                  const RecentContextBundle &bundle);
 
+    // PR-2.2：当前用户身份与群昵称别名（可信 system 信息）。
+    static QString buildViewerIdentityBlock(const RequestMeta &meta,
+                                            const RecentContextBundle &recentContext,
+                                            const QStringList &knownAliases = {});
+
     // 短期记忆 messages（含 history note；proactive/perception 不生成空 user 消息）
     static QJsonArray buildHistoryMessages(const QList<HistoryTurn> &history,
                                            const RequestMeta &meta);
