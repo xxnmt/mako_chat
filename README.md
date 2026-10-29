@@ -15,15 +15,20 @@
 - 🖱️ **拖拽移动**：支持自由拖动角色窗口
 - 📍 **位置锚点**：气泡和聊天窗口自动跟随角色
 - ⚙️ **AI 资源管理**：配置文件持久化（JSON格式）、系统提示词外部化（prompt.txt）
-- 🧠 **AI 记忆系统**（五层记忆架构，SQLite数据库）：
+- 🧠 **AI 记忆系统**（五层记忆架构 + R3 关系/授权层，SQLite数据库，`user_version=9`）：
   - 短期记忆（最近N轮对话上下文，默认15轮）
   - 角色档案（character_profile，区分用户/茉子主体的稳定特质）
   - 情景记忆（episodic_memory，事件/承诺/冲突，按重要度衰减）
   - 长期记忆摘要（LLM自动提取重要事件，跨会话持久化）
   - 关系状态（relationship_state，亲密度/信任度量化）
+  - 人物身份（persons / person_identities，QQ→person_id，群昵称保留有效期）
+  - 群聊交互片段（interactions / interaction_participants，按会话分段并生成结构化摘要）
+  - 可授权事实（memory_claims，三主体独立；默认 quarantine，保守激活）
+  - 群成员关系（group_membership_periods / snapshots，定时刷新、入群/退群、失败 fail closed）
+  - 近期群聊上下文（RecentContextPlanner + searchRecentGroupContext，只读按时间窗检索）
   - 对话历史管理（分页浏览、删除、清空）
 - ⚙️ **设置界面**：左侧目录 + 右侧滚动内容，点击目录跳转、滚动自动高亮双向同步；支持 API Key、短期记忆轮数、长期记忆摘轮数、夜晚时段与退火时长、TTS 模型切换、历史记录管理
-- 🔌 **多渠道架构（Phase 0）**：统一 `Utterance` 输出协议 + `IChannelAdapter` 渠道抽象 + `SessionRouter` 输入路由；记忆按 `channel + session_id` 双键隔离。QQ 文本已接入（SnowLuma / OneBot v11 WS），语音/图片待扩展
+- 🔌 **多渠道架构（Phase 1 主体）**：统一 `Utterance` 输出协议 + `IChannelAdapter` 渠道抽象 + `SessionRouter` 输入路由；记忆按 `channel + session_id` 双键隔离。QQ 文本已接入（SnowLuma / OneBot v11 WS + 白名单/@ 门控 + 群记忆），语音/图片/表情包待扩展
 
 ### 开发中功能
 - 🔊 **语音合成**：✅ 已实现（见下方「TTS 语音系统说明」：策略模式 + 流式播放 + GPT/SoVITS 模型热切换）
@@ -142,15 +147,15 @@ POST /tts
 
 ### 当前架构问题
 - **AppController 职责过重**（上帝对象）：承担了消息分发、记忆协调、UI更新、错误处理等过多职责
-- **LLMService 头文件依赖**：直接依赖 MemoryManager，增加编译依赖链
-- **AnchorManager 内存泄漏风险**：未正确管理注册 Widget 的生命周期
+- ~~**LLMService 头文件依赖**~~：已用 `class MemoryManager;` 前向声明（TD-015 已修复）
+- ~~**AnchorManager 内存泄漏风险**~~：非问题，仅持弱引用，widget 所有权归 AppController（TD-014 已结案）
 
 ### 改进方案
 1. **信号路由分离**：将信号槽连接逻辑抽离到 `SignalRouter` 类
 2. **记忆协调分离**：将记忆系统协调逻辑抽离到 `MemoryCoordinator` 类
 3. **错误处理分离**：将错误处理逻辑抽离到 `ErrorHandler` 类
-4. **依赖优化**：使用前向声明减少头文件依赖
-5. **内存管理**：使用 Qt 父对象机制或显式所有权管理解决内存泄漏
+4. ~~**依赖优化**：使用前向声明减少头文件依赖~~（已完成）
+5. ~~**内存管理**：使用 Qt 父对象机制或显式所有权管理解决内存泄漏~~（核查为非问题）
 
 ## 🛠️ 技术栈
 
@@ -160,7 +165,7 @@ POST /tts
 - **AI 服务**: DeepSeek API (deepseek-v4-flash)
 - **语音合成**: GPT-SoVITS（API 已接入，策略模式封装）
 - **音频播放**: IPcmPlayer 抽象（StreamPlayer 流式 / FilePlayer 文件，QAudioSink + QBuffer）
-- **数据库**: SQLite（v4 结构：原始事件流水 `raw_events` + 对话轮次 `chat_history` + 蒸馏记忆：角色档案、情景记忆、长期摘要、关系状态 + 蒸馏游标 `memory_cursor`；情景记忆带 `origin/visibility/subject/session_id`）
+- **数据库**: SQLite（`user_version=9`，14 张表：`chat_history` + `raw_events` + 蒸馏记忆（角色档案/情景记忆/长期摘要/关系状态）+ `memory_cursor` + R3 关系层（`interactions`/`interaction_participants`/`persons`/`person_identities`/`memory_claims`/`group_membership_periods`/`group_membership_snapshots`））
 
 ## 📦 安装与构建
 
@@ -219,6 +224,8 @@ cmake --build . --config Release
 
 ### 配置项说明
 
+> `setting.json` 是纯 JSON，不支持 `//` 或 `/* */` 注释；设置界面保存时会按固定字段重写文件。完整字段、默认值与取值范围见 [CONFIG_REFERENCE.md](docs/CONFIG_REFERENCE.md)。
+
 ```json
 {
     "api": {
@@ -227,7 +234,10 @@ cmake --build . --config Release
     },
     "memory": {
         "short_term_length": 15,
-        "summary_length": 15
+        "summary_length": 15,
+        "short_context_enabled": true,
+        "long_term_memory_enabled": true,
+        "debug_full_logs": false
     },
     "time": {
         "night_start": "22:00",
@@ -236,24 +246,32 @@ cmake --build . --config Release
         "emotion_lasting": 15,
         "distance_lasting": 15
     },
+    "qq": {
+        "enabled": false,
+        "ws_url": "ws://127.0.0.1:3001",
+        "access_token": "",
+        "reply": {
+            "private": "master",
+            "group": "none"
+        }
+    },
     "tts": {
         "mode": "api"
     }
 }
 ```
 
-| 配置项 | 默认值 | 说明 |
-|--------|--------|------|
-| `api.deepseek_api_key` | `sk-placeholder-key` | DeepSeek API 密钥 |
-| `api.gpt_sovits_url` | `http://127.0.0.1:9880` | GPT-SoVITS 服务地址 |
-| `memory.short_term_length` | `15` | 短期记忆轮数（AI对话时携带的历史上下文数量） |
-| `memory.summary_length` | `15` | 长期记忆自动摘轮数（未摘要对话达到该轮数时触发后台记忆提取） |
-| `time.night_start` | `22:00` | 夜晚开始时间（`HH:mm`，支持跨零点） |
-| `time.night_end` | `07:00` | 夜晚结束时间（`HH:mm`） |
-| `time.blush_lasting` | `30` | 脸红退火时长（秒，1-3600） |
-| `time.emotion_lasting` | `15` | 表情退火时长（秒，1-3600） |
-| `time.distance_lasting` | `15` | 距离退火时长（秒，1-3600） |
-| `tts.mode` | `api` | TTS 模式：`api`（真实API）或 `mock`（模拟实现） |
+| 配置组 | 关键字段 | 说明 |
+|--------|----------|------|
+| `api` | `deepseek_api_key` / `gpt_sovits_url` | DeepSeek 密钥、GPT-SoVITS 服务地址 |
+| `memory` | `short_term_length` / `summary_length` / `short_context_enabled` / `long_term_memory_enabled` | 短期上下文与长期记忆分别控制；关闭长期记忆不等于关闭短期上下文 |
+| `memory` | `debug_full_logs` / `privacy_rules` | 默认关闭全文日志；隐私规则支持 exact / keyword / pattern |
+| `memory` | `recent_group_context` | 近期群聊检索预算；默认开启 |
+| `time` | `night_start` / `night_end` / `*_lasting` | 昼夜切换与表情/脸红/距离退火时长 |
+| `qq` | `enabled` / `ws_url` / `access_token` / `reply` | OneBot v11 WS 连接与私聊/群聊回复策略 |
+| `qq` | `group_memory_*` / `group_sender_allowlist` / `group_retention_days` | 群记忆 opt-in、群模式、记录/回复白名单与保留期 |
+| `qq` | `membership_refresh_minutes` / `membership_max_age_minutes` | 成员快照刷新间隔（0=关闭）与过期时间；过期后跨群 fail closed |
+| `tts` | `mode` / 模型路径 / 参考音频 | `api`（真实合成）或 `mock`（模拟） |
 
 ### identity.json（身份绑定，Phase 1 前置，已实现）
 
@@ -277,9 +295,11 @@ cmake --build . --config Release
 
 规则：按 uin 绑定（与昵称无关）；`self` 消息直接丢弃、`master` → `user`、未知 QQ → `qq:<uin>`；应用启动时加载，日志输出 `identity.json 加载完成: self N 个 / master N 个`。
 
+可选项：`memory.blind_zones`（不入长期记忆的渠道/会话）与 `proactive.*`（Phase 2 主动对话预留，当前只解析不调度）也在该文件中配置，详见 [CONFIG_REFERENCE.md](docs/CONFIG_REFERENCE.md)。
+
 ### QQ 接入（可选）
 
-SnowLuma 提供 OneBot v11 WebSocket 服务端；在 `setting.json` 的 `qq` 段填写 `ws_url`、`access_token`，并用 `reply` 白名单控制哪些好友/群可回复。未通过白名单不记录、不回复。字段与策略见 [ARCHITECTURE.md](docs/ARCHITECTURE.md#L1142)。
+SnowLuma 提供 OneBot v11 WebSocket 服务端；在 `setting.json` 的 `qq` 段填写 `ws_url`、`access_token`，并用 `reply` 白名单控制哪些好友/群可回复。默认 `strict_whitelist` 下未通过白名单不记录、不回复；显式开启 `group_authorized` 后，非白名单群成员可进入群记忆，但不获得回复资格。字段与策略见 [ARCHITECTURE.md](docs/ARCHITECTURE.md) 的「QQ 渠道」与 [CONFIG_REFERENCE.md](docs/CONFIG_REFERENCE.md)。
 
 ### 获取 DeepSeek API Key
 
@@ -323,7 +343,7 @@ SnowLuma 提供 OneBot v11 WebSocket 服务端；在 `setting.json` 的 `qq` 段
 
 ### 记忆系统说明
 
-茉子的记忆系统分为五个层次（v3 结构：底层新增原始事件流水与轮次元数据，上层仍是五层蒸馏记忆）：
+茉子的记忆系统保留五层蒸馏结构（短期记忆 / 角色档案 / 情景记忆 / 长期摘要 / 关系状态），并在 R3 增加“身份、交互、事实授权、成员关系”四层可追溯结构：
 
 | 记忆类型 | 存储方式 | 描述 |
 |----------|----------|------|
@@ -332,10 +352,16 @@ SnowLuma 提供 OneBot v11 WebSocket 服务端；在 `setting.json` 的 `qq` 段
 | **情景记忆** | SQLite（episodic_memory） | 事件/承诺/冲突/里程碑，按重要度衰减 |
 | **长期摘要** | SQLite（long_term_summary） | LLM自动提取的重要事件摘要，跨会话持久化 |
 | **关系状态** | SQLite（relationship_state） | 亲密度/信任度量化（默认30/30），驱动角色关系 |
+| **人物身份** | SQLite（persons / person_identities） | owner / `qq:<uin>` 的稳定 person_id；群昵称保留 valid_from/valid_to |
+| **群聊交互** | SQLite（interactions / interaction_participants） | 按会话和时间窗分段的交流片段；摘要带 person_refs segments |
+| **可授权事实** | SQLite（memory_claims） | 一条 claim 只表达一个事实；默认 quarantine，仅当前群三主体一致的自述可保守激活 |
+| **成员关系** | SQLite（group_membership_periods / snapshots） | 快照成功才开区间；入群/退群维护区间；失败保留旧区间但跨群 fail closed |
 
 **记忆提取机制**：当未摘要对话达到「长期记忆自动摘轮数」（默认 15 轮，可在设置界面或 `memory.summary_length` 配置）时，自动触发后台记忆提取，LLM 分析对话内容，传入已有档案做增量更新，生成角色档案、情景记忆、长期摘要和关系状态更新。
 
-**三层存储（v4）**：`raw_events` 存全量原始事件（QQ / B 站 / 窥屏 / 主动触发；`message_id` 去重，默认不进上下文）；`chat_history` 存对话轮次（`turn_kind` = reply/proactive/perception，`user_input` 可为 NULL，`trigger_event_ids` 关联原始事件，`subject` 标记对话对象）；`episodic_memory` / `long_term_summary` / `character_profile` / `relationship_state` 存蒸馏产物（情景记忆带 `origin` / `visibility` / `subject` / `session_id`，按渠道+会话隔离）。`memory_cursor` 按 `channel + session_id` 记录蒸馏进度。提取时按「长期有效 / 本人明确陈述 / 非敏感」决定是否提升为角色档案。
+**存储分层（v9）**：`raw_events` 存全量原始事件（QQ / B 站 / 窥屏 / 主动触发；`message_id` 去重，默认不进上下文；带 `redaction_status` / `redaction_rules` / `policy_version` / `person_id`）；`chat_history` 存对话轮次（`turn_kind` = reply/proactive/perception，`user_input` 可为 NULL，`trigger_event_ids` 关联原始事件，`subject` 标记对话对象）；`interactions` 由 `RawEventProcessor` 按会话和时间窗消费 `raw_events` 生成，`interaction_participants` 保留参与者 person_id；`episodic_memory` / `long_term_summary` / `character_profile` / `relationship_state` 存蒸馏产物（情景记忆带 `origin` / `visibility` / `subject` / `session_id`，按渠道+会话隔离）；`memory_claims` 存可独立授权的长期事实；`group_membership_*` 存成员区间与快照状态。`memory_cursor` 按 `channel + session_id` 记录蒸馏进度。提取时按「长期有效 / 本人明确陈述 / 非敏感」决定是否提升为角色档案。
+
+**R3 披露规则**：`MemoryAccessPolicy` 把事实分为 `shareable / owner_candidate / known_only / forbidden` 四态；群聊只使用当前群公开内容与 viewer 自己的可披露表达；第三方私聊、secret、非共同群信息保持 `forbidden`。成员快照失败或过期时，跨群检索 fail closed。完整契约见 [MEMORY_V5_R3_BASELINE.md](docs/MEMORY_V5_R3_BASELINE.md)。
 
 ## 📁 项目结构
 
@@ -345,6 +371,8 @@ Windows_AI/
 │   ├── ARCHITECTURE.md      # 架构设计文档
 │   ├── ROADMAP.md           # 开发路线图
 │   ├── HUMANIZATION_PLAN.md # 类人化升级方案
+│   ├── MEMORY_V5_R3_BASELINE.md # 记忆 v5 R3 实施基线
+│   ├── CONFIG_REFERENCE.md  # setting.json / identity.json 字段说明
 │   └── OutDoc/              # 外部文档（API文档等）
 ├── app_data/                # 应用数据（运行时生成）
 │   ├── config/              # 配置文件
@@ -352,7 +380,7 @@ Windows_AI/
 │   │   ├── identity.json    # 身份绑定（self/master QQ，可选）
 │   │   └── prompt.txt       # 系统提示词
 │   ├── memory/              # 记忆数据（SQLite数据库）
-│   │   └── QianDaoMoZi_memory.db  # 7 张表：chat_history/raw_events/episodic_memory/character_profile/long_term_summary/relationship_state/memory_cursor
+│   │   └── QianDaoMoZi_memory.db  # 14 张表（user_version=9）：对话/原始事件/蒸馏记忆 + R3 身份/交互/claims/成员关系
 │   ├── reference_audio/    # 参考音频文件（GPT-SoVITS用）
 │   │   ├── happy_idle_01.wav
 │   │   ├── happy_more_01.wav
@@ -363,11 +391,20 @@ Windows_AI/
 │   ├── closer/              # 近景立绘
 │   ├── far/                 # 远景立绘
 │   └── default_config/      # 默认配置（prompt.txt）
-├── tests/                   # 单元测试（Qt Test + CTest，7 套件 / 64 例）
+├── tests/                   # 单元测试（Qt Test + CTest，14 套件 / 126 个测试函数）
 │   ├── tst_memorymanager.cpp
 │   ├── tst_configmanager.cpp
+│   ├── tst_memorypolicy.cpp
+│   ├── tst_recentcontext.cpp
+│   ├── tst_memorytextutils.cpp
+│   ├── tst_memoryaccesspolicy.cpp
+│   ├── tst_groupmembership.cpp
+│   ├── tst_interactionsegmenter.cpp
+│   ├── tst_memoryoutputguard.cpp
 │   ├── tst_sessionrouter.cpp
 │   ├── tst_promptassembler.cpp
+│   ├── tst_qqreplypolicy.cpp
+│   ├── tst_qqmessageparser.cpp
 │   └── tst_globalmoodstate.cpp
 ├── image.qrc                # Qt 资源文件
 ├── CMakeLists.txt           # CMake 构建配置
@@ -404,13 +441,21 @@ Windows_AI/
 ├── timemanager.h/cpp       # 时间管理（退火 + 昼夜服装切换）
 ├── appearancemanager.h/cpp  # 外观管理器
 ├── configmanager.h/cpp      # 配置管理器（单例）
-├── memorymanager.h/cpp      # AI 记忆系统（SQLite）
-├── historyturn.h            # 对话历史数据结构
+├── memorymanager.h/cpp      # AI 记忆系统（SQLite / R3 schema）
+├── memorypolicy.h/cpp       # 入站策略、脱敏、隐私规则
+├── memoryaccesspolicy.h/cpp # claims 四态授权（shareable/known_only/forbidden）
+├── recentcontext.h/cpp      # 近期群聊上下文检索与预算
+├── raweventprocessor.h/cpp  # raw_events → interactions → summary/claims
+├── interactionsegmenter.h/cpp # 群聊交互分段
+├── groupmembershipservice.h/cpp # 成员快照/生命周期
+├── memoryoutputguard.h/cpp  # 最终输出隐私保护
+├── memorytextutils.h        # P1/P2 标签替换等文本工具
+├── historyturn.h            # 历史/交互/claim 数据结构
 ├── settingswidget.h/cpp/ui  # 设置界面
 └── sentencedata.h           # 句子数据结构
 ```
 
-## � API 参考
+## 📡 API 参考
 
 ### DeepSeek API
 
@@ -471,11 +516,12 @@ Windows_AI/
 ## ⚠️ 已知限制
 
 1. **流式粒度为句子级**：v3 模型"流式"实为句子级分段返回，首音需等首句整句合成完成（token 级真流式仅 v1/v2 + `streaming_mode=2/3` 支持）
-2. **无错误重试机制**：API 请求失败后不会自动重试，直接跳过该句
+2. **网络失败无自动重试**：TTS/网络请求失败后不会无限重试；LLM 的空回复/输出保护有单次重试，QQ 发送 `retcode=100` 有 4 秒单次重试
 3. **无网络状态检测**：应用启动时不会检测网络连接状态
 4. **立绘切换无过渡动画**：换图时直接切换，没有淡入淡出效果
 5. **仅支持单角色**：当前仅支持「千岛茉子」一个角色
-6. **外部渠道**：QQ 文本收发已接入；语音/图片/表情包与主动转述待后续（主动转述设计见 `docs/HUMANIZATION_PLAN.md` 6.4–6.6）
+6. **外部渠道**：QQ 文本、群记忆、成员关系已接入；QQ 语音/图片/表情包、群聊滑动窗口与主动转述待后续（主动转述设计见 `docs/HUMANIZATION_PLAN.md` 6.4–6.6）
+7. **R3 手工验收未完成项**：PR-3.2b/3.2c 的 claim 三主体激活与跨群 viewer 过滤已通过单测，仍待真实账号手工验收；PR-4 MemoryAgent、PR-5 留存 UI 尚未开始
 
 ## 🔧 故障排除
 
@@ -486,7 +532,8 @@ Windows_AI/
 **解决方案**：
 - 删除 `app_data/config/setting.json` 文件
 - 重新启动应用，会自动创建新的配置文件
-- 或手动编辑配置文件，确保JSON格式正确
+- 或手动编辑配置文件，确保是标准 JSON；**不要加 `//` 或 `/* */` 注释**，Qt 的 JSON 解析器会拒绝
+- 修改前建议备份；设置界面保存会按固定字段重写整个文件
 
 ### 问题2：API Key 无效
 

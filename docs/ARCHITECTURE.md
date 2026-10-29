@@ -1,8 +1,8 @@
 # 架构设计文档
 
 > 项目：Windows_AI 桌面看板娘（桌宠）
-> 版本：v0.6.0 + Phase 0/0.5 + Phase 1 前置（记忆库 v4）
-> 更新日期：2026-10-27
+> 版本：v0.7.0-rc6-dev + Phase 0/0.5 + Phase 1（记忆库 v9 / R3）
+> 更新日期：2026-10-29
 
 ---
 
@@ -24,11 +24,18 @@
 | | QQReplyPolicy | 白名单/@ 门控：Drop / RecordOnly / Reply | qqreplypolicy.h/cpp |
 | | QQChannelAdapter | QQ 文本输出（`send_private_msg`/`send_group_msg`） | qqchanneladapter.h/cpp |
 | | SessionRouter | 输入路由：身份解析 + 会话历史组装 | sessionrouter.h/cpp |
+| | GroupMembershipService | 允许群成员快照、入群/退群区间、定时刷新 | groupmembershipservice.h/cpp |
 | **UI层** | CharacterWidget | 立绘显示、鼠标拖拽、右键菜单 | characterwidget.h/cpp |
 | | BubbleWidget | 气泡显示、打字机特效 | bubblewidget.h/cpp/ui |
 | | ChatWidget | 聊天输入窗口、弹出跟随 | chatwidget.h/cpp |
 | **业务层** | LLMService | DeepSeek请求、JSON协议解析、句子拆分、记忆提取 | llmservice.h/cpp |
-| | PromptAssembler | 按渠道/可见性组装 system prompt 与短期记忆 messages（C3） | promptassembler.h/cpp |
+| | PromptAssembler | 按渠道/可见性组装 system prompt、短期记忆、MEMORY_DATA、RECENT_GROUP_CONTEXT | promptassembler.h/cpp |
+| | RawEventProcessor | 消费 `raw_events`，生成 interactions 并触发 summary/claims | raweventprocessor.h/cpp |
+| | InteractionSegmenter | 按会话/时间窗/reply 链切分交互片段 | interactionsegmenter.h/cpp |
+| | RecentContextPlanner | 近期群聊检索模式、预算、allowedGroups、viewer 过滤 | recentcontext.h/cpp |
+| | MemoryAccessPolicy | claims 四态授权：shareable/owner_candidate/known_only/forbidden | memoryaccesspolicy.h/cpp |
+| | MemoryOutputGuard | 最终输出隐私检查、一次安全重试 | memoryoutputguard.h/cpp |
+| | MemoryTextUtils | 内部 P1/P2 speaker 标签替换与检测 | memorytextutils.h |
 | | GlobalMoodState | 全局情绪（emotion/blush/distance）；D1 控制外部情绪是否驱动桌宠立绘 | globalmoodstate.h/cpp |
 | | TTSService | TTS 合成队列、策略模式（ITTSProvider）；播放交给 IAudioSink | ttsservice.h/cpp, ittsprovider.h, apittsprovider.h/cpp |
 | | IAudioSink / PetAudioSink | 音频输出抽象 / 桌宠播放实现（播放器 + 播放队列） | iaudiosink.h, petaudiosink.h/cpp |
@@ -42,13 +49,17 @@
 | | TimeManager | 时间管理、表情/脸红退火（QTimer singleShot）、服装时段切换 | timemanager.h/cpp |
 | | AnchorManager | 位置锚点管理、统一位置跟随 | anchormanager.h/cpp |
 | | TagValidator | 标签合法性校验、编辑距离修正 | llmservice.h/cpp（内部类） |
-| **数据层** | ConfigManager | API Key、记忆长度、时间/退火配置、单例模式 | configmanager.h/cpp |
-| | MemoryManager | AI对话历史管理、SQLite数据库 | memorymanager.h/cpp |
+| **数据层** | ConfigManager | API Key、记忆长度、时间/退火、QQ/群记忆/成员配置、单例模式 | configmanager.h/cpp |
+| | MemoryManager | raw_events / chat_history / interactions / claims / persons / membership 等 SQLite 读写 | memorymanager.h/cpp |
+| | MemoryPolicy | 入站记录资格、三种开关、脱敏规则 | memorypolicy.h/cpp |
 | **设置层** | SettingsWidget | 设置界面（左右目录+滚动双向同步）、API/记忆/TTS模型配置 | settingswidget.h/cpp/ui |
 | **数据结构** | SentenceText | 句子数据模型（中文/日文/标签） | sentencedata.h |
 | | Utterance | 输出协议（text/ttsText/tags/channel/sessionId/speaker） | utterance.h |
 | | RequestMeta | 输入元数据（channel/sessionId/speaker/subject/sensitive） | utterance.h |
 | | HistoryTurn | 对话历史数据结构 | historyturn.h |
+| | MemoryClaim / ClaimDraft | 可授权事实（person_id 三主体、privacy_level、状态） | historyturn.h |
+| | InteractionSummary | 群聊交互摘要（summary_format / segments） | historyturn.h |
+| | RecentContextBundle | 近期群聊候选、viewer 标记、预算与截断状态 | recentcontext.h |
 | | CharacterProfile | 角色档案数据结构（user/mako 主体） | historyturn.h |
 | | EpisodicMemory | 情景记忆数据结构（事件/承诺/冲突/里程碑） | historyturn.h |
 | | LongTermSummary | 长期摘要数据结构 | historyturn.h |
@@ -130,7 +141,7 @@ SessionRouter::submitInput(channel, sessionId, speaker, text, senderId)   // 桌
                 └─ AppearanceManager::applyTags（立绘表现；外部情绪经 D1 才驱动）
 ```
 
-**边界**：QQ 文本链路已接线（WS 客户端→解析→策略→`raw_events`→`SessionRouter`）；QQ 语音/图片/表情包未实现；观察权/主动转述为 Phase 2 设计（见 HUMANIZATION_PLAN 6.4–6.6）。
+**边界**：QQ 文本链路已接线（WS 客户端→解析→策略→`raw_events`→`SessionRouter`），并已接入群记忆、interactions/claims、成员关系快照与近期群聊检索；QQ 语音/图片/表情包未实现；观察权/主动转述为 Phase 2 设计（见 HUMANIZATION_PLAN 6.4–6.6）。R3 的跨群检索在成员快照失败/过期时 fail closed。
 
 ---
 
@@ -306,10 +317,11 @@ m_llmService->registerStateProvider([this](){return m_appearance->getCurrentStat
 **关键方法**：
 | 方法 | 作用 | 参数 | 返回值 |
 |------|------|------|--------|
-| `askDeepSeek()` | 发起DeepSeek API请求，构建系统提示词（基础prompt+角色档案+情景记忆+长期摘要+关系状态） | QString userInput, QList\<HistoryTurn\> historyQA | - |
-| `onReplyFinished()` | 解析JSON→拆句→标签校验→发信号 | QNetworkReply* | - |
+| `askDeepSeek()` | 发起DeepSeek API请求，按渠道/身份/成员关系组装 MEMORY_DATA、RECENT_GROUP_CONTEXT 与 VIEWER_IDENTITY | QString userInput, QList\<HistoryTurn\> historyQA, RequestMeta meta | - |
+| `onReplyFinished()` | 解析JSON→拆句→标签校验→输出保护→发信号 | QNetworkReply* | - |
 | `parseJsonReply()` | 解析JSON回复，提取句子和标签 | QString replyText | QPair\<QList\<SentenceText\>, QString\> |
-| `extractMemoryAsync()` | 后台异步提取记忆（角色档案+情景记忆+长期摘要+关系状态），传入已有档案/记忆/关系做增量更新 | turns, lastEndId, sourceIds, existingProfiles, existingMemories, RequestMeta meta | - |
+| `extractMemoryAsync()` | 后台异步提取记忆（角色档案+情景记忆+长期摘要+关系状态），传入已有档案/记忆做增量更新 | turns, lastEndId, sourceIds, existingProfiles, existingMemories, RequestMeta meta | - |
+| `summarizeInteractionAsync()` | 为一条 interaction 生成同群 safe summary、person_refs segments 与 claims 草稿 | interactionId, QList\<RawEvent\> events | - |
 | `registerStateProvider()` | 注册状态提供者回调 | std::function\<QString()\> | - |
 | `setMemoryManager()` | 设置MemoryManager实例 | MemoryManager* manager | - |
 | `initializePromptFile()` | 初始化提示词文件 | - | - |
@@ -321,7 +333,10 @@ m_llmService->registerStateProvider([this](){return m_appearance->getCurrentStat
 |------|----------|------|
 | `sentencesReady(sentences, rawReply)` | 回复解析完成 | QList\<SentenceText\>, QString |
 | `internetErrorSignal(msg)` | 网络错误 | QString |
+| `replyAbnormal(reason)` | 回复为空/乱码/缺语言/缺标签，整轮抛弃 | QString |
 | `memoryExtractionReady(extractionResult, lastEndId, sourceIdsJson, meta)` | 记忆提取完成（结果含 character_updates/episodic_memories/working_summary/relationship_updates 四类字段；meta 为本轮渠道/会话/说话人/主体） | QJsonObject, qlonglong, QString, RequestMeta |
+| `interactionSummaryReady(interactionId, summary, summaryFormat, segmentsJson, claims)` | interaction 摘要与 claims 草稿生成完成 | qlonglong, QString, QString, QString, QJsonArray |
+| `interactionSummaryFailed(interactionId, reason)` | 摘要失败/重试耗尽 | qlonglong, QString |
 
 **JSON输出协议**：
 ```json
@@ -726,7 +741,7 @@ LLMService::parseJsonReply() → TagValidator校验
 **职责**：管理AI对话历史记录、角色档案、情景记忆、长期摘要和关系状态
 
 **设计要点**：
-- 使用SQLite存储三层数据：原始事件流水（`raw_events`）+ 对话轮次（`chat_history`）+ 蒸馏记忆（档案/情景/摘要/关系）；数据库版本 `PRAGMA user_version = 4`
+- 使用SQLite存储原始事件、对话轮次、蒸馏记忆与 R3 身份/交互/claims/成员关系；数据库版本 `PRAGMA user_version = 9`
 - 每次对话后保存用户输入、AI回复（JSON对象）
 - 对话前读取最近N轮历史作为短期记忆
 - 角色档案区分 `user` / `mako` 两个主体，长期稳定特质
@@ -736,7 +751,9 @@ LLMService::parseJsonReply() → TagValidator校验
 - 数据库路径：`app_data/memory/QianDaoMoZi_memory.db`
 - 注：旧的 `user_profile` 表已被 `character_profile` 表取代（通过 subject 字段区分 user/mako）
 
-**数据库结构**（`PRAGMA user_version = 4`；v1/v2 基础 + v3 记忆库调整 + v4 会话隔离，合计 7 张表）：
+**数据库结构**（`PRAGMA user_version = 9`；v1 基础 5 表 → v2 多渠道 → v3 raw_events/memory_cursor → v4 episodic.session_id → v5 脱敏审计列 → v6 interactions → v7 persons/identities → v8 claims/summary_segments → v9 membership，当前 14 张表）：
+
+> 下表保留 v1–v4 基础表字段；v5–v9 新增表与字段见本节末尾“R3 新增表”，完整 DDL 以 [MEMORY_V5_R3_BASELINE.md](MEMORY_V5_R3_BASELINE.md) 第 2 节为准。
 
 **表1：chat_history（对话历史）**
 | 字段 | 类型 | 说明 |
@@ -811,7 +828,7 @@ LLMService::parseJsonReply() → TagValidator校验
 
 初始化数据：`intimacy=30.0`、`trust=30.0`（initDatabase 时若表为空自动插入）
 
-**表6：raw_events（原始事件流水，v3 由 raw_messages 泛化；本阶段只建不写）**
+**表6：raw_events（原始事件流水，v3 由 raw_messages 泛化；已由 QQ/感知链路写入）**
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | id | INTEGER PRIMARY KEY AUTOINCREMENT | 记录ID |
@@ -829,8 +846,12 @@ LLMService::parseJsonReply() → TagValidator校验
 | sensitive | INTEGER NOT NULL DEFAULT 0 | 盲区/敏感标记 |
 | visibility | TEXT NOT NULL DEFAULT 'private' | private / channel / public |
 | processed | INTEGER NOT NULL DEFAULT 0 | 是否已被蒸馏 |
+| redaction_status | TEXT NOT NULL DEFAULT 'none' | none / redacted / blocked（v5） |
+| redaction_rules | TEXT | 命中的隐私规则 id JSON 数组（v5） |
+| policy_version | TEXT | 脱敏策略版本（v5） |
+| person_id | TEXT | 解析后的 person_id（v7） |
 
-索引：`idx_raw_events_session(channel, session_id, occurred_at)`、`idx_raw_events_processed(processed)`
+索引：`idx_raw_events_session(channel, session_id, occurred_at)`、`idx_raw_events_processed(processed)`、`idx_raw_events_person(person_id)`
 
 **表7：memory_cursor（蒸馏游标，v3 新增）**
 | 字段 | 类型 | 说明 |
@@ -842,6 +863,23 @@ LLMService::parseJsonReply() → TagValidator校验
 | updated_at | DATETIME DEFAULT (datetime('now','localtime')) | 更新时间 |
 
 约束：`PRIMARY KEY(channel, session_id)`
+
+**R3 新增表（v6–v9）**：
+
+| 表 | 版本 | 作用 | 关键字段 |
+|----|------|------|----------|
+| **表8：interactions** | v6/v8 | 群聊交流片段与摘要状态 | `channel/session_id/started_at/ended_at/source_event_ids/segmentation_method/confidence/safe_summary/summary_status/summary_attempts/summary_format/summary_segments` |
+| **表9：interaction_participants** | v6/v7 | 片段参与者 | `interaction_id/user_id/display_name_at_time/participation_kind/person_id` |
+| **表10：persons** | v7 | 稳定人物主体 | `person_id(PK)/role/canonical_name/created_at/updated_at` |
+| **表11：person_identities** | v7 | 平台身份与群昵称有效期 | `person_id/platform/platform_user_id/group_id/display_name/valid_from/valid_to/source/last_verified_at` |
+| **表12：memory_claims** | v8 | 可独立授权的事实 | `interaction_id/asserted_by_person_id/about_person_id/privacy_owner_person_id/counterpart_person_id/statement/privacy_level/source_*/valid_time_*/claim_status` |
+| **表13：group_membership_periods** | v9 | 成员在群区间 | `group_id/user_id/person_id/valid_from/valid_to/source/last_verified_at` |
+| **表14：group_membership_snapshots** | v9 | 群成员快照状态 | `group_id(PK)/last_verified_at/status(ok/failed)/last_error` |
+
+- `interactions.summary_status`：`pending / ready / quarantine / failed`。
+- `memory_claims.claim_status`：`active / quarantine / deleted / superseded`；默认 `quarantine`。
+- `group_membership_snapshots.status`：`ok / failed`；失败不关闭旧 period，但跨群检索 fail closed。
+- `person_id` 规则：owner/master → `owner`；普通 QQ → `qq:<uin>`；`unknown` 不得作为可披露主体。
 
 **关键方法**：
 
@@ -859,9 +897,38 @@ LLMService::parseJsonReply() → TagValidator校验
 **原始事件与蒸馏游标（v3）**：
 | 方法 | 作用 | 参数 | 返回值 |
 |------|------|------|--------|
-| `appendRawEvent()` | 写入 raw_events（`INSERT OR IGNORE`，按 message_id 去重；本阶段不接线） | platform, channel, sessionId, eventType, content, messageId, direction, senderId, senderName, payloadJson, occurredAt, sensitive, visibility | bool |
+| `appendRawEvent()` | 写入 raw_events（`INSERT OR IGNORE`，按 message_id 去重；blocked 行只留审计元数据） | RawEventWrite / 旧参数重载 | bool |
+| `appendPrivacyBlockedEvent()` | blocked 消息只写审计行，content/payload 为空 | platform, channel, session, messageId, sender, occurredAt, ruleIds, policyVersion | bool |
 | `updateMemoryCursor()` | 更新每 channel+session 的蒸馏游标 | channel, sessionId, lastEventId, lastTurnId | bool |
 | `getMemoryCursorEventId()` | 读取事件游标（无记录返回 0） | channel, sessionId | qlonglong |
+
+**R3：interactions / claims**：
+| 方法 | 作用 |
+|------|------|
+| `getUnprocessedGroupEvents()` / `getPendingGroupSessions()` | 取待消费的群事件与会话 |
+| `createInteractionBatch()` | 将事件 id 批次写成 interaction + participants |
+| `getPendingInteractionIds()` / `getInteractionSourceEvents()` | 摘要重试与来源回溯 |
+| `saveInteractionSummaryWithClaims()` | 事务写入 summary/segments/claims |
+| `markInteractionSummaryFailed()` | 摘要失败重试计数 |
+| `getClaimsForInteraction()` / `getActiveClaims()` | 读取 claims 草稿/已激活 claims |
+| `getRecentInteractionSummaries()` | 按渠道+会话读取同群 summary |
+
+**R3：近期上下文与身份**：
+| 方法 | 作用 |
+|------|------|
+| `searchRecentGroupContext()` | 只读时间窗检索；不推进 cursor/processed |
+| `getRecentGroupIds()` / `getKnownDisplayNamesForUserIds()` | 允许群范围与昵称候选 |
+| `seedIdentity()` / `resolvePersonId()` / `ensurePersonIdentity()` | owner/qq:<uin> 映射、历史回填、群昵称有效期 |
+| `getPersonAliases()` | 读取当前/历史显示名 |
+
+**R3：成员关系**：
+| 方法 | 作用 |
+|------|------|
+| `replaceGroupMembershipSnapshot()` | 成功快照：开新区间、关闭缺席区间、写 snapshot=ok |
+| `markGroupMembershipSnapshotFailed()` | 失败快照：snapshot=failed，保留旧 periods |
+| `hasValidGroupMembershipSnapshot()` | 按 maxAge 判断快照是否可用 |
+| `getOpenGroupMemberIds()` / `getOpenGroupsForUser()` | 当前成员/共同群查询 |
+| `openGroupMembershipPeriod()` / `closeGroupMembershipPeriod()` | 入群/退群 notice 维护区间 |
 
 **角色档案 CRUD**：
 | 方法 | 作用 | 参数 | 返回值 |
@@ -1113,11 +1180,16 @@ ChatWidget::textSubmitted(text)
 | 方法 | 作用 |
 |------|------|
 | `buildSystemPrompt(base, meta, MemoryContext)` | 基础 prompt + 茉子人设 + 主人档案 + 情景记忆 + 摘要 + 关系状态；群聊过滤关系数值与亲密档案 key |
+| `buildMemoryDataMessage(meta, MemoryContext)` | 独立不可信 `MEMORY_DATA`；包含 profile/episodic/interaction_summary/claim/summary/relationship |
+| `buildRecentContextMessage(meta, bundle)` | 独立 `RECENT_GROUP_CONTEXT`；带 sender/is_viewer，budget 截断 |
+| `buildViewerIdentityBlock(meta, bundle, aliases)` | 服务端 `VIEWER_IDENTITY`：person_id、显示名、is_viewer 事实 |
 | `buildHistoryMessages(history, meta)` | 短期记忆 messages（含 history note）；proactive/perception 只发 assistant；群聊用户消息带说话人前缀 |
 | `isEpisodicVisible()` | 桌宠全可见（主人特权）；`public` 全渠道；`channel` 要求 `origin + sessionId` 匹配；`private` 仅桌宠 |
 | `isUserProfileVisible()` | 群聊过滤含「关系/称呼/情感/依赖/性格」的档案 key |
 
-**记忆上下文结构**：`MemoryContext { userProfiles, makoProfiles, memories, summaries, relationships }`，由 `LLMService` 取数后传入。
+**记忆上下文结构**：`MemoryContext { userProfiles, makoProfiles, memories, interactionSummaries, claims, summaries, relationships }`，由 `LLMService` 取数后传入。
+
+**viewer-aware summary**：`summary_format=person_refs` 时按 `summary_segments` 渲染，当前 viewer 段显示“你”，其他段显示群昵称；legacy summary 保持原文，不伪造 person 映射。
 
 ---
 
@@ -1139,18 +1211,25 @@ ChatWidget::textSubmitted(text)
 
 ---
 
-### 2.19 QQ 渠道（文本已接入）
+### 2.19 QQ 渠道（文本 + 群记忆 + 成员关系已接入）
 
-**职责**：OneBot v11 文本收发；QQ 语音/图片/表情包与主动观察为后续批次。
+**职责**：OneBot v11 文本、notice 与群成员列表；QQ 语音/图片/表情包与主动观察为后续批次。
 
 **入站链路**：
 ```
 SnowLuma WS 服务端 (:3001)
-  → QQProtocolClient::messageEvent(QJsonObject)
-  → QQMessageParser::parse（channel/session/speaker/senderId/mentionedSelf/rawJson）
+  → QQProtocolClient::messageEvent / noticeEvent
+  → QQMessageParser::parse（channel/session/speaker/senderId/mentionedSelf/replyTo）
   → QQReplyPolicyEngine::decide（Drop / RecordOnly / Reply）
-  → raw_events（仅非 Drop）
+  → QQInboundPolicyEngine::decide（记录资格/短期上下文/长期记忆）
+  → Sanitize（blocked 仅审计行）
+  → raw_events（仅非 Drop；group_authorized 下非白名单成员可 record-only）
   → SessionRouter::submitInput（仅 Reply）
+
+group_increase / group_decrease
+  → GroupMembershipService
+      ├─ open/close group_membership_periods
+      └─ refresh group_membership_snapshots（显示名补齐）
 ```
 
 **出站链路**：
@@ -1165,11 +1244,48 @@ AppController::handleMakoReply
 **策略语义**：
 - `private`：`none` / `master` / `allowlist` / `all`；`allowlist` 自动包含 master
 - `group`：`none` / `mention` / `all`；`group_allow` 非空时只处理这些群
-- 未通过白名单：不写 `raw_events`、不回复
+- 默认 `strict_whitelist`：未通过白名单不写 `raw_events`、不回复
 - 通过群但未 @：只写 `raw_events`，不进大脑
+- `group_authorized`：群级 opt-in 后非白名单成员可进入群记忆，但不获得回复资格、不写 `chat_history`
+- 群成员快照：连接/重连立即刷新，之后按 `membership_refresh_minutes` 定时；pending 去重，10 秒超时标记 snapshot=failed 但保留旧 periods
+- 快照超过 `membership_max_age_minutes`：跨群检索 fail closed
 - `retcode=100` 视为瞬时发送失败，4 秒后重试一次
 
-**配置**：`setting.json` 的 `qq` 段（`enabled/ws_url/access_token/reply`）。
+**配置**：`setting.json` 的 `qq` 段（`enabled/ws_url/access_token/reply/group_memory_*/membership_*`）。字段说明见 [CONFIG_REFERENCE.md](CONFIG_REFERENCE.md)。
+
+---
+
+### 2.20 R3 记忆检索与授权链路
+
+**职责**：把 QQ 原始事件变成可追溯、可授权的长期记忆，并在每次请求时按 viewer/场景裁剪。
+
+```
+QQ event
+  → QQMessageParser
+  → QQReplyPolicy（回复资格） + MemoryPolicyEngine（记录资格）
+  → Sanitize（blocked 只写审计行）
+  → raw_events
+  → RawEventProcessor / InteractionSegmenter
+      → interactions + interaction_participants
+      → LLM summarizeInteractionAsync
+      → summary_segments（P1/P2 → person_id）
+      → memory_claims（默认 quarantine）
+  → MemoryAccessPolicy（shareable / owner_candidate / known_only / forbidden）
+  → RecentContextPlanner / searchRecentGroupContext（只读时间窗）
+  → PromptAssembler（独立 MEMORY_DATA / RECENT_GROUP_CONTEXT / VIEWER_IDENTITY）
+  → LLMService
+  → MemoryOutputGuard
+  → QQ / pet
+```
+
+**硬约束**：
+
+- 回复资格与记录资格独立；`group_authorized` 只放宽记录，不放宽回复。
+- `blocked` 不进入 chat_history / interactions / claims / prompt；`redacted` 只用脱敏文本。
+- claims 三主体任一为 `unknown` 或互相矛盾 → `quarantine`；secret 永远 `forbidden`。
+- 跨群先查 `group_membership_periods` 与快照有效性；快照失败/过期 → fail closed。
+- 非 Owner 私聊只返回 viewer 自己可披露的表达；群聊只看当前群。
+- 检索接口只读，不推进 cursor/processed，不改 summary 状态。
 
 ---
 
@@ -1269,6 +1385,8 @@ AppController::handleMakoReply
 **设计决策**：只注入纯文本，不注入标签格式，避免影响LLM的输出格式。
 
 **v3 轮次渲染规则**：`reply` 轮注入 `user` + `assistant`；`proactive` / `perception`（或 `user_input` 为 NULL）只注入 `assistant`，不生成空 `user` 消息；记忆提取 prompt 对主动/感知轮输出「茉子（主动）: …」，不生成「用户:」空行。
+
+**R3 注入规则**：检索到的 interaction summary / claim / 近期群消息不再拼进 system，而是作为独立不可信 `MEMORY_DATA` / `RECENT_GROUP_CONTEXT` user 消息；`VIEWER_IDENTITY` 是服务端可信事实；claims 只注入 `MemoryAccessPolicy` 判定为 `shareable` 的条目；最终发送前由 `MemoryOutputGuard` 做一次隐私检查与单次安全重试。
 
 ---
 
@@ -1382,11 +1500,11 @@ image/
 
 | 阶段 | 版本 | 内容 |
 |------|------|------|
-| 当前 | v0.6.0 | 流式TTS播放、IPcmPlayer抽象（静态工厂）、播放完成检测、预填充防吞开头、TimeManager QTimer singleShot 退火、TTSProcessManager 孤儿进程清理 |
-| 已完成 | Phase 0 | 大脑/渠道解耦：Utterance/IChannelAdapter/SessionRouter、DB v2 双键记忆、identity.json 解析、23 例测试 |
-| 下一步 | Phase 0.5 → Phase 1 | 记忆 visibility/appendRawMessage 预留 → SnowLuma/OneBot v11 QQ 渠道接入 |
-| 中期 | v0.7.0 | 设置界面完善、AppController职责拆分、独立存档系统 |
-| 远期 | v0.8.0+ | 架构改进、独立存档、插件化 |
+| 当前 | v0.7.0-rc6-dev | Phase 1 QQ 文本 + 记忆 v5 R3：interactions/claims/persons/membership、近期群聊上下文、输出保护；14 套件 / 126 用例 |
+| 已完成 | Phase 0 / 0.5 | 大脑/渠道解耦：Utterance/IChannelAdapter/SessionRouter、DB v2/v3、identity.json、raw_events/memory_cursor |
+| 下一步 | PR-4 | MemoryAgent 只读检索工具：memory_search/memory_read/memory_related，超时回退 top-k，审计/P95 |
+| 中期 | PR-5 + Phase 1 剩余 | 留存 UI/清理/删除传播；QQ 语音/图片/表情包、群聊滑动窗口 |
+| 远期 | Phase 2+ | 主动转述、ChatPlanner、v0.7.0 架构拆分/独立存档、插件化 |
 
 ---
 

@@ -1,7 +1,7 @@
 # 记忆系统 v5 R3 实施基线
 
-> 状态：**PR-1a / PR-1b 已通过手工验收；PR-2 / PR-2.1 / PR-2.2 / PR-3.0 / PR-3.1 / PR-3.2a / PR-3.2a.1 / PR-3.2b / PR-3.2c 已实现并通过单测，待手工验收**
-> 日期：2026-10-28
+> 状态：**PR-1a / PR-1b 已通过手工验收；PR-2 / PR-2.1 / PR-2.2 / PR-3.0 / PR-3.1 / PR-3.2a / PR-3.2a.1 / PR-3.2b / PR-3.2c 已实现并通过单测。3.2a / 3.2a.1 成员生命周期已手工验证；3.2b / 3.2c 待手工验收。下一项 PR-4。**
+> 日期：2026-10-29
 > 冻结：`blocked` 默认不回复；`group_authorized` 下非白名单成员只记录、不回复、不写 `chat_history`。
 > 取代：[MEMORY_V5_DESIGN.md](MEMORY_V5_DESIGN.md) 的历史草案
 > 依据：R2 源码核对方案 + 本轮四项产品决策
@@ -17,6 +17,16 @@
 4. **已识别的 secret 原文在入库前脱敏或丢弃。** 不能只阻止它进入 claim，却让原文留在 `raw_events`、`payload`、日志或 `chat_history`。
 
 这四条是后续 schema、检索 API、Prompt、输出检查和测试的共同契约。
+
+### 当前实现快照（2026-10-29）
+
+- 数据库：`PRAGMA user_version = 9`，当前 14 张表。
+- 迁移链：v1 基础 5 表 → v2 多渠道 → v3 `raw_events`/`memory_cursor` → v4 `episodic.session_id` → v5 脱敏审计列 → v6 `interactions` → v7 `persons`/`person_identities` → v8 `memory_claims`/`summary_segments` → v9 `group_membership_*`。
+- 测试：14 个 CTest 套件 / 126 个测试函数全绿；新增 `tst_groupmembership` 覆盖 pending timeout。
+- 检索：`RecentContextPlanner` + `searchRecentGroupContext` 只读时间窗；claims 只注入 `shareable`。
+- 成员关系：连接/重连/定时刷新；入群/退群 notice；快照失败保留旧 period 但跨群 fail closed。
+- 明确不含：向量库、embedding、独立 agent runtime、第二套原始事件系统。
+- 下一项 PR-4 MemoryAgent；PR-5 留存 UI 未开始。
 
 ---
 
@@ -470,14 +480,14 @@ user: 当前输入
 - 新增只读 `searchRecentGroupContext()`；按时间窗查询，不依赖 `processed=0`。
 - 候选窗口与注入预算分离：每群最多 50 条候选，定向 10 条/1200 字符，泛问 50 条压缩/2200 字符。
 - 定向模式使用关键词/子串 + reply 链；泛问使用 hot window + warm window，不要求 summary ready。
-- Owner 私聊/pet 可读取获准群，最多 2 个最近活跃群；当前群只读当前群；非 Owner 跨群等待 PR-3。
+- Owner 私聊/pet 可读取获准群，最多 2 个最近活跃群；当前群只读当前群；非 Owner 跨群由 PR-3.2c 接入（共同群 + viewer 过滤）。
 - 查询只读：不推进 cursor、不改 processed、不改 summary 状态。
 - blocked 不进入；redacted 只使用脱敏 content，不读 payload 原文。
 - 失败时回退到已有短期上下文/summary；无结果不编造。
 
 验收：R21-1 第 35 条定向命中；R21-2 第 35 条泛问可见；R21-3 processed/summary 状态正交；R21-4 预算独立；R21-5 Owner 范围；R21-6 当前群隔离；R21-7 blocked/redacted；R21-8 不推进后台状态；R21-9 泛问触发；R21-10 无结果不编造。
 
-实现说明：当前代码已增加 `RecentContextPlanner`、`MemoryManager::searchRecentGroupContext()`、`PromptAssembler::buildRecentContextMessage()` 与 `LLMService` 注入；单测覆盖定向命中、泛问覆盖、预算与无结果。非 Owner 共同群仍等待 PR-3。
+实现说明：当前代码已增加 `RecentContextPlanner`、`MemoryManager::searchRecentGroupContext()`、`PromptAssembler::buildRecentContextMessage()` 与 `LLMService` 注入；单测覆盖定向命中、泛问覆盖、预算与无结果。非 Owner 共同群已在 PR-3.2c 接入：按 `group_membership_periods` + 快照有效期判定，只返回 viewer 自己的表达。
 
 ### PR-2.2：Viewer Identity Facts
 
@@ -520,8 +530,14 @@ user: 当前输入
 - `MemoryManager::openGroupMembershipPeriod()` / `closeGroupMembershipPeriod()`。
 - 连接/重连立即刷新；定时刷新对 pending 群去重。
 - 不新增 schema。
+- `handlePendingTimeout()` 抽为 public slot，供确定性测试直接调用；超时只标记 snapshot=failed，不关闭旧 period。
+- `tst_groupmembership` 覆盖：已有 ok 快照 → timeout → `hasValidGroupMembershipSnapshot=false`，旧 open period 保留。
+
+**状态**：已实现；成员生命周期已手工验证（允许群/非允许群、退群/入群、定时刷新），timeout 由单测覆盖。
 
 ### PR-3.2b：Claims 授权
+
+**状态**：已实现并通过单测，待手工验收。
 
 - `MemoryAccessPolicy` 四态：shareable / owner_candidate / known_only / forbidden。
 - claims 保守激活：仅当前群公开、三主体一致的自述事实进入 `active`。
@@ -529,6 +545,8 @@ user: 当前输入
 - 第三方 claims、unknown、secret、越权来源保持 forbidden/quarantine。
 
 ### PR-3.2c：跨群
+
+**状态**：已实现并通过单测，待手工验收。
 
 - Owner 私聊/pet 使用允许群。
 - 非 Owner 私聊使用 `group_membership_periods` 共同群。
@@ -539,6 +557,8 @@ user: 当前输入
 
 ### PR-4：MemoryAgent
 
+**状态**：未开始（下一项）。
+
 - 只读 `memory_search` / `memory_read` / `memory_related`。
 - QQ 可用，pet 只用自动 top-k。
 - 超时回退已授权 top-k。
@@ -547,6 +567,8 @@ user: 当前输入
 验收：Agent 不能指定 viewer/owner/location；不能写库；越权测试通过。
 
 ### PR-5：留存 UI 与生命周期
+
+**状态**：未开始。
 
 - 群保留期、observe-only、规则 UI、记忆清理、删除传播。
 - 启动/重连/定时成员快照。
@@ -636,9 +658,9 @@ user: 当前输入
 
 仍需实现时确认：
 
-- SnowLuma/OneBot 的 `get_group_member_list` 字段与入群/退群事件格式。
+- ~~SnowLuma/OneBot 的 `get_group_member_list` 字段与入群/退群事件格式~~：已确认并接入（`actionResponse` + `noticeEvent`）。
 - Qt 目标 SQLite 是否带 FTS5；不带则用兼容关键词查询。
-- 加密/保留期/删除传播的具体实现方式。
+- 加密/保留期/删除传播的具体实现方式（PR-5）。
 - 未来“安全行为投影”是否进入后续版本；R3 首版不做。
 
 ---
