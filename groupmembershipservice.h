@@ -23,6 +23,10 @@ public:
     void start();
     void refreshAllowedGroups();
 
+public slots:
+    // 由 10 秒 pending 定时器调用；独立出来便于确定性测试。
+    void handlePendingTimeout(const QString &echo, const QString &groupId);
+
 private slots:
     void onConnected();
     void onActionResponse(const QString &echo,

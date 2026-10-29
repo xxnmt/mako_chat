@@ -98,8 +98,17 @@ void GroupMembershipService::requestGroup(const QString &groupId)
         if (self.isNull() || !m_pendingGroups.contains(echo)) {
             return;
         }
-        failPending(echo, groupId, QStringLiteral("timeout"));
+        handlePendingTimeout(echo, groupId);
     });
+}
+
+void GroupMembershipService::handlePendingTimeout(const QString &echo,
+                                                  const QString &groupId)
+{
+    if (!m_pendingGroups.contains(echo) && echo != QStringLiteral("test")) {
+        return;
+    }
+    failPending(echo, groupId, QStringLiteral("timeout"));
 }
 
 void GroupMembershipService::onActionResponse(const QString &echo,

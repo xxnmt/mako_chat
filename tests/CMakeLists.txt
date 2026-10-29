@@ -88,6 +88,27 @@ add_phase0_test(tst_memoryaccesspolicy
     ${PROJECT_SOURCE_DIR}/historyturn.h
 )
 
+add_phase0_test(tst_groupmembership
+    tst_groupmembership.cpp
+    ${PROJECT_SOURCE_DIR}/groupmembershipservice.h
+    ${PROJECT_SOURCE_DIR}/groupmembershipservice.cpp
+    ${PROJECT_SOURCE_DIR}/qqprotocolclient.h
+    ${PROJECT_SOURCE_DIR}/qqprotocolclient.cpp
+    ${PROJECT_SOURCE_DIR}/memorymanager.h
+    ${PROJECT_SOURCE_DIR}/memorymanager.cpp
+    ${PROJECT_SOURCE_DIR}/recentcontext.h
+    ${PROJECT_SOURCE_DIR}/recentcontext.cpp
+    ${PROJECT_SOURCE_DIR}/qqmessageparser.h
+    ${PROJECT_SOURCE_DIR}/qqmessageparser.cpp
+    ${PROJECT_SOURCE_DIR}/configmanager.h
+    ${PROJECT_SOURCE_DIR}/configmanager.cpp
+    ${PROJECT_SOURCE_DIR}/memorypolicy.h
+    ${PROJECT_SOURCE_DIR}/memorypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/qqreplypolicy.h
+    ${PROJECT_SOURCE_DIR}/qqreplypolicy.cpp
+)
+target_link_libraries(tst_groupmembership PRIVATE Qt6::WebSockets Qt6::Network)
+
 add_phase0_test(tst_interactionsegmenter
     tst_interactionsegmenter.cpp
     ${PROJECT_SOURCE_DIR}/interactionsegmenter.h
