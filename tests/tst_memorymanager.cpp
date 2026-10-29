@@ -1013,6 +1013,21 @@ private slots:
                  QStringList{QStringLiteral("20002")});
         QCOMPARE(mm.getOpenGroupMemberIds(QStringLiteral("40001")),
                  QStringList{QStringLiteral("20002")});
+
+        QVERIFY(mm.openGroupMembershipPeriod(
+            QStringLiteral("40003"), QStringLiteral("20003"),
+            QStringLiteral("小红"), QStringLiteral("group_increase"), now));
+        QVERIFY(mm.getOpenGroupMemberIds(QStringLiteral("40003"))
+                    .contains(QStringLiteral("20003")));
+        QVERIFY(mm.closeGroupMembershipPeriod(
+            QStringLiteral("40003"), QStringLiteral("20003"), now.addSecs(5)));
+        QVERIFY(!mm.getOpenGroupMemberIds(QStringLiteral("40003"))
+                     .contains(QStringLiteral("20003")));
+        QVERIFY(mm.closeGroupMembershipPeriod(
+            QStringLiteral("40003"), QStringLiteral("20003"), now.addSecs(6)));
+
+        QVERIFY(!mm.hasValidGroupMembershipSnapshot(
+            QStringLiteral("40001"), 60, now.addSecs(2 * 60 * 60)));
     }
 
     void onlyViewerRecentContextFiltersOthers()

@@ -141,6 +141,14 @@ public:
                                          const QDateTime &now = QDateTime());
     QStringList getOpenGroupMemberIds(const QString &groupId);
     QStringList getOpenGroupsForUser(const QString &userId, int limit);
+    bool openGroupMembershipPeriod(const QString &groupId,
+                                   const QString &userId,
+                                   const QString &displayName,
+                                   const QString &source,
+                                   const QDateTime &at);
+    bool closeGroupMembershipPeriod(const QString &groupId,
+                                    const QString &userId,
+                                    const QDateTime &at);
 
 //蒸馏游标（memory_cursor）：每 channel+session 一条；Phase 1 蒸馏接线时使用
     bool updateMemoryCursor(const QString &channel, const QString &sessionId,

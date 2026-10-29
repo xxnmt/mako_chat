@@ -3,7 +3,10 @@
 
 #include <QObject>
 #include <QHash>
+#include <QJsonObject>
 #include <QJsonValue>
+
+class QTimer;
 
 class MemoryManager;
 class QQProtocolClient;
@@ -25,14 +28,17 @@ private slots:
     void onActionResponse(const QString &echo,
                           const QJsonValue &data,
                           int retcode);
+    void onNoticeEvent(const QJsonObject &event);
 
 private:
+    bool isAllowedGroup(const QString &groupId) const;
     void requestGroup(const QString &groupId);
     void failPending(const QString &echo, const QString &group,
                      const QString &reason);
 
     MemoryManager *m_memoryManager = nullptr;
     QQProtocolClient *m_qqClient = nullptr;
+    QTimer *m_refreshTimer = nullptr;
     QHash<QString, QString> m_pendingGroups; // echo -> group_id
 };
 

@@ -202,6 +202,10 @@ bool ConfigManager::loadSetting()
             readIdArray(qqObj.value("group_memory_allow").toArray());
         m_qqGroupMemory.retentionDays =
             qBound(1, qqObj.value("group_retention_days").toInt(30), 3650);
+        m_qqGroupMemory.membershipRefreshMinutes =
+            qBound(0, qqObj.value("membership_refresh_minutes").toInt(30), 1440);
+        m_qqGroupMemory.membershipMaxAgeMinutes =
+            qBound(1, qqObj.value("membership_max_age_minutes").toInt(1440), 10080);
 
         const QJsonObject modes = qqObj.value("group_memory_mode").toObject();
         for (auto it = modes.constBegin(); it != modes.constEnd(); ++it) {
@@ -337,6 +341,10 @@ bool ConfigManager::saveSetting()
     }
     qqObj.insert("group_memory_allow", groupMemoryAllow);
     qqObj.insert("group_retention_days", m_qqGroupMemory.retentionDays);
+    qqObj.insert("membership_refresh_minutes",
+                 m_qqGroupMemory.membershipRefreshMinutes);
+    qqObj.insert("membership_max_age_minutes",
+                 m_qqGroupMemory.membershipMaxAgeMinutes);
 
     QJsonObject groupModes;
     for (auto it = m_qqGroupMemory.modeByGroup.constBegin();

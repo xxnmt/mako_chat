@@ -227,6 +227,8 @@ private slots:
         QVERIFY(groups.groupAllow.isEmpty());
         QVERIFY(groups.senderAllowByGroup.isEmpty());
         QCOMPARE(groups.retentionDays, 30);
+        QCOMPARE(groups.membershipRefreshMinutes, 30);
+        QCOMPARE(groups.membershipMaxAgeMinutes, 1440);
     }
 
     void parsesMemoryPolicyAndGroupMemory()
@@ -270,6 +272,8 @@ private slots:
         qq.insert("group_memory_enabled", true);
         qq.insert("group_memory_allow", QJsonArray{30001});
         qq.insert("group_retention_days", 7);
+        qq.insert("membership_refresh_minutes", 15);
+        qq.insert("membership_max_age_minutes", 120);
         QJsonObject modes;
         modes.insert("30001", QStringLiteral("group_authorized"));
         qq.insert("group_memory_mode", modes);
@@ -310,6 +314,8 @@ private slots:
         QVERIFY(groups.enabled);
         QCOMPARE(groups.groupAllow, (QList<qlonglong>{30001}));
         QCOMPARE(groups.retentionDays, 7);
+        QCOMPARE(groups.membershipRefreshMinutes, 15);
+        QCOMPARE(groups.membershipMaxAgeMinutes, 120);
         QCOMPARE(groups.modeByGroup.value(QStringLiteral("30001")),
                  QQGroupMemoryMode::GroupAuthorized);
         QCOMPARE(groups.senderAllowByGroup.value(QStringLiteral("30001")).size(), 2);
@@ -323,6 +329,8 @@ private slots:
         QVERIFY(cfg.loadSetting());
         QCOMPARE(cfg.getMemoryPolicyConfig().privacyRules.size(), 2);
         QCOMPARE(cfg.getQQGroupMemoryConfig().retentionDays, 7);
+        QCOMPARE(cfg.getQQGroupMemoryConfig().membershipRefreshMinutes, 15);
+        QCOMPARE(cfg.getQQGroupMemoryConfig().membershipMaxAgeMinutes, 120);
     }
 
     void corruptSettingIsPreserved()

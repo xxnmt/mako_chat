@@ -19,11 +19,16 @@ GroupMembershipService::GroupMembershipService(MemoryManager *memoryManager,
       m_memoryManager(memoryManager),
       m_qqClient(qqClient)
 {
+    m_refreshTimer = new QTimer(this);
+    connect(m_refreshTimer, &QTimer::timeout,
+            this, &GroupMembershipService::refreshAllowedGroups);
     if (m_qqClient) {
         connect(m_qqClient, &QQProtocolClient::connected,
                 this, &GroupMembershipService::onConnected);
         connect(m_qqClient, &QQProtocolClient::actionResponse,
                 this, &GroupMembershipService::onActionResponse);
+        connect(m_qqClient, &QQProtocolClient::noticeEvent,
+                this, &GroupMembershipService::onNoticeEvent);
     }
 }
 
@@ -32,11 +37,30 @@ void GroupMembershipService::start()
     if (m_qqClient && m_qqClient->isConnected()) {
         onConnected();
     }
+    const QQGroupMemoryConfig groups =
+        ConfigManager::instance().getQQGroupMemoryConfig();
+    if (groups.membershipRefreshMinutes > 0) {
+        m_refreshTimer->start(groups.membershipRefreshMinutes * 60 * 1000);
+    }
 }
 
 void GroupMembershipService::onConnected()
 {
+    const QQGroupMemoryConfig groups =
+        ConfigManager::instance().getQQGroupMemoryConfig();
+    if (groups.membershipRefreshMinutes > 0) {
+        m_refreshTimer->start(groups.membershipRefreshMinutes * 60 * 1000);
+    } else {
+        m_refreshTimer->stop();
+    }
     refreshAllowedGroups();
+}
+
+bool GroupMembershipService::isAllowedGroup(const QString &groupId) const
+{
+    const QQGroupMemoryConfig groups =
+        ConfigManager::instance().getQQGroupMemoryConfig();
+    return groups.enabled && groups.groupAllow.contains(groupId.toLongLong());
 }
 
 void GroupMembershipService::refreshAllowedGroups()
@@ -47,16 +71,24 @@ void GroupMembershipService::refreshAllowedGroups()
     const QQGroupMemoryConfig groups =
         ConfigManager::instance().getQQGroupMemoryConfig();
     for (qlonglong groupId : groups.groupAllow) {
-        requestGroup(QString::number(groupId));
+        const QString id = QString::number(groupId);
+        const QString echo = QStringLiteral("membership:") + id;
+        if (m_pendingGroups.contains(echo)) {
+            continue;
+        }
+        requestGroup(id);
     }
 }
 
 void GroupMembershipService::requestGroup(const QString &groupId)
 {
-    if (!m_qqClient || groupId.isEmpty()) {
+    if (!m_qqClient || groupId.isEmpty() || !isAllowedGroup(groupId)) {
         return;
     }
     const QString echo = QStringLiteral("membership:") + groupId;
+    if (m_pendingGroups.contains(echo)) {
+        return;
+    }
     m_pendingGroups.insert(echo, groupId);
     m_qqClient->sendAction(QStringLiteral("get_group_member_list"),
                            QJsonObject{{QStringLiteral("group_id"),
@@ -119,6 +151,39 @@ void GroupMembershipService::onActionResponse(const QString &echo,
     }
     qDebug() << "[Membership] 群成员快照成功:" << groupId
              << "members=" << parsed.size();
+}
+
+void GroupMembershipService::onNoticeEvent(const QJsonObject &event)
+{
+    const QString noticeType = event.value(QStringLiteral("notice_type")).toString();
+    if (noticeType != QStringLiteral("group_increase")
+        && noticeType != QStringLiteral("group_decrease")) {
+        return;
+    }
+    const QString groupId = event.value(QStringLiteral("group_id"))
+                                .toVariant().toString();
+    const QString userId = event.value(QStringLiteral("user_id"))
+                               .toVariant().toString();
+    if (groupId.isEmpty() || userId.isEmpty() || !isAllowedGroup(groupId)) {
+        return;
+    }
+    if (!m_memoryManager) {
+        return;
+    }
+    const QDateTime now = QDateTime::currentDateTime();
+    if (noticeType == QStringLiteral("group_increase")) {
+        m_memoryManager->openGroupMembershipPeriod(
+            groupId, userId, userId, QStringLiteral("group_increase"), now);
+    } else {
+        m_memoryManager->closeGroupMembershipPeriod(groupId, userId, now);
+    }
+    // 增减事件可能没有群名片，立即刷新一次补齐显示名。
+    const QString echo = QStringLiteral("membership:") + groupId;
+    if (!m_pendingGroups.contains(echo)) {
+        requestGroup(groupId);
+    }
+    qDebug() << "[Membership] 群成员事件:" << noticeType
+             << "group=" << groupId << "user=" << userId;
 }
 
 void GroupMembershipService::failPending(const QString &echo,

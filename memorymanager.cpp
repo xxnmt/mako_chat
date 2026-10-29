@@ -2041,6 +2041,85 @@ QStringList MemoryManager::getOpenGroupsForUser(const QString &userId, int limit
     return groups;
 }
 
+bool MemoryManager::openGroupMembershipPeriod(const QString &groupId,
+                                              const QString &userId,
+                                              const QString &displayName,
+                                              const QString &source,
+                                              const QDateTime &at)
+{
+    if (groupId.isEmpty() || userId.isEmpty()
+        || (!m_db.isOpen() && !m_db.open())) {
+        return false;
+    }
+    const QString when = (at.isValid() ? at : QDateTime::currentDateTime())
+                             .toString("yyyy-MM-dd HH:mm:ss");
+    const QString personId = resolvePersonId(
+        QStringLiteral("qq"), userId, groupId);
+    if (!ensurePersonIdentity(QStringLiteral("qq"), userId, groupId,
+                              displayName, at, source.isEmpty()
+                                                    ? QStringLiteral("group_increase")
+                                                    : source)) {
+        return false;
+    }
+    QSqlQuery open(m_db);
+    open.prepare("SELECT id FROM group_membership_periods "
+                 "WHERE group_id=? AND user_id=? AND valid_to IS NULL "
+                 "ORDER BY id DESC LIMIT 1");
+    open.addBindValue(groupId);
+    open.addBindValue(userId);
+    if (!open.exec()) {
+        return false;
+    }
+    if (open.next()) {
+        QSqlQuery update(m_db);
+        update.prepare("UPDATE group_membership_periods "
+                       "SET person_id=?, last_verified_at=? WHERE id=?");
+        update.addBindValue(personId);
+        update.addBindValue(when);
+        update.addBindValue(open.value(0).toLongLong());
+        return update.exec();
+    }
+    QSqlQuery insert(m_db);
+    insert.prepare("INSERT INTO group_membership_periods "
+                   "(group_id, user_id, person_id, valid_from, source, "
+                   " last_verified_at) VALUES (?, ?, ?, ?, ?, ?)");
+    insert.addBindValue(groupId);
+    insert.addBindValue(userId);
+    insert.addBindValue(personId);
+    insert.addBindValue(when);
+    insert.addBindValue(source.isEmpty() ? QStringLiteral("group_increase")
+                                          : source);
+    insert.addBindValue(when);
+    if (!insert.exec()) {
+        qDebug() << "[MemoryManager]打开 membership period 失败:" << insert.lastError();
+        return false;
+    }
+    return true;
+}
+
+bool MemoryManager::closeGroupMembershipPeriod(const QString &groupId,
+                                               const QString &userId,
+                                               const QDateTime &at)
+{
+    if (groupId.isEmpty() || userId.isEmpty()
+        || (!m_db.isOpen() && !m_db.open())) {
+        return false;
+    }
+    const QString when = (at.isValid() ? at : QDateTime::currentDateTime())
+                             .toString("yyyy-MM-dd HH:mm:ss");
+    QSqlQuery query(m_db);
+    query.prepare("UPDATE group_membership_periods SET valid_to=? "
+                  "WHERE group_id=? AND user_id=? AND valid_to IS NULL");
+    query.addBindValue(when);
+    query.addBindValue(groupId);
+    query.addBindValue(userId);
+    if (!query.exec()) {
+        qDebug() << "[MemoryManager]关闭 membership period 失败:" << query.lastError();
+        return false;
+    }
+    return true;
+}
+
 void MemoryManager::seedIdentity(const QStringList &masterUserIds)
 {
     if (!m_db.isOpen() && !m_db.open()) {

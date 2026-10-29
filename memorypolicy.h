@@ -60,6 +60,8 @@ struct QQGroupMemoryConfig {
     QMap<QString, QQGroupMemoryMode> modeByGroup;
     QMap<QString, QList<qlonglong>> senderAllowByGroup;
     int retentionDays = 30;
+    int membershipRefreshMinutes = 30;
+    int membershipMaxAgeMinutes = 1440;
 };
 
 struct QQInboundDecision {

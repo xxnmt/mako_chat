@@ -1,6 +1,6 @@
 # 记忆系统 v5 R3 实施基线
 
-> 状态：**PR-1a / PR-1b 已通过手工验收；PR-2 / PR-2.1 / PR-2.2 / PR-3.0 / PR-3.1 / PR-3.2a / PR-3.2b / PR-3.2c 已实现并通过单测，待手工验收**
+> 状态：**PR-1a / PR-1b 已通过手工验收；PR-2 / PR-2.1 / PR-2.2 / PR-3.0 / PR-3.1 / PR-3.2a / PR-3.2a.1 / PR-3.2b / PR-3.2c 已实现并通过单测，待手工验收**
 > 日期：2026-10-28
 > 冻结：`blocked` 默认不回复；`group_authorized` 下非白名单成员只记录、不回复、不写 `chat_history`。
 > 取代：[MEMORY_V5_DESIGN.md](MEMORY_V5_DESIGN.md) 的历史草案
@@ -509,6 +509,18 @@ user: 当前输入
 - 快照失败标记 `failed`，不关闭旧区间；跨群 fail closed。
 - 非 Owner 私聊只使用共同群，且只返回 viewer 自己的 raw 消息（`onlyViewer`）。
 
+### PR-3.2a.1：成员关系生命周期
+
+- `membership_refresh_minutes`：默认 30 分钟，0 关闭定时刷新。
+- `membership_max_age_minutes`：默认 1440 分钟；过期快照跨群 fail closed。
+- `QQProtocolClient::noticeEvent` 暴露 OneBot notice。
+- `GroupMembershipService` 处理 `group_increase` / `group_decrease`：
+  - 增加：open period + 立即刷新快照补齐显示名；
+  - 减少：close period + 刷新快照。
+- `MemoryManager::openGroupMembershipPeriod()` / `closeGroupMembershipPeriod()`。
+- 连接/重连立即刷新；定时刷新对 pending 群去重。
+- 不新增 schema。
+
 ### PR-3.2b：Claims 授权
 
 - `MemoryAccessPolicy` 四态：shareable / owner_candidate / known_only / forbidden。
@@ -594,6 +606,11 @@ user: 当前输入
 | R32-5 | 跨群 viewer 过滤 | 非 Owner 私聊只返回 viewer 自己的 raw |
 | R32-6 | claims 披露 | 只注入 shareable；第三方/secret/越权 forbidden |
 | R32-7 | 空回复重试 | 第一次空重试一次；第二次仍空才 replyAbnormal |
+| R32a.1-1 | 定时刷新 | 默认 30 分钟；0 关闭；pending 去重 |
+| R32a.1-2 | 群成员增加 | open period；随后快照补齐显示名 |
+| R32a.1-3 | 群成员减少 | close period；历史区间保留 |
+| R32a.1-4 | 快照过期 | 超过 maxAge 跨群返回空 |
+| R32a.1-5 | 非允许群 notice | 忽略 |
 
 ---
 

@@ -135,7 +135,7 @@ void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> 
                     continue;
                 }
                 if (!m_memoryManager->hasValidGroupMembershipSnapshot(
-                        groupId, 24 * 60)) {
+                        groupId, groupConfig.membershipMaxAgeMinutes)) {
                     continue;
                 }
                 common << groupId;
@@ -158,7 +158,7 @@ void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> 
         access.membershipFailed = false;
         access.membershipVerified = isGroup
             ? m_memoryManager->hasValidGroupMembershipSnapshot(
-                  m_currentMeta.sessionId, 24 * 60)
+                  m_currentMeta.sessionId, groupConfig.membershipMaxAgeMinutes)
             : commonGroupsVerified;
         const QList<MemoryClaim> activeClaims =
             m_memoryManager->getActiveClaims(50);

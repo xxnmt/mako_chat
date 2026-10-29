@@ -194,7 +194,10 @@ void QQProtocolClient::onTextMessageReceived(const QString &message)
         return;
     }
 
-    if (obj.value("post_type").toString() == QStringLiteral("message")) {
+    const QString postType = obj.value("post_type").toString();
+    if (postType == QStringLiteral("message")) {
         emit messageEvent(obj);
+    } else if (postType == QStringLiteral("notice")) {
+        emit noticeEvent(obj);
     }
 }
