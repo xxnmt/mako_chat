@@ -15,6 +15,7 @@ struct RecentContextQuery {
     QString viewerId;
     QStringList viewerIds; // 兼容旧调用：当前用户平台 ID
     QString viewerPersonId; // 服务端解析后的当前用户 person_id
+    bool onlyViewer = false; // 跨群只返回 viewer 自己的消息
     QString locationChannel;
     QString locationSessionId;
     QStringList allowedGroupIds;

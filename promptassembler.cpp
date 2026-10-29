@@ -165,6 +165,16 @@ QJsonArray buildMemoryItems(const RequestMeta &meta,
         items.append(item);
     }
 
+    for (const MemoryClaim &claim : context.claims) {
+        QJsonObject item;
+        item["kind"] = "claim";
+        item["text"] = claim.statement;
+        if (claim.validTimeStart.isValid()) {
+            item["time"] = claim.validTimeStart.toString("yyyy-MM-dd HH:mm:ss");
+        }
+        items.append(item);
+    }
+
     for (const LongTermSummary &summary : context.summaries) {
         QJsonObject item;
         item["kind"] = "summary";

@@ -23,6 +23,7 @@ public:
         QList<CharacterProfile> makoProfiles;
         QList<EpisodicMemory> memories;
         QList<InteractionSummary> interactionSummaries;
+        QList<MemoryClaim> claims;
         QList<LongTermSummary> summaries;
         QList<RelationshipState> relationships;
     };

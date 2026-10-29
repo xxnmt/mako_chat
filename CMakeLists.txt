@@ -22,6 +22,8 @@ qt_add_executable(Windows_AI
     interactionsegmenter.h interactionsegmenter.cpp
     recentcontext.h recentcontext.cpp
     raweventprocessor.h raweventprocessor.cpp
+    groupmembershipservice.h groupmembershipservice.cpp
+    memoryaccesspolicy.h memoryaccesspolicy.cpp
     llmservice.h llmservice.cpp
     promptassembler.h promptassembler.cpp
     appcontroller.h appcontroller.cpp

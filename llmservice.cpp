@@ -15,6 +15,8 @@
 #include "promptassembler.h"
 #include "memoryoutputguard.h"
 #include "recentcontext.h"
+#include "memorytextutils.h"
+#include "memoryaccesspolicy.h"
 #include "debuglog.h"
 
 
@@ -114,20 +116,71 @@ void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> 
         }
     }
 
+    const QQGroupMemoryConfig groupConfig =
+        ConfigManager::instance().getQQGroupMemoryConfig();
+    QStringList allowedGroups =
+        RecentContextPlanner::allowedGroupIdsForRequest(
+            isGroup, ownerPrivateOrPet, m_currentMeta.sessionId,
+            groupConfig.enabled, groupConfig.groupAllow);
+    const bool nonOwnerPrivate = !isGroup && !ownerPrivateOrPet;
+    bool commonGroupsVerified = false;
+    if (m_memoryManager && nonOwnerPrivate && groupConfig.enabled) {
+        QStringList common;
+        for (const QString &viewerId : viewerIds) {
+            const QStringList groups =
+                m_memoryManager->getOpenGroupsForUser(viewerId, 10);
+            for (const QString &groupId : groups) {
+                if (!groupConfig.groupAllow.contains(groupId.toLongLong())
+                    || common.contains(groupId)) {
+                    continue;
+                }
+                if (!m_memoryManager->hasValidGroupMembershipSnapshot(
+                        groupId, 24 * 60)) {
+                    continue;
+                }
+                common << groupId;
+            }
+        }
+        if (common.size() > 2) {
+            common = common.mid(0, 2);
+        }
+        allowedGroups = common;
+        commonGroupsVerified = !common.isEmpty();
+    }
+
+    if (m_memoryManager && !viewerPersonId.isEmpty()) {
+        MemoryAccessContext access;
+        access.viewerPersonId = viewerPersonId;
+        access.channel = m_currentMeta.channel;
+        access.sessionId = m_currentMeta.sessionId;
+        access.allowedGroupIds = allowedGroups;
+        access.viewerIsOwner = m_currentMeta.subject == QStringLiteral("user");
+        access.membershipFailed = false;
+        access.membershipVerified = isGroup
+            ? m_memoryManager->hasValidGroupMembershipSnapshot(
+                  m_currentMeta.sessionId, 24 * 60)
+            : commonGroupsVerified;
+        const QList<MemoryClaim> activeClaims =
+            m_memoryManager->getActiveClaims(50);
+        for (const MemoryClaim &claim : activeClaims) {
+            const MemoryAccessDecision decision =
+                MemoryAccessPolicy::evaluate(claim, access);
+            if (decision.state == MemoryAccessState::Shareable) {
+                context.claims.append(claim);
+            }
+        }
+        qDebug() << "[LLM]active claims=" << activeClaims.size()
+                 << "shareable=" << context.claims.size();
+    }
+
     if (m_memoryManager && memoryPolicy.recentContext.enabled
         && !RecentContextPlanner::isHistoricalCue(userInput)) {
-        const QQGroupMemoryConfig groups =
-            ConfigManager::instance().getQQGroupMemoryConfig();
-        const QStringList allowedGroups =
-            RecentContextPlanner::allowedGroupIdsForRequest(
-                isGroup, ownerPrivateOrPet, m_currentMeta.sessionId,
-                groups.enabled, groups.groupAllow);
-
         if (!allowedGroups.isEmpty()) {
             RecentContextQuery query;
             query.viewerId = m_currentMeta.subject;
             query.viewerIds = viewerIds;
             query.viewerPersonId = viewerPersonId;
+            query.onlyViewer = nonOwnerPrivate;
             query.locationChannel = m_currentMeta.channel;
             query.locationSessionId = m_currentMeta.sessionId;
             query.allowedGroupIds = allowedGroups;
@@ -242,6 +295,7 @@ void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> 
 
     m_lastRequestMessages = messagesArray;
     m_outputRetryCount = 0;
+    m_emptyRetryCount = 0;
     sendChatRequest(messagesArray);
 
     qDebug() << "[LLM]茉子带着"<<historyQA.size()<<"轮短期记忆正在思考......";
@@ -284,6 +338,24 @@ void LLMService::sendSafeRetry()
     retryMessages.insert(insertAt, retryMessage);
 
     qDebug() << "[LLM]输出保护命中，发起一次安全重试";
+    sendChatRequest(retryMessages);
+}
+
+void LLMService::sendEmptyReplyRetry()
+{
+    if (m_lastRequestMessages.isEmpty()) {
+        emit replyAbnormal(QStringLiteral("empty_reply"));
+        return;
+    }
+    QJsonObject retryMessage;
+    retryMessage["role"] = "system";
+    retryMessage["content"] = QStringLiteral(
+        "【空回复重试】上一次生成没有返回最终内容。请重新回答最后一条用户消息，"
+        "严格按约定 JSON 格式输出，不要只输出思考内容。");
+    QJsonArray retryMessages = m_lastRequestMessages;
+    const int insertAt = qMax(0, retryMessages.size() - 1);
+    retryMessages.insert(insertAt, retryMessage);
+    qDebug() << "[LLM]空回复，发起一次重试";
     sendChatRequest(retryMessages);
 }
 
@@ -656,14 +728,17 @@ void LLMService::summarizeInteractionAsync(qlonglong interactionId,
         content = content.trimmed();
 
         const QJsonDocument resultDoc = QJsonDocument::fromJson(content.toUtf8());
-        const QString summary = resultDoc.object().value("summary").toString().trimmed();
-        if (summary.isEmpty()) {
+        const QString rawSummary =
+            resultDoc.object().value("summary").toString().trimmed();
+        if (rawSummary.isEmpty()) {
             qDebug() << "[LLM]interaction summary 为空:" << interactionId
                      << "chars=" << content.size();
             emit interactionSummaryFailed(interactionId, QStringLiteral("empty_summary"));
             reply->deleteLater();
             return;
         }
+        const QString summary = MemoryTextUtils::replaceSpeakerLabels(
+            rawSummary, labelToDisplay);
 
         auto resolveSpeaker = [&](const QString &speaker) -> QString {
             const QString key = speaker.trimmed();
@@ -684,10 +759,12 @@ void LLMService::summarizeInteractionAsync(qlonglong interactionId,
         const QJsonArray rawSegments = resultDoc.object().value("segments").toArray();
         for (const QJsonValue &value : rawSegments) {
             const QJsonObject obj = value.toObject();
-            const QString text = obj.value("text").toString().trimmed();
-            if (text.isEmpty()) {
+            const QString rawText = obj.value("text").toString().trimmed();
+            if (rawText.isEmpty()) {
                 continue;
             }
+            const QString text = MemoryTextUtils::replaceSpeakerLabels(
+                rawText, labelToDisplay);
             const QString speaker = obj.value("speaker").toString();
             QJsonObject segment;
             segment["person_id"] = resolveSpeaker(speaker);
@@ -703,10 +780,13 @@ void LLMService::summarizeInteractionAsync(qlonglong interactionId,
         const QJsonArray rawClaims = resultDoc.object().value("claims").toArray();
         for (const QJsonValue &value : rawClaims) {
             const QJsonObject obj = value.toObject();
-            const QString statement = obj.value("statement").toString().trimmed();
-            if (statement.isEmpty()) {
+            const QString rawStatement =
+                obj.value("statement").toString().trimmed();
+            if (rawStatement.isEmpty()) {
                 continue;
             }
+            const QString statement = MemoryTextUtils::replaceSpeakerLabels(
+                rawStatement, labelToDisplay);
             QJsonObject claim;
             claim["asserted_by_person_id"] = resolveSpeaker(
                 obj.value("asserted_by").toString());
@@ -808,6 +888,12 @@ void LLMService::onReplyFinished(QNetworkReply *reply)
             // 异常回复拦截（空/解析失败/缺中文/缺日文/缺标签）
             // parseJsonReply 的所有异常路径统一返回空 sentences，以此作为唯一判据
             if (parsedSentences.isEmpty()) {
+                if (m_emptyRetryCount == 0 && !m_lastRequestMessages.isEmpty()) {
+                    m_emptyRetryCount = 1;
+                    reply->deleteLater();
+                    sendEmptyReplyRetry();
+                    return;
+                }
                 qDebug() << "[LLM]回复内容异常，抛弃本次回复（不入库，不走TTS）: chars="
                          << replyText.size();
                 emit replyAbnormal(QStringLiteral("invalid_reply"));
@@ -819,6 +905,12 @@ void LLMService::onReplyFinished(QNetworkReply *reply)
             }
         }
         else {
+            if (m_emptyRetryCount == 0 && !m_lastRequestMessages.isEmpty()) {
+                m_emptyRetryCount = 1;
+                reply->deleteLater();
+                sendEmptyReplyRetry();
+                return;
+            }
             // HTTP 200 但 choices 为空，视为异常回复（原本静默无反馈）
             qDebug()<<"[LLM]choices为空，回复内容异常";
             emit replyAbnormal(QStringLiteral("choices为空"));

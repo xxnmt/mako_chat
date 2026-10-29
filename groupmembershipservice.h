@@ -1,0 +1,39 @@
+#ifndef GROUPMEMBERSHIPSERVICE_H
+#define GROUPMEMBERSHIPSERVICE_H
+
+#include <QObject>
+#include <QHash>
+#include <QJsonValue>
+
+class MemoryManager;
+class QQProtocolClient;
+
+// PR-3.2a：拉取允许群的成员列表并维护 group_membership_periods。
+class GroupMembershipService : public QObject
+{
+    Q_OBJECT
+public:
+    GroupMembershipService(MemoryManager *memoryManager,
+                           QQProtocolClient *qqClient,
+                           QObject *parent = nullptr);
+
+    void start();
+    void refreshAllowedGroups();
+
+private slots:
+    void onConnected();
+    void onActionResponse(const QString &echo,
+                          const QJsonValue &data,
+                          int retcode);
+
+private:
+    void requestGroup(const QString &groupId);
+    void failPending(const QString &echo, const QString &group,
+                     const QString &reason);
+
+    MemoryManager *m_memoryManager = nullptr;
+    QQProtocolClient *m_qqClient = nullptr;
+    QHash<QString, QString> m_pendingGroups; // echo -> group_id
+};
+
+#endif // GROUPMEMBERSHIPSERVICE_H

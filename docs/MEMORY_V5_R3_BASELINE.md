@@ -1,6 +1,6 @@
 # 记忆系统 v5 R3 实施基线
 
-> 状态：**PR-1a / PR-1b 已通过手工验收；PR-2 / PR-2.1 / PR-2.2 / PR-3.0 / PR-3.1 已实现并通过单测，待手工验收**
+> 状态：**PR-1a / PR-1b 已通过手工验收；PR-2 / PR-2.1 / PR-2.2 / PR-3.0 / PR-3.1 / PR-3.2a / PR-3.2b / PR-3.2c 已实现并通过单测，待手工验收**
 > 日期：2026-10-28
 > 冻结：`blocked` 默认不回复；`group_authorized` 下非白名单成员只记录、不回复、不写 `chat_history`。
 > 取代：[MEMORY_V5_DESIGN.md](MEMORY_V5_DESIGN.md) 的历史草案
@@ -501,13 +501,27 @@ user: 当前输入
 - viewer-aware 渲染：当前用户段显示“你”，其他段显示昵称；legacy summary 保持原文。
 - claims 默认 `quarantine`，本批不进入检索。
 
-### PR-3.2：成员关系、claims 授权与跨群
+### PR-3.2a：成员关系
 
-- `group_membership_periods`。
-- 动态隐私规则。
-- 查询时 `MemoryAccessPolicy` 四态。
-- Owner 特权、共同群资格、群 B 匿名化。
-- claims 检索与披露。
+- v9：`group_membership_periods`、`group_membership_snapshots`。
+- `QQProtocolClient::actionResponse` 暴露 OneBot 动作响应。
+- `GroupMembershipService` 拉取 `get_group_member_list`，维护成员区间。
+- 快照失败标记 `failed`，不关闭旧区间；跨群 fail closed。
+- 非 Owner 私聊只使用共同群，且只返回 viewer 自己的 raw 消息（`onlyViewer`）。
+
+### PR-3.2b：Claims 授权
+
+- `MemoryAccessPolicy` 四态：shareable / owner_candidate / known_only / forbidden。
+- claims 保守激活：仅当前群公开、三主体一致的自述事实进入 `active`。
+- `LLMService` 只把 `shareable` claims 注入 `MEMORY_DATA`。
+- 第三方 claims、unknown、secret、越权来源保持 forbidden/quarantine。
+
+### PR-3.2c：跨群
+
+- Owner 私聊/pet 使用允许群。
+- 非 Owner 私聊使用 `group_membership_periods` 共同群。
+- 当前实现只返回 viewer 自己的跨群表达；第三方 claims 不展示（fail closed），A1 匿名展示留待后续增强。
+- 群聊仍只看当前群。
 
 验收：A→B 跨群只呈现 U 可披露表达；A1 隐私不出现；成员快照失败 fail closed；模式切换后旧非白名单 claim 隐藏/清理。
 
@@ -546,7 +560,7 @@ user: 当前输入
 | A13 | Output Guard | 已知 secret/forbidden fact 不发送；失败回退 |
 | A14 | claims 三主体含混 | `quarantine`，不进入检索 |
 | A15 | 成员快照失败 | 跨群返回空/拒绝 |
-| A16 | v4 → v8 迁移 | 旧表/行保留；失败回滚 |
+| A16 | v4 → v9 迁移 | 旧表/行保留；失败回滚 |
 | A17 | `blocked` 消息 | 不回复、不解释、不写 chat_history；不进入蒸馏/摘要/claim/prompt；仅审计行 |
 | A18 | 群记忆关闭 | 不写 `raw_events` / interactions / claims；短期上下文按 D2 |
 | A19 | 群级授权，非白名单成员合规消息 | 写脱敏 `raw_events`；不回复；不建 `chat_history`；可进入 interaction 蒸馏 |
@@ -573,6 +587,13 @@ user: 当前输入
 | R31-2 | claims 主体 | 三主体使用 person_id；unknown 进入 quarantine |
 | R31-3 | summary/claims 事务 | 任一写入失败回滚，不产生半成品 |
 | R31-4 | legacy summary | 保持原文，不伪造 person 映射 |
+| R32-1 | 成员快照成功 | periods 开区间；snapshot=ok |
+| R32-2 | 成员退出 | 旧区间 valid_to 关闭 |
+| R32-3 | 快照失败 | snapshot=failed；旧 periods 保留；跨群 fail closed |
+| R32-4 | 保守 claim 激活 | 当前群三主体一致自述 active；其余 quarantine |
+| R32-5 | 跨群 viewer 过滤 | 非 Owner 私聊只返回 viewer 自己的 raw |
+| R32-6 | claims 披露 | 只注入 shareable；第三方/secret/越权 forbidden |
+| R32-7 | 空回复重试 | 第一次空重试一次；第二次仍空才 replyAbnormal |
 
 ---
 

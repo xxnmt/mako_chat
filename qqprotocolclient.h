@@ -5,6 +5,7 @@
 #include <QWebSocket>
 #include <QTimer>
 #include <QJsonObject>
+#include <QJsonValue>
 #include <QHash>
 
 #include "configmanager.h"
@@ -31,6 +32,7 @@ signals:
     void connected();
     void disconnected();
     void messageEvent(const QJsonObject &event);
+    void actionResponse(const QString &echo, const QJsonValue &data, int retcode);
     void errorOccurred(const QString &error);
 
 private slots:

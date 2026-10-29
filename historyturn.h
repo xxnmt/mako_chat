@@ -106,6 +106,23 @@ struct InteractionSummary {
     QDateTime endedAt;
 };
 
+// 已持久化的 claim；用于授权判定与 viewer-aware 渲染。
+struct MemoryClaim {
+    qlonglong id = -1;
+    qlonglong interactionId = -1;
+    QString assertedByPersonId = QStringLiteral("unknown");
+    QString aboutPersonId = QStringLiteral("unknown");
+    QString privacyOwnerPersonId = QStringLiteral("unknown");
+    QString counterpartPersonId;
+    QString statement;
+    int privacyLevel = 1;
+    QString sourceChannel;
+    QString sourceSessionId;
+    QString claimStatus = QStringLiteral("quarantine");
+    QDateTime validTimeStart;
+    QDateTime validTimeEnd;
+};
+
 // 尚未经过授权判定的 claim 草稿；主体只使用 person_id。
 struct ClaimDraft {
     QString assertedByPersonId = QStringLiteral("unknown");

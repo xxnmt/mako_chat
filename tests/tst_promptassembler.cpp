@@ -377,6 +377,26 @@ private slots:
         QVERIFY(!dataText.contains(QStringLiteral("群主：吃了烤肉拌饭")));
     }
 
+    void claimEntersMemoryData()
+    {
+        RequestMeta meta;
+        meta.channel = Channel::kQQPrivate;
+        meta.sessionId = QStringLiteral("20001");
+        meta.subject = QStringLiteral("user");
+        meta.personId = QStringLiteral("owner");
+
+        PromptAssembler::MemoryContext context;
+        MemoryClaim claim;
+        claim.statement = QStringLiteral("主人吃了烤肉拌饭");
+        claim.validTimeStart = QDateTime(QDate(2026, 10, 28), QTime(20, 0));
+        context.claims.append(claim);
+
+        const QString dataText = PromptAssembler::buildMemoryDataMessage(meta, context)
+                                     .value("content").toString();
+        QVERIFY(dataText.contains(QStringLiteral("\"kind\":\"claim\"")));
+        QVERIFY(dataText.contains(QStringLiteral("主人吃了烤肉拌饭")));
+    }
+
     void emptyContextHasNoMemoryDataMessage()
     {
         RequestMeta meta;

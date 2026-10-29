@@ -1371,11 +1371,16 @@ bool MemoryManager::saveInteractionSummaryWithClaims(
         QString owner = claim.privacyOwnerPersonId.isEmpty()
                             ? QStringLiteral("unknown")
                             : claim.privacyOwnerPersonId;
-        QString claimStatus = claim.claimStatus;
-        if (asserted == QStringLiteral("unknown")
-            || about == QStringLiteral("unknown")
-            || owner == QStringLiteral("unknown")) {
-            claimStatus = QStringLiteral("quarantine");
+        QString claimStatus = QStringLiteral("quarantine");
+        if (asserted != QStringLiteral("unknown")
+            && about != QStringLiteral("unknown")
+            && owner != QStringLiteral("unknown")
+            && asserted == about
+            && about == owner
+            && sourceChannel == QStringLiteral("qq_group")
+            && claim.privacyLevel <= 2) {
+            // 保守激活：只允许群内公开的自述事实。
+            claimStatus = QStringLiteral("active");
         }
         QSqlQuery insert(m_db);
         insert.prepare("INSERT INTO memory_claims "
@@ -1439,6 +1444,44 @@ QList<ClaimDraft> MemoryManager::getClaimsForInteraction(qlonglong interactionId
         claim.statement = query.value(4).toString();
         claim.privacyLevel = query.value(5).toInt();
         claim.claimStatus = query.value(6).toString();
+        claims.append(claim);
+    }
+    return claims;
+}
+
+QList<MemoryClaim> MemoryManager::getActiveClaims(int limit)
+{
+    QList<MemoryClaim> claims;
+    if (!m_db.isOpen() && !m_db.open()) {
+        return claims;
+    }
+    QSqlQuery query(m_db);
+    query.prepare("SELECT id, interaction_id, asserted_by_person_id, "
+                  "about_person_id, privacy_owner_person_id, counterpart_person_id, "
+                  "statement, privacy_level, source_channel, source_session_id, "
+                  "claim_status, valid_time_start, valid_time_end "
+                  "FROM memory_claims WHERE claim_status='active' "
+                  "ORDER BY id DESC LIMIT ?");
+    query.addBindValue(qMax(1, limit));
+    if (!query.exec()) {
+        qDebug() << "[MemoryManager]查询 active claims 失败:" << query.lastError();
+        return claims;
+    }
+    while (query.next()) {
+        MemoryClaim claim;
+        claim.id = query.value(0).toLongLong();
+        claim.interactionId = query.value(1).toLongLong();
+        claim.assertedByPersonId = query.value(2).toString();
+        claim.aboutPersonId = query.value(3).toString();
+        claim.privacyOwnerPersonId = query.value(4).toString();
+        claim.counterpartPersonId = query.value(5).toString();
+        claim.statement = query.value(6).toString();
+        claim.privacyLevel = query.value(7).toInt();
+        claim.sourceChannel = query.value(8).toString();
+        claim.sourceSessionId = query.value(9).toString();
+        claim.claimStatus = query.value(10).toString();
+        claim.validTimeStart = query.value(11).toDateTime();
+        claim.validTimeEnd = query.value(12).toDateTime();
         claims.append(claim);
     }
     return claims;
@@ -1567,6 +1610,9 @@ RecentContextBundle MemoryManager::searchRecentGroupContext(
         if (query.since.isValid()) {
             sql += QStringLiteral(" AND occurred_at >= ?");
         }
+        if (query.onlyViewer && !query.viewerPersonId.isEmpty()) {
+            sql += QStringLiteral(" AND person_id=?");
+        }
         sql += QStringLiteral(" ORDER BY occurred_at DESC, id DESC LIMIT ?");
 
         QSqlQuery eventQuery(m_db);
@@ -1574,6 +1620,9 @@ RecentContextBundle MemoryManager::searchRecentGroupContext(
         eventQuery.addBindValue(groupId);
         if (query.since.isValid()) {
             eventQuery.addBindValue(query.since.toString("yyyy-MM-dd HH:mm:ss"));
+        }
+        if (query.onlyViewer && !query.viewerPersonId.isEmpty()) {
+            eventQuery.addBindValue(query.viewerPersonId);
         }
         eventQuery.addBindValue(qMax(1, query.perGroupCandidateLimit));
         if (!eventQuery.exec()) {
@@ -1787,6 +1836,209 @@ QStringList MemoryManager::getPersonAliases(const QString &personId,
         }
     }
     return aliases;
+}
+
+bool MemoryManager::replaceGroupMembershipSnapshot(
+    const QString &groupId,
+    const QList<QPair<QString, QString>> &members,
+    const QDateTime &verifiedAt)
+{
+    if (groupId.isEmpty() || (!m_db.isOpen() && !m_db.open())) {
+        return false;
+    }
+    const QString when = (verifiedAt.isValid() ? verifiedAt
+                                                : QDateTime::currentDateTime())
+                             .toString("yyyy-MM-dd HH:mm:ss");
+    m_db.transaction();
+
+    QStringList memberIds;
+    for (const auto &member : members) {
+        const QString userId = member.first;
+        if (userId.isEmpty()) {
+            continue;
+        }
+        memberIds << userId;
+        const QString personId = resolvePersonId(
+            QStringLiteral("qq"), userId, groupId);
+        if (!ensurePersonIdentity(QStringLiteral("qq"), userId, groupId,
+                                  member.second, verifiedAt)) {
+            m_db.rollback();
+            return false;
+        }
+        QSqlQuery open(m_db);
+        open.prepare("SELECT id FROM group_membership_periods "
+                     "WHERE group_id=? AND user_id=? AND valid_to IS NULL "
+                     "ORDER BY id DESC LIMIT 1");
+        open.addBindValue(groupId);
+        open.addBindValue(userId);
+        if (!open.exec()) {
+            m_db.rollback();
+            return false;
+        }
+        if (open.next()) {
+            QSqlQuery touch(m_db);
+            touch.prepare("UPDATE group_membership_periods "
+                          "SET person_id=?, last_verified_at=? WHERE id=?");
+            touch.addBindValue(personId);
+            touch.addBindValue(when);
+            touch.addBindValue(open.value(0).toLongLong());
+            if (!touch.exec()) {
+                m_db.rollback();
+                return false;
+            }
+        } else {
+            QSqlQuery insert(m_db);
+            insert.prepare("INSERT INTO group_membership_periods "
+                           "(group_id, user_id, person_id, valid_from, "
+                           " source, last_verified_at) "
+                           "VALUES (?, ?, ?, ?, 'snapshot', ?)");
+            insert.addBindValue(groupId);
+            insert.addBindValue(userId);
+            insert.addBindValue(personId);
+            insert.addBindValue(when);
+            insert.addBindValue(when);
+            if (!insert.exec()) {
+                qDebug() << "[MemoryManager]写入 membership period 失败:"
+                         << insert.lastError();
+                m_db.rollback();
+                return false;
+            }
+        }
+    }
+
+    if (memberIds.isEmpty()) {
+        QSqlQuery closeAll(m_db);
+        closeAll.prepare("UPDATE group_membership_periods SET valid_to=? "
+                         "WHERE group_id=? AND valid_to IS NULL");
+        closeAll.addBindValue(when);
+        closeAll.addBindValue(groupId);
+        if (!closeAll.exec()) {
+            m_db.rollback();
+            return false;
+        }
+    } else {
+        QStringList placeholders;
+        for (int i = 0; i < memberIds.size(); ++i) {
+            placeholders.append(QStringLiteral("?"));
+        }
+        QSqlQuery closeMissing(m_db);
+        closeMissing.prepare(QStringLiteral(
+            "UPDATE group_membership_periods SET valid_to=? "
+            "WHERE group_id=? AND valid_to IS NULL "
+            "AND user_id NOT IN (%1)").arg(placeholders.join(',')));
+        closeMissing.addBindValue(when);
+        closeMissing.addBindValue(groupId);
+        for (const QString &userId : memberIds) {
+            closeMissing.addBindValue(userId);
+        }
+        if (!closeMissing.exec()) {
+            m_db.rollback();
+            return false;
+        }
+    }
+
+    QSqlQuery snapshot(m_db);
+    snapshot.prepare("INSERT OR REPLACE INTO group_membership_snapshots "
+                     "(group_id, last_verified_at, status, last_error) "
+                     "VALUES (?, ?, 'ok', NULL)");
+    snapshot.addBindValue(groupId);
+    snapshot.addBindValue(when);
+    if (!snapshot.exec()) {
+        m_db.rollback();
+        return false;
+    }
+    if (!m_db.commit()) {
+        m_db.rollback();
+        return false;
+    }
+    return true;
+}
+
+bool MemoryManager::markGroupMembershipSnapshotFailed(
+    const QString &groupId,
+    const QString &error,
+    const QDateTime &verifiedAt)
+{
+    if (groupId.isEmpty() || (!m_db.isOpen() && !m_db.open())) {
+        return false;
+    }
+    const QString when = (verifiedAt.isValid() ? verifiedAt
+                                                : QDateTime::currentDateTime())
+                             .toString("yyyy-MM-dd HH:mm:ss");
+    QSqlQuery snapshot(m_db);
+    snapshot.prepare("INSERT OR REPLACE INTO group_membership_snapshots "
+                     "(group_id, last_verified_at, status, last_error) "
+                     "VALUES (?, ?, 'failed', ?)");
+    snapshot.addBindValue(groupId);
+    snapshot.addBindValue(when);
+    snapshot.addBindValue(error);
+    if (!snapshot.exec()) {
+        qDebug() << "[MemoryManager]标记 membership 快照失败失败:"
+                 << snapshot.lastError();
+        return false;
+    }
+    return true;
+}
+
+bool MemoryManager::hasValidGroupMembershipSnapshot(
+    const QString &groupId, int maxAgeMinutes, const QDateTime &now)
+{
+    if (groupId.isEmpty() || (!m_db.isOpen() && !m_db.open())) {
+        return false;
+    }
+    QSqlQuery query(m_db);
+    query.prepare("SELECT last_verified_at FROM group_membership_snapshots "
+                  "WHERE group_id=? AND status='ok'");
+    query.addBindValue(groupId);
+    if (!query.exec() || !query.next()) {
+        return false;
+    }
+    const QDateTime verified = query.value(0).toDateTime();
+    if (!verified.isValid()) {
+        return false;
+    }
+    const QDateTime current = now.isValid() ? now : QDateTime::currentDateTime();
+    return verified.secsTo(current) <= qMax(0, maxAgeMinutes) * 60;
+}
+
+QStringList MemoryManager::getOpenGroupMemberIds(const QString &groupId)
+{
+    QStringList ids;
+    if (groupId.isEmpty() || (!m_db.isOpen() && !m_db.open())) {
+        return ids;
+    }
+    QSqlQuery query(m_db);
+    query.prepare("SELECT user_id FROM group_membership_periods "
+                  "WHERE group_id=? AND valid_to IS NULL ORDER BY user_id");
+    query.addBindValue(groupId);
+    if (!query.exec()) {
+        return ids;
+    }
+    while (query.next()) {
+        ids.append(query.value(0).toString());
+    }
+    return ids;
+}
+
+QStringList MemoryManager::getOpenGroupsForUser(const QString &userId, int limit)
+{
+    QStringList groups;
+    if (userId.isEmpty() || (!m_db.isOpen() && !m_db.open())) {
+        return groups;
+    }
+    QSqlQuery query(m_db);
+    query.prepare("SELECT DISTINCT group_id FROM group_membership_periods "
+                  "WHERE user_id=? AND valid_to IS NULL "
+                  "ORDER BY group_id DESC LIMIT ?");
+    query.addBindValue(userId);
+    query.addBindValue(qMax(1, limit));
+    if (!query.exec()) {
+        return groups;
+    }
+    while (query.next()) {
+        groups.append(query.value(0).toString());
+    }
+    return groups;
 }
 
 void MemoryManager::seedIdentity(const QStringList &masterUserIds)
@@ -2513,6 +2765,51 @@ void MemoryManager::initDatabase(const QString &dbFilePath)
                 qDebug() << "[MemoryManager]设置数据库版本异常:" << query.lastError();
             }
             currentVersion = 8;
+            qDebug() << "[MemoryManager]数据库结构升级完成,版本:" << currentVersion;
+        }
+
+        // ============== v9: 群成员关系快照（PR-3.2a） ==============
+        if (currentVersion < 9) {
+            qDebug() << "[MemoryManager]正在升级数据库结构至 v9(membership):";
+            const QString createPeriods = R"(
+                CREATE TABLE IF NOT EXISTS group_membership_periods (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    group_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    person_id TEXT,
+                    valid_from DATETIME NOT NULL,
+                    valid_to DATETIME,
+                    source TEXT NOT NULL,
+                    last_verified_at DATETIME,
+                    UNIQUE(group_id, user_id, valid_from)
+                );
+            )";
+            if (!query.exec(createPeriods)) {
+                throw query.lastError();
+            }
+            if (!query.exec("CREATE INDEX IF NOT EXISTS idx_membership_group_user "
+                            "ON group_membership_periods(group_id, user_id, valid_to)")) {
+                throw query.lastError();
+            }
+            if (!query.exec("CREATE INDEX IF NOT EXISTS idx_membership_person "
+                            "ON group_membership_periods(person_id, group_id)")) {
+                throw query.lastError();
+            }
+            const QString createSnapshots = R"(
+                CREATE TABLE IF NOT EXISTS group_membership_snapshots (
+                    group_id TEXT PRIMARY KEY,
+                    last_verified_at DATETIME,
+                    status TEXT NOT NULL,
+                    last_error TEXT
+                );
+            )";
+            if (!query.exec(createSnapshots)) {
+                throw query.lastError();
+            }
+            if (!query.exec("PRAGMA user_version = 9")) {
+                qDebug() << "[MemoryManager]设置数据库版本异常:" << query.lastError();
+            }
+            currentVersion = 9;
             qDebug() << "[MemoryManager]数据库结构升级完成,版本:" << currentVersion;
         }
 

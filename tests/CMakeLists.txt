@@ -76,6 +76,18 @@ add_phase0_test(tst_recentcontext
     ${PROJECT_SOURCE_DIR}/recentcontext.cpp
 )
 
+add_phase0_test(tst_memorytextutils
+    tst_memorytextutils.cpp
+    ${PROJECT_SOURCE_DIR}/memorytextutils.h
+)
+
+add_phase0_test(tst_memoryaccesspolicy
+    tst_memoryaccesspolicy.cpp
+    ${PROJECT_SOURCE_DIR}/memoryaccesspolicy.h
+    ${PROJECT_SOURCE_DIR}/memoryaccesspolicy.cpp
+    ${PROJECT_SOURCE_DIR}/historyturn.h
+)
+
 add_phase0_test(tst_interactionsegmenter
     tst_interactionsegmenter.cpp
     ${PROJECT_SOURCE_DIR}/interactionsegmenter.h

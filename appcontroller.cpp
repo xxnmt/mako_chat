@@ -17,6 +17,7 @@
 #include "qqchanneladapter.h"
 #include "sessionrouter.h"
 #include "qqprotocolclient.h"
+#include "groupmembershipservice.h"
 #include "qqmessageparser.h"
 #include "qqreplypolicy.h"
 #include "memorypolicy.h"
@@ -101,6 +102,9 @@ AppController::AppController(QObject *parent)
     m_qqClient = new QQProtocolClient(this);
     m_qqClient->setConfig(ConfigManager::instance().getQQConfig());
     m_qqChannel->setClient(m_qqClient);
+    m_membershipService = new GroupMembershipService(
+        m_memoryManager, m_qqClient, this);
+    m_membershipService->start();
     connect(m_qqClient, &QQProtocolClient::messageEvent, this,
             [this](const QJsonObject &event) {
         if (QQMessageParser::isSelfMessage(event)) {

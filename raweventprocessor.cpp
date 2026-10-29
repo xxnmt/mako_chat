@@ -3,6 +3,7 @@
 #include "configmanager.h"
 #include "llmservice.h"
 #include "memorymanager.h"
+#include "memorytextutils.h"
 
 #include <QDateTime>
 #include <QDebug>
@@ -168,6 +169,8 @@ void RawEventProcessor::onSummaryReady(qlonglong interactionId,
                             QStringLiteral("@某位成员"));
         safeSummary.replace(QRegularExpression(QStringLiteral("\\b\\d{5,}\\b")),
                             QStringLiteral("[成员]"));
+        safeSummary = MemoryTextUtils::replaceSpeakerLabels(
+            safeSummary, QHash<QString, QString>());
 
         QJsonArray safeSegments;
         const QJsonArray rawSegments = QJsonDocument::fromJson(
@@ -184,6 +187,8 @@ void RawEventProcessor::onSummaryReady(qlonglong interactionId,
                          QStringLiteral("@某位成员"));
             text.replace(QRegularExpression(QStringLiteral("\\b\\d{5,}\\b")),
                          QStringLiteral("[成员]"));
+            text = MemoryTextUtils::replaceSpeakerLabels(
+                text, QHash<QString, QString>());
             if (text.trimmed().isEmpty()) {
                 continue;
             }
@@ -207,7 +212,8 @@ void RawEventProcessor::onSummaryReady(qlonglong interactionId,
                 obj.value("privacy_owner_person_id").toString();
             claim.counterpartPersonId =
                 obj.value("counterpart_person_id").toString();
-            claim.statement = claimSanitized.text;
+            claim.statement = MemoryTextUtils::replaceSpeakerLabels(
+                claimSanitized.text, QHash<QString, QString>());
             claim.privacyLevel = qBound(1, obj.value("privacy_level").toInt(1), 5);
             claim.claimStatus = obj.value("claim_status").toString(
                 QStringLiteral("quarantine"));

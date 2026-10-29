@@ -101,6 +101,7 @@ public:
                                           const QString &status);
     bool markInteractionSummaryFailed(qlonglong id);
     QList<ClaimDraft> getClaimsForInteraction(qlonglong interactionId);
+    QList<MemoryClaim> getActiveClaims(int limit);
     QList<InteractionSummary> getRecentInteractionSummaries(const QString &channel,
                                                             const QString &sessionId,
                                                             int limit);
@@ -126,6 +127,20 @@ public:
     QStringList getPersonAliases(const QString &personId,
                                  const QString &groupId,
                                  int limit);
+
+    // PR-3.2a: 群成员关系快照
+    bool replaceGroupMembershipSnapshot(
+        const QString &groupId,
+        const QList<QPair<QString, QString>> &members,
+        const QDateTime &verifiedAt);
+    bool markGroupMembershipSnapshotFailed(const QString &groupId,
+                                           const QString &error,
+                                           const QDateTime &verifiedAt);
+    bool hasValidGroupMembershipSnapshot(const QString &groupId,
+                                         int maxAgeMinutes,
+                                         const QDateTime &now = QDateTime());
+    QStringList getOpenGroupMemberIds(const QString &groupId);
+    QStringList getOpenGroupsForUser(const QString &userId, int limit);
 
 //蒸馏游标（memory_cursor）：每 channel+session 一条；Phase 1 蒸馏接线时使用
     bool updateMemoryCursor(const QString &channel, const QString &sessionId,

@@ -161,6 +161,7 @@ void QQProtocolClient::onTextMessageReceived(const QString &message)
     if (obj.contains("echo")) {
         const QString echo = obj.value("echo").toString();
         const bool ok = obj.value("status").toString() == QStringLiteral("ok");
+        emit actionResponse(echo, obj.value("data"), obj.value("retcode").toInt());
         if (echo == QStringLiteral("login")) {
             const QJsonObject data = obj.value("data").toObject();
             qDebug() << "[QQ]登录账号:" << data.value("user_id").toVariant().toString()
