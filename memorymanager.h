@@ -105,6 +105,15 @@ public:
     QList<InteractionSummary> getRecentInteractionSummaries(const QString &channel,
                                                             const QString &sessionId,
                                                             int limit);
+    QList<InteractionSummary> getInteractionSummariesInRange(
+        const QString &channel,
+        const QString &sessionId,
+        const QDateTime &from,
+        const QDateTime &to,
+        int limit);
+    QString getGroupDisplayName(const QString &groupId);
+    QList<qlonglong> getFailedInteractionsWithUnsafeParticipantNames(int limit = 100);
+    bool resetInteractionSummaryForRetry(qlonglong interactionId);
 
     // PR-2.1: 只读近期群聊上下文检索
     QStringList getRecentGroupIds(const QStringList &allowedGroupIds,

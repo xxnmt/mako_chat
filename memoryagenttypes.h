@@ -10,10 +10,12 @@
 #include <algorithm>
 
 #include "memoryaccesspolicy.h"
+#include "memoryrecalltypes.h"
 #include "recentcontext.h"
 
-// PR-4：MemoryAgent 的服务端作用域。所有字段由 LLMService 在服务端构建，
-// 模型只能通过工具参数提供 query/kinds/limit/ids，不能覆盖 viewer/owner/location。
+// MemoryAgent 的服务端作用域。所有字段由 LLMService 在服务端构建；
+// Planner 只能提供 query/kinds/source_hint/time.expression，不能覆盖
+// viewer/owner/location/allowed_groups。
 struct MemoryAgentScope {
     QString requestId;
     QString channel;
@@ -24,8 +26,11 @@ struct MemoryAgentScope {
     bool membershipVerified = false;
     bool membershipFailed = false;
     int maxResults = 8;
-    int timeoutMs = 2500;
-    int maxRounds = 3;
+    int timeoutMs = 6000;
+    int maxRounds = 2;
+    bool planV2 = true;
+    QString timezone;
+    QList<PlannerTurn> recentTurns;
     MemoryAccessContext access;
     RecentContextQuery recentQueryTemplate;
 };
@@ -37,18 +42,21 @@ struct MemoryAgentItem {
     QString text;
     QDateTime time;
     QString source;             // current_group / allowed_group / internal
+    QString groupLabel;         // 可展示的群名，不含原始群号
     QString personId;
     qlonglong rawEventId = -1;
     qlonglong interactionId = -1;
     qlonglong claimId = -1;
     QString sourceSessionId;    // 仅服务端内部使用，不进入工具结果
+    QStringList matchedNeedIds; // 本次 run 内命中的 need，不暴露数据库 ID
     bool isViewer = false;
 };
 
 struct MemoryAgentResult {
     QList<MemoryAgentItem> items;
+    QList<MemoryNeedResult> needs;
     bool truncated = false;
-    QString status;             // ok / timeout / failed / empty
+    QString status;             // ok / partial / timeout / failed / empty
 };
 
 struct MemoryAgentAudit {

@@ -2,7 +2,7 @@
 
 > 项目：Windows_AI 桌面看板娘（桌宠）
 > 版本：v0.7.0-rc6-dev + Phase 0/0.5 + Phase 1（记忆库 v9 / R3）
-> 更新日期：2026-10-29
+> 更新日期：2026-10-31
 
 ---
 
@@ -34,7 +34,11 @@
 | | InteractionSegmenter | 按会话/时间窗/reply 链切分交互片段 | interactionsegmenter.h/cpp |
 | | RecentContextPlanner | 近期群聊检索模式、预算、allowedGroups、viewer 过滤 | recentcontext.h/cpp |
 | | MemoryAccessPolicy | claims 四态授权：shareable/owner_candidate/known_only/forbidden | memoryaccesspolicy.h/cpp |
-| | MemoryAgent | QQ 记忆问句的只读检索规划器与工具；超时回退 top-k | memoryagent.h/cpp, memoryagenttypes.h |
+| | MemoryAgent | QQ 记忆问句的 Planner；v2 输出多 need，保留旧工具循环回退 | memoryagent.h/cpp, memoryagenttypes.h |
+| | MemoryRecallPlan | 多 need 契约、状态与校验 | memoryrecalltypes.h/cpp |
+| | MemoryTimeResolver | 单个时间表达的独立解析与 interpretation | memorytimeresolver.h/cpp |
+| | MemoryExecutor | 多 need 确定性检索、去重、partial/审计 | memoryexecutor.h/cpp |
+| | MemoryTimeRangePlanner | 旧规则 fallback（仅非 v2/无 time 时） | memorytimerange.h/cpp |
 | | MemoryOutputGuard | 最终输出隐私检查、一次安全重试 | memoryoutputguard.h/cpp |
 | | MemoryTextUtils | 内部 P1/P2 speaker 标签替换与检测 | memorytextutils.h |
 | | GlobalMoodState | 全局情绪（emotion/blush/distance）；D1 控制外部情绪是否驱动桌宠立绘 | globalmoodstate.h/cpp |
@@ -1274,7 +1278,7 @@ QQ event
       → memory_claims（默认 quarantine）
   → MemoryAccessPolicy（shareable / owner_candidate / known_only / forbidden）
   → RecentContextPlanner / searchRecentGroupContext（只读时间窗）
-  → MemoryAgent（仅 QQ 记忆问句；只读三工具，超时回退）
+  → MemoryAgent（Planner needs → Resolver → Executor；旧工具循环回退）
   → PromptAssembler（独立 MEMORY_DATA / RECENT_GROUP_CONTEXT / MEMORY_AGENT_DATA / VIEWER_IDENTITY）
   → LLMService
   → MemoryOutputGuard
@@ -1303,32 +1307,59 @@ QQ event
 - `agent_trigger=always`，或问题命中历史/记忆线索（上次/之前/记得/聊过/谁/昵称等）。
 - pet 永不进入；普通 QQ 闲聊默认不进入。
 
-**工具**：
-| 工具 | 参数 | 作用 |
-|------|------|------|
-| `memory_search` | `query` / `kinds(recent,summary,claim)` / `limit` | 当前群或允许群的近期消息、interaction summary、shareable claims |
-| `memory_read` | `ids` | 读取本次 run 已返回的句柄，最多 8 个 |
-| `memory_related` | `id` / `limit` | 同 session/同 interaction 的已授权关联条目 |
+**v2 Planner 输出**：
+```json
+{
+  "needs": [
+    {
+      "id": "need-1",
+      "query": "昨晚群聊内容",
+      "kinds": ["recent", "summary", "claim"],
+      "source_hint": "current_group",
+      "time": {"expression": "昨晚", "target": "message_time"}
+    }
+  ]
+}
+```
+
+约束：最多 4 个 need；一个 need 一个独立回忆目标；`time.expression` 是用户原文，Planner 不生成 ISO；不接受 `from/to` 或任何权限字段。
+
+**时间目标**：
+| target | 执行 |
+|---|---|
+| `message_time` | `MemoryTimeResolver` 解析后过滤 `occurred_at` / interaction 时间 |
+| `event_time` | 当前无独立事件时间索引；明确标记 `event_time_message_time_fallback`，按消息时间检索并返回 `fallback`，不声称是事件时间 |
+| `fact_validity` | 当前未接入 claim 有效时间索引，返回 `unsupported` |
+
+**Resolver**：`MemoryTimeResolver` 只解析单个 expression，支持“昨晚 / 上周三晚上 / 今天下午”等；半开区间 `[from,to)`；凌晨的“今天下午”标记 `previous_completed_period`；无法解析返回 `unresolved`。
+
+**Executor**：`MemoryExecutor` 按 need 调用现有只读检索，最多 4 个 need、每个 8 条、总计 16 条；同一结果被多个 need 命中时保留 `matched_need_ids`；每个 need 独立 `success/empty/unresolved/unsupported/denied/error`；整体可为 `partial`。
+
+**最近对话**：Planner 输入包含最近 4 轮、最多约 1200 字符的 `recent_turns`。历史只用于理解指代/纠正，不是记忆事实证据。
+
+**兼容路径**：`agent_plan_v2=false` 时仍使用旧 `tool_calls` / `memory_search` 工具循环；v2 Planner 也接受旧 `tool_calls` 作为回退，但默认优先 needs。
 
 **硬约束**：
-- 工具 schema 不包含 viewer/owner/location/channel/session/allowed_groups；这些由 `MemoryAgentScope` 服务端绑定。
-- `memory_read` / `memory_related` 只接受本次 run 的句柄，不能直接读数据库 ID。
-- 工具结果只使用脱敏文本；blocked 不进入；claims 只返回 `shareable`。
-- Agent 只读；无 append/update/delete 调用。
+- Planner 不输出 viewer/owner/location/channel/session/allowed_groups；scope 由服务端绑定。
+- 时间范围只能缩小检索，不能扩大群/viewer 权限。
+- 工具结果只使用脱敏文本；claims 只返回 `shareable`。
+- 无 append/update/delete 调用。
 
 **流程**：
 ```
 LLMService::askDeepSeek
-  → 构建 baseline top-k / scope
+  → 构建 scope + recent_turns + current_time
   → MemoryAgentPlanner::shouldRun
-  → MemoryAgent::start (JSON planner, 最多 N 轮)
-       → MemoryAgentTools::execute (本地只读)
-       → [TOOL_RESULTS] 回填
-  → finished: PromptAssembler::buildAgentDataMessage → 主回复
-  → failed/timeout/empty: 原 top-k + 回退提示 → 主回复
+  → MemoryAgent::start
+       → Planner 输出 needs（或旧 tool_calls）
+       → TimeResolver（每个 need）
+       → MemoryExecutor（确定性检索、去重、per-need 状态）
+  → PromptAssembler::buildAgentDataMessage
+       → items + matched_need_ids + needs 状态 + partial
+  → 主回复模型
 ```
 
-**审计/指标**：`MemoryAgentAudit { requestId, channel, tool, argsHash, queryLength, resultCount, latencyMs, status }`；进程内保留最近 200 条；`MemoryAgentMetrics` 提供 P50/P95，不持久化原文。持久化审计与 UI 留给 PR-5。
+**审计/指标**：每个 need 记录 `need`、query hash、expression、resolved range、target、status、耗时；进程内保留最近 200 条；P50/P95；不持久化原文。持久化审计与 UI 留给 PR-5。
 
 ---
 
@@ -1545,7 +1576,7 @@ image/
 
 | 阶段 | 版本 | 内容 |
 |------|------|------|
-| 当前 | v0.7.0-rc6-dev | Phase 1 QQ 文本 + 记忆 v5 R3：interactions/claims/persons/membership、近期群聊上下文、输出保护、MemoryAgent；15 套件 / 132 用例 |
+| 当前 | v0.7.0-rc6-dev | Phase 1 QQ 文本 + 记忆 v5 R3：interactions/claims/persons/membership、近期群聊上下文、输出保护、多 need MemoryAgent；15 套件 / 145 用例 |
 | 已完成 | Phase 0 / 0.5 | 大脑/渠道解耦：Utterance/IChannelAdapter/SessionRouter、DB v2/v3、identity.json、raw_events/memory_cursor |
 | 下一步 | PR-5 | 留存 UI、保留期、observe-only、清理/删除传播 |
 | 中期 | Phase 1 剩余 | QQ 语音/图片/表情包、群聊滑动窗口 |

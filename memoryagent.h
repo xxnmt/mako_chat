@@ -23,7 +23,8 @@ class QTimer;
 class MemoryAgentTools
 {
 public:
-    MemoryAgentTools(MemoryManager *memoryManager, const MemoryAgentScope &scope);
+    MemoryAgentTools(MemoryManager *memoryManager, const MemoryAgentScope &scope,
+                     bool useQueryTimeFallback = true);
 
     static QJsonArray toolDefinitions();
 
@@ -39,6 +40,7 @@ private:
     QJsonObject search(const QJsonObject &args, QString *error);
     QJsonObject read(const QJsonObject &args, QString *error);
     QJsonObject related(const QJsonObject &args, QString *error);
+    QString groupLabelFor(const QString &groupId);
 
     void remember(const MemoryAgentItem &item);
     QJsonObject itemToJson(const MemoryAgentItem &item) const;
@@ -48,11 +50,13 @@ private:
     MemoryAgentScope m_scope;
     QHash<QString, MemoryAgentItem> m_cache;
     QList<MemoryAgentItem> m_ordered;
+    QHash<QString, QString> m_groupNames;
+    bool m_useQueryTimeFallback = true;
     bool m_truncated = false;
 };
 
-// PR-4：只读检索规划器。先由 planner 决定调用哪些工具，工具在本地执行，
-// 结果再回填给 planner；最终结果交给主回复模型，不直接生成用户回复。
+// 只读检索规划器。v2 由 planner 输出多 need，服务端 Resolver/Executor
+// 一次性检索；同时保留旧 tool_calls 路径作为兼容回退。
 class MemoryAgent : public QObject
 {
     Q_OBJECT
@@ -87,7 +91,9 @@ private:
     void handlePlannerReply(bool ok, const QJsonObject &content,
                             const QString &error);
     void executeToolCalls(const QJsonArray &toolCalls);
-    void finishWithStatus(const QString &status);
+    void executePlan(const MemoryRecallPlan &plan);
+    void finishWithStatus(const QString &status, bool timedOut = false);
+    void finishWithResult(MemoryAgentResult result, bool timedOut = false);
     void failRun(const QString &reason, bool timedOut = false);
     void appendAudit(const QString &tool, const QJsonObject &args,
                      int resultCount, int latencyMs, const QString &status);

@@ -22,6 +22,7 @@ struct RecentContextQuery {
     QString queryText;
     RecentContextMode mode = RecentContextMode::RecentOverview;
     QDateTime since;
+    QDateTime until; // 可选半开区间上界，用于“下午/昨天”等时间检索
     int perGroupCandidateLimit = 50;
     int maxGroups = 2;
     int itemLimit = 10;

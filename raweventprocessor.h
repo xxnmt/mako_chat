@@ -38,11 +38,13 @@ private:
     void scan();
     void processSession(const QString &sessionId);
     void processPendingSummaries();
+    void recoverUnsafeSummaryInteractions();
 
     MemoryManager *m_memoryManager = nullptr;
     LLMService *m_llmService = nullptr;
     QTimer *m_timer = nullptr;
     bool m_summaryInFlight = false;
+    bool m_recoveredUnsafeSummaries = false;
 };
 
 #endif // RAWEVENTPROCESSOR_H

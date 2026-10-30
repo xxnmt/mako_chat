@@ -8,6 +8,7 @@
 #include <QStringList>
 
 #include "memoryagenttypes.h"
+#include "memorytextutils.h"
 
 namespace {
 
@@ -282,8 +283,9 @@ QJsonObject PromptAssembler::buildRecentContextMessage(
         json["group"] = item.sourceGroupId;
         json["time"] = item.occurredAt.toString("yyyy-MM-dd HH:mm:ss");
         json["person_id"] = item.personId;
-        json["sender"] = item.senderDisplayName;
-        json["text"] = item.sanitizedText;
+        json["sender"] = MemoryTextUtils::sanitizeIdentityText(
+            item.senderDisplayName, QStringLiteral("群友"));
+        json["text"] = MemoryTextUtils::sanitizePromptText(item.sanitizedText);
         json["warm"] = item.warm;
         json["is_viewer"] = item.isViewer;
         items.append(json);
@@ -342,7 +344,14 @@ QJsonObject PromptAssembler::buildAgentDataMessage(
                            : QString();
         json["text"] = text;
         json["source"] = item.source;
+        if (!item.groupLabel.isEmpty()) {
+            json["group"] = MemoryTextUtils::sanitizeIdentityText(
+                item.groupLabel, QStringLiteral("群聊"));
+        }
         json["is_viewer"] = item.isViewer;
+        if (!item.matchedNeedIds.isEmpty()) {
+            json["matched_need_ids"] = QJsonArray::fromStringList(item.matchedNeedIds);
+        }
         items.append(json);
         used += text.size();
     }
@@ -351,8 +360,25 @@ QJsonObject PromptAssembler::buildAgentDataMessage(
     }
 
     QJsonObject payload;
+    payload["partial"] = result.status == QStringLiteral("timeout")
+                         || result.status == QStringLiteral("partial");
     payload["truncated"] = truncated;
     payload["items"] = items;
+    if (!result.needs.isEmpty()) {
+        QJsonArray needs;
+        for (const MemoryNeedResult &need : result.needs) {
+            QJsonObject needJson;
+            needJson["id"] = need.needId;
+            needJson["status"] = need.status;
+            needJson["target"] = memoryTimeTargetToString(need.timeTarget);
+            if (!need.interpretation.isEmpty()) {
+                needJson["interpretation"] = need.interpretation;
+            }
+            needJson["result_count"] = need.resultCount;
+            needs.append(needJson);
+        }
+        payload["needs"] = needs;
+    }
 
     QJsonObject message;
     message["role"] = "user";
@@ -378,17 +404,29 @@ QString PromptAssembler::buildViewerIdentityBlock(
     const bool owner = meta.subject == QStringLiteral("user");
     QStringList aliases;
     if (!meta.speaker.isEmpty()) {
-        aliases << meta.speaker;
+        const QString alias = MemoryTextUtils::sanitizeIdentityText(
+            meta.speaker, QStringLiteral("对方"));
+        if (!aliases.contains(alias)) {
+            aliases << alias;
+        }
     }
-    for (const QString &alias : knownAliases) {
-        if (!alias.isEmpty() && !aliases.contains(alias)) {
+    for (const QString &rawAlias : knownAliases) {
+        if (rawAlias.isEmpty()) {
+            continue;
+        }
+        const QString alias = MemoryTextUtils::sanitizeIdentityText(
+            rawAlias, QStringLiteral("对方"));
+        if (!aliases.contains(alias)) {
             aliases << alias;
         }
     }
     for (const RecentContextItem &item : recentContext.items) {
-        if (item.isViewer && !item.senderDisplayName.isEmpty()
-            && !aliases.contains(item.senderDisplayName)) {
-            aliases << item.senderDisplayName;
+        if (item.isViewer && !item.senderDisplayName.isEmpty()) {
+            const QString alias = MemoryTextUtils::sanitizeIdentityText(
+                item.senderDisplayName, QStringLiteral("对方"));
+            if (!aliases.contains(alias)) {
+                aliases << alias;
+            }
         }
     }
 
@@ -398,7 +436,9 @@ QString PromptAssembler::buildViewerIdentityBlock(
     }
     block += owner
                  ? QStringLiteral("- 当前对话用户：主人（owner）。\n")
-                 : QStringLiteral("- 当前对话用户：%1。\n").arg(meta.speaker);
+                 : QStringLiteral("- 当前对话用户：%1。\n")
+                       .arg(MemoryTextUtils::sanitizeIdentityText(
+                           meta.speaker, QStringLiteral("对方")));
     if (owner) {
         block += QStringLiteral("- 对主人的称呼：欧尼酱。\n");
     }

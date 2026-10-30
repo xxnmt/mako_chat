@@ -67,7 +67,8 @@ private:
     void sendChatRequest(const QJsonArray &messages);
     void sendSafeRetry();
     void sendEmptyReplyRetry();
-    void sendPendingReply(const QJsonObject &agentMessage = QJsonObject());
+    void sendPendingReply(const QJsonObject &agentMessage = QJsonObject(),
+                          bool partial = false);
 
     QPair<QList<SentenceText>, QString> parseJsonReply(const QString &replyText);
 

@@ -2,7 +2,7 @@
 
 > 项目：Windows_AI 桌面看板娘（桌宠）
 > 版本：v0.7.0-rc6-dev（Phase 0/0.5、Phase 1 前置、QQ 文本、记忆系统 v5 R3 + PR-4 MemoryAgent 完成）
-> 更新日期：2026-10-29
+> 更新日期：2026-10-31
 
 ---
 
@@ -241,10 +241,10 @@
 - [x] **PR-3.2a.1 成员关系生命周期**：定时刷新、入群/退群 notice、pending 去重与 10 秒超时
 - [ ] **PR-3.2b Claims 授权**：四态 `MemoryAccessPolicy`、保守激活、只注入 shareable —— 已实现并通过单测，**待手工验收**
 - [ ] **PR-3.2c 跨群**：Owner 允许群 / 非 Owner 共同群、viewer 过滤、非共同群 fail closed —— 已实现并通过单测，**待手工验收**
-- [x] **PR-4 MemoryAgent**：只读 `memory_search` / `memory_read` / `memory_related`，QQ 记忆问句触发，超时回退 top-k，工具审计与 P95
+- [x] **PR-4 MemoryAgent**：QQ 记忆问句触发；v2 Planner 输出多 need，Resolver 独立解析时间，Executor 去重并保留 per-need partial；旧 tool_calls 路径仍可回退
 - [ ] **PR-5 留存 UI 与生命周期**：保留期、observe-only、规则 UI、清理/删除传播 —— **下一项**
 
-**当前基线**：数据库 `user_version=9`（14 张表）；15 个 CTest 套件 / 132 个测试函数全绿。不引入向量库。
+**当前基线**：数据库 `user_version=9`（14 张表）；15 个 CTest 套件 / 145 个测试函数全绿。不引入向量库。
 
 ### v0.7.0 - 架构改进 & 独立存档
 **状态**：📋 待开始
@@ -532,12 +532,12 @@ v0.9.0  ░░░░░░░░░░░░░░░░░░░░   0%  智�
 
 ---
 
-## 近期任务（Next Up，2026-10-29 更新）
+## 近期任务（Next Up，2026-10-31 更新）
 
 1. **R3 封版验收**
    - 3.2b：claim 三主体激活/隔离；非 shareable 不进入 `MEMORY_DATA`
    - 3.2c：非 Owner 私聊共同群；跨群只返回 viewer 自己可披露的表达；快照失败 fail closed
-   - PR-4：QQ 记忆问句触发、pet 不触发、超时回退、审计无原文
+   - PR-4：QQ 记忆问句触发、pet 不触发、时间范围召回、partial timeout、审计无原文
 2. **PR-5 留存 UI 与生命周期**
    - 群保留期、observe-only、规则 UI、记忆清理、删除传播
 3. **Phase 1 主体剩余**

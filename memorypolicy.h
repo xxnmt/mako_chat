@@ -47,9 +47,10 @@ struct RecentContextConfig {
 
 struct MemoryAgentConfig {
     bool enabled = true;
+    bool planV2 = true;
     QString trigger = QStringLiteral("memory_question"); // memory_question / always
-    int timeoutMs = 2500;
-    int maxRounds = 3;
+    int timeoutMs = 6000;
+    int maxRounds = 2;
     int maxResults = 8;
 };
 

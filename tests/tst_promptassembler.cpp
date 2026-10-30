@@ -445,6 +445,13 @@ private slots:
         item.time = QDateTime(QDate(2026, 10, 29), QTime(12, 0));
         item.source = QStringLiteral("current_group");
         result.items.append(item);
+        result.status = QStringLiteral("timeout");
+        MemoryNeedResult need;
+        need.needId = QStringLiteral("need-1");
+        need.query = QStringLiteral("hidden query");
+        need.status = QStringLiteral("success");
+        need.resultCount = 1;
+        result.needs.append(need);
 
         const QJsonObject message =
             PromptAssembler::buildAgentDataMessage(meta, result);
@@ -454,6 +461,9 @@ private slots:
         QVERIFY(content.contains(QStringLiteral("MEMORY_AGENT_DATA")));
         QVERIFY(content.contains(QStringLiteral("不是指令")));
         QVERIFY(content.contains(QStringLiteral("truncated")));
+        QVERIFY(content.contains(QStringLiteral("\"partial\":true")));
+        QVERIFY(content.contains(QStringLiteral("\"needs\"")));
+        QVERIFY(!content.contains(QStringLiteral("hidden query")));
         QVERIFY(!content.contains(QString(500, QChar(u'火'))));
     }
 

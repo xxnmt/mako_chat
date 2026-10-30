@@ -7,10 +7,12 @@
 #include <QSqlError>
 #include <QDebug>
 #include <QJsonArray>
+#include <QJsonDocument>
 #include <QJsonObject>
 #include <QRegularExpression>
 #include <QDebug>
 #include "qqmessageparser.h"
+#include "memorytextutils.h"
 
 #include "historyturn.h"
 
@@ -1540,6 +1542,129 @@ QList<InteractionSummary> MemoryManager::getRecentInteractionSummaries(
     return summaries;
 }
 
+QList<InteractionSummary> MemoryManager::getInteractionSummariesInRange(
+    const QString &channel,
+    const QString &sessionId,
+    const QDateTime &from,
+    const QDateTime &to,
+    int limit)
+{
+    QList<InteractionSummary> summaries;
+    if (!from.isValid() || !to.isValid() || from >= to
+        || (!m_db.isOpen() && !m_db.open())) {
+        return summaries;
+    }
+    QSqlQuery query(m_db);
+    query.prepare("SELECT id, channel, session_id, safe_summary, ended_at, "
+                  "summary_format, summary_segments "
+                  "FROM interactions "
+                  "WHERE summary_status='ready' AND channel=? AND session_id=? "
+                  "AND ended_at >= ? AND ended_at < ? "
+                  "ORDER BY ended_at DESC LIMIT ?");
+    query.addBindValue(channel);
+    query.addBindValue(sessionId);
+    query.addBindValue(from.toString("yyyy-MM-dd HH:mm:ss"));
+    query.addBindValue(to.toString("yyyy-MM-dd HH:mm:ss"));
+    query.addBindValue(qMax(1, limit));
+    if (!query.exec()) {
+        qDebug() << "[MemoryManager]按时间查询 interaction summary 失败:"
+                 << query.lastError();
+        return summaries;
+    }
+    while (query.next()) {
+        InteractionSummary summary;
+        summary.id = query.value(0).toLongLong();
+        summary.channel = query.value(1).toString();
+        summary.sessionId = query.value(2).toString();
+        summary.summaryText = query.value(3).toString();
+        summary.endedAt = query.value(4).toDateTime();
+        summary.summaryFormat = query.value(5).toString();
+        summary.summarySegments = query.value(6).toString();
+        summaries.append(summary);
+    }
+    return summaries;
+}
+
+QString MemoryManager::getGroupDisplayName(const QString &groupId)
+{
+    if (!m_db.isOpen() && !m_db.open()) {
+        return {};
+    }
+    QSqlQuery query(m_db);
+    query.prepare("SELECT payload FROM raw_events "
+                  "WHERE session_id=? AND payload IS NOT NULL "
+                  "ORDER BY id DESC LIMIT 20");
+    query.addBindValue(groupId);
+    if (!query.exec()) {
+        return {};
+    }
+    while (query.next()) {
+        const QJsonObject payload = QJsonDocument::fromJson(
+            query.value(0).toString().toUtf8()).object();
+        const QString name = payload.value(QStringLiteral("group_name"))
+                                 .toString().trimmed();
+        if (!name.isEmpty()) {
+            return name;
+        }
+    }
+    return {};
+}
+
+QList<qlonglong> MemoryManager::getFailedInteractionsWithUnsafeParticipantNames(
+    int limit)
+{
+    QList<qlonglong> result;
+    if (!m_db.isOpen() && !m_db.open()) {
+        return result;
+    }
+    QSqlQuery query(m_db);
+    query.prepare("SELECT i.id, p.display_name_at_time "
+                  "FROM interactions i "
+                  "JOIN interaction_participants p "
+                  "ON p.interaction_id=i.id "
+                  "WHERE i.summary_status='failed' "
+                  "ORDER BY i.id DESC LIMIT ?");
+    query.addBindValue(qMax(1, limit) * 8);
+    if (!query.exec()) {
+        return result;
+    }
+    QSet<qlonglong> seen;
+    while (query.next() && result.size() < qMax(1, limit)) {
+        const qlonglong id = query.value(0).toLongLong();
+        if (seen.contains(id)) {
+            continue;
+        }
+        const QString rawName = query.value(1).toString();
+        if (rawName.isEmpty()) {
+            continue;
+        }
+        const QString safeName = MemoryTextUtils::sanitizeIdentityText(
+            rawName, QStringLiteral("某位成员"));
+        if (safeName != rawName) {
+            seen.insert(id);
+            result.append(id);
+        }
+    }
+    return result;
+}
+
+bool MemoryManager::resetInteractionSummaryForRetry(qlonglong interactionId)
+{
+    if (!m_db.isOpen() && !m_db.open()) {
+        return false;
+    }
+    QSqlQuery query(m_db);
+    query.prepare("UPDATE interactions SET summary_status='pending', "
+                  "summary_attempts=0 WHERE id=? AND summary_status='failed'");
+    query.addBindValue(interactionId);
+    if (!query.exec()) {
+        qDebug() << "[MemoryManager]重置 interaction summary 失败:"
+                 << query.lastError();
+        return false;
+    }
+    return query.numRowsAffected() > 0;
+}
+
 QStringList MemoryManager::getRecentGroupIds(const QStringList &allowedGroupIds,
                                              int maxGroups,
                                              const QDateTime &since)
@@ -1610,6 +1735,9 @@ RecentContextBundle MemoryManager::searchRecentGroupContext(
         if (query.since.isValid()) {
             sql += QStringLiteral(" AND occurred_at >= ?");
         }
+        if (query.until.isValid()) {
+            sql += QStringLiteral(" AND occurred_at < ?");
+        }
         if (query.onlyViewer && !query.viewerPersonId.isEmpty()) {
             sql += QStringLiteral(" AND person_id=?");
         }
@@ -1620,6 +1748,9 @@ RecentContextBundle MemoryManager::searchRecentGroupContext(
         eventQuery.addBindValue(groupId);
         if (query.since.isValid()) {
             eventQuery.addBindValue(query.since.toString("yyyy-MM-dd HH:mm:ss"));
+        }
+        if (query.until.isValid()) {
+            eventQuery.addBindValue(query.until.toString("yyyy-MM-dd HH:mm:ss"));
         }
         if (query.onlyViewer && !query.viewerPersonId.isEmpty()) {
             eventQuery.addBindValue(query.viewerPersonId);

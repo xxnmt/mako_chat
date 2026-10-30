@@ -222,9 +222,10 @@ private slots:
         QCOMPARE(policy.recentContext.targetedCharBudget, 1200);
         QCOMPARE(policy.recentContext.overviewCharBudget, 2200);
         QVERIFY(policy.agent.enabled);
+        QVERIFY(policy.agent.planV2);
         QCOMPARE(policy.agent.trigger, QStringLiteral("memory_question"));
-        QCOMPARE(policy.agent.timeoutMs, 2500);
-        QCOMPARE(policy.agent.maxRounds, 3);
+        QCOMPARE(policy.agent.timeoutMs, 6000);
+        QCOMPARE(policy.agent.maxRounds, 2);
         QCOMPARE(policy.agent.maxResults, 8);
 
         const QQGroupMemoryConfig groups = cfg.getQQGroupMemoryConfig();
@@ -260,6 +261,7 @@ private slots:
         recent.insert("warm_line_max_chars", 18);
         memory.insert("recent_group_context", recent);
         memory.insert("agent_enabled", false);
+        memory.insert("agent_plan_v2", false);
         memory.insert("agent_trigger", QStringLiteral("always"));
         memory.insert("agent_timeout_ms", 4000);
         memory.insert("agent_max_rounds", 4);
@@ -316,6 +318,7 @@ private slots:
         QCOMPARE(policy.recentContext.targetedCharBudget, 500);
         QCOMPARE(policy.recentContext.overviewCharBudget, 900);
         QVERIFY(!policy.agent.enabled);
+        QVERIFY(!policy.agent.planV2);
         QCOMPARE(policy.agent.trigger, QStringLiteral("always"));
         QCOMPARE(policy.agent.timeoutMs, 4000);
         QCOMPARE(policy.agent.maxRounds, 4);

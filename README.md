@@ -26,7 +26,9 @@
   - 可授权事实（memory_claims，三主体独立；默认 quarantine，保守激活）
   - 群成员关系（group_membership_periods / snapshots，定时刷新、入群/退群、失败 fail closed）
   - 近期群聊上下文（RecentContextPlanner + searchRecentGroupContext，只读按时间窗检索）
-  - 只读记忆检索 Agent（QQ 记忆问句可用；`memory_search` / `memory_read` / `memory_related`，超时回退 top-k）
+  - 只读记忆检索 Agent（QQ 记忆问句可用；`memory_search` / `memory_read` / `memory_related`，超时保留部分结果并回退 top-k）
+  - 多 need 记忆检索（Planner 拆目标；独立 Resolver 解析时间；Executor 去重与 partial 状态）
+  - prompt 昵称净化（去除控制字符/双向控制符，数据库保留原始昵称）
   - 对话历史管理（分页浏览、删除、清空）
 - ⚙️ **设置界面**：左侧目录 + 右侧滚动内容，点击目录跳转、滚动自动高亮双向同步；支持 API Key、短期记忆轮数、长期记忆摘轮数、夜晚时段与退火时长、TTS 模型切换、历史记录管理
 - 🔌 **多渠道架构（Phase 1 主体）**：统一 `Utterance` 输出协议 + `IChannelAdapter` 渠道抽象 + `SessionRouter` 输入路由；记忆按 `channel + session_id` 双键隔离。QQ 文本已接入（SnowLuma / OneBot v11 WS + 白名单/@ 门控 + 群记忆），语音/图片/表情包待扩展
@@ -240,8 +242,9 @@ cmake --build . --config Release
         "long_term_memory_enabled": true,
         "debug_full_logs": false,
         "agent_enabled": true,
+        "agent_plan_v2": true,
         "agent_trigger": "memory_question",
-        "agent_timeout_ms": 2500
+        "agent_timeout_ms": 6000
     },
     "time": {
         "night_start": "22:00",
@@ -271,7 +274,7 @@ cmake --build . --config Release
 | `memory` | `short_term_length` / `summary_length` / `short_context_enabled` / `long_term_memory_enabled` | 短期上下文与长期记忆分别控制；关闭长期记忆不等于关闭短期上下文 |
 | `memory` | `debug_full_logs` / `privacy_rules` | 默认关闭全文日志；隐私规则支持 exact / keyword / pattern |
 | `memory` | `recent_group_context` | 近期群聊检索预算；默认开启 |
-| `memory` | `agent_enabled` / `agent_trigger` / `agent_timeout_ms` | QQ 记忆问句的只读 MemoryAgent；pet 不进入，超时回退 top-k |
+| `memory` | `agent_enabled` / `agent_plan_v2` / `agent_trigger` / `agent_timeout_ms` | QQ 记忆问句的多 need 检索；pet 不进入，超时回退 top-k |
 | `time` | `night_start` / `night_end` / `*_lasting` | 昼夜切换与表情/脸红/距离退火时长 |
 | `qq` | `enabled` / `ws_url` / `access_token` / `reply` | OneBot v11 WS 连接与私聊/群聊回复策略 |
 | `qq` | `group_memory_*` / `group_sender_allowlist` / `group_retention_days` | 群记忆 opt-in、群模式、记录/回复白名单与保留期 |
@@ -368,6 +371,8 @@ SnowLuma 提供 OneBot v11 WebSocket 服务端；在 `setting.json` 的 `qq` 段
 
 **R3 披露规则**：`MemoryAccessPolicy` 把事实分为 `shareable / owner_candidate / known_only / forbidden` 四态；群聊只使用当前群公开内容与 viewer 自己的可披露表达；第三方私聊、secret、非共同群信息保持 `forbidden`。成员快照失败或过期时，跨群检索 fail closed。完整契约见 [MEMORY_V5_R3_BASELINE.md](docs/MEMORY_V5_R3_BASELINE.md)。
 
+**时间检索与文本安全**：v2 Planner 先拆多个 recall need，`MemoryTimeResolver` 独立解析“昨晚 / 上周三晚上 / 今天下午”等表达；`MemoryExecutor` 负责去重、partial 和权限。旧 `MemoryTimeRangePlanner` 仅作 fallback。昵称进入 prompt 前会去除控制字符、双向控制符和零宽字符，但数据库保留原始昵称；受异常昵称影响的失败摘要会在启动时按需重新排队。
+
 ## 📁 项目结构
 
 ```
@@ -396,7 +401,7 @@ Windows_AI/
 │   ├── closer/              # 近景立绘
 │   ├── far/                 # 远景立绘
 │   └── default_config/      # 默认配置（prompt.txt）
-├── tests/                   # 单元测试（Qt Test + CTest，15 套件 / 132 个测试函数）
+├── tests/                   # 单元测试（Qt Test + CTest，15 套件 / 145 个测试函数）
 │   ├── tst_memorymanager.cpp
 │   ├── tst_configmanager.cpp
 │   ├── tst_memorypolicy.cpp
@@ -449,7 +454,11 @@ Windows_AI/
 ├── configmanager.h/cpp      # 配置管理器（单例）
 ├── memorymanager.h/cpp      # AI 记忆系统（SQLite / R3 schema）
 ├── memoryagenttypes.h       # MemoryAgent scope/result/audit 数据结构
-├── memoryagent.h/cpp        # 只读记忆检索 Agent + 工具
+├── memoryagent.h/cpp        # Planner + 兼容工具循环
+├── memoryrecalltypes.h/cpp  # 多 need plan/status 数据结构
+├── memorytimeresolver.h/cpp # 独立时间表达解析
+├── memoryexecutor.h/cpp     # 多 need 确定性检索/去重/partial
+├── memorytimerange.h/cpp    # 旧规则 fallback
 ├── memorypolicy.h/cpp       # 入站策略、脱敏、隐私规则
 ├── memoryaccesspolicy.h/cpp # claims 四态授权（shareable/known_only/forbidden）
 ├── recentcontext.h/cpp      # 近期群聊上下文检索与预算

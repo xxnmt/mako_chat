@@ -35,6 +35,35 @@ private slots:
             QStringLiteral("API1 P1"), labels);
         QCOMPARE(text, QStringLiteral("API1 小明"));
     }
+
+    void sanitizesControlCharactersAndKeepsVisibleName()
+    {
+        const QString raw = QStringLiteral(
+            "\n\n\n\x08&ÿ\x00ÿÿ\n\x17\x12\x15群废物ᅠ\u2067\u2067\u202d\x10\x00");
+        const QString safe = MemoryTextUtils::sanitizeIdentityText(raw);
+        QVERIFY(!safe.contains(QChar(0)));
+        QVERIFY(!safe.contains(QChar(0x08)));
+        QVERIFY(!safe.contains(QChar(0x2067)));
+        QVERIFY(!safe.contains(QChar(0x202d)));
+        QVERIFY(!safe.contains(QChar('\n')));
+        QVERIFY(safe.contains(QStringLiteral("群废物")));
+    }
+
+    void sanitizeIdentityFallsBackForDigits()
+    {
+        QCOMPARE(MemoryTextUtils::sanitizeIdentityText(QStringLiteral("123456789")),
+                 QStringLiteral("某位成员"));
+        QCOMPARE(MemoryTextUtils::sanitizeIdentityText(QString()), QStringLiteral("某位成员"));
+    }
+
+    void sanitizeKeepsEmojiJoiner()
+    {
+        const QString emoji = QStringLiteral("👩‍❤️‍👨");
+        const QString safe = MemoryTextUtils::sanitizeIdentityText(
+            emoji + QChar(0x202e));
+        QVERIFY(safe.contains(QChar(0x200d)));
+        QVERIFY(!safe.contains(QChar(0x202e)));
+    }
 };
 
 QTEST_GUILESS_MAIN(TestMemoryTextUtils)

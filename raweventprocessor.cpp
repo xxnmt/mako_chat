@@ -33,8 +33,29 @@ RawEventProcessor::RawEventProcessor(MemoryManager *memoryManager,
 
 void RawEventProcessor::start()
 {
+    recoverUnsafeSummaryInteractions();
     m_timer->start();
     QTimer::singleShot(3000, this, &RawEventProcessor::tick);
+}
+
+void RawEventProcessor::recoverUnsafeSummaryInteractions()
+{
+    if (m_recoveredUnsafeSummaries || !m_memoryManager) {
+        return;
+    }
+    m_recoveredUnsafeSummaries = true;
+    const QList<qlonglong> ids =
+        m_memoryManager->getFailedInteractionsWithUnsafeParticipantNames(100);
+    int reset = 0;
+    for (qlonglong id : ids) {
+        if (m_memoryManager->resetInteractionSummaryForRetry(id)) {
+            ++reset;
+        }
+    }
+    if (reset > 0) {
+        qDebug() << "[RawEventProcessor] 已重置受异常昵称影响的失败摘要:"
+                 << reset;
+    }
 }
 
 void RawEventProcessor::notifyNewEvent()

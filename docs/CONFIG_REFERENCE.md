@@ -1,7 +1,7 @@
 # 配置参考：setting.json / identity.json
 
 > 适用版本：v0.7.0-rc6-dev（记忆库 v9 / 记忆 v5 R3）
-> 更新日期：2026-10-29
+> 更新日期：2026-10-31
 > 关联：[README](../README.md)、[ARCHITECTURE](ARCHITECTURE.md)、[MEMORY_V5_R3_BASELINE](MEMORY_V5_R3_BASELINE.md)
 
 ---
@@ -131,12 +131,15 @@ app_data/config/identity.json
 | 字段 | 默认值 | 范围 | 说明 |
 |------|--------|------|------|
 | `agent_enabled` | `true` | bool | 是否允许 QQ 记忆问句使用只读检索 Agent；pet 永不进入 |
+| `agent_plan_v2` | `true` | bool | v2 多 need Planner/Resolver/Executor；false 回退旧 tool_calls 路径 |
 | `agent_trigger` | `"memory_question"` | `memory_question` / `always` | 仅记忆问句触发，或所有 QQ 回复都尝试 |
-| `agent_timeout_ms` | `2500` | 500–10000 | 单次 Agent 总超时；超时回退已授权 top-k |
-| `agent_max_rounds` | `3` | 1–5 | planner 最多工具轮数 |
+| `agent_timeout_ms` | `6000` | 1000–15000 | 单次 Agent 总超时；超时保留已授权部分结果并回退 top-k |
+| `agent_max_rounds` | `2` | 1–4 | planner 最多工具轮数 |
 | `agent_max_results` | `8` | 1–20 | 单次 Agent 累计结果上限 |
 
 > Agent 只读 `memory_search` / `memory_read` / `memory_related`；工具参数不含 viewer/owner/location/allowed_groups。审计只记录工具名、参数 hash、结果数、耗时和状态，不记录 query/记忆原文。
+>
+> v2 Planner 只输出 `time.expression` 和 `target`（message_time/event_time/fact_validity），不输出 ISO。`MemoryTimeResolver` 独立解析每个表达，半开区间，最大 31 天；无法解析返回 `unresolved`。`event_time` 无独立索引时按 message_time 检索并标记 `fallback`/`event_time_message_time_fallback`；`fact_validity` 返回 `unsupported`。时间范围只能缩小检索，不能改变 viewer/群权限。
 
 ### 1.7 memory：隐私规则
 

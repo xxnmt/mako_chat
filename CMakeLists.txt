@@ -24,7 +24,11 @@ qt_add_executable(Windows_AI
     raweventprocessor.h raweventprocessor.cpp
     groupmembershipservice.h groupmembershipservice.cpp
     memoryaccesspolicy.h memoryaccesspolicy.cpp
+    memorytimerange.h memorytimerange.cpp
+    memoryrecalltypes.h memoryrecalltypes.cpp
+    memorytimeresolver.h memorytimeresolver.cpp
     memoryagenttypes.h memoryagent.h memoryagent.cpp
+    memoryexecutor.h memoryexecutor.cpp
     llmservice.h llmservice.cpp
     promptassembler.h promptassembler.cpp
     appcontroller.h appcontroller.cpp

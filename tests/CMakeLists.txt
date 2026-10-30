@@ -114,12 +114,21 @@ add_phase0_test(tst_memoryagent
     ${PROJECT_SOURCE_DIR}/memoryagenttypes.h
     ${PROJECT_SOURCE_DIR}/memoryagent.h
     ${PROJECT_SOURCE_DIR}/memoryagent.cpp
+    ${PROJECT_SOURCE_DIR}/memoryrecalltypes.h
+    ${PROJECT_SOURCE_DIR}/memoryrecalltypes.cpp
+    ${PROJECT_SOURCE_DIR}/memorytimeresolver.h
+    ${PROJECT_SOURCE_DIR}/memorytimeresolver.cpp
+    ${PROJECT_SOURCE_DIR}/memoryexecutor.h
+    ${PROJECT_SOURCE_DIR}/memoryexecutor.cpp
     ${PROJECT_SOURCE_DIR}/memorymanager.h
     ${PROJECT_SOURCE_DIR}/memorymanager.cpp
     ${PROJECT_SOURCE_DIR}/memoryaccesspolicy.h
     ${PROJECT_SOURCE_DIR}/memoryaccesspolicy.cpp
+    ${PROJECT_SOURCE_DIR}/memorytimerange.h
+    ${PROJECT_SOURCE_DIR}/memorytimerange.cpp
     ${PROJECT_SOURCE_DIR}/recentcontext.h
     ${PROJECT_SOURCE_DIR}/recentcontext.cpp
+    ${PROJECT_SOURCE_DIR}/memorytextutils.h
     ${PROJECT_SOURCE_DIR}/memorypolicy.h
     ${PROJECT_SOURCE_DIR}/memorypolicy.cpp
     ${PROJECT_SOURCE_DIR}/qqreplypolicy.h
@@ -159,6 +168,8 @@ add_phase0_test(tst_promptassembler
     tst_promptassembler.cpp
     ${PROJECT_SOURCE_DIR}/promptassembler.h
     ${PROJECT_SOURCE_DIR}/promptassembler.cpp
+    ${PROJECT_SOURCE_DIR}/memoryrecalltypes.h
+    ${PROJECT_SOURCE_DIR}/memoryrecalltypes.cpp
 )
 
 add_phase0_test(tst_qqreplypolicy
