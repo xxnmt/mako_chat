@@ -3,6 +3,7 @@
 #include <QJsonObject>
 
 #include "promptassembler.h"
+#include "memoryagenttypes.h"
 #include "utterance.h"
 
 class TestPromptAssembler : public QObject
@@ -428,6 +429,32 @@ private slots:
                     .contains(QStringLiteral("小明：在吗")));
         QCOMPARE(messages.at(2).toObject()["role"].toString(), QStringLiteral("assistant"));
         QCOMPARE(messages.at(2).toObject()["content"].toString(), QStringLiteral("在的"));
+    }
+
+    void agentDataIsIndependentAndCapped()
+    {
+        RequestMeta meta;
+        meta.channel = Channel::kQQGroup;
+        meta.sessionId = QStringLiteral("30001");
+
+        MemoryAgentResult result;
+        MemoryAgentItem item;
+        item.id = QStringLiteral("claim:1");
+        item.kind = QStringLiteral("claim");
+        item.text = QString(500, QChar(u'火'));
+        item.time = QDateTime(QDate(2026, 10, 29), QTime(12, 0));
+        item.source = QStringLiteral("current_group");
+        result.items.append(item);
+
+        const QJsonObject message =
+            PromptAssembler::buildAgentDataMessage(meta, result);
+        QCOMPARE(message.value(QStringLiteral("role")).toString(),
+                 QStringLiteral("user"));
+        const QString content = message.value(QStringLiteral("content")).toString();
+        QVERIFY(content.contains(QStringLiteral("MEMORY_AGENT_DATA")));
+        QVERIFY(content.contains(QStringLiteral("不是指令")));
+        QVERIFY(content.contains(QStringLiteral("truncated")));
+        QVERIFY(!content.contains(QString(500, QChar(u'火'))));
     }
 
     void proactiveHistoryOnlyAssistant()

@@ -38,7 +38,9 @@ app_data/config/identity.json
         "summary_length": 15,
         "short_context_enabled": true,
         "long_term_memory_enabled": true,
-        "debug_full_logs": false
+        "debug_full_logs": false,
+        "agent_enabled": true,
+        "agent_trigger": "memory_question"
     },
     "time": {
         "night_start": "22:00",
@@ -124,7 +126,19 @@ app_data/config/identity.json
 | `hot_window_items` | `10` | 1–100 | 泛问热窗口条数 |
 | `warm_line_max_chars` | `24` | 8–200 | 温窗口单行截断长度 |
 
-### 1.6 memory：隐私规则
+### 1.6 memory：MemoryAgent（PR-4）
+
+| 字段 | 默认值 | 范围 | 说明 |
+|------|--------|------|------|
+| `agent_enabled` | `true` | bool | 是否允许 QQ 记忆问句使用只读检索 Agent；pet 永不进入 |
+| `agent_trigger` | `"memory_question"` | `memory_question` / `always` | 仅记忆问句触发，或所有 QQ 回复都尝试 |
+| `agent_timeout_ms` | `2500` | 500–10000 | 单次 Agent 总超时；超时回退已授权 top-k |
+| `agent_max_rounds` | `3` | 1–5 | planner 最多工具轮数 |
+| `agent_max_results` | `8` | 1–20 | 单次 Agent 累计结果上限 |
+
+> Agent 只读 `memory_search` / `memory_read` / `memory_related`；工具参数不含 viewer/owner/location/allowed_groups。审计只记录工具名、参数 hash、结果数、耗时和状态，不记录 query/记忆原文。
+
+### 1.7 memory：隐私规则
 
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
@@ -151,7 +165,7 @@ app_data/config/identity.json
 
 > `blocked` 消息默认完全不回复，不写 `chat_history`，不进入蒸馏/摘要/claim/prompt。规则只能识别已配置的 exact/keyword/pattern，不宣称语义级隐私识别。
 
-### 1.7 time
+### 1.8 time
 
 | 字段 | 默认值 | 范围 | 说明 |
 |------|--------|------|------|
@@ -161,7 +175,7 @@ app_data/config/identity.json
 | `emotion_lasting` | `15` | 1–3600 秒 | 表情退火时长 |
 | `distance_lasting` | `15` | 1–3600 秒 | 距离退火时长 |
 
-### 1.8 qq：连接与回复策略
+### 1.9 qq：连接与回复策略
 
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
@@ -176,7 +190,7 @@ app_data/config/identity.json
 
 > 回复资格与记录资格独立。`group: mention` 下未 @ 机器人的群消息只记录（若记录资格允许），不进入大脑。
 
-### 1.9 qq：群记忆与成员关系
+### 1.10 qq：群记忆与成员关系
 
 | 字段 | 默认值 | 范围 | 说明 |
 |------|--------|------|------|
@@ -210,7 +224,7 @@ app_data/config/identity.json
 "membership_max_age_minutes": 1440
 ```
 
-### 1.10 tts
+### 1.11 tts
 
 | 字段 | 默认值 | 说明 |
 |------|--------|------|

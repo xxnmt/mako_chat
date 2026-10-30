@@ -221,6 +221,11 @@ private slots:
         QCOMPARE(policy.recentContext.maxOwnerGroups, 2);
         QCOMPARE(policy.recentContext.targetedCharBudget, 1200);
         QCOMPARE(policy.recentContext.overviewCharBudget, 2200);
+        QVERIFY(policy.agent.enabled);
+        QCOMPARE(policy.agent.trigger, QStringLiteral("memory_question"));
+        QCOMPARE(policy.agent.timeoutMs, 2500);
+        QCOMPARE(policy.agent.maxRounds, 3);
+        QCOMPARE(policy.agent.maxResults, 8);
 
         const QQGroupMemoryConfig groups = cfg.getQQGroupMemoryConfig();
         QVERIFY(!groups.enabled);
@@ -254,6 +259,11 @@ private slots:
         recent.insert("hot_window_items", 5);
         recent.insert("warm_line_max_chars", 18);
         memory.insert("recent_group_context", recent);
+        memory.insert("agent_enabled", false);
+        memory.insert("agent_trigger", QStringLiteral("always"));
+        memory.insert("agent_timeout_ms", 4000);
+        memory.insert("agent_max_rounds", 4);
+        memory.insert("agent_max_results", 12);
         memory.insert("privacy_policy_version", QStringLiteral("test-r3"));
 
         QJsonObject rule;
@@ -305,6 +315,11 @@ private slots:
         QCOMPARE(policy.recentContext.maxOwnerGroups, 3);
         QCOMPARE(policy.recentContext.targetedCharBudget, 500);
         QCOMPARE(policy.recentContext.overviewCharBudget, 900);
+        QVERIFY(!policy.agent.enabled);
+        QCOMPARE(policy.agent.trigger, QStringLiteral("always"));
+        QCOMPARE(policy.agent.timeoutMs, 4000);
+        QCOMPARE(policy.agent.maxRounds, 4);
+        QCOMPARE(policy.agent.maxResults, 12);
         QCOMPARE(policy.policyVersion, QStringLiteral("test-r3"));
         QCOMPARE(policy.privacyRules.size(), 2);
         QCOMPARE(policy.privacyRules.at(0).id, QStringLiteral("phone"));
@@ -331,6 +346,12 @@ private slots:
         QCOMPARE(cfg.getQQGroupMemoryConfig().retentionDays, 7);
         QCOMPARE(cfg.getQQGroupMemoryConfig().membershipRefreshMinutes, 15);
         QCOMPARE(cfg.getQQGroupMemoryConfig().membershipMaxAgeMinutes, 120);
+        const MemoryAgentConfig agent = cfg.getMemoryPolicyConfig().agent;
+        QVERIFY(!agent.enabled);
+        QCOMPARE(agent.trigger, QStringLiteral("always"));
+        QCOMPARE(agent.timeoutMs, 4000);
+        QCOMPARE(agent.maxRounds, 4);
+        QCOMPARE(agent.maxResults, 12);
     }
 
     void corruptSettingIsPreserved()

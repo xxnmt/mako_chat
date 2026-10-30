@@ -1,6 +1,6 @@
 # 记忆系统 v5 R3 实施基线
 
-> 状态：**PR-1a / PR-1b 已通过手工验收；PR-2 / PR-2.1 / PR-2.2 / PR-3.0 / PR-3.1 / PR-3.2a / PR-3.2a.1 / PR-3.2b / PR-3.2c 已实现并通过单测。3.2a / 3.2a.1 成员生命周期已手工验证；3.2b / 3.2c 待手工验收。下一项 PR-4。**
+> 状态：**PR-1a / PR-1b 已通过手工验收；PR-2 / PR-2.1 / PR-2.2 / PR-3.0 / PR-3.1 / PR-3.2a / PR-3.2a.1 / PR-3.2b / PR-3.2c / PR-4 已实现并通过单测。3.2a / 3.2a.1 成员生命周期已手工验证；3.2b / 3.2c 待手工验收。下一项 PR-5。**
 > 日期：2026-10-29
 > 冻结：`blocked` 默认不回复；`group_authorized` 下非白名单成员只记录、不回复、不写 `chat_history`。
 > 取代：[MEMORY_V5_DESIGN.md](MEMORY_V5_DESIGN.md) 的历史草案
@@ -22,11 +22,12 @@
 
 - 数据库：`PRAGMA user_version = 9`，当前 14 张表。
 - 迁移链：v1 基础 5 表 → v2 多渠道 → v3 `raw_events`/`memory_cursor` → v4 `episodic.session_id` → v5 脱敏审计列 → v6 `interactions` → v7 `persons`/`person_identities` → v8 `memory_claims`/`summary_segments` → v9 `group_membership_*`。
-- 测试：14 个 CTest 套件 / 126 个测试函数全绿；新增 `tst_groupmembership` 覆盖 pending timeout。
+- 测试：15 个 CTest 套件 / 132 个测试函数全绿；新增 `tst_groupmembership` 覆盖 pending timeout，`tst_memoryagent` 覆盖工具授权/Agent 循环/timeout。
 - 检索：`RecentContextPlanner` + `searchRecentGroupContext` 只读时间窗；claims 只注入 `shareable`。
 - 成员关系：连接/重连/定时刷新；入群/退群 notice；快照失败保留旧 period 但跨群 fail closed。
 - 明确不含：向量库、embedding、独立 agent runtime、第二套原始事件系统。
-- 下一项 PR-4 MemoryAgent；PR-5 留存 UI 未开始。
+- PR-4 MemoryAgent：QQ 记忆问句触发，pet 不进入；只读三工具；超时回退 top-k；审计/P95 进程内保留。
+- 下一项 PR-5 留存 UI；持久化审计/UI 尚未开始。
 
 ---
 
@@ -557,12 +558,21 @@ user: 当前输入
 
 ### PR-4：MemoryAgent
 
-**状态**：未开始（下一项）。
+**状态**：已实现并通过单测（2026-10-29）。
 
 - 只读 `memory_search` / `memory_read` / `memory_related`。
 - QQ 可用，pet 只用自动 top-k。
 - 超时回退已授权 top-k。
 - 工具审计与 P95 指标。
+
+实现说明：
+- 新增 `memoryagent.h/cpp` / `memoryagenttypes.h`；`MemoryAgentScope` 由 `LLMService` 在服务端构建，工具参数不含 viewer/owner/location/allowed_groups。
+- planner 使用 JSON 协议（`tool_calls` / `done`），最多 3 轮；独立 `QNetworkAccessManager` + 2.5 秒 deadline；测试可注入 transport，不依赖真实网络。
+- `memory_read`/`memory_related` 只接受本次 run 的句柄；工具结果只使用脱敏文本；claims 仅 `shareable`。
+- 成功结果由 `PromptAssembler::buildAgentDataMessage()` 作为独立不可信 `MEMORY_AGENT_DATA` 注入；超时/失败/空结果回退原 top-k。
+- 配置：`memory.agent_enabled`、`agent_trigger`、`agent_timeout_ms`、`agent_max_rounds`、`agent_max_results`。
+- 审计：工具名、参数 hash、query 长度、结果数、耗时、状态；进程内 200 条；P50/P95。
+- 测试：`tst_memoryagent` 5 例（工具定义、搜索/读取、claim 授权、planner 触发、Agent 循环与 timeout）。
 
 验收：Agent 不能指定 viewer/owner/location；不能写库；越权测试通过。
 
@@ -633,6 +643,11 @@ user: 当前输入
 | R32a.1-3 | 群成员减少 | close period；历史区间保留 |
 | R32a.1-4 | 快照过期 | 超过 maxAge 跨群返回空 |
 | R32a.1-5 | 非允许群 notice | 忽略 |
+| R40-1 | QQ 记忆问句 | 触发 MemoryAgent；pet/普通闲聊不触发 |
+| R40-2 | 工具参数越权 | schema 无 viewer/owner/location；伪造参数被拒绝 |
+| R40-3 | 句柄越权 | memory_read/related 只接受本次 run 的 id；未知/跨 run id denied |
+| R40-4 | Agent 超时/失败 | 不阻塞回复；回退已授权 top-k；无依据不编造 |
+| R40-5 | 审计 | 不记录 query/记忆原文；记录工具名、hash、结果数、耗时、状态、P50/P95 |
 
 ---
 

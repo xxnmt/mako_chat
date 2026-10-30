@@ -109,6 +109,26 @@ add_phase0_test(tst_groupmembership
 )
 target_link_libraries(tst_groupmembership PRIVATE Qt6::WebSockets Qt6::Network)
 
+add_phase0_test(tst_memoryagent
+    tst_memoryagent.cpp
+    ${PROJECT_SOURCE_DIR}/memoryagenttypes.h
+    ${PROJECT_SOURCE_DIR}/memoryagent.h
+    ${PROJECT_SOURCE_DIR}/memoryagent.cpp
+    ${PROJECT_SOURCE_DIR}/memorymanager.h
+    ${PROJECT_SOURCE_DIR}/memorymanager.cpp
+    ${PROJECT_SOURCE_DIR}/memoryaccesspolicy.h
+    ${PROJECT_SOURCE_DIR}/memoryaccesspolicy.cpp
+    ${PROJECT_SOURCE_DIR}/recentcontext.h
+    ${PROJECT_SOURCE_DIR}/recentcontext.cpp
+    ${PROJECT_SOURCE_DIR}/memorypolicy.h
+    ${PROJECT_SOURCE_DIR}/memorypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/qqreplypolicy.h
+    ${PROJECT_SOURCE_DIR}/qqreplypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/qqmessageparser.h
+    ${PROJECT_SOURCE_DIR}/qqmessageparser.cpp
+)
+target_link_libraries(tst_memoryagent PRIVATE Qt6::Network)
+
 add_phase0_test(tst_interactionsegmenter
     tst_interactionsegmenter.cpp
     ${PROJECT_SOURCE_DIR}/interactionsegmenter.h

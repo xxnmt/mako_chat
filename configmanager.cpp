@@ -112,6 +112,20 @@ bool ConfigManager::loadSetting()
         m_memoryPolicy.recentContext.warmLineMaxChars =
             qBound(8, recentObj.value("warm_line_max_chars").toInt(24), 200);
 
+        m_memoryPolicy.agent.enabled =
+            memoryObj.value("agent_enabled").toBool(true);
+        m_memoryPolicy.agent.trigger =
+            memoryObj.value("agent_trigger").toString(QStringLiteral("memory_question"));
+        if (m_memoryPolicy.agent.trigger != QStringLiteral("always")) {
+            m_memoryPolicy.agent.trigger = QStringLiteral("memory_question");
+        }
+        m_memoryPolicy.agent.timeoutMs =
+            qBound(500, memoryObj.value("agent_timeout_ms").toInt(2500), 10000);
+        m_memoryPolicy.agent.maxRounds =
+            qBound(1, memoryObj.value("agent_max_rounds").toInt(3), 5);
+        m_memoryPolicy.agent.maxResults =
+            qBound(1, memoryObj.value("agent_max_results").toInt(8), 20);
+
         m_memoryPolicy.policyVersion =
             memoryObj.value("privacy_policy_version").toString(QStringLiteral("r3"));
         if (m_memoryPolicy.policyVersion.isEmpty()) {
@@ -294,6 +308,11 @@ bool ConfigManager::saveSetting()
     recentContextObj.insert("warm_line_max_chars",
                             m_memoryPolicy.recentContext.warmLineMaxChars);
     memoryObj.insert("recent_group_context", recentContextObj);
+    memoryObj.insert("agent_enabled", m_memoryPolicy.agent.enabled);
+    memoryObj.insert("agent_trigger", m_memoryPolicy.agent.trigger);
+    memoryObj.insert("agent_timeout_ms", m_memoryPolicy.agent.timeoutMs);
+    memoryObj.insert("agent_max_rounds", m_memoryPolicy.agent.maxRounds);
+    memoryObj.insert("agent_max_results", m_memoryPolicy.agent.maxResults);
     memoryObj.insert("privacy_policy_version", m_memoryPolicy.policyVersion);
     QJsonArray privacyRules;
     for (const PrivacyRule &rule : m_memoryPolicy.privacyRules) {

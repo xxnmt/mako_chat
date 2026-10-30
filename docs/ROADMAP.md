@@ -1,7 +1,7 @@
 # 开发路线图
 
 > 项目：Windows_AI 桌面看板娘（桌宠）
-> 版本：v0.7.0-rc6-dev（Phase 0/0.5、Phase 1 前置、QQ 文本、记忆系统 v5 R3 主体完成）
+> 版本：v0.7.0-rc6-dev（Phase 0/0.5、Phase 1 前置、QQ 文本、记忆系统 v5 R3 + PR-4 MemoryAgent 完成）
 > 更新日期：2026-10-29
 
 ---
@@ -225,10 +225,10 @@
 - [ ] **Phase 3**：QQ 空间说说/评论/点赞、合并转发/戳一戳/表情回应
 - [ ] **Phase 4**：经 dsh ACP 接入浏览器类工具
 
-**当前状态**：SnowLuma + 专用小号已部署，QQ 私聊/群聊文本链路已通；记忆 v5 R3 主体已落地，下一批为 3.2b/3.2c 手工验收 + PR-4 MemoryAgent，QQ 语音/图片随后。
+**当前状态**：SnowLuma + 专用小号已部署，QQ 私聊/群聊文本链路已通；记忆 v5 R3 主体与 PR-4 MemoryAgent 已落地，下一批为 3.2b/3.2c 手工验收 + PR-5 留存/清理，QQ 语音/图片随后。
 
 ### 记忆系统 v5 R3（进行中，详见 MEMORY_V5_R3_BASELINE.md）
-**状态**：PR-1 ~ PR-3.2c 已实现；3.2a/3.2a.1 已手工验证；3.2b/3.2c 待手工验收；PR-4/PR-5 未开始。
+**状态**：PR-1 ~ PR-4 已实现；3.2a/3.2a.1 已手工验证；3.2b/3.2c 待手工验收；PR-5 未开始。
 
 - [x] **PR-1a 安全与持久化边界**：写入前 Sanitize、群级 opt-in、短期/长期开关分离、关闭全文日志
 - [x] **PR-1b 输出保护与 Prompt Injection**：记忆移入独立 `MEMORY_DATA`、`MemoryOutputGuard` 单次安全重试
@@ -241,10 +241,10 @@
 - [x] **PR-3.2a.1 成员关系生命周期**：定时刷新、入群/退群 notice、pending 去重与 10 秒超时
 - [ ] **PR-3.2b Claims 授权**：四态 `MemoryAccessPolicy`、保守激活、只注入 shareable —— 已实现并通过单测，**待手工验收**
 - [ ] **PR-3.2c 跨群**：Owner 允许群 / 非 Owner 共同群、viewer 过滤、非共同群 fail closed —— 已实现并通过单测，**待手工验收**
-- [ ] **PR-4 MemoryAgent**：只读 `memory_search` / `memory_read` / `memory_related`，超时回退 top-k，审计与 P95 —— **下一项**
-- [ ] **PR-5 留存 UI 与生命周期**：保留期、observe-only、规则 UI、清理/删除传播
+- [x] **PR-4 MemoryAgent**：只读 `memory_search` / `memory_read` / `memory_related`，QQ 记忆问句触发，超时回退 top-k，工具审计与 P95
+- [ ] **PR-5 留存 UI 与生命周期**：保留期、observe-only、规则 UI、清理/删除传播 —— **下一项**
 
-**当前基线**：数据库 `user_version=9`（14 张表）；14 个 CTest 套件 / 126 个测试函数全绿。不引入向量库。
+**当前基线**：数据库 `user_version=9`（14 张表）；15 个 CTest 套件 / 132 个测试函数全绿。不引入向量库。
 
 ### v0.7.0 - 架构改进 & 独立存档
 **状态**：📋 待开始
@@ -524,7 +524,7 @@ Phase 0   ████████████████████  100%  �
 Phase 0.5 ████████████████████  100%  记忆库 v3（已提交 8f24ae5）
 Phase 1 前置 ████████████████████  100%  全部完成（identity/上下文/v4/TTS 分离/GlobalMoodState）
 Phase 1    ████████████░░░░░░░░   60%  QQ 文本 + R3 记忆主体已通；语音/图片/门控待做
-记忆 v5 R3 ███████████████░░░░░   75%  PR-1~3.2c 已实现；3.2b/c 待手工验收；PR-4/5 未做
+记忆 v5 R3 █████████████████░░░   85%  PR-1~4 已实现；3.2b/c 待手工验收；PR-5 未做
 v0.7.0  ░░░░░░░░░░░░░░░░░░░░   0%  架构改进 & 独立存档
 v0.8.0  ░░░░░░░░░░░░░░░░░░░░   0%  角色自定义 & 剧本系统
 v0.9.0  ░░░░░░░░░░░░░░░░░░░░   0%  智能助手 & 性能优化
@@ -537,16 +537,13 @@ v0.9.0  ░░░░░░░░░░░░░░░░░░░░   0%  智�
 1. **R3 封版验收**
    - 3.2b：claim 三主体激活/隔离；非 shareable 不进入 `MEMORY_DATA`
    - 3.2c：非 Owner 私聊共同群；跨群只返回 viewer 自己可披露的表达；快照失败 fail closed
-2. **PR-4 MemoryAgent**
-   - 只读 `memory_search` / `memory_read` / `memory_related`
-   - QQ 可用、pet 仅自动 top-k；超时回退已授权 top-k
-   - 工具审计 + P50/P95；不引入向量库
-3. **PR-5 留存 UI 与生命周期**
+   - PR-4：QQ 记忆问句触发、pet 不触发、超时回退、审计无原文
+2. **PR-5 留存 UI 与生命周期**
    - 群保留期、observe-only、规则 UI、记忆清理、删除传播
-4. **Phase 1 主体剩余**
+3. **Phase 1 主体剩余**
    - QQ 语音/图片/表情包输出
    - 群聊滑动窗口/发言门控
-5. **Phase 2 主动对话**
+4. **Phase 2 主动对话**
    - 2a 观察权 + 主人相关事件转述（只投 pet）→ 2b 群摘要 → 2c 私聊 metadata → 2d 反馈
    > 设计见 HUMANIZATION_PLAN 6.4–6.6；前置依赖 R3 验收与 scope/audience
 

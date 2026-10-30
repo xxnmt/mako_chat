@@ -34,6 +34,7 @@
 | | InteractionSegmenter | 按会话/时间窗/reply 链切分交互片段 | interactionsegmenter.h/cpp |
 | | RecentContextPlanner | 近期群聊检索模式、预算、allowedGroups、viewer 过滤 | recentcontext.h/cpp |
 | | MemoryAccessPolicy | claims 四态授权：shareable/owner_candidate/known_only/forbidden | memoryaccesspolicy.h/cpp |
+| | MemoryAgent | QQ 记忆问句的只读检索规划器与工具；超时回退 top-k | memoryagent.h/cpp, memoryagenttypes.h |
 | | MemoryOutputGuard | 最终输出隐私检查、一次安全重试 | memoryoutputguard.h/cpp |
 | | MemoryTextUtils | 内部 P1/P2 speaker 标签替换与检测 | memorytextutils.h |
 | | GlobalMoodState | 全局情绪（emotion/blush/distance）；D1 控制外部情绪是否驱动桌宠立绘 | globalmoodstate.h/cpp |
@@ -313,6 +314,7 @@ m_llmService->registerStateProvider([this](){return m_appearance->getCurrentStat
 - **标签校验**：`TagValidator` 类实现标签合法性校验和编辑距离修正
 - **上下文组装**：交给 `PromptAssembler`（档案/情景/摘要/关系按渠道可见性过滤；短期记忆的 proactive/群聊格式也在此处理）
 - **提取带元数据**：`extractMemoryAsync` 接收 `RequestMeta`，信号原样回传；写入按本轮 meta 归属（渠道/会话/说话人/主体）
+- **QQ 记忆问句预取**：`MemoryAgent` 只读检索成功后追加 `MEMORY_AGENT_DATA`；超时/失败回退原 top-k
 
 **关键方法**：
 | 方法 | 作用 | 参数 | 返回值 |
@@ -1272,7 +1274,8 @@ QQ event
       → memory_claims（默认 quarantine）
   → MemoryAccessPolicy（shareable / owner_candidate / known_only / forbidden）
   → RecentContextPlanner / searchRecentGroupContext（只读时间窗）
-  → PromptAssembler（独立 MEMORY_DATA / RECENT_GROUP_CONTEXT / VIEWER_IDENTITY）
+  → MemoryAgent（仅 QQ 记忆问句；只读三工具，超时回退）
+  → PromptAssembler（独立 MEMORY_DATA / RECENT_GROUP_CONTEXT / MEMORY_AGENT_DATA / VIEWER_IDENTITY）
   → LLMService
   → MemoryOutputGuard
   → QQ / pet
@@ -1286,6 +1289,46 @@ QQ event
 - 跨群先查 `group_membership_periods` 与快照有效性；快照失败/过期 → fail closed。
 - 非 Owner 私聊只返回 viewer 自己可披露的表达；群聊只看当前群。
 - 检索接口只读，不推进 cursor/processed，不改 summary 状态。
+
+---
+
+### 2.21 MemoryAgent（PR-4）
+
+**职责**：QQ 记忆问句的只读检索预取；不生成最终回复，不写数据库。
+
+**触发**：
+- `Channel::kQQPrivate` / `Channel::kQQGroup`；
+- `turn_kind=reply`；
+- `memory.agent_enabled=true`；
+- `agent_trigger=always`，或问题命中历史/记忆线索（上次/之前/记得/聊过/谁/昵称等）。
+- pet 永不进入；普通 QQ 闲聊默认不进入。
+
+**工具**：
+| 工具 | 参数 | 作用 |
+|------|------|------|
+| `memory_search` | `query` / `kinds(recent,summary,claim)` / `limit` | 当前群或允许群的近期消息、interaction summary、shareable claims |
+| `memory_read` | `ids` | 读取本次 run 已返回的句柄，最多 8 个 |
+| `memory_related` | `id` / `limit` | 同 session/同 interaction 的已授权关联条目 |
+
+**硬约束**：
+- 工具 schema 不包含 viewer/owner/location/channel/session/allowed_groups；这些由 `MemoryAgentScope` 服务端绑定。
+- `memory_read` / `memory_related` 只接受本次 run 的句柄，不能直接读数据库 ID。
+- 工具结果只使用脱敏文本；blocked 不进入；claims 只返回 `shareable`。
+- Agent 只读；无 append/update/delete 调用。
+
+**流程**：
+```
+LLMService::askDeepSeek
+  → 构建 baseline top-k / scope
+  → MemoryAgentPlanner::shouldRun
+  → MemoryAgent::start (JSON planner, 最多 N 轮)
+       → MemoryAgentTools::execute (本地只读)
+       → [TOOL_RESULTS] 回填
+  → finished: PromptAssembler::buildAgentDataMessage → 主回复
+  → failed/timeout/empty: 原 top-k + 回退提示 → 主回复
+```
+
+**审计/指标**：`MemoryAgentAudit { requestId, channel, tool, argsHash, queryLength, resultCount, latencyMs, status }`；进程内保留最近 200 条；`MemoryAgentMetrics` 提供 P50/P95，不持久化原文。持久化审计与 UI 留给 PR-5。
 
 ---
 
@@ -1318,6 +1361,8 @@ QQ event
    │
    ├── 构建系统提示词（基础prompt + 角色档案 + 情景记忆 + 长期摘要 + 关系状态）
    ├── 构建短期记忆（纯文本注入，不含标签）
+   ├── 注入 MEMORY_DATA / RECENT_GROUP_CONTEXT / VIEWER_IDENTITY
+   ├── QQ 记忆问句：MemoryAgent 只读检索 → MEMORY_AGENT_DATA（失败/超时回退 top-k）
    ├── 注入当前环境状态（UI状态 + 当前时间，作为独立 system message）
    ├── 构建JSON请求体（含 response_format: json_object）
    └── 发送POST到DeepSeek API
@@ -1500,10 +1545,10 @@ image/
 
 | 阶段 | 版本 | 内容 |
 |------|------|------|
-| 当前 | v0.7.0-rc6-dev | Phase 1 QQ 文本 + 记忆 v5 R3：interactions/claims/persons/membership、近期群聊上下文、输出保护；14 套件 / 126 用例 |
+| 当前 | v0.7.0-rc6-dev | Phase 1 QQ 文本 + 记忆 v5 R3：interactions/claims/persons/membership、近期群聊上下文、输出保护、MemoryAgent；15 套件 / 132 用例 |
 | 已完成 | Phase 0 / 0.5 | 大脑/渠道解耦：Utterance/IChannelAdapter/SessionRouter、DB v2/v3、identity.json、raw_events/memory_cursor |
-| 下一步 | PR-4 | MemoryAgent 只读检索工具：memory_search/memory_read/memory_related，超时回退 top-k，审计/P95 |
-| 中期 | PR-5 + Phase 1 剩余 | 留存 UI/清理/删除传播；QQ 语音/图片/表情包、群聊滑动窗口 |
+| 下一步 | PR-5 | 留存 UI、保留期、observe-only、清理/删除传播 |
+| 中期 | Phase 1 剩余 | QQ 语音/图片/表情包、群聊滑动窗口 |
 | 远期 | Phase 2+ | 主动转述、ChatPlanner、v0.7.0 架构拆分/独立存档、插件化 |
 
 ---

@@ -2,9 +2,9 @@
 
 > 项目：Windows_AI 桌面看板娘（桌宠）
 > 类型：规划文档（分阶段实施中）
-> 版本：v1.2（Phase 1 主体 QQ 文本 + 记忆 v5 R3 主体，2026-10-29）
+> 版本：v1.3（Phase 1 主体 QQ 文本 + 记忆 v5 R3 + PR-4 MemoryAgent，2026-10-29）
 > 制定日期：2026-10-19
-> 状态：Phase 0 / 0.5 已完成；Phase 1 前置项全部完成；Phase 1 主体 **QQ 私聊/群聊文本收发已通**（SnowLuma + OneBot WS + 白名单/@ 门控）；记忆 v5 R3 主体已实现（PR-1~3.2c，3.2b/3.2c 待手工验收，PR-4/PR-5 未开始）；下一步 R3 验收、PR-4 MemoryAgent、QQ 语音/图片与 Phase 2 主动对话
+> 状态：Phase 0 / 0.5 已完成；Phase 1 前置项全部完成；Phase 1 主体 **QQ 私聊/群聊文本收发已通**（SnowLuma + OneBot WS + 白名单/@ 门控）；记忆 v5 R3 主体与 PR-4 MemoryAgent 已实现（PR-1~4，3.2b/3.2c 待手工验收，PR-5 未开始）；下一步 R3 验收、PR-5 留存 UI、QQ 语音/图片与 Phase 2 主动对话
 > 关联文档：[ROADMAP.md](ROADMAP.md)、[ARCHITECTURE.md](ARCHITECTURE.md)
 
 ---
@@ -730,7 +730,7 @@ CREATE TABLE memory_cursor (
 
 > 代码提交：`1aa4436`（identity + PromptAssembler + v4 提取链路）；当时测试：7 套件 / 64 例全绿；真实库 v3→v4 迁移验证通过。
 >
-> **2026-10-29 更新**：记忆 v5 R3 主体（PR-1~3.2c）已合入；当前基线为 **14 套件 / 126 个测试函数**、数据库 `user_version=9`（14 张表）。3.2a/3.2a.1 已手工验证，3.2b/3.2c 待手工验收；PR-4/PR-5 未开始。上面 7/64 为 2026-10-27 时点记录，保留不改。
+> **2026-10-29 更新**：记忆 v5 R3 主体（PR-1~3.2c）与 PR-4 MemoryAgent 已合入；当前基线为 **15 套件 / 132 个测试函数**、数据库 `user_version=9`（14 张表）。3.2a/3.2a.1 已手工验证，3.2b/3.2c 待手工验收；PR-5 未开始。上面 7/64 为 2026-10-27 时点记录，保留不改。
 
 #### 10.5.1 identity 身份接入
 

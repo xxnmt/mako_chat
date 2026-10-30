@@ -26,6 +26,7 @@
   - 可授权事实（memory_claims，三主体独立；默认 quarantine，保守激活）
   - 群成员关系（group_membership_periods / snapshots，定时刷新、入群/退群、失败 fail closed）
   - 近期群聊上下文（RecentContextPlanner + searchRecentGroupContext，只读按时间窗检索）
+  - 只读记忆检索 Agent（QQ 记忆问句可用；`memory_search` / `memory_read` / `memory_related`，超时回退 top-k）
   - 对话历史管理（分页浏览、删除、清空）
 - ⚙️ **设置界面**：左侧目录 + 右侧滚动内容，点击目录跳转、滚动自动高亮双向同步；支持 API Key、短期记忆轮数、长期记忆摘轮数、夜晚时段与退火时长、TTS 模型切换、历史记录管理
 - 🔌 **多渠道架构（Phase 1 主体）**：统一 `Utterance` 输出协议 + `IChannelAdapter` 渠道抽象 + `SessionRouter` 输入路由；记忆按 `channel + session_id` 双键隔离。QQ 文本已接入（SnowLuma / OneBot v11 WS + 白名单/@ 门控 + 群记忆），语音/图片/表情包待扩展
@@ -237,7 +238,10 @@ cmake --build . --config Release
         "summary_length": 15,
         "short_context_enabled": true,
         "long_term_memory_enabled": true,
-        "debug_full_logs": false
+        "debug_full_logs": false,
+        "agent_enabled": true,
+        "agent_trigger": "memory_question",
+        "agent_timeout_ms": 2500
     },
     "time": {
         "night_start": "22:00",
@@ -267,6 +271,7 @@ cmake --build . --config Release
 | `memory` | `short_term_length` / `summary_length` / `short_context_enabled` / `long_term_memory_enabled` | 短期上下文与长期记忆分别控制；关闭长期记忆不等于关闭短期上下文 |
 | `memory` | `debug_full_logs` / `privacy_rules` | 默认关闭全文日志；隐私规则支持 exact / keyword / pattern |
 | `memory` | `recent_group_context` | 近期群聊检索预算；默认开启 |
+| `memory` | `agent_enabled` / `agent_trigger` / `agent_timeout_ms` | QQ 记忆问句的只读 MemoryAgent；pet 不进入，超时回退 top-k |
 | `time` | `night_start` / `night_end` / `*_lasting` | 昼夜切换与表情/脸红/距离退火时长 |
 | `qq` | `enabled` / `ws_url` / `access_token` / `reply` | OneBot v11 WS 连接与私聊/群聊回复策略 |
 | `qq` | `group_memory_*` / `group_sender_allowlist` / `group_retention_days` | 群记忆 opt-in、群模式、记录/回复白名单与保留期 |
@@ -391,7 +396,7 @@ Windows_AI/
 │   ├── closer/              # 近景立绘
 │   ├── far/                 # 远景立绘
 │   └── default_config/      # 默认配置（prompt.txt）
-├── tests/                   # 单元测试（Qt Test + CTest，14 套件 / 126 个测试函数）
+├── tests/                   # 单元测试（Qt Test + CTest，15 套件 / 132 个测试函数）
 │   ├── tst_memorymanager.cpp
 │   ├── tst_configmanager.cpp
 │   ├── tst_memorypolicy.cpp
@@ -399,6 +404,7 @@ Windows_AI/
 │   ├── tst_memorytextutils.cpp
 │   ├── tst_memoryaccesspolicy.cpp
 │   ├── tst_groupmembership.cpp
+│   ├── tst_memoryagent.cpp
 │   ├── tst_interactionsegmenter.cpp
 │   ├── tst_memoryoutputguard.cpp
 │   ├── tst_sessionrouter.cpp
@@ -442,6 +448,8 @@ Windows_AI/
 ├── appearancemanager.h/cpp  # 外观管理器
 ├── configmanager.h/cpp      # 配置管理器（单例）
 ├── memorymanager.h/cpp      # AI 记忆系统（SQLite / R3 schema）
+├── memoryagenttypes.h       # MemoryAgent scope/result/audit 数据结构
+├── memoryagent.h/cpp        # 只读记忆检索 Agent + 工具
 ├── memorypolicy.h/cpp       # 入站策略、脱敏、隐私规则
 ├── memoryaccesspolicy.h/cpp # claims 四态授权（shareable/known_only/forbidden）
 ├── recentcontext.h/cpp      # 近期群聊上下文检索与预算
@@ -521,7 +529,7 @@ Windows_AI/
 4. **立绘切换无过渡动画**：换图时直接切换，没有淡入淡出效果
 5. **仅支持单角色**：当前仅支持「千岛茉子」一个角色
 6. **外部渠道**：QQ 文本、群记忆、成员关系已接入；QQ 语音/图片/表情包、群聊滑动窗口与主动转述待后续（主动转述设计见 `docs/HUMANIZATION_PLAN.md` 6.4–6.6）
-7. **R3 手工验收未完成项**：PR-3.2b/3.2c 的 claim 三主体激活与跨群 viewer 过滤已通过单测，仍待真实账号手工验收；PR-4 MemoryAgent、PR-5 留存 UI 尚未开始
+7. **R3 手工验收未完成项**：PR-3.2b/3.2c 的 claim 三主体激活与跨群 viewer 过滤已通过单测，仍待真实账号手工验收；PR-4 MemoryAgent 已实现并通过单测，PR-5 留存 UI 尚未开始
 
 ## 🔧 故障排除
 

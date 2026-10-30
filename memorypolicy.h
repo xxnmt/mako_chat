@@ -45,6 +45,14 @@ struct RecentContextConfig {
     int warmLineMaxChars = 24;
 };
 
+struct MemoryAgentConfig {
+    bool enabled = true;
+    QString trigger = QStringLiteral("memory_question"); // memory_question / always
+    int timeoutMs = 2500;
+    int maxRounds = 3;
+    int maxResults = 8;
+};
+
 struct MemoryPolicyConfig {
     bool shortContextEnabled = true;
     bool longTermMemoryEnabled = true;
@@ -52,6 +60,7 @@ struct MemoryPolicyConfig {
     QString policyVersion = QStringLiteral("r3");
     InteractionConfig interaction;
     RecentContextConfig recentContext;
+    MemoryAgentConfig agent;
 };
 
 struct QQGroupMemoryConfig {

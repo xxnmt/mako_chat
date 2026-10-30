@@ -10,6 +10,8 @@
 #include "utterance.h"
 #include "recentcontext.h"
 
+struct MemoryAgentResult;
+
 // 提示词/上下文组装（HUMANIZATION_PLAN 10.4 / Phase 1 前置项）
 // 职责：
 //   1. 把角色档案 / 情景记忆 / 长期摘要 / 关系状态按渠道与可见性过滤后拼进 system prompt（C3）
@@ -41,6 +43,10 @@ public:
     // PR-2.1：近期原始群消息作为独立不可信数据消息。
     static QJsonObject buildRecentContextMessage(const RequestMeta &meta,
                                                  const RecentContextBundle &bundle);
+
+    // PR-4：MemoryAgent 只读检索结果作为独立不可信数据消息。
+    static QJsonObject buildAgentDataMessage(const RequestMeta &meta,
+                                             const MemoryAgentResult &result);
 
     // PR-2.2：当前用户身份与群昵称别名（可信 system 信息）。
     static QString buildViewerIdentityBlock(const RequestMeta &meta,
