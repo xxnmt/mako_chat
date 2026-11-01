@@ -64,11 +64,25 @@ private:
     //处理提示词的两个函数
     void initializePromptFile();
     QString loadSystemPrompt();
-    void sendChatRequest(const QJsonArray &messages);
+    void sendChatRequest(const QJsonArray &messages,
+                         bool withMemoryTool = false,
+                         bool jsonResponse = true);
     void sendSafeRetry();
     void sendEmptyReplyRetry();
     void sendPendingReply(const QJsonObject &agentMessage = QJsonObject(),
                           bool partial = false);
+
+    // 主 Conversation Agent 的记忆工具路径。
+    void startMemoryToolPath(const QJsonArray &messages,
+                             const MemoryAgentScope &scope,
+                             const QString &protocol);
+    bool handleMemoryToolReply(const QJsonObject &message);
+    void handleNativeToolCalls(const QJsonObject &message,
+                               const QJsonArray &toolCalls);
+    void handleEnvelopeRecall(const QJsonObject &content);
+    void sendMemoryToolFinal(bool withTools);
+    void switchMemoryToolToEnvelope();
+    QString envelopeToolInstruction() const;
 
     QPair<QList<SentenceText>, QString> parseJsonReply(const QString &replyText);
 
@@ -91,9 +105,18 @@ private:
     MemoryAgent *m_memoryAgent = nullptr;
     RequestMeta m_currentMeta;   // 当前轮次元数据（askDeepSeek 设置，prompt 组装与记忆注入使用）
     QJsonArray m_lastRequestMessages;
-    QJsonArray m_pendingMessages; // PR-4: 等待 MemoryAgent 的主请求
+    QJsonArray m_pendingMessages; // legacy：等待 MemoryAgent 的主请求
     quint64 m_agentGeneration = 0;
     bool m_agentPending = false;
+
+    // tool 模式：同一个主模型、同一份消息历史，工具结果只追加到会话。
+    QJsonArray m_toolMessages;
+    MemoryAgentScope m_toolScope;
+    QString m_toolProtocol;       // native / json_envelope
+    int m_toolRound = 0;
+    bool m_memoryToolActive = false;
+    bool m_toolFallbackUsed = false;
+
     int m_outputRetryCount = 0;
     int m_emptyRetryCount = 0;
 };

@@ -7,6 +7,7 @@
 #include "memoryagent.h"
 #include "memoryexecutor.h"
 #include "memorymanager.h"
+#include "memoryrecalltool.h"
 #include "memoryrecalltypes.h"
 #include "memorytimerange.h"
 #include "memorytimeresolver.h"
@@ -739,9 +740,109 @@ private slots:
         QVERIFY(plannerInput.contains(QStringLiteral("memory_capabilities")));
     }
 
+    void toolGateDoesNotReadUserText()
+    {
+        MemoryAgentConfig config;
+        RequestMeta group;
+        group.channel = Channel::kQQGroup;
+        group.sessionId = QStringLiteral("30003");
+        group.turnKind = QStringLiteral("reply");
+        QVERIFY(MemoryAgentPlanner::canExposeTools(group, config));
+        // tool 模式下旧关键词门控必须失效；是否调用由主模型决定。
+        QVERIFY(!MemoryAgentPlanner::shouldRun(
+            group, QStringLiteral("你还记得昨天吗"), config));
+
+        RequestMeta pet;
+        pet.channel = Channel::kPet;
+        pet.turnKind = QStringLiteral("reply");
+        QVERIFY(!MemoryAgentPlanner::canExposeTools(pet, config));
+
+        RequestMeta proactive;
+        proactive.channel = Channel::kQQPrivate;
+        proactive.turnKind = QStringLiteral("proactive");
+        QVERIFY(!MemoryAgentPlanner::canExposeTools(proactive, config));
+
+        config.mode = QStringLiteral("legacy");
+        QVERIFY(!MemoryAgentPlanner::canExposeTools(group, config));
+
+        config.mode = QStringLiteral("tool");
+        config.enabled = false;
+        QVERIFY(!MemoryAgentPlanner::canExposeTools(group, config));
+    }
+
+    void recallToolRejectsScopeFieldsAndKeepsPerNeedStatus()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager mm(dir.filePath("recall_tool.db"));
+        mm.seedIdentity({QStringLiteral("20001")});
+        const QDateTime now = QDateTime::currentDateTime();
+        QVERIFY(makeInteraction(mm, QStringLiteral("30009"),
+                                QStringLiteral("今晚吃火锅"), QStringLiteral("20001"),
+                                QStringLiteral("主人")) >= 0);
+
+        const MemoryAgentScope scope = ownerGroupScope(QStringLiteral("30009"), now);
+        MemoryRecallTool tool(&mm, scope);
+
+        const QJsonObject definition = MemoryRecallTool::definition();
+        const QString serialized = QString::fromUtf8(
+            QJsonDocument(definition).toJson(QJsonDocument::Compact));
+        QVERIFY(serialized.contains(QStringLiteral("memory_recall")));
+        QVERIFY(serialized.contains(QStringLiteral("needs")));
+        QVERIFY(!serialized.contains(QStringLiteral("viewer_id")));
+        QVERIFY(!serialized.contains(QStringLiteral("allowed_groups")));
+        QVERIFY(!serialized.contains(QStringLiteral("group_id")));
+        QVERIFY(!serialized.contains(QStringLiteral("\"from\"")));
+        QVERIFY(!serialized.contains(QStringLiteral("\"to\"")));
+
+        const QJsonObject args{
+            {QStringLiteral("needs"),
+             QJsonArray{
+                 QJsonObject{{QStringLiteral("id"), QStringLiteral("need-1")},
+                             {QStringLiteral("query"), QStringLiteral("火锅")}},
+                 QJsonObject{{QStringLiteral("id"), QStringLiteral("need-2")},
+                             {QStringLiteral("query"), QStringLiteral("完全不存在的词")}}}}};
+        QString error;
+        const QJsonObject payload = tool.execute(args, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(payload.value(QStringLiteral("status")).toString(),
+                 QStringLiteral("complete"));
+        QVERIFY(payload.value(QStringLiteral("has_empty")).toBool());
+        QCOMPARE(payload.value(QStringLiteral("needs")).toArray().size(), 2);
+        QCOMPARE(payload.value(QStringLiteral("needs")).toArray().at(0)
+                     .toObject().value(QStringLiteral("status")).toString(),
+                 QStringLiteral("success"));
+        QCOMPARE(payload.value(QStringLiteral("needs")).toArray().at(1)
+                     .toObject().value(QStringLiteral("status")).toString(),
+                 QStringLiteral("empty"));
+
+        const QJsonObject forged{
+            {QStringLiteral("needs"),
+             QJsonArray{QJsonObject{
+                 {QStringLiteral("id"), QStringLiteral("need-1")},
+                 {QStringLiteral("query"), QStringLiteral("火锅")},
+                 {QStringLiteral("viewer_id"), QStringLiteral("owner")}}}}};
+        error.clear();
+        const QJsonObject rejected = tool.execute(forged, &error);
+        QCOMPARE(error, QStringLiteral("invalid_arguments"));
+        QCOMPARE(rejected.value(QStringLiteral("status")).toString(),
+                 QStringLiteral("failed"));
+
+        QJsonArray tooMany;
+        for (int i = 0; i < 5; ++i) {
+            tooMany.append(QJsonObject{
+                {QStringLiteral("id"), QStringLiteral("need-%1").arg(i)},
+                {QStringLiteral("query"), QStringLiteral("火锅")}});
+        }
+        error.clear();
+        tool.execute(QJsonObject{{QStringLiteral("needs"), tooMany}}, &error);
+        QCOMPARE(error, QStringLiteral("invalid_arguments"));
+    }
+
     void plannerOnlyRunsForQQMemoryQuestions()
     {
         MemoryAgentConfig config;
+        config.mode = QStringLiteral("legacy");
         RequestMeta group;
         group.channel = Channel::kQQGroup;
         group.sessionId = QStringLiteral("30003");

@@ -40,6 +40,8 @@ app_data/config/identity.json
         "long_term_memory_enabled": true,
         "debug_full_logs": false,
         "agent_enabled": true,
+        "agent_mode": "tool",
+        "agent_protocol": "native",
         "agent_trigger": "memory_question"
     },
     "time": {
@@ -126,20 +128,26 @@ app_data/config/identity.json
 | `hot_window_items` | `10` | 1–100 | 泛问热窗口条数 |
 | `warm_line_max_chars` | `24` | 8–200 | 温窗口单行截断长度 |
 
-### 1.6 memory：MemoryAgent（PR-4）
+### 1.6 memory：Memory Recall Tool
 
 | 字段 | 默认值 | 范围 | 说明 |
 |------|--------|------|------|
-| `agent_enabled` | `true` | bool | 是否允许 QQ 记忆问句使用只读检索 Agent；pet 永不进入 |
-| `agent_plan_v2` | `true` | bool | v2 多 need Planner/Resolver/Executor；false 回退旧 tool_calls 路径 |
-| `agent_trigger` | `"memory_question"` | `memory_question` / `always` | 仅记忆问句触发，或所有 QQ 回复都尝试 |
-| `agent_timeout_ms` | `6000` | 1000–15000 | 单次 Agent 总超时；超时保留已授权部分结果并回退 top-k |
-| `agent_max_rounds` | `2` | 1–4 | planner 最多工具轮数 |
-| `agent_max_results` | `8` | 1–20 | 单次 Agent 累计结果上限 |
+| `agent_enabled` | `true` | bool | 是否允许 QQ 记忆检索；pet 永不进入 |
+| `agent_mode` | `"tool"` | `tool` / `legacy` | `tool`：主 Conversation Agent 自主调用 `memory_recall`；`legacy`：旧关键词门控 + 独立 Planner |
+| `agent_protocol` | `"native"` | `native` / `json_envelope` | 原生 DeepSeek tools，或 JSON 动作协议兜底 |
+| `agent_plan_v2` | `true` | bool | 仅 legacy 路径：多 need Planner；false 回退旧 `tool_calls` |
+| `agent_trigger` | `"memory_question"` | `memory_question` / `always` | 仅 legacy 路径使用 |
+| `agent_timeout_ms` | `6000` | 1000–15000 | 单次工具检索预算 |
+| `agent_max_rounds` | `2` | 1–4 | 主模型最多工具轮数 |
+| `agent_max_results` | `8` | 1–20 | 单个 need 的结果上限；执行器当前硬上限为 8 |
 
-> Agent 只读 `memory_search` / `memory_read` / `memory_related`；工具参数不含 viewer/owner/location/allowed_groups。审计只记录工具名、参数 hash、结果数、耗时和状态，不记录 query/记忆原文。
+> `tool` 模式下，主模型只收到 `memory_recall` 一个只读工具；参数只接受 `needs`（`id/query/kinds/time`），不含 viewer/owner/location/group/session/allowed_groups。是否调用由主模型决定，程序只做功能、渠道、turn 类型和 pet 能力门控。
 >
-> v2 Planner 只输出 `time.expression` 和 `target`（message_time/event_time/fact_validity），不输出 ISO。`MemoryTimeResolver` 独立解析每个表达，半开区间，最大 31 天；无法解析返回 `unresolved`。`event_time` 无独立索引时按 message_time 检索并标记 `fallback`/`event_time_message_time_fallback`；`fact_validity` 返回 `unsupported`。时间范围只能缩小检索，不能改变 viewer/群权限。
+> Inline：稳定档案/关系/RecentContext 自动注入。Spill：episodic、interaction summary、claim、长期 summary 不自动注入，由工具按需检索。
+>
+> 每个 need 独立 `success/empty/unresolved/unsupported/denied/error`；整体 `complete/partial/empty/failed`。`need-1=empty`、`need-2=success` 整体为 `complete`，但会返回 `has_empty=true`。
+>
+> `MemoryTimeResolver` 独立解析 `time.expression`，半开区间，最大 31 天；无法解析返回 `unresolved`。`event_time` 无独立索引时按 message_time 检索并标记 `fallback`/`event_time_message_time_fallback`；`fact_validity` 返回 `unsupported`。时间范围只能缩小检索，不能改变 viewer/群权限。
 
 ### 1.7 memory：隐私规则
 

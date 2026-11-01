@@ -222,6 +222,8 @@ private slots:
         QCOMPARE(policy.recentContext.targetedCharBudget, 1200);
         QCOMPARE(policy.recentContext.overviewCharBudget, 2200);
         QVERIFY(policy.agent.enabled);
+        QCOMPARE(policy.agent.mode, QStringLiteral("tool"));
+        QCOMPARE(policy.agent.protocol, QStringLiteral("native"));
         QVERIFY(policy.agent.planV2);
         QCOMPARE(policy.agent.trigger, QStringLiteral("memory_question"));
         QCOMPARE(policy.agent.timeoutMs, 6000);
@@ -261,6 +263,8 @@ private slots:
         recent.insert("warm_line_max_chars", 18);
         memory.insert("recent_group_context", recent);
         memory.insert("agent_enabled", false);
+        memory.insert("agent_mode", QStringLiteral("legacy"));
+        memory.insert("agent_protocol", QStringLiteral("json_envelope"));
         memory.insert("agent_plan_v2", false);
         memory.insert("agent_trigger", QStringLiteral("always"));
         memory.insert("agent_timeout_ms", 4000);
@@ -318,6 +322,8 @@ private slots:
         QCOMPARE(policy.recentContext.targetedCharBudget, 500);
         QCOMPARE(policy.recentContext.overviewCharBudget, 900);
         QVERIFY(!policy.agent.enabled);
+        QCOMPARE(policy.agent.mode, QStringLiteral("legacy"));
+        QCOMPARE(policy.agent.protocol, QStringLiteral("json_envelope"));
         QVERIFY(!policy.agent.planV2);
         QCOMPARE(policy.agent.trigger, QStringLiteral("always"));
         QCOMPARE(policy.agent.timeoutMs, 4000);
@@ -351,6 +357,8 @@ private slots:
         QCOMPARE(cfg.getQQGroupMemoryConfig().membershipMaxAgeMinutes, 120);
         const MemoryAgentConfig agent = cfg.getMemoryPolicyConfig().agent;
         QVERIFY(!agent.enabled);
+        QCOMPARE(agent.mode, QStringLiteral("legacy"));
+        QCOMPARE(agent.protocol, QStringLiteral("json_envelope"));
         QCOMPARE(agent.trigger, QStringLiteral("always"));
         QCOMPARE(agent.timeoutMs, 4000);
         QCOMPARE(agent.maxRounds, 4);

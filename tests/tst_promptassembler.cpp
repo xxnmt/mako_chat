@@ -467,6 +467,41 @@ private slots:
         QVERIFY(!content.contains(QString(500, QChar(u'火'))));
     }
 
+    void agentDataKeepsPerNeedStatusAndHasEmpty()
+    {
+        RequestMeta meta;
+        meta.channel = Channel::kQQGroup;
+        meta.sessionId = QStringLiteral("30001");
+
+        MemoryAgentResult result;
+        result.status = QStringLiteral("complete");
+        MemoryAgentItem item;
+        item.id = QStringLiteral("item:1");
+        item.kind = QStringLiteral("summary");
+        item.text = QStringLiteral("确实存在的证据");
+        item.source = QStringLiteral("current_group");
+        result.items.append(item);
+
+        MemoryNeedResult success;
+        success.needId = QStringLiteral("need-1");
+        success.status = QStringLiteral("success");
+        success.resultCount = 1;
+        result.needs.append(success);
+        MemoryNeedResult empty;
+        empty.needId = QStringLiteral("need-2");
+        empty.status = QStringLiteral("empty");
+        result.needs.append(empty);
+
+        const QJsonObject message =
+            PromptAssembler::buildAgentDataMessage(meta, result);
+        const QString content = message.value(QStringLiteral("content")).toString();
+        QVERIFY(content.contains(QStringLiteral("\"status\":\"complete\"")));
+        QVERIFY(content.contains(QStringLiteral("\"partial\":false")));
+        QVERIFY(content.contains(QStringLiteral("\"has_empty\":true")));
+        QVERIFY(content.contains(QStringLiteral("need-1")));
+        QVERIFY(content.contains(QStringLiteral("need-2")));
+    }
+
     void proactiveHistoryOnlyAssistant()
     {
         HistoryTurn turn;

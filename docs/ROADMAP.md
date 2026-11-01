@@ -1,8 +1,8 @@
 # 开发路线图
 
 > 项目：Windows_AI 桌面看板娘（桌宠）
-> 版本：v0.7.0-rc6-dev（Phase 0/0.5、Phase 1 前置、QQ 文本、记忆系统 v5 R3 + PR-4 MemoryAgent 完成）
-> 更新日期：2026-10-31
+> 版本：v0.7.0-rc7-dev（Phase 0/0.5、Phase 1 前置、QQ 文本、记忆系统 v5 R3 + Memory Recall Tool 完成）
+> 更新日期：2026-11-01
 
 ---
 
@@ -225,10 +225,10 @@
 - [ ] **Phase 3**：QQ 空间说说/评论/点赞、合并转发/戳一戳/表情回应
 - [ ] **Phase 4**：经 dsh ACP 接入浏览器类工具
 
-**当前状态**：SnowLuma + 专用小号已部署，QQ 私聊/群聊文本链路已通；记忆 v5 R3 主体与 PR-4 MemoryAgent 已落地，下一批为 3.2b/3.2c 手工验收 + PR-5 留存/清理，QQ 语音/图片随后。
+**当前状态**：SnowLuma + 专用小号已部署，QQ 私聊/群聊文本链路已通；记忆 v5 R3 主体与 PR-4/PR-6 已落地，下一批为 3.2b/3.2c 手工验收 + PR-5 留存/清理，QQ 语音/图片随后。
 
 ### 记忆系统 v5 R3（进行中，详见 MEMORY_V5_R3_BASELINE.md）
-**状态**：PR-1 ~ PR-4 已实现；3.2a/3.2a.1 已手工验证；3.2b/3.2c 待手工验收；PR-5 未开始。
+**状态**：PR-1 ~ PR-4、PR-6 已实现；3.2a/3.2a.1 已手工验证；3.2b/3.2c 待手工验收；PR-5 未开始。
 
 - [x] **PR-1a 安全与持久化边界**：写入前 Sanitize、群级 opt-in、短期/长期开关分离、关闭全文日志
 - [x] **PR-1b 输出保护与 Prompt Injection**：记忆移入独立 `MEMORY_DATA`、`MemoryOutputGuard` 单次安全重试
@@ -241,10 +241,11 @@
 - [x] **PR-3.2a.1 成员关系生命周期**：定时刷新、入群/退群 notice、pending 去重与 10 秒超时
 - [ ] **PR-3.2b Claims 授权**：四态 `MemoryAccessPolicy`、保守激活、只注入 shareable —— 已实现并通过单测，**待手工验收**
 - [ ] **PR-3.2c 跨群**：Owner 允许群 / 非 Owner 共同群、viewer 过滤、非共同群 fail closed —— 已实现并通过单测，**待手工验收**
-- [x] **PR-4 MemoryAgent**：QQ 记忆问句触发；v2 Planner 输出多 need，Resolver 独立解析时间，Executor 去重并保留 per-need partial；旧 tool_calls 路径仍可回退
+- [x] **PR-4 MemoryAgent（legacy）**：关键词门控 + 独立 Planner；保留作为 `agent_mode=legacy` 回滚
+- [x] **PR-6 Memory Recall Tool**：主 Conversation Agent 自主调用 `memory_recall`；原生 Tool Calling + 同上下文最终回复；tool 模式停止历史记忆自动注入；状态语义 `complete/partial/empty/failed`；`agent_mode=tool` 默认
 - [ ] **PR-5 留存 UI 与生命周期**：保留期、observe-only、规则 UI、清理/删除传播 —— **下一项**
 
-**当前基线**：数据库 `user_version=9`（14 张表）；15 个 CTest 套件 / 145 个测试函数全绿。不引入向量库。
+**当前基线**：数据库 `user_version=9`（14 张表）；15 个 CTest 套件 / 148 个测试函数全绿。不引入向量库。
 
 ### v0.7.0 - 架构改进 & 独立存档
 **状态**：📋 待开始
@@ -532,12 +533,13 @@ v0.9.0  ░░░░░░░░░░░░░░░░░░░░   0%  智�
 
 ---
 
-## 近期任务（Next Up，2026-10-31 更新）
+## 近期任务（Next Up，2026-11-01 更新）
 
 1. **R3 封版验收**
    - 3.2b：claim 三主体激活/隔离；非 shareable 不进入 `MEMORY_DATA`
    - 3.2c：非 Owner 私聊共同群；跨群只返回 viewer 自己可披露的表达；快照失败 fail closed
-   - PR-4：QQ 记忆问句触发、pet 不触发、时间范围召回、partial timeout、审计无原文
+   - PR-4 legacy：QQ 记忆问句触发、pet 不触发、时间范围召回、partial timeout、审计无原文
+   - PR-6：隐式回忆自主调用、普通闲聊不调用、工具参数越权拒绝、need-1 empty + need-2 success、native/envelope 回退
 2. **PR-5 留存 UI 与生命周期**
    - 群保留期、observe-only、规则 UI、记忆清理、删除传播
 3. **Phase 1 主体剩余**

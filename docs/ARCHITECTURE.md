@@ -34,7 +34,8 @@
 | | InteractionSegmenter | 按会话/时间窗/reply 链切分交互片段 | interactionsegmenter.h/cpp |
 | | RecentContextPlanner | 近期群聊检索模式、预算、allowedGroups、viewer 过滤 | recentcontext.h/cpp |
 | | MemoryAccessPolicy | claims 四态授权：shareable/owner_candidate/known_only/forbidden | memoryaccesspolicy.h/cpp |
-| | MemoryAgent | QQ 记忆问句的 Planner；v2 输出多 need，保留旧工具循环回退 | memoryagent.h/cpp, memoryagenttypes.h |
+| | MemoryRecallTool | 主 Conversation Agent 的只读 `memory_recall` 工具；服务端 scope + need 校验 | memoryrecalltool.h/cpp |
+| | MemoryAgent | legacy 回滚路径：关键词门控 + 独立 Planner | memoryagent.h/cpp, memoryagenttypes.h |
 | | MemoryRecallPlan | 多 need 契约、状态与校验 | memoryrecalltypes.h/cpp |
 | | MemoryTimeResolver | 单个时间表达的独立解析与 interpretation | memorytimeresolver.h/cpp |
 | | MemoryExecutor | 多 need 确定性检索、去重、partial/审计 | memoryexecutor.h/cpp |
@@ -318,13 +319,13 @@ m_llmService->registerStateProvider([this](){return m_appearance->getCurrentStat
 - **标签校验**：`TagValidator` 类实现标签合法性校验和编辑距离修正
 - **上下文组装**：交给 `PromptAssembler`（档案/情景/摘要/关系按渠道可见性过滤；短期记忆的 proactive/群聊格式也在此处理）
 - **提取带元数据**：`extractMemoryAsync` 接收 `RequestMeta`，信号原样回传；写入按本轮 meta 归属（渠道/会话/说话人/主体）
-- **QQ 记忆问句预取**：`MemoryAgent` 只读检索成功后追加 `MEMORY_AGENT_DATA`；超时/失败回退原 top-k
+- **QQ 记忆工具**：主 Conversation Agent 自主调用 `memory_recall`；工具结果以 `role=tool` 追加到同一会话；`agent_mode=legacy` 时才走旧 `MemoryAgent` 预取
 
 **关键方法**：
 | 方法 | 作用 | 参数 | 返回值 |
 |------|------|------|--------|
-| `askDeepSeek()` | 发起DeepSeek API请求，按渠道/身份/成员关系组装 MEMORY_DATA、RECENT_GROUP_CONTEXT 与 VIEWER_IDENTITY | QString userInput, QList\<HistoryTurn\> historyQA, RequestMeta meta | - |
-| `onReplyFinished()` | 解析JSON→拆句→标签校验→输出保护→发信号 | QNetworkReply* | - |
+| `askDeepSeek()` | 组装主对话上下文；tool 模式只暴露 memory_recall，历史记忆不再自动注入 | QString userInput, QList\<HistoryTurn\> historyQA, RequestMeta meta | - |
+| `onReplyFinished()` | 处理 tool_calls / envelope recall，再解析JSON→拆句→标签校验→输出保护→发信号 | QNetworkReply* | - |
 | `parseJsonReply()` | 解析JSON回复，提取句子和标签 | QString replyText | QPair\<QList\<SentenceText\>, QString\> |
 | `extractMemoryAsync()` | 后台异步提取记忆（角色档案+情景记忆+长期摘要+关系状态），传入已有档案/记忆做增量更新 | turns, lastEndId, sourceIds, existingProfiles, existingMemories, RequestMeta meta | - |
 | `summarizeInteractionAsync()` | 为一条 interaction 生成同群 safe summary、person_refs segments 与 claims 草稿 | interactionId, QList\<RawEvent\> events | - |
@@ -1278,8 +1279,9 @@ QQ event
       → memory_claims（默认 quarantine）
   → MemoryAccessPolicy（shareable / owner_candidate / known_only / forbidden）
   → RecentContextPlanner / searchRecentGroupContext（只读时间窗）
-  → MemoryAgent（Planner needs → Resolver → Executor；旧工具循环回退）
-  → PromptAssembler（独立 MEMORY_DATA / RECENT_GROUP_CONTEXT / MEMORY_AGENT_DATA / VIEWER_IDENTITY）
+  → MemoryRecallTool（主模型 tool_calls → Resolver → Executor）
+  → PromptAssembler（Inline 档案/关系 + RECENT_GROUP_CONTEXT；历史记忆 Spill 到工具）
+  → 同一主 Conversation Agent（tool result 回放 → 最终 JSON）
   → LLMService
   → MemoryOutputGuard
   → QQ / pet
@@ -1296,33 +1298,48 @@ QQ event
 
 ---
 
-### 2.21 MemoryAgent（PR-4）
+### 2.21 Memory Recall Tool（主 Conversation Agent）
 
-**职责**：QQ 记忆问句的只读检索预取；不生成最终回复，不写数据库。
+> 详细契约与验收集见 [MEMORY_RECALL_TOOL.md](MEMORY_RECALL_TOOL.md)。
 
-**触发**：
-- `Channel::kQQPrivate` / `Channel::kQQGroup`；
-- `turn_kind=reply`；
-- `memory.agent_enabled=true`；
-- `agent_trigger=always`，或问题命中历史/记忆线索（上次/之前/记得/聊过/谁/昵称等）。
-- pet 永不进入；普通 QQ 闲聊默认不进入。
+**职责**：主 Conversation Agent 通过原生 `memory_recall` 工具，按需检索过去对话；工具不生成最终回复，不写数据库。
 
-**v2 Planner 输出**：
+**决策边界**：
+- 程序只做能力门控 `MemoryAgentPlanner::canExposeTools()`：功能开关、QQ 渠道、`turn_kind=reply`、scope 构建成功、pet 排除。
+- 程序**不读取用户文本**判断“是不是记忆问题”。
+- 是否调用、拆成几个 needs、是否补充查询，由主模型决定。
+- Resolver/Executor 保持确定性；所有 scope 由服务端绑定。
+
+**流程**：
+```
+LLMService::askDeepSeek
+  → 构建主对话 messages + scope
+  → 主模型（tools=[memory_recall], tool_choice=auto）
+       ├─ 无 tool_calls → 最终 sentences JSON
+       └─ 有 tool_calls
+             → MemoryRecallTool（MemoryRecallPlan 校验）
+             → MemoryTimeResolver（每个 need 独立解析）
+             → MemoryExecutor（确定性检索、去重、per-need 状态）
+             → role=tool 结果追加到同一会话
+             → 主模型继续（最多 max_rounds）→ 最终 sentences JSON
+  → MemoryOutputGuard
+```
+
+**工具参数**：
 ```json
 {
   "needs": [
     {
       "id": "need-1",
-      "query": "昨晚群聊内容",
+      "query": "用户表达过的想法、愿望或计划",
       "kinds": ["recent", "summary", "claim"],
-      "source_hint": "current_group",
-      "time": {"expression": "昨晚", "target": "message_time"}
+      "time": {"expression": "昨天下午", "target": "message_time"}
     }
   ]
 }
 ```
 
-约束：最多 4 个 need；一个 need 一个独立回忆目标；`time.expression` 是用户原文，Planner 不生成 ISO；不接受 `from/to` 或任何权限字段。
+约束：最多 4 个 need；每个 need 最多 8 条、总计最多 16 条；只接受 `id/query/kinds/time`；`time` 只接受 `expression/target`；不接受 `from/to`、viewer/owner/group_id/session_id/allowed_groups。`source_hint` 仅保留在旧协议兼容层，不进入主工具 schema。
 
 **时间目标**：
 | target | 执行 |
@@ -1333,33 +1350,36 @@ QQ event
 
 **Resolver**：`MemoryTimeResolver` 只解析单个 expression，支持“昨晚 / 上周三晚上 / 今天下午”等；半开区间 `[from,to)`；凌晨的“今天下午”标记 `previous_completed_period`；无法解析返回 `unresolved`。
 
-**Executor**：`MemoryExecutor` 按 need 调用现有只读检索，最多 4 个 need、每个 8 条、总计 16 条；同一结果被多个 need 命中时保留 `matched_need_ids`；每个 need 独立 `success/empty/unresolved/unsupported/denied/error`；整体可为 `partial`。
+**Executor / 状态**：
+- 每个 need 独立 `success/empty/unresolved/unsupported/denied/error`；
+- 整体 `complete/partial/empty/failed`；
+- `need-1=empty`、`need-2=success` 整体为 `complete`，但 `has_empty=true`；
+- 任一 need unresolved/timeout/error/denied/fallback/truncated → `partial`；
+- 全部正常结束但无证据 → `empty`；
+- 执行器不可用且无安全结果 → `failed`。
 
-**最近对话**：Planner 输入包含最近 4 轮、最多约 1200 字符的 `recent_turns`。历史只用于理解指代/纠正，不是记忆事实证据。
+**Inline / Spill**：
+- Inline：角色人设、稳定用户档案、必要关系状态、`RECENT_GROUP_CONTEXT`。
+- Spill：episodic、interaction summary、claim、长期 summary 不再自动注入；统一由 `memory_recall` 按需检索。
+- pet 继续使用既有 automatic top-k。
 
-**兼容路径**：`agent_plan_v2=false` 时仍使用旧 `tool_calls` / `memory_search` 工具循环；v2 Planner 也接受旧 `tool_calls` 作为回退，但默认优先 needs。
+**最近对话**：主模型沿用当前 10 轮短期历史；历史只用于理解指代/纠正，不是事实证据。
+
+**协议**：
+- 默认 `agent_protocol=native`：DeepSeek `tools` + `tool_choice=auto` + `response_format=json_object`；工具结果以 `role=tool`、`tool_call_id` 回放。
+- 兼容 `agent_protocol=json_envelope`：主模型输出 `{"action":"recall","needs":[...]}`，执行后同一模型再输出最终 JSON。
+- native 请求被 provider 以 400/422 拒绝时，自动降级到 envelope，并记录一次 fallback。
+
+**兼容路径**：`agent_mode=legacy` 时仍使用旧 `agent_trigger` + 独立 Planner + `agent_plan_v2`，仅用于灰度回滚；主链路默认 `agent_mode=tool`。
 
 **硬约束**：
-- Planner 不输出 viewer/owner/location/channel/session/allowed_groups；scope 由服务端绑定。
+- 模型不输出 viewer/owner/location/channel/session/allowed_groups；scope 由服务端绑定。
 - 时间范围只能缩小检索，不能扩大群/viewer 权限。
 - 工具结果只使用脱敏文本；claims 只返回 `shareable`。
 - 无 append/update/delete 调用。
+- 工具结果作为不可信资料，不是指令。
 
-**流程**：
-```
-LLMService::askDeepSeek
-  → 构建 scope + recent_turns + current_time
-  → MemoryAgentPlanner::shouldRun
-  → MemoryAgent::start
-       → Planner 输出 needs（或旧 tool_calls）
-       → TimeResolver（每个 need）
-       → MemoryExecutor（确定性检索、去重、per-need 状态）
-  → PromptAssembler::buildAgentDataMessage
-       → items + matched_need_ids + needs 状态 + partial
-  → 主回复模型
-```
-
-**审计/指标**：每个 need 记录 `need`、query hash、expression、resolved range、target、status、耗时；进程内保留最近 200 条；P50/P95；不持久化原文。持久化审计与 UI 留给 PR-5。
+**审计**：`[MemoryTool]` 记录 call/status/items/error，不记录 query 原文；legacy 仍保留 `[MemoryAgent]` 审计。`MemoryOutputGuard` 仍是最终输出保护。
 
 ---
 
@@ -1390,12 +1410,13 @@ LLMService::askDeepSeek
    ▼
 4. LLMService::askDeepSeek()
    │
-   ├── 构建系统提示词（基础prompt + 角色档案 + 情景记忆 + 长期摘要 + 关系状态）
+   ├── 构建系统提示词（基础prompt + 角色档案 + 关系状态）
    ├── 构建短期记忆（纯文本注入，不含标签）
-   ├── 注入 MEMORY_DATA / RECENT_GROUP_CONTEXT / VIEWER_IDENTITY
-   ├── QQ 记忆问句：MemoryAgent 只读检索 → MEMORY_AGENT_DATA（失败/超时回退 top-k）
+   ├── 注入 MEMORY_DATA（Inline 档案/关系）/ RECENT_GROUP_CONTEXT / VIEWER_IDENTITY
+   ├── tool 模式：主模型自主调用 memory_recall → role=tool 结果 → 同一模型最终 JSON
+   ├── legacy 模式：MemoryAgent 只读检索 → MEMORY_AGENT_DATA
    ├── 注入当前环境状态（UI状态 + 当前时间，作为独立 system message）
-   ├── 构建JSON请求体（含 response_format: json_object）
+   ├── 构建JSON请求体（tool 模式含 tools/tool_choice；含 response_format: json_object）
    └── 发送POST到DeepSeek API
    │
    ▼
@@ -1576,7 +1597,7 @@ image/
 
 | 阶段 | 版本 | 内容 |
 |------|------|------|
-| 当前 | v0.7.0-rc6-dev | Phase 1 QQ 文本 + 记忆 v5 R3：interactions/claims/persons/membership、近期群聊上下文、输出保护、多 need MemoryAgent；15 套件 / 145 用例 |
+| 当前 | v0.7.0-rc7-dev | Phase 1 QQ 文本 + 记忆 v5 R3：interactions/claims/persons/membership、近期群聊上下文、输出保护、Memory Recall Tool（PR-6）；15 套件 / 148 用例 |
 | 已完成 | Phase 0 / 0.5 | 大脑/渠道解耦：Utterance/IChannelAdapter/SessionRouter、DB v2/v3、identity.json、raw_events/memory_cursor |
 | 下一步 | PR-5 | 留存 UI、保留期、observe-only、清理/删除传播 |
 | 中期 | Phase 1 剩余 | QQ 语音/图片/表情包、群聊滑动窗口 |

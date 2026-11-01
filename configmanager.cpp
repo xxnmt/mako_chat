@@ -114,6 +114,18 @@ bool ConfigManager::loadSetting()
 
         m_memoryPolicy.agent.enabled =
             memoryObj.value("agent_enabled").toBool(true);
+        m_memoryPolicy.agent.mode =
+            memoryObj.value("agent_mode").toString(QStringLiteral("tool")).toLower();
+        if (m_memoryPolicy.agent.mode != QStringLiteral("legacy")) {
+            m_memoryPolicy.agent.mode = QStringLiteral("tool");
+        }
+        m_memoryPolicy.agent.protocol =
+            memoryObj.value("agent_protocol")
+                .toString(QStringLiteral("native"))
+                .toLower();
+        if (m_memoryPolicy.agent.protocol != QStringLiteral("json_envelope")) {
+            m_memoryPolicy.agent.protocol = QStringLiteral("native");
+        }
         m_memoryPolicy.agent.planV2 =
             memoryObj.value("agent_plan_v2").toBool(true);
         m_memoryPolicy.agent.trigger =
@@ -311,6 +323,8 @@ bool ConfigManager::saveSetting()
                             m_memoryPolicy.recentContext.warmLineMaxChars);
     memoryObj.insert("recent_group_context", recentContextObj);
     memoryObj.insert("agent_enabled", m_memoryPolicy.agent.enabled);
+    memoryObj.insert("agent_mode", m_memoryPolicy.agent.mode);
+    memoryObj.insert("agent_protocol", m_memoryPolicy.agent.protocol);
     memoryObj.insert("agent_plan_v2", m_memoryPolicy.agent.planV2);
     memoryObj.insert("agent_trigger", m_memoryPolicy.agent.trigger);
     memoryObj.insert("agent_timeout_ms", m_memoryPolicy.agent.timeoutMs);

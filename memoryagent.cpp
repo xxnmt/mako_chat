@@ -948,7 +948,7 @@ void MemoryAgent::handlePlannerReply(bool ok,
     }
 
     if (content.value(QStringLiteral("done")).toBool(false)) {
-        finishWithStatus(QStringLiteral("ok"));
+        finishWithStatus(QStringLiteral("complete"));
         return;
     }
 
@@ -976,7 +976,7 @@ void MemoryAgent::handlePlannerReply(bool ok,
     }
 
     if (m_round >= qMax(1, m_scope.maxRounds)) {
-        finishWithStatus(QStringLiteral("ok"));
+        finishWithStatus(QStringLiteral("complete"));
         return;
     }
     ++m_round;
@@ -987,7 +987,7 @@ void MemoryAgent::handlePlannerReply(bool ok,
         return;
     }
     if (m_round >= qMax(1, m_scope.maxRounds)) {
-        finishWithStatus(QStringLiteral("ok"));
+        finishWithStatus(QStringLiteral("complete"));
         return;
     }
     sendPlanner(m_messages);
@@ -1078,7 +1078,7 @@ void MemoryAgent::finishWithStatus(const QString &status, bool timedOut)
         result.items = m_tools->items();
         result.truncated = m_tools->truncated();
     }
-    result.status = status.isEmpty() ? QStringLiteral("ok") : status;
+    result.status = status.isEmpty() ? QStringLiteral("complete") : status;
     finishWithResult(result, timedOut);
 }
 
@@ -1096,7 +1096,7 @@ void MemoryAgent::finishWithResult(MemoryAgentResult result, bool timedOut)
         result.status = m_timedOut ? QStringLiteral("timeout")
                                    : (result.items.isEmpty()
                                           ? QStringLiteral("empty")
-                                          : QStringLiteral("ok"));
+                                          : QStringLiteral("complete"));
     }
     if (m_metricsEnabled) {
         m_metrics.recordRun(!timedOut, timedOut, latency);
@@ -1182,6 +1182,19 @@ void MemoryAgent::appendAudit(const QString &tool,
     emit auditRecorded(audit);
 }
 
+bool MemoryAgentPlanner::canExposeTools(const RequestMeta &meta,
+                                        const MemoryAgentConfig &config)
+{
+    if (!config.enabled || config.mode != QStringLiteral("tool")) {
+        return false;
+    }
+    if (meta.channel != Channel::kQQGroup
+        && meta.channel != Channel::kQQPrivate) {
+        return false;
+    }
+    return meta.turnKind == QStringLiteral("reply");
+}
+
 bool MemoryAgentPlanner::isMemoryQuestion(const QString &input)
 {
     if (RecentContextPlanner::isHistoricalCue(input)
@@ -1197,7 +1210,8 @@ bool MemoryAgentPlanner::shouldRun(const RequestMeta &meta,
                                    const QString &input,
                                    const MemoryAgentConfig &config)
 {
-    if (!config.enabled || input.trimmed().isEmpty()) {
+    if (!config.enabled || config.mode != QStringLiteral("legacy")
+        || input.trimmed().isEmpty()) {
         return false;
     }
     if (meta.channel != Channel::kQQGroup

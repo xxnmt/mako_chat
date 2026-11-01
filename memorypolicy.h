@@ -47,6 +47,12 @@ struct RecentContextConfig {
 
 struct MemoryAgentConfig {
     bool enabled = true;
+    // tool：主 Conversation Agent 自主调用 memory_recall；
+    // legacy：保留旧关键词门控 + 独立 Planner，作为灰度回滚路径。
+    QString mode = QStringLiteral("tool");
+    // native：DeepSeek 原生 tools；json_envelope：兼容 JSON 动作协议。
+    QString protocol = QStringLiteral("native");
+    // 仅 legacy 路径使用。
     bool planV2 = true;
     QString trigger = QStringLiteral("memory_question"); // memory_question / always
     int timeoutMs = 6000;

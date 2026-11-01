@@ -56,7 +56,8 @@ struct MemoryAgentResult {
     QList<MemoryAgentItem> items;
     QList<MemoryNeedResult> needs;
     bool truncated = false;
-    QString status;             // ok / partial / timeout / failed / empty
+    // complete / partial / empty / failed / timeout（timeout 仅 legacy）
+    QString status;
 };
 
 struct MemoryAgentAudit {

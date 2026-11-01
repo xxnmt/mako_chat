@@ -21,6 +21,8 @@ MemoryAgentResult MemoryExecutor::execute(const MemoryRecallPlan &plan)
     QHash<QString, int> itemIndexByToolId;
     int opaqueId = 0;
     bool anyFailure = false;
+    QElapsedTimer runTimer;
+    runTimer.start();
 
     for (const MemoryRecallNeed &need : plan.needs) {
         MemoryNeedResult needResult;
@@ -31,6 +33,15 @@ MemoryAgentResult MemoryExecutor::execute(const MemoryRecallPlan &plan)
 
         QElapsedTimer timer;
         timer.start();
+
+        if (m_scope.timeoutMs > 0
+            && runTimer.elapsed() >= m_scope.timeoutMs) {
+            needResult.status = QStringLiteral("timeout");
+            needResult.error = QStringLiteral("retrieval_budget_exceeded");
+            anyFailure = true;
+            result.needs.append(needResult);
+            continue;
+        }
 
         if (need.timeTarget == MemoryTimeTarget::FactValidity) {
             needResult.status = QStringLiteral("unsupported");
@@ -130,12 +141,31 @@ MemoryAgentResult MemoryExecutor::execute(const MemoryRecallPlan &plan)
         result.needs.append(needResult);
     }
 
-    if (result.items.isEmpty()) {
+    anyFailure = anyFailure || result.truncated;
+    // complete：所有 need 都正常结束（包括明确 empty）；
+    // empty：全部正常结束但没有任何证据；
+    // partial：至少一个 need 未完成（unresolved/timeout/error/denied/fallback/truncated）；
+    // failed：执行器不可用且没有任何可安全交付的结果。
+    bool anyNeed = false;
+    bool allFailed = true;
+    for (const MemoryNeedResult &need : result.needs) {
+        anyNeed = true;
+        if (need.status != QStringLiteral("error")
+            && need.status != QStringLiteral("denied")) {
+            allFailed = false;
+        }
+    }
+
+    if (result.items.isEmpty() && anyNeed && allFailed) {
+        result.status = QStringLiteral("failed");
+    } else if (result.items.isEmpty() && anyFailure) {
+        result.status = QStringLiteral("partial");
+    } else if (result.items.isEmpty()) {
         result.status = QStringLiteral("empty");
     } else if (anyFailure) {
         result.status = QStringLiteral("partial");
     } else {
-        result.status = QStringLiteral("ok");
+        result.status = QStringLiteral("complete");
     }
     return result;
 }

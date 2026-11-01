@@ -1,7 +1,7 @@
 # 记忆系统 v5 R3 实施基线
 
-> 状态：**PR-1a / PR-1b 已通过手工验收；PR-2 / PR-2.1 / PR-2.2 / PR-3.0 / PR-3.1 / PR-3.2a / PR-3.2a.1 / PR-3.2b / PR-3.2c / PR-4 已实现并通过单测。3.2a / 3.2a.1 成员生命周期已手工验证；3.2b / 3.2c 待手工验收。下一项 PR-5。**
-> 日期：2026-10-31
+> 状态：**PR-1a / PR-1b 已通过手工验收；PR-2 / PR-2.1 / PR-2.2 / PR-3.0 / PR-3.1 / PR-3.2a / PR-3.2a.1 / PR-3.2b / PR-3.2c / PR-4 / PR-6 已实现并通过单测。3.2a / 3.2a.1 成员生命周期已手工验证；3.2b / 3.2c 待手工验收。下一项 PR-5。**
+> 日期：2026-11-01
 > 冻结：`blocked` 默认不回复；`group_authorized` 下非白名单成员只记录、不回复、不写 `chat_history`。
 > 取代：[MEMORY_V5_DESIGN.md](MEMORY_V5_DESIGN.md) 的历史草案
 > 依据：R2 源码核对方案 + 本轮四项产品决策
@@ -22,11 +22,12 @@
 
 - 数据库：`PRAGMA user_version = 9`，当前 14 张表。
 - 迁移链：v1 基础 5 表 → v2 多渠道 → v3 `raw_events`/`memory_cursor` → v4 `episodic.session_id` → v5 脱敏审计列 → v6 `interactions` → v7 `persons`/`person_identities` → v8 `memory_claims`/`summary_segments` → v9 `group_membership_*`。
-- 测试：15 个 CTest 套件 / 145 个测试函数全绿；`tst_memoryagent` 覆盖工具授权、多 need 契约、Resolver、Executor 去重/partial、最近对话上下文、时间范围与排序回归。
+- 测试：15 个 CTest 套件 / 148 个测试函数全绿；`tst_memoryagent` 覆盖工具授权、多 need 契约、Resolver、Executor 去重/partial、最近对话上下文、时间范围与排序回归。
 - 检索：`RecentContextPlanner` + `searchRecentGroupContext` 只读时间窗；claims 只注入 `shareable`。
 - 成员关系：连接/重连/定时刷新；入群/退群 notice；快照失败保留旧 period 但跨群 fail closed。
 - 明确不含：向量库、embedding、独立 agent runtime、第二套原始事件系统。
-- PR-4 MemoryAgent：QQ 记忆问句触发，pet 不进入；Planner 多 need、Resolver、Executor；旧工具循环回退；partial/去重/审计/P95。
+- PR-4 MemoryAgent（legacy）：QQ 记忆问句触发，pet 不进入；Planner 多 need、Resolver、Executor；旧工具循环回退；partial/去重/审计/P95。
+- PR-6 Memory Recall Tool：主 Conversation Agent 自主调用 `memory_recall`；原生 Tool Calling；Inline/Spill；per-need 状态与 `has_empty`；`agent_mode=tool` 默认。
 - 下一项 PR-5 留存 UI；持久化审计/UI 尚未开始。
 
 ---
@@ -586,6 +587,22 @@ user: 当前输入
 
 验收：Agent 不能指定 viewer/owner/location；不能写库；越权测试通过。
 
+### PR-6：主 Conversation Agent 自主调用 memory_recall
+
+**状态**：已实现，灰度默认 `tool`。
+
+- 移除主链路的 `MemoryAgentPlanner::shouldRun()` 语义判断；`canExposeTools()` 只检查功能、QQ 渠道、`turn_kind=reply`、pet 排除。
+- 主模型通过原生 `tools` + `tool_choice=auto` 自主决定是否调用 `memory_recall`；工具结果以 `role=tool` 追加到同一会话，再由同一主模型输出最终 sentences JSON。
+- `MemoryRecallTool` 复用 `MemoryRecallPlan` 校验、`MemoryTimeResolver`、`MemoryExecutor`；参数不接受 `from/to` 或任何权限字段。
+- 新增 `memoryresultjson.h/cpp`：统一 per-need 状态、`has_empty`、`matched_need_ids`、脱敏 item 序列化。
+- Inline/Spill：tool 模式下 episodic / interaction summary / claim / 长期 summary 不再自动注入；档案、关系、RecentContext 保留。
+- 状态语义统一为 `complete/partial/empty/failed`；`need-1=empty`、`need-2=success` 为 `complete` 且 `has_empty=true`。
+- `agent_protocol=native` 优先；provider 400/422 时自动降级 `json_envelope`；`agent_mode=legacy` 保留旧关键词门控 + 独立 Planner 作为回滚。
+- 配置：`memory.agent_mode`、`memory.agent_protocol`；旧 `agent_plan_v2` / `agent_trigger` 仅 legacy 使用。
+- 测试：`tst_memoryagent` 新增工具门控、工具参数拒绝 scope、per-need complete/empty；`tst_promptassembler` 新增 `has_empty` / `complete` 序列化；`tst_configmanager` 新增 mode/protocol 默认与回读。
+
+验收：主模型在“昨天下午我有没有说过什么愿望”这类无关键词问句上可自主调用工具；普通陈述不触发；工具参数不能改变权限；工具结果不编造。
+
 ### PR-5：留存 UI 与生命周期
 
 **状态**：未开始。
@@ -660,6 +677,11 @@ user: 当前输入
 | R40-5 | 审计 | 不记录 query/记忆原文；记录工具名、hash、结果数、耗时、状态、P50/P95 |
 | R40-6 | 时间问句 | “今天下午/昨天上午/刚才”解析为服务端时间范围；凌晨“今天下午”映射到刚过去的下午 |
 | R40-7 | 异常昵称 | prompt 去除控制字符/双向控制符；数据库保留原文；受污染 failed interaction 可重排 |
+| R60-1 | 主模型自主调用 | 无关键词的隐式回忆可调用 memory_recall；普通闲聊不调用 |
+| R60-2 | 工具参数 | 只接受 needs；viewer/group/from-to 等字段被拒绝 |
+| R60-3 | per-need 状态 | need-1 empty + need-2 success → complete + has_empty；partial/failed 不伪装全成功 |
+| R60-4 | Inline/Spill | tool 模式不自动注入 episodic/interaction summary/claim/长期 summary |
+| R60-5 | 协议回退 | native 400/422 → json_envelope；工具结果仍由同一主模型消费 |
 | R40-8 | 摘要截断 | 长篇摘要使用足够 token；截断/JSON 失败与空 summary 分开记录 |
 
 ---

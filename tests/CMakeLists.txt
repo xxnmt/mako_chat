@@ -114,6 +114,10 @@ add_phase0_test(tst_memoryagent
     ${PROJECT_SOURCE_DIR}/memoryagenttypes.h
     ${PROJECT_SOURCE_DIR}/memoryagent.h
     ${PROJECT_SOURCE_DIR}/memoryagent.cpp
+    ${PROJECT_SOURCE_DIR}/memoryresultjson.h
+    ${PROJECT_SOURCE_DIR}/memoryresultjson.cpp
+    ${PROJECT_SOURCE_DIR}/memoryrecalltool.h
+    ${PROJECT_SOURCE_DIR}/memoryrecalltool.cpp
     ${PROJECT_SOURCE_DIR}/memoryrecalltypes.h
     ${PROJECT_SOURCE_DIR}/memoryrecalltypes.cpp
     ${PROJECT_SOURCE_DIR}/memorytimeresolver.h
@@ -170,6 +174,8 @@ add_phase0_test(tst_promptassembler
     ${PROJECT_SOURCE_DIR}/promptassembler.cpp
     ${PROJECT_SOURCE_DIR}/memoryrecalltypes.h
     ${PROJECT_SOURCE_DIR}/memoryrecalltypes.cpp
+    ${PROJECT_SOURCE_DIR}/memoryresultjson.h
+    ${PROJECT_SOURCE_DIR}/memoryresultjson.cpp
 )
 
 add_phase0_test(tst_qqreplypolicy

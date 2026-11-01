@@ -125,6 +125,11 @@ private:
 class MemoryAgentPlanner
 {
 public:
+    // 工具模式的能力门控：只检查功能、渠道、turn 类型，不读取用户文本。
+    static bool canExposeTools(const RequestMeta &meta,
+                               const MemoryAgentConfig &config);
+
+    // 以下两个仅保留给 legacy 回滚路径，不得用于 tool 模式。
     static bool shouldRun(const RequestMeta &meta,
                           const QString &input,
                           const MemoryAgentConfig &config);
