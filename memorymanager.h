@@ -111,6 +111,16 @@ public:
         const QDateTime &from,
         const QDateTime &to,
         int limit);
+    QList<InteractionSummary> getInteractionSummariesOverlapping(
+        const QString &channel,
+        const QString &sessionId,
+        const QDateTime &from,
+        const QDateTime &to,
+        int limit);
+    int countInteractionsInRange(const QString &channel,
+                                 const QString &sessionId,
+                                 const QDateTime &from,
+                                 const QDateTime &to);
     QString getGroupDisplayName(const QString &groupId);
     QList<qlonglong> getFailedInteractionsWithUnsafeParticipantNames(int limit = 100);
     bool resetInteractionSummaryForRetry(qlonglong interactionId);

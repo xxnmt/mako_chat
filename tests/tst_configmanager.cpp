@@ -224,6 +224,7 @@ private slots:
         QVERIFY(policy.agent.enabled);
         QCOMPARE(policy.agent.mode, QStringLiteral("tool"));
         QCOMPARE(policy.agent.protocol, QStringLiteral("native"));
+        QVERIFY(!policy.agent.ownerCrossChannelPrivate);
         QVERIFY(policy.agent.planV2);
         QCOMPARE(policy.agent.trigger, QStringLiteral("memory_question"));
         QCOMPARE(policy.agent.timeoutMs, 6000);
@@ -265,6 +266,7 @@ private slots:
         memory.insert("agent_enabled", false);
         memory.insert("agent_mode", QStringLiteral("legacy"));
         memory.insert("agent_protocol", QStringLiteral("json_envelope"));
+        memory.insert("owner_cross_channel_private", true);
         memory.insert("agent_plan_v2", false);
         memory.insert("agent_trigger", QStringLiteral("always"));
         memory.insert("agent_timeout_ms", 4000);
@@ -324,6 +326,7 @@ private slots:
         QVERIFY(!policy.agent.enabled);
         QCOMPARE(policy.agent.mode, QStringLiteral("legacy"));
         QCOMPARE(policy.agent.protocol, QStringLiteral("json_envelope"));
+        QVERIFY(policy.agent.ownerCrossChannelPrivate);
         QVERIFY(!policy.agent.planV2);
         QCOMPARE(policy.agent.trigger, QStringLiteral("always"));
         QCOMPARE(policy.agent.timeoutMs, 4000);
@@ -359,6 +362,7 @@ private slots:
         QVERIFY(!agent.enabled);
         QCOMPARE(agent.mode, QStringLiteral("legacy"));
         QCOMPARE(agent.protocol, QStringLiteral("json_envelope"));
+        QVERIFY(agent.ownerCrossChannelPrivate);
         QCOMPARE(agent.trigger, QStringLiteral("always"));
         QCOMPARE(agent.timeoutMs, 4000);
         QCOMPARE(agent.maxRounds, 4);

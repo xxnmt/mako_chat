@@ -7,7 +7,7 @@ find_package(Qt6 6.5 REQUIRED COMPONENTS Core Widgets Network Sql Multimedia Web
 qt_standard_project_setup()
 
 # 添加资源文件
-qt6_add_resources(RESOURCE_FILES image.qrc)
+qt6_add_resources(RESOURCE_FILES image.qrc calendar.qrc)
 
 qt_add_executable(Windows_AI
     WIN32 MACOSX_BUNDLE
@@ -26,6 +26,11 @@ qt_add_executable(Windows_AI
     memoryaccesspolicy.h memoryaccesspolicy.cpp
     memorytimerange.h memorytimerange.cpp
     memoryrecalltypes.h memoryrecalltypes.cpp
+    memorytimeframe.h memorytimeframe.cpp
+    festivalcalendar.h festivalcalendar.cpp
+    timeframeresolver.h timeframeresolver.cpp
+    memorysourcepolicy.h memorysourcepolicy.cpp
+    memoryoverview.h memoryoverview.cpp
     memorytimeresolver.h memorytimeresolver.cpp
     memoryagenttypes.h memoryagent.h memoryagent.cpp
     memoryresultjson.h memoryresultjson.cpp

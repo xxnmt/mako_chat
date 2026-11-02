@@ -126,6 +126,8 @@ bool ConfigManager::loadSetting()
         if (m_memoryPolicy.agent.protocol != QStringLiteral("json_envelope")) {
             m_memoryPolicy.agent.protocol = QStringLiteral("native");
         }
+        m_memoryPolicy.agent.ownerCrossChannelPrivate =
+            memoryObj.value("owner_cross_channel_private").toBool(false);
         m_memoryPolicy.agent.planV2 =
             memoryObj.value("agent_plan_v2").toBool(true);
         m_memoryPolicy.agent.trigger =
@@ -325,6 +327,8 @@ bool ConfigManager::saveSetting()
     memoryObj.insert("agent_enabled", m_memoryPolicy.agent.enabled);
     memoryObj.insert("agent_mode", m_memoryPolicy.agent.mode);
     memoryObj.insert("agent_protocol", m_memoryPolicy.agent.protocol);
+    memoryObj.insert("owner_cross_channel_private",
+                     m_memoryPolicy.agent.ownerCrossChannelPrivate);
     memoryObj.insert("agent_plan_v2", m_memoryPolicy.agent.planV2);
     memoryObj.insert("agent_trigger", m_memoryPolicy.agent.trigger);
     memoryObj.insert("agent_timeout_ms", m_memoryPolicy.agent.timeoutMs);

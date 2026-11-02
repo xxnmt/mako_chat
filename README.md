@@ -27,8 +27,11 @@
   - 群成员关系（group_membership_periods / snapshots，定时刷新、入群/退群、失败 fail closed）
   - 近期群聊上下文（RecentContextPlanner + searchRecentGroupContext，只读按时间窗检索）
   - 主 Conversation Agent 自主调用 `memory_recall`（原生 Tool Calling；同一上下文完成工具调用与最终回复）
-  - 多 need 记忆检索（主模型拆目标；Resolver 独立解析时间；Executor 去重与 per-need 状态）
-  - Inline/Spill：档案与关系内联，episodic/interaction summary/claim/长期 summary 按需检索
+  - 多 need 记忆检索（lookup）；`mode=overview` 覆盖完整时间段并返回覆盖率/时间桶/可展开句柄
+  - 数据源：group_recent、interaction_summary、claim、episodic、long_term_summary、chat_history
+  - TimeFrame：模型表达 anchor/occurrence/span/period，服务端计算日期；公共节日数据驱动
+  - Inline/Spill：档案与关系内联，历史记忆按需检索
+  - `owner_cross_channel_private` 默认关闭；仅 Owner QQ 私聊可按开关读取自己的 pet/private 记忆
   - `agent_mode=legacy` 保留旧关键词门控 + 独立 Planner，作为灰度回滚
   - prompt 昵称净化（去除控制字符/双向控制符，数据库保留原始昵称）
   - 对话历史管理（分页浏览、删除、清空）
@@ -246,6 +249,7 @@ cmake --build . --config Release
         "agent_enabled": true,
         "agent_mode": "tool",
         "agent_protocol": "native",
+        "owner_cross_channel_private": false,
         "agent_plan_v2": true,
         "agent_trigger": "memory_question",
         "agent_timeout_ms": 6000
@@ -279,6 +283,7 @@ cmake --build . --config Release
 | `memory` | `debug_full_logs` / `privacy_rules` | 默认关闭全文日志；隐私规则支持 exact / keyword / pattern |
 | `memory` | `recent_group_context` | 近期群聊检索预算；默认开启 |
 | `memory` | `agent_enabled` / `agent_mode` / `agent_protocol` | `tool`：主模型自主调用 `memory_recall`；`legacy`：旧关键词门控 + 独立 Planner；协议可选 `native` / `json_envelope` |
+| `memory` | `owner_cross_channel_private` | 默认 `false`；仅 Owner QQ 私聊可读取自己的 pet/private 记忆，群聊/非 Owner 始终禁止 |
 | `memory` | `agent_timeout_ms` / `agent_max_rounds` / `agent_max_results` | 工具超时、工具轮数与单次 need 结果上限 |
 | `time` | `night_start` / `night_end` / `*_lasting` | 昼夜切换与表情/脸红/距离退火时长 |
 | `qq` | `enabled` / `ws_url` / `access_token` / `reply` | OneBot v11 WS 连接与私聊/群聊回复策略 |
@@ -407,7 +412,7 @@ Windows_AI/
 │   ├── closer/              # 近景立绘
 │   ├── far/                 # 远景立绘
 │   └── default_config/      # 默认配置（prompt.txt）
-├── tests/                   # 单元测试（Qt Test + CTest，15 套件 / 148 个测试函数）
+├── tests/                   # 单元测试（Qt Test + CTest，15 套件 / 152 个测试函数）
 │   ├── tst_memorymanager.cpp
 │   ├── tst_configmanager.cpp
 │   ├── tst_memorypolicy.cpp
@@ -464,7 +469,12 @@ Windows_AI/
 ├── memoryrecalltool.h/cpp   # 主模型 memory_recall 工具
 ├── memoryresultjson.h/cpp   # per-need 状态/结果序列化
 ├── memoryrecalltypes.h/cpp  # 多 need plan/status 数据结构
-├── memorytimeresolver.h/cpp # 独立时间表达解析
+├── memorytimeframe.h/cpp    # 结构化时间帧
+├── festivalcalendar.h/cpp   # 公共节日数据
+├── timeframeresolver.h/cpp  # 时间帧 -> 日期范围
+├── memorysourcepolicy.h/cpp # 数据源授权矩阵
+├── memoryoverview.h/cpp     # 区间概览/覆盖率/桶
+├── memorytimeresolver.h/cpp # 独立时间表达解析（legacy/兼容）
 ├── memoryexecutor.h/cpp     # 多 need 确定性检索/去重/partial
 ├── memorytimerange.h/cpp    # 旧规则 fallback
 ├── memorypolicy.h/cpp       # 入站策略、脱敏、隐私规则
@@ -546,7 +556,7 @@ Windows_AI/
 4. **立绘切换无过渡动画**：换图时直接切换，没有淡入淡出效果
 5. **仅支持单角色**：当前仅支持「千岛茉子」一个角色
 6. **外部渠道**：QQ 文本、群记忆、成员关系已接入；QQ 语音/图片/表情包、群聊滑动窗口与主动转述待后续（主动转述设计见 `docs/HUMANIZATION_PLAN.md` 6.4–6.6）
-7. **R3 手工验收未完成项**：PR-3.2b/3.2c 的 claim 三主体激活与跨群 viewer 过滤已通过单测，仍待真实账号手工验收；PR-4 legacy MemoryAgent 与 PR-6 Memory Recall Tool 已实现并通过单测，PR-5 留存 UI 尚未开始
+7. **R3 手工验收未完成项**：PR-3.2b/3.2c 的 claim 三主体激活与跨群 viewer 过滤已通过单测，仍待真实账号手工验收；PR-4 legacy MemoryAgent 与 PR-6/7/8/9 Memory Recall Tool 已实现并通过单测，PR-5 留存 UI 尚未开始
 
 ## 🔧 故障排除
 

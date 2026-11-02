@@ -29,6 +29,8 @@ struct MemoryAgentScope {
     int timeoutMs = 6000;
     int maxRounds = 2;
     bool planV2 = true;
+    // 仅对 Owner QQ 私聊生效：允许读取自己的 pet/private 记忆。
+    bool ownerCrossChannelPrivate = false;
     QString timezone;
     QList<PlannerTurn> recentTurns;
     MemoryAccessContext access;
@@ -47,6 +49,9 @@ struct MemoryAgentItem {
     qlonglong rawEventId = -1;
     qlonglong interactionId = -1;
     qlonglong claimId = -1;
+    qlonglong episodicId = -1;
+    qlonglong longTermSummaryId = -1;
+    qlonglong historyTurnId = -1;
     QString sourceSessionId;    // 仅服务端内部使用，不进入工具结果
     QStringList matchedNeedIds; // 本次 run 内命中的 need，不暴露数据库 ID
     bool isViewer = false;

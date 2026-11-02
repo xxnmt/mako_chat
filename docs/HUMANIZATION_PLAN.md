@@ -2,9 +2,9 @@
 
 > 项目：Windows_AI 桌面看板娘（桌宠）
 > 类型：规划文档（分阶段实施中）
-> 版本：v1.4（Phase 1 主体 QQ 文本 + 记忆 v5 R3 + Memory Recall Tool，2026-11-01）
+> 版本：v1.5（Phase 1 主体 QQ 文本 + 记忆 v5 R3 + Memory Recall Tool/Overview/TimeFrame，2026-11-02）
 > 制定日期：2026-10-19
-> 状态：Phase 0 / 0.5 已完成；Phase 1 前置项全部完成；Phase 1 主体 **QQ 私聊/群聊文本收发已通**（SnowLuma + OneBot WS + 白名单/@ 门控）；记忆 v5 R3 主体、legacy MemoryAgent 与 Memory Recall Tool 已实现（PR-1~4、PR-6，3.2b/3.2c 待手工验收，PR-5 未开始）；下一步 R3 验收、PR-5 留存 UI、QQ 语音/图片与 Phase 2 主动对话
+> 状态：Phase 0 / 0.5 已完成；Phase 1 前置项全部完成；Phase 1 主体 **QQ 私聊/群聊文本收发已通**（SnowLuma + OneBot WS + 白名单/@ 门控）；记忆 v5 R3 主体、legacy MemoryAgent 与 Memory Recall Tool/Overview/TimeFrame 已实现（PR-1~4、PR-6~9，3.2b/3.2c 待手工验收，PR-5 未开始）；下一步 R3 验收、PR-5 留存 UI、QQ 语音/图片与 Phase 2 主动对话
 > 关联文档：[ROADMAP.md](ROADMAP.md)、[ARCHITECTURE.md](ARCHITECTURE.md)
 
 ---
@@ -733,6 +733,8 @@ CREATE TABLE memory_cursor (
 > **2026-10-31 更新**：记忆 v5 R3 主体（PR-1~3.2c）与 PR-4 MemoryAgent 已合入，并补充异常昵称清洗、时间范围检索、partial timeout；当前基线为 **15 套件 / 145 个测试函数**、数据库 `user_version=9`（14 张表）。3.2a/3.2a.1 已手工验证，3.2b/3.2c 待手工验收；PR-5 未开始。上面 7/64 为 2026-10-27 时点记录，保留不改。
 >
 > **2026-11-01 更新**：PR-6 Memory Recall Tool 已合入。默认 `agent_mode=tool`：主 Conversation Agent 通过原生 `memory_recall` 自主决定是否检索；主链路不再使用 `shouldRun()` 关键词门控。tool 模式下 episodic/interaction summary/claim/长期 summary 不再自动注入，改为按需检索；`agent_mode=legacy` 保留旧路径回滚。
+>
+> **2026-11-02 更新**：PR-7A/7B/7C/8/9 已合入。新增 episodic/long_term_summary/chat_history 检索与 Owner 跨渠道开关、区间概览 `mode=overview`、TimeFrame + 公共节日数据、per-need 审计；默认仍关闭 `owner_cross_channel_private`。
 
 #### 10.5.1 identity 身份接入
 

@@ -1,0 +1,5 @@
+<RCC>
+    <qresource prefix="/">
+        <file>calendar/festivals.json</file>
+    </qresource>
+</RCC>

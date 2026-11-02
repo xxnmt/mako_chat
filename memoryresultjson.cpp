@@ -77,7 +77,27 @@ QJsonObject memoryAgentResultToJson(const MemoryAgentResult &result,
         if (!need.interpretation.isEmpty()) {
             needJson.insert(QStringLiteral("interpretation"), need.interpretation);
         }
+        if (!need.evidenceState.isEmpty()) {
+            needJson.insert(QStringLiteral("evidence_state"), need.evidenceState);
+        }
+        if (!need.timeCertainty.isEmpty()) {
+            needJson.insert(QStringLiteral("time_certainty"), need.timeCertainty);
+        }
+        needJson.insert(QStringLiteral("time_constraint_applied"),
+                        need.timeConstraintApplied);
+        if (!need.sourceKinds.isEmpty()) {
+            needJson.insert(QStringLiteral("source_kinds"),
+                            QJsonArray::fromStringList(need.sourceKinds));
+        }
+        if (!need.resolvedFrom.isEmpty()) {
+            needJson.insert(QStringLiteral("resolved_from"), need.resolvedFrom);
+        }
+        if (!need.resolvedTo.isEmpty()) {
+            needJson.insert(QStringLiteral("resolved_to"), need.resolvedTo);
+        }
+        needJson.insert(QStringLiteral("scanned_count"), need.scannedCount);
         needJson.insert(QStringLiteral("result_count"), need.resultCount);
+        needJson.insert(QStringLiteral("latency_ms"), need.latencyMs);
         if (!need.error.isEmpty()) {
             needJson.insert(QStringLiteral("error"), need.error);
         }
@@ -99,7 +119,17 @@ QJsonObject memoryAgentResultToJson(const MemoryAgentResult &result,
                          || (sawFailure && status != QStringLiteral("complete"));
 
     QJsonObject payload;
+    QString evidenceState = QStringLiteral("partial");
+    if (status == QStringLiteral("complete")) {
+        evidenceState = items.isEmpty() ? QStringLiteral("empty")
+                                        : QStringLiteral("found");
+    } else if (status == QStringLiteral("empty")) {
+        evidenceState = QStringLiteral("empty");
+    } else if (status == QStringLiteral("failed")) {
+        evidenceState = QStringLiteral("denied");
+    }
     payload.insert(QStringLiteral("status"), status);
+    payload.insert(QStringLiteral("evidence_state"), evidenceState);
     payload.insert(QStringLiteral("partial"), partial);
     payload.insert(QStringLiteral("truncated"), truncated);
     payload.insert(QStringLiteral("has_empty"), hasEmptyNeed(result));

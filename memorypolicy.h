@@ -52,6 +52,8 @@ struct MemoryAgentConfig {
     QString mode = QStringLiteral("tool");
     // native：DeepSeek 原生 tools；json_envelope：兼容 JSON 动作协议。
     QString protocol = QStringLiteral("native");
+    // 仅 Owner QQ 私聊；允许读取自己的 pet/private 记忆。
+    bool ownerCrossChannelPrivate = false;
     // 仅 legacy 路径使用。
     bool planV2 = true;
     QString trigger = QStringLiteral("memory_question"); // memory_question / always

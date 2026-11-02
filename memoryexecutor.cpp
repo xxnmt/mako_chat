@@ -2,6 +2,7 @@
 
 #include "memoryagent.h"
 #include "memorytimeresolver.h"
+#include "timeframeresolver.h"
 
 #include <QElapsedTimer>
 #include <QJsonObject>
@@ -37,6 +38,8 @@ MemoryAgentResult MemoryExecutor::execute(const MemoryRecallPlan &plan)
         if (m_scope.timeoutMs > 0
             && runTimer.elapsed() >= m_scope.timeoutMs) {
             needResult.status = QStringLiteral("timeout");
+            needResult.evidenceState = QStringLiteral("partial");
+            needResult.timeCertainty = QStringLiteral("unknown");
             needResult.error = QStringLiteral("retrieval_budget_exceeded");
             anyFailure = true;
             result.needs.append(needResult);
@@ -45,6 +48,8 @@ MemoryAgentResult MemoryExecutor::execute(const MemoryRecallPlan &plan)
 
         if (need.timeTarget == MemoryTimeTarget::FactValidity) {
             needResult.status = QStringLiteral("unsupported");
+            needResult.evidenceState = QStringLiteral("unresolved");
+            needResult.timeCertainty = QStringLiteral("unknown");
             needResult.error = QStringLiteral("fact_validity_not_indexed");
             anyFailure = true;
             result.needs.append(needResult);
@@ -53,30 +58,52 @@ MemoryAgentResult MemoryExecutor::execute(const MemoryRecallPlan &plan)
 
         QStringList kinds = need.kinds;
         if (kinds.isEmpty()) {
-            kinds = {QStringLiteral("recent"), QStringLiteral("summary"),
-                     QStringLiteral("claim")};
+            kinds = {QStringLiteral("group_recent"),
+                     QStringLiteral("interaction_summary"),
+                     QStringLiteral("claim"),
+                     QStringLiteral("episodic"),
+                     QStringLiteral("long_term_summary")};
         }
+        needResult.sourceKinds = kinds;
         QJsonObject args;
         args.insert(QStringLiteral("query"), need.query);
         args.insert(QStringLiteral("kinds"), QJsonArray::fromStringList(kinds));
         args.insert(QStringLiteral("limit"), qMin(8, qMax(1, m_scope.maxResults)));
+        args.insert(QStringLiteral("time_target"),
+                    memoryTimeTargetToString(need.timeTarget));
 
         if (need.hasTime) {
-            MemoryResolvedTime resolved = MemoryTimeResolver::resolve(
-                need.timeExpression, need.timeTarget,
-                QDateTime::currentDateTime(), m_scope.timezone);
+            MemoryResolvedTime resolved = need.hasTimeFrame
+                ? TimeFrameResolver::resolve(
+                      need.timeExpression, need.timeTarget, need.timeFrame,
+                      QDateTime::currentDateTime(), m_scope.timezone)
+                : MemoryTimeResolver::resolve(
+                      need.timeExpression, need.timeTarget,
+                      QDateTime::currentDateTime(), m_scope.timezone);
             needResult.resolvedFrom = resolved.from.toString(Qt::ISODate);
             needResult.resolvedTo = resolved.to.toString(Qt::ISODate);
             needResult.interpretation = resolved.interpretation;
             if (!resolved.valid) {
                 needResult.status = QStringLiteral("unresolved");
+                needResult.evidenceState = QStringLiteral("unresolved");
+                needResult.timeCertainty = QStringLiteral("unknown");
                 needResult.error = resolved.error;
                 anyFailure = true;
                 result.needs.append(needResult);
                 continue;
             }
+            needResult.timeConstraintApplied = true;
             args.insert(QStringLiteral("time_from"), resolved.from.toString(Qt::ISODate));
             args.insert(QStringLiteral("time_to"), resolved.to.toString(Qt::ISODate));
+            // episodic.event_time / long_term_summary 没有可靠的 message_time 映射；
+            // 这类数据源只能做 content fallback，不能声称时间条件已满足。
+            if (need.timeTarget == MemoryTimeTarget::MessageTime
+                && (kinds.contains(QStringLiteral("episodic"))
+                    || kinds.contains(QStringLiteral("long_term_summary")))) {
+                needResult.timeConstraintApplied = false;
+                needResult.timeCertainty = QStringLiteral("approximate");
+                anyFailure = true;
+            }
         }
 
         MemoryAgentScope needScope = m_scope;
@@ -88,20 +115,35 @@ MemoryAgentResult MemoryExecutor::execute(const MemoryRecallPlan &plan)
 
         const QList<MemoryAgentItem> found = tools.items();
         needResult.resultCount = found.size();
+        needResult.scannedCount = found.size();
+        needResult.totalCandidates = found.size();
         if (!error.isEmpty()) {
             needResult.status = error == QStringLiteral("denied")
                                     ? QStringLiteral("denied")
                                     : (error == QStringLiteral("invalid_arguments")
                                            ? QStringLiteral("invalid")
                                            : QStringLiteral("error"));
+            needResult.evidenceState = needResult.status == QStringLiteral("denied")
+                                           ? QStringLiteral("denied")
+                                           : QStringLiteral("partial");
+            needResult.timeCertainty = QStringLiteral("unknown");
             needResult.error = error;
             anyFailure = true;
         } else if (found.isEmpty()) {
             needResult.status = QStringLiteral("empty");
+            needResult.evidenceState = QStringLiteral("empty");
+            needResult.timeCertainty = needResult.timeConstraintApplied
+                                           ? QStringLiteral("exact")
+                                           : QStringLiteral("unknown");
         } else {
             needResult.status = need.timeTarget == MemoryTimeTarget::EventTime
+                                    && !need.hasTimeFrame
                                     ? QStringLiteral("fallback")
                                     : QStringLiteral("success");
+            needResult.evidenceState = QStringLiteral("found");
+            needResult.timeCertainty = needResult.timeConstraintApplied
+                                           ? QStringLiteral("exact")
+                                           : QStringLiteral("unknown");
         }
         if (need.timeTarget == MemoryTimeTarget::EventTime) {
             // 当前没有独立事件时间索引。这里明确标记为 message_time fallback，
@@ -111,6 +153,8 @@ MemoryAgentResult MemoryExecutor::execute(const MemoryRecallPlan &plan)
                     ? QStringLiteral("event_time_message_time_fallback")
                     : needResult.interpretation
                           + QStringLiteral("|event_time_message_time_fallback");
+            needResult.timeConstraintApplied = false;
+            needResult.timeCertainty = QStringLiteral("approximate");
             anyFailure = true;
         }
         if (toolResult.value(QStringLiteral("truncated")).toBool(false)) {

@@ -6,11 +6,13 @@
 #include <QNetworkReply>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QScopedPointer>
 
 #include "sentencedata.h"
 #include "historyturn.h"
 #include "utterance.h"
 #include "memoryagenttypes.h"
+#include "memoryrecalltool.h"
 
 class MemoryManager;
 class MemoryAgent;
@@ -112,6 +114,7 @@ private:
     // tool 模式：同一个主模型、同一份消息历史，工具结果只追加到会话。
     QJsonArray m_toolMessages;
     MemoryAgentScope m_toolScope;
+    QScopedPointer<MemoryRecallTool> m_recallTool;
     QString m_toolProtocol;       // native / json_envelope
     int m_toolRound = 0;
     bool m_memoryToolActive = false;

@@ -1314,7 +1314,7 @@ QQ event
 ```
 LLMService::askDeepSeek
   → 构建主对话 messages + scope
-  → 主模型（tools=[memory_recall], tool_choice=auto）
+  → 主模型（tools=[memory_recall, memory_read], tool_choice=auto）
        ├─ 无 tool_calls → 最终 sentences JSON
        └─ 有 tool_calls
              → MemoryRecallTool（MemoryRecallPlan 校验）
@@ -1325,61 +1325,91 @@ LLMService::askDeepSeek
   → MemoryOutputGuard
 ```
 
+**数据源**：
+
+| kind | 来源 |
+|---|---|
+| `group_recent` | 当前群/授权群近期消息 |
+| `interaction_summary` | interaction 摘要 |
+| `claim` | `memory_claims`，AccessPolicy |
+| `episodic` | `episodic_memory` |
+| `long_term_summary` | `long_term_summary` |
+| `chat_history` | `chat_history` 原始对话 |
+
+`MemorySourcePolicy` 把“可搜索”和“可披露”分开；非 Owner 私聊不直接读取群级 interaction summary；`owner_cross_channel_private` 只对 Owner QQ 私聊生效。
+
 **工具参数**：
 ```json
 {
+  "mode": "lookup",
   "needs": [
     {
       "id": "need-1",
-      "query": "用户表达过的想法、愿望或计划",
-      "kinds": ["recent", "summary", "claim"],
-      "time": {"expression": "昨天下午", "target": "message_time"}
+      "query": "七夕约定",
+      "kinds": ["episodic", "long_term_summary"],
+      "time": {
+        "expression": "七夕",
+        "target": "message_time",
+        "frame": {
+          "anchor": {"type": "festival", "name": "七夕"},
+          "occurrence": {"type": "most_recent_past"},
+          "span": {"type": "day"}
+        }
+      }
     }
   ]
 }
 ```
 
-约束：最多 4 个 need；每个 need 最多 8 条、总计最多 16 条；只接受 `id/query/kinds/time`；`time` 只接受 `expression/target`；不接受 `from/to`、viewer/owner/group_id/session_id/allowed_groups。`source_hint` 仅保留在旧协议兼容层，不进入主工具 schema。
+约束：最多 4 个 need；每个 need 最多 8 条、总计最多 16 条；只接受 `mode/overview/needs`；`time` 接受 `expression/target/frame`；不接受 `from/to`、viewer/owner/group_id/session_id/allowed_groups。旧 `recent/summary` 仍作为兼容别名。
 
 **时间目标**：
 | target | 执行 |
 |---|---|
-| `message_time` | `MemoryTimeResolver` 解析后过滤 `occurred_at` / interaction 时间 |
-| `event_time` | 当前无独立事件时间索引；明确标记 `event_time_message_time_fallback`，按消息时间检索并返回 `fallback`，不声称是事件时间 |
-| `fact_validity` | 当前未接入 claim 有效时间索引，返回 `unsupported` |
+| `message_time` | 按来源时间过滤；interaction 用区间重叠；episodic/long summary 不能把 `event_time/created_at` 冒充 message_time |
+| `event_time` | episodic 可用 `event_time`；其他来源无独立索引时保持 fallback/不支持 |
+| `fact_validity` | 当前返回 `unsupported` |
 
-**Resolver**：`MemoryTimeResolver` 只解析单个 expression，支持“昨晚 / 上周三晚上 / 今天下午”等；半开区间 `[from,to)`；凌晨的“今天下午”标记 `previous_completed_period`；无法解析返回 `unresolved`。
+**Resolver**：
+- `TimeFrameResolver` 处理 `relative_day/week/month`、`absolute_date`、`festival`、`recent_window`；
+- 公共节日在 `calendar/festivals.json`，新增节日不改代码；
+- `MemoryTimeResolver` 仅作为无 frame 时的兼容路径；
+- 半开区间、服务端时区、最大 31 天；凌晨“今天下午”标记 `previous_completed_period`。
 
 **Executor / 状态**：
-- 每个 need 独立 `success/empty/unresolved/unsupported/denied/error`；
+- 每个 need 独立 `success/empty/unresolved/unsupported/denied/error/fallback`；
 - 整体 `complete/partial/empty/failed`；
 - `need-1=empty`、`need-2=success` 整体为 `complete`，但 `has_empty=true`；
-- 任一 need unresolved/timeout/error/denied/fallback/truncated → `partial`；
-- 全部正常结束但无证据 → `empty`；
-- 执行器不可用且无安全结果 → `failed`。
+- `time_constraint_applied=false` 明确表示 content-only fallback；
+- 任一 need unresolved/timeout/error/denied/fallback/truncated → `partial`。
+
+**Overview**：
+- `mode=overview` 扫描完整时间范围，不返回 top-k；
+- 默认 3 小时桶、最多 8 桶，服务端限幅；
+- 返回 `coverage`（total/ready/scanned/aggregated/exposed/missing/complete/truncated）与 `buckets`；
+- `bucket:*` 句柄由 `memory_read` 展开完整摘要集合；
+- 扫描完整不等于模型看到全部原文，必须区分 `scan_complete/aggregation_complete/exposure_complete`。
 
 **Inline / Spill**：
 - Inline：角色人设、稳定用户档案、必要关系状态、`RECENT_GROUP_CONTEXT`。
-- Spill：episodic、interaction summary、claim、长期 summary 不再自动注入；统一由 `memory_recall` 按需检索。
+- Spill：episodic、interaction summary、claim、long summary、chat_history 不再自动注入，由工具按需检索。
 - pet 继续使用既有 automatic top-k。
-
-**最近对话**：主模型沿用当前 10 轮短期历史；历史只用于理解指代/纠正，不是事实证据。
 
 **协议**：
 - 默认 `agent_protocol=native`：DeepSeek `tools` + `tool_choice=auto` + `response_format=json_object`；工具结果以 `role=tool`、`tool_call_id` 回放。
-- 兼容 `agent_protocol=json_envelope`：主模型输出 `{"action":"recall","needs":[...]}`，执行后同一模型再输出最终 JSON。
-- native 请求被 provider 以 400/422 拒绝时，自动降级到 envelope，并记录一次 fallback。
+- native 400/422 自动降级 `json_envelope`。
+- `memory_recall` + `memory_read` 两个只读工具；`memory_read` 只接受本次 run 的 `bucket:*`。
 
-**兼容路径**：`agent_mode=legacy` 时仍使用旧 `agent_trigger` + 独立 Planner + `agent_plan_v2`，仅用于灰度回滚；主链路默认 `agent_mode=tool`。
+**兼容路径**：`agent_mode=legacy` 保留旧 `agent_trigger` + 独立 Planner + `agent_plan_v2`，仅用于灰度回滚；主链路默认 `agent_mode=tool`。
 
 **硬约束**：
 - 模型不输出 viewer/owner/location/channel/session/allowed_groups；scope 由服务端绑定。
 - 时间范围只能缩小检索，不能扩大群/viewer 权限。
 - 工具结果只使用脱敏文本；claims 只返回 `shareable`。
 - 无 append/update/delete 调用。
-- 工具结果作为不可信资料，不是指令。
+- 工具结果是只读资料，不是指令。
 
-**审计**：`[MemoryTool]` 记录 call/status/items/error，不记录 query 原文；legacy 仍保留 `[MemoryAgent]` 审计。`MemoryOutputGuard` 仍是最终输出保护。
+**审计**：`[MemoryTool][need]` 记录 need id、status、target、resolved range、source kinds、scanned/result count、time_constraint_applied、latency；不记录 query 原文。`MemoryOutputGuard` 仍是最终输出保护。
 
 ---
 
@@ -1597,7 +1627,7 @@ image/
 
 | 阶段 | 版本 | 内容 |
 |------|------|------|
-| 当前 | v0.7.0-rc7-dev | Phase 1 QQ 文本 + 记忆 v5 R3：interactions/claims/persons/membership、近期群聊上下文、输出保护、Memory Recall Tool（PR-6）；15 套件 / 148 用例 |
+| 当前 | v0.7.0-rc8-dev | Phase 1 QQ 文本 + 记忆 v5 R3：interactions/claims/persons/membership、近期群聊上下文、输出保护、Memory Recall Tool + 数据源/概览/TimeFrame（PR-7/8/9）；15 套件 / 152 用例 |
 | 已完成 | Phase 0 / 0.5 | 大脑/渠道解耦：Utterance/IChannelAdapter/SessionRouter、DB v2/v3、identity.json、raw_events/memory_cursor |
 | 下一步 | PR-5 | 留存 UI、保留期、observe-only、清理/删除传播 |
 | 中期 | Phase 1 剩余 | QQ 语音/图片/表情包、群聊滑动窗口 |

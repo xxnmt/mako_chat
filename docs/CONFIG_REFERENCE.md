@@ -42,6 +42,7 @@ app_data/config/identity.json
         "agent_enabled": true,
         "agent_mode": "tool",
         "agent_protocol": "native",
+        "owner_cross_channel_private": false,
         "agent_trigger": "memory_question"
     },
     "time": {
@@ -135,19 +136,24 @@ app_data/config/identity.json
 | `agent_enabled` | `true` | bool | 是否允许 QQ 记忆检索；pet 永不进入 |
 | `agent_mode` | `"tool"` | `tool` / `legacy` | `tool`：主 Conversation Agent 自主调用 `memory_recall`；`legacy`：旧关键词门控 + 独立 Planner |
 | `agent_protocol` | `"native"` | `native` / `json_envelope` | 原生 DeepSeek tools，或 JSON 动作协议兜底 |
+| `owner_cross_channel_private` | `false` | bool | 仅 Owner QQ 私聊：允许读取自己的 pet/private 记忆；群聊/非 Owner 永远不开放 |
 | `agent_plan_v2` | `true` | bool | 仅 legacy 路径：多 need Planner；false 回退旧 `tool_calls` |
 | `agent_trigger` | `"memory_question"` | `memory_question` / `always` | 仅 legacy 路径使用 |
 | `agent_timeout_ms` | `6000` | 1000–15000 | 单次工具检索预算 |
 | `agent_max_rounds` | `2` | 1–4 | 主模型最多工具轮数 |
 | `agent_max_results` | `8` | 1–20 | 单个 need 的结果上限；执行器当前硬上限为 8 |
 
-> `tool` 模式下，主模型只收到 `memory_recall` 一个只读工具；参数只接受 `needs`（`id/query/kinds/time`），不含 viewer/owner/location/group/session/allowed_groups。是否调用由主模型决定，程序只做功能、渠道、turn 类型和 pet 能力门控。
+> `tool` 模式下，主模型收到 `memory_recall` 与 `memory_read`。`memory_recall` 支持 `mode=lookup|overview`；`memory_read` 只展开本次 overview 的 `bucket:*` 句柄。
 >
-> Inline：稳定档案/关系/RecentContext 自动注入。Spill：episodic、interaction summary、claim、长期 summary 不自动注入，由工具按需检索。
+> `kinds`：`group_recent / interaction_summary / claim / episodic / long_term_summary / chat_history`。旧 `recent/summary` 作为兼容别名。
 >
-> 每个 need 独立 `success/empty/unresolved/unsupported/denied/error`；整体 `complete/partial/empty/failed`。`need-1=empty`、`need-2=success` 整体为 `complete`，但会返回 `has_empty=true`。
+> Inline：稳定档案/关系/RecentContext 自动注入。Spill：episodic、interaction summary、claim、长期 summary、chat_history 由工具按需检索。
 >
-> `MemoryTimeResolver` 独立解析 `time.expression`，半开区间，最大 31 天；无法解析返回 `unresolved`。`event_time` 无独立索引时按 message_time 检索并标记 `fallback`/`event_time_message_time_fallback`；`fact_validity` 返回 `unsupported`。时间范围只能缩小检索，不能改变 viewer/群权限。
+> 每个 need 独立 `success/empty/unresolved/unsupported/denied/error/fallback`；整体 `complete/partial/empty/failed`。`need-1=empty`、`need-2=success` 整体为 `complete`，但会返回 `has_empty=true`。
+>
+> `mode=overview` 扫描完整时间段并返回 `coverage`、`buckets`、`handles`；默认 3 小时桶、最多 8 桶，服务端限幅。
+>
+> 时间：`time.expression + target + frame`。frame 支持 relative_day/week/month、absolute_date、festival、recent_window；公共节日在 `calendar/festivals.json`，不写 Resolver 关键词。`episodic.event_time` 不能冒充 message_time；long summary 的 `created_at` 不能冒充 message_time。`event_time` 无独立索引时保持 fallback；`fact_validity` 返回 `unsupported`。最大 31 天。
 
 ### 1.7 memory：隐私规则
 

@@ -1,6 +1,8 @@
 # Phase 0 单元测试（Qt Test）
 # 输出目录固定到 <build>/tests，避免测试进程在应用目录旁创建 app_data 污染正式配置。
 
+qt6_add_resources(CALENDAR_RESOURCES ${PROJECT_SOURCE_DIR}/calendar.qrc)
+
 set(PHASE0_CORE_SOURCES
     ${PROJECT_SOURCE_DIR}/memorymanager.h
     ${PROJECT_SOURCE_DIR}/memorymanager.cpp
@@ -111,6 +113,7 @@ target_link_libraries(tst_groupmembership PRIVATE Qt6::WebSockets Qt6::Network)
 
 add_phase0_test(tst_memoryagent
     tst_memoryagent.cpp
+    ${CALENDAR_RESOURCES}
     ${PROJECT_SOURCE_DIR}/memoryagenttypes.h
     ${PROJECT_SOURCE_DIR}/memoryagent.h
     ${PROJECT_SOURCE_DIR}/memoryagent.cpp
@@ -120,6 +123,16 @@ add_phase0_test(tst_memoryagent
     ${PROJECT_SOURCE_DIR}/memoryrecalltool.cpp
     ${PROJECT_SOURCE_DIR}/memoryrecalltypes.h
     ${PROJECT_SOURCE_DIR}/memoryrecalltypes.cpp
+    ${PROJECT_SOURCE_DIR}/memorytimeframe.h
+    ${PROJECT_SOURCE_DIR}/memorytimeframe.cpp
+    ${PROJECT_SOURCE_DIR}/festivalcalendar.h
+    ${PROJECT_SOURCE_DIR}/festivalcalendar.cpp
+    ${PROJECT_SOURCE_DIR}/timeframeresolver.h
+    ${PROJECT_SOURCE_DIR}/timeframeresolver.cpp
+    ${PROJECT_SOURCE_DIR}/memorysourcepolicy.h
+    ${PROJECT_SOURCE_DIR}/memorysourcepolicy.cpp
+    ${PROJECT_SOURCE_DIR}/memoryoverview.h
+    ${PROJECT_SOURCE_DIR}/memoryoverview.cpp
     ${PROJECT_SOURCE_DIR}/memorytimeresolver.h
     ${PROJECT_SOURCE_DIR}/memorytimeresolver.cpp
     ${PROJECT_SOURCE_DIR}/memoryexecutor.h
@@ -174,6 +187,8 @@ add_phase0_test(tst_promptassembler
     ${PROJECT_SOURCE_DIR}/promptassembler.cpp
     ${PROJECT_SOURCE_DIR}/memoryrecalltypes.h
     ${PROJECT_SOURCE_DIR}/memoryrecalltypes.cpp
+    ${PROJECT_SOURCE_DIR}/memorytimeframe.h
+    ${PROJECT_SOURCE_DIR}/memorytimeframe.cpp
     ${PROJECT_SOURCE_DIR}/memoryresultjson.h
     ${PROJECT_SOURCE_DIR}/memoryresultjson.cpp
 )

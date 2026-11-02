@@ -1,154 +1,191 @@
-# Memory Recall Tool：主 Conversation Agent 自主检索
+﻿# Memory Recall Tool：数据源、授权、概览与时间语义
 
-> 状态：已实现（PR-6），默认 `agent_mode=tool`
-> 关联：[ARCHITECTURE.md](ARCHITECTURE.md)、[CONFIG_REFERENCE.md](CONFIG_REFERENCE.md)、[MEMORY_V5_R3_BASELINE.md](MEMORY_V5_R3_BASELINE.md)
+> 状态：PR-7A / PR-7B / PR-7C / PR-8 / PR-9 已实现；PR-10 legacy 保留为回滚
+> 关联：[ARCHITECTURE.md](ARCHITECTURE.md)、[CONFIG_REFERENCE.md](CONFIG_REFERENCE.md)
 
 ## 1. 目标
 
-把“要不要回忆、回忆什么”从关键词门控和独立 Planner 交回主 Conversation Agent；程序只保留能力门控、权限、时间解析和确定性检索。
+主 Conversation Agent 自主决定是否调用记忆工具；服务端负责数据源范围、逐条披露、时间计算、覆盖率和审计。
 
 ```text
 用户消息 + 最近对话
         │
         ▼
-主 Conversation Agent（同一上下文）
-        │
-   ┌────┴─────┐
-   │          │
-不调用      调用 memory_recall
-   │          │
-最终 JSON   MemoryTimeResolver
-              │
-           MemoryExecutor
-              │
-           role=tool 结果
-              │
-           同一 Agent
-              │
-           最终 JSON
+主 Conversation Agent
+        ├─ lookup：定点召回，top-k + per-need 状态
+        └─ overview：完整时间段扫描 + 覆盖率 + 时间桶
+                         │
+                    memory_read(bucket)
+                         │
+                    同一主模型最终回复
 ```
 
-## 2. 责任边界
+## 2. 数据源
 
-| 角色 | 负责 |
+| kind | 数据源 |
 |---|---|
-| 主 Conversation Agent | 是否调用、拆 needs、理解纠正/指代、最终回复 |
-| `canExposeTools()` | 功能开关、QQ 渠道、`turn_kind=reply`、pet 排除 |
-| `MemoryRecallTool` | 参数校验、调用 Resolver/Executor、返回证据 |
-| `MemoryTimeResolver` | 每个 need 独立解析时间 |
-| `MemoryExecutor` | 只读检索、去重、预算、per-need 状态 |
-| 服务端 `MemoryAgentScope` | viewer/owner/channel/session/allowedGroups/membership |
-| `MemoryOutputGuard` | 最终输出保护 |
+| `group_recent` | 当前群/授权群近期消息 |
+| `interaction_summary` | `interactions.safe_summary` |
+| `claim` | `memory_claims`，经 `MemoryAccessPolicy` |
+| `episodic` | `episodic_memory` |
+| `long_term_summary` | `long_term_summary` |
+| `chat_history` | `chat_history` 原始对话 |
 
-程序不读用户文本判断“是不是记忆问题”；`agent_trigger` 只属于 legacy 路径。
+为兼容 PR-6，`recent` / `summary` 作为旧别名继续接受；新调用使用新名称。
+`profile` / `relationship` 继续 Inline，不进入检索。
 
-## 3. 工具契约
+## 3. 授权矩阵
+
+| 数据源 | Owner 私聊 | Owner 群聊 | 非 Owner 私聊 | 非 Owner 群聊 |
+|---|---|---|---|---|
+| `group_recent` | 授权群 | 当前群 | 仅共同群、viewer 范围 | 当前群权限 |
+| `interaction_summary` | 授权群 | 当前群 | **不直接开放群摘要** | 当前群权限 |
+| `claim` | AccessPolicy | AccessPolicy | AccessPolicy | AccessPolicy |
+| `episodic` | pet/private 需开关 | 仅 public/channel 当前群 | 禁止 | 禁止 |
+| `long_term_summary` | pet/private 需开关 | 仅当前群/渠道 | 禁止 | 禁止 |
+| `chat_history` | pet/private 需开关 | 当前群 | 禁止 | 禁止 |
+
+`memory.owner_cross_channel_private=false` 默认关闭。开启后只对 Owner QQ 私聊生效。
+`episodic.subject` 只是关联主体，不是逐条隐私所有者；记录仍要检查 `origin/visibility/session/source_ids`。
+
+## 4. 时间语义
+
+| 数据源 | `message_time` | `event_time` | `fact_validity` |
+|---|---|---|---|
+| `group_recent` | `occurred_at` | fallback/不支持 | 不支持 |
+| `interaction_summary` | interaction 时间区间重叠 | 不支持 | 不支持 |
+| `episodic` | 通过 `source_ids` 回溯；否则 content-only | 使用 `event_time` | 不支持 |
+| `long_term_summary` | 通过 `covered_turn_end_id/source_ids` 回溯；不能用 `created_at` | 不支持 | 不支持 |
+| `claim` | source session/event | 不支持 | `unsupported` |
+| `chat_history` | turn timestamp | 不支持 | 不支持 |
+
+禁止：
+
+```text
+episodic.event_time == message_time
+long_term_summary.created_at == message_time
+```
+
+## 5. 工具契约
 
 ```json
 {
+  "mode": "lookup",
   "needs": [
     {
       "id": "need-1",
-      "query": "用户表达过的想法、愿望或计划",
-      "kinds": ["recent", "summary", "claim"],
-      "time": {"expression": "昨天下午", "target": "message_time"}
+      "query": "七夕约定",
+      "kinds": ["episodic", "long_term_summary"],
+      "time": {
+        "expression": "七夕",
+        "target": "message_time",
+        "frame": {
+          "anchor": {"type": "festival", "name": "七夕"},
+          "occurrence": {"type": "most_recent_past"},
+          "span": {"type": "day"}
+        }
+      }
     }
   ]
 }
 ```
 
-- 最多 4 个 need；每个 need 最多 8 条，总计最多 16 条。
-- 只接受 `id/query/kinds/time`；`time` 只接受 `expression/target`。
-- 不接受 `from/to`、viewer/owner/group_id/session_id/allowed_groups。
-- `source_hint` 只在旧协议兼容层接受，不进入主工具 schema。
-- `kinds` 只允许 `recent/summary/claim`；`target` 只允许 `message_time/event_time/fact_validity`。
+约束：
 
-## 4. 状态语义
+- 最多 4 needs；每个 need 最多 8 条，总计最多 16 条；
+- `mode=lookup|overview`；
+- 不接受 `from/to`、viewer/owner/group/session/allowed_groups；
+- `frame` 只接受受控字段，时区由服务端提供；
+- `absolute_date` 由模型复制、服务端校验，模型不计算日期。
 
-need：
+## 6. Overview
 
-| 状态 | 含义 |
-|---|---|
-| `success` | 取得有效授权证据 |
-| `empty` | 查询完成但无结果 |
-| `unresolved` | 时间表达无法解析 |
-| `unsupported` | 当前不支持的时间目标/检索类型 |
-| `denied` | 访问范围不允许 |
-| `error` | 查询异常 |
+```json
+{
+  "mode": "overview",
+  "needs": [{"id": "overview-1", "query": "今天群聊", "time": {"expression": "今天"}}],
+  "overview": {"bucket_minutes": 180, "max_buckets": 8}
+}
+```
 
-整体：
+服务端扫描时间范围内全部 ready interaction summaries，返回：
 
-| 状态 | 含义 |
-|---|---|
-| `complete` | 所有 need 正常结束（包括 empty） |
-| `partial` | 存在 unresolved/unsupported/denied/error/timeout/fallback/truncated |
-| `empty` | 所有 need 正常结束但无证据 |
-| `failed` | 执行器不可用且无安全结果 |
+- `coverage.total_interactions`；
+- `ready_summaries`；
+- `scanned` / `aggregated` / `exposed`；
+- `missing_summaries` / `missing_ranges` / `empty_buckets`；
+- `scan_complete` / `aggregation_complete` / `exposure_complete`；
+- `buckets[]`，每桶带 `representative_summaries` 和 `handles`。
 
-`need-1=empty`、`need-2=success` 为 `complete`，同时 `has_empty=true`；不能伪装成两个都成功。
+`handles` 对应桶内完整摘要集合，`memory_read` 可展开；representative 只是直接交给模型的子集。
+`bucket_minutes` 默认 180，`max_buckets` 默认 8，由服务端限幅；模型不决定资源预算。
 
-## 5. Inline / Spill
+## 7. 状态与审计
 
-| 资料 | 进入方式 |
-|---|---|
-| 角色人设、稳定用户档案、必要关系 | Inline 自动注入 |
-| RecentContext | Inline，严格预算 |
-| episodic | Spill，`memory_recall` 按需 |
-| interaction summary | Spill，`memory_recall` 按需 |
-| claim | Spill，`memory_recall` 按需 |
-| 长期 summary | Spill，`memory_recall` 按需 |
-| pet 渠道 | 既有 automatic top-k，不进入本工具 |
+need：`success / empty / unresolved / unsupported / denied / error / fallback`。
+整体：`complete / partial / empty / failed`。
 
-## 6. 协议
+`need-1=empty`、`need-2=success` 为 `complete`，同时 `has_empty=true`。
 
-- 默认 `agent_protocol=native`：`tools` + `tool_choice=auto` + `response_format=json_object`；工具结果用 `role=tool` + `tool_call_id` 回放。
-- `json_envelope`：主模型输出 `{"action":"recall","needs":[...]}`，执行后同一模型再输出最终 JSON。
-- native 请求被 provider 以 400/422 拒绝时自动降级 envelope，并记录一次 fallback。
-- 最多 `agent_max_rounds` 轮；每轮结果保留，超时不撤销已取得证据。
+每个 need 输出：
 
-## 7. 配置
+```text
+status / target / evidence_state / time_certainty
+resolved_from / resolved_to / time_constraint_applied
+source_kinds / scanned_count / result_count / latency_ms
+```
+
+日志只记录 need id、状态、时间范围、来源、数量、耗时，不记录 query 原始文本。
+
+## 8. TimeFrame
+
+```json
+{
+  "anchor": {"type": "festival", "name": "七夕"},
+  "occurrence": {"type": "year_offset", "value": -1},
+  "span": {"type": "week_containing"},
+  "period": null
+}
+```
+
+支持：
+
+- `relative_day` + `offset`；
+- `relative_week` + `offset` + `weekday`；
+- `relative_month` + `offset`；
+- `absolute_date` + `date`；
+- `festival` + `name`；
+- `recent_window` + `minutes`；
+- `occurrence`: most_recent_past / next_future / year / year_offset；
+- `span`: day / week_containing / surrounding_days(before/after) / month_containing；
+- `period`: morning / afternoon / evening / night。
+
+公共节日在 `calendar/festivals.json`；新增节日不改 Resolver 代码。当前数据支持 2024–2026，超出返回 `unresolved`。用户纪念日不进入公共节日文件。
+
+## 9. 配置
 
 | key | 默认 | 说明 |
 |---|---|---|
 | `memory.agent_enabled` | `true` | 开关 |
 | `memory.agent_mode` | `tool` | `tool` / `legacy` |
 | `memory.agent_protocol` | `native` | `native` / `json_envelope` |
+| `memory.owner_cross_channel_private` | `false` | 仅 Owner 私聊读取自己的 pet/private |
 | `memory.agent_timeout_ms` | `6000` | 检索预算 |
 | `memory.agent_max_rounds` | `2` | 工具轮数 |
 | `memory.agent_max_results` | `8` | 单 need 结果上限 |
 | `memory.agent_plan_v2` | `true` | 仅 legacy |
 | `memory.agent_trigger` | `memory_question` | 仅 legacy |
 
-## 8. 回滚与灰度
-
-- `agent_mode=legacy` 恢复旧关键词门控 + 独立 Planner；不需要数据库迁移。
-- `agent_mode=tool` 是默认；灰度期间保留 legacy 代码与测试。
-- 不在本阶段引入向量库、schema 变更、Router/Worker/Ticket、Watchdog 或主动巡检。
-
-## 9. Tool Calling 兼容性实测
-
-2026-11-01 用当前 `deepseek-v4-flash` 配置做了最小探测：
-
-| 请求 | 结果 |
-|---|---|
-| `tools` + `tool_choice=auto` + `response_format=json_object` | `finish_reason=tool_calls`，返回 `memory_recall` 调用 |
-| assistant `tool_calls` + `role=tool` + `tool_call_id` 回放 | 第二轮 `finish_reason=stop`，返回最终 JSON |
-| 工具结果后再追加一条 system 说明 | 仍能正常返回最终 JSON |
-| 普通闲聊（工具可用） | 不返回 `tool_calls`，直接最终 JSON |
-
-结论：`native` 作为默认协议；`json_envelope` 仍保留为 provider 400/422 或未来模型差异的兜底。
-
 ## 10. 验收集
 
 | 输入 | 期望 |
 |---|---|
-| “今天心情不错” | 不调用工具 |
-| “刚刚吃了一个可颂” | 不调用工具 |
-| “昨天下午我有没有对你说过什么愿望？” | 调用工具 |
-| “上周三和昨天晚上分别聊了什么？” | 两个 needs |
-| “不对，那个是周三，不是昨天” | 结合上下文修正 |
-| “上个月某个时候” | unresolved，不猜测 |
-| need-1 empty、need-2 success | per-need 正确，整体 complete + has_empty |
-| 非 Owner 群里问私聊 | 拒绝/不可访问 |
-| 工具参数伪造 viewer/group/scope | 服务端拒绝 |
-| pet 渠道 | 不进入本工具 |
+| 普通闲聊/“刚刚吃了一个可颂” | 不调用工具 |
+| “七夕约定” | 调用；Owner 私聊开关开启时返回 episodic/long term |
+| Owner 群聊问 pet/private | 不返回、不泄露存在性 |
+| “总结今天群里的消息” | `mode=overview`，覆盖 146 条，分桶 |
+| “上周三晚上” | TimeFrame relative_week |
+| “去年七夕那周” | festival + year_offset + week_containing |
+| “某个时候” | unresolved，不猜测 |
+| bucket handle | `memory_read` 能展开桶内完整摘要 |
+| 工具参数伪造权限 | 拒绝 |

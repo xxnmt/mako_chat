@@ -1585,6 +1585,72 @@ QList<InteractionSummary> MemoryManager::getInteractionSummariesInRange(
     return summaries;
 }
 
+QList<InteractionSummary> MemoryManager::getInteractionSummariesOverlapping(
+    const QString &channel,
+    const QString &sessionId,
+    const QDateTime &from,
+    const QDateTime &to,
+    int limit)
+{
+    QList<InteractionSummary> summaries;
+    if (!from.isValid() || !to.isValid() || from >= to
+        || (!m_db.isOpen() && !m_db.open())) {
+        return summaries;
+    }
+    QSqlQuery query(m_db);
+    query.prepare("SELECT id, channel, session_id, safe_summary, ended_at, "
+                  "summary_format, summary_segments "
+                  "FROM interactions "
+                  "WHERE summary_status='ready' AND channel=? AND session_id=? "
+                  "AND started_at < ? AND ended_at > ? "
+                  "ORDER BY ended_at ASC LIMIT ?");
+    query.addBindValue(channel);
+    query.addBindValue(sessionId);
+    query.addBindValue(to.toString("yyyy-MM-dd HH:mm:ss"));
+    query.addBindValue(from.toString("yyyy-MM-dd HH:mm:ss"));
+    query.addBindValue(qMax(1, limit));
+    if (!query.exec()) {
+        qDebug() << "[MemoryManager]按重叠时间查询 interaction summary 失败:"
+                 << query.lastError();
+        return summaries;
+    }
+    while (query.next()) {
+        InteractionSummary summary;
+        summary.id = query.value(0).toLongLong();
+        summary.channel = query.value(1).toString();
+        summary.sessionId = query.value(2).toString();
+        summary.summaryText = query.value(3).toString();
+        summary.endedAt = query.value(4).toDateTime();
+        summary.summaryFormat = query.value(5).toString();
+        summary.summarySegments = query.value(6).toString();
+        summaries.append(summary);
+    }
+    return summaries;
+}
+
+int MemoryManager::countInteractionsInRange(const QString &channel,
+                                            const QString &sessionId,
+                                            const QDateTime &from,
+                                            const QDateTime &to)
+{
+    if (!from.isValid() || !to.isValid() || from >= to
+        || (!m_db.isOpen() && !m_db.open())) {
+        return 0;
+    }
+    QSqlQuery query(m_db);
+    query.prepare("SELECT COUNT(*) FROM interactions "
+                  "WHERE channel=? AND session_id=? "
+                  "AND started_at < ? AND ended_at > ?");
+    query.addBindValue(channel);
+    query.addBindValue(sessionId);
+    query.addBindValue(to.toString("yyyy-MM-dd HH:mm:ss"));
+    query.addBindValue(from.toString("yyyy-MM-dd HH:mm:ss"));
+    if (!query.exec() || !query.next()) {
+        return 0;
+    }
+    return query.value(0).toInt();
+}
+
 QString MemoryManager::getGroupDisplayName(const QString &groupId)
 {
     if (!m_db.isOpen() && !m_db.open()) {

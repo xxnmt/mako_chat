@@ -7,6 +7,8 @@
 #include <QString>
 #include <QStringList>
 
+#include "memorytimeframe.h"
+
 // 一次独立回忆任务的时间目标。message_time 可直接过滤；
 // event_time / fact_validity 需要额外的数据字段，当前不能普遍硬过滤。
 enum class MemoryTimeTarget {
@@ -34,9 +36,13 @@ struct MemoryRecallNeed {
     QString timeExpression;
     MemoryTimeTarget timeTarget = MemoryTimeTarget::MessageTime;
     bool hasTime = false;
+    MemoryTimeFrame timeFrame;
+    bool hasTimeFrame = false;
 };
 
 struct MemoryRecallPlan {
+    QString mode = QStringLiteral("lookup"); // lookup / overview
+    QJsonObject overview;                    // bucket_minutes / max_buckets (server clamps)
     QList<MemoryRecallNeed> needs;
 
     static bool fromJson(const QJsonObject &object,
@@ -53,6 +59,12 @@ struct MemoryNeedResult {
     QString resolvedFrom;
     QString resolvedTo;
     QString interpretation;
+    QString evidenceState;   // found / empty / unresolved / denied / partial
+    QString timeCertainty;   // exact / approximate / unknown
+    QStringList sourceKinds;
+    bool timeConstraintApplied = false;
+    int scannedCount = 0;
+    int totalCandidates = 0;
     int resultCount = 0;
     int latencyMs = 0;
     QString error;

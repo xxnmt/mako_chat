@@ -17,9 +17,15 @@ bool hasOnlyKeys(const QJsonObject &object, const QSet<QString> &allowed)
 
 bool isValidKind(const QString &kind)
 {
-    return kind == QStringLiteral("recent")
-           || kind == QStringLiteral("summary")
-           || kind == QStringLiteral("claim");
+    return kind == QStringLiteral("group_recent")
+           || kind == QStringLiteral("interaction_summary")
+           || kind == QStringLiteral("claim")
+           || kind == QStringLiteral("episodic")
+           || kind == QStringLiteral("long_term_summary")
+           || kind == QStringLiteral("chat_history")
+           // 兼容 PR-6 的旧名称；新调用应使用上面的语义名称。
+           || kind == QStringLiteral("recent")
+           || kind == QStringLiteral("summary");
 }
 
 bool isValidSourceHint(const QString &value)
@@ -63,11 +69,53 @@ bool MemoryRecallPlan::fromJson(const QJsonObject &object,
     if (error) {
         error->clear();
     }
-    if (!plan || !hasOnlyKeys(object, {QStringLiteral("needs")})) {
+    if (!plan || !hasOnlyKeys(object, {QStringLiteral("needs"),
+                                       QStringLiteral("mode"),
+                                       QStringLiteral("overview")})) {
         if (error) {
             *error = QStringLiteral("invalid_plan_shape");
         }
         return false;
+    }
+
+    MemoryRecallPlan parsed;
+    parsed.mode = object.value(QStringLiteral("mode"))
+                      .toString(QStringLiteral("lookup"))
+                      .trimmed()
+                      .toLower();
+    if (parsed.mode != QStringLiteral("lookup")
+        && parsed.mode != QStringLiteral("overview")) {
+        if (error) {
+            *error = QStringLiteral("invalid_mode");
+        }
+        return false;
+    }
+    const QJsonValue overviewValue = object.value(QStringLiteral("overview"));
+    if (!overviewValue.isUndefined() && !overviewValue.isNull()) {
+        if (!overviewValue.isObject()) {
+            if (error) {
+                *error = QStringLiteral("invalid_overview");
+            }
+            return false;
+        }
+        const QJsonObject overview = overviewValue.toObject();
+        if (!hasOnlyKeys(overview, {QStringLiteral("bucket_minutes"),
+                                    QStringLiteral("max_buckets")})) {
+            if (error) {
+                *error = QStringLiteral("invalid_overview");
+            }
+            return false;
+        }
+        for (const QString &key : {QStringLiteral("bucket_minutes"),
+                                   QStringLiteral("max_buckets")}) {
+            if (overview.contains(key) && !overview.value(key).isDouble()) {
+                if (error) {
+                    *error = QStringLiteral("invalid_overview");
+                }
+                return false;
+            }
+        }
+        parsed.overview = overview;
     }
 
     const QJsonValue needsValue = object.value(QStringLiteral("needs"));
@@ -85,7 +133,6 @@ bool MemoryRecallPlan::fromJson(const QJsonObject &object,
         return false;
     }
 
-    MemoryRecallPlan parsed;
     QSet<QString> ids;
     for (const QJsonValue &value : needs) {
         if (!value.isObject()) {
@@ -137,8 +184,11 @@ bool MemoryRecallPlan::fromJson(const QJsonObject &object,
             return false;
         }
         if (need.kinds.isEmpty()) {
-            need.kinds = {QStringLiteral("recent"), QStringLiteral("summary"),
-                          QStringLiteral("claim")};
+            need.kinds = {QStringLiteral("group_recent"),
+                          QStringLiteral("interaction_summary"),
+                          QStringLiteral("claim"),
+                          QStringLiteral("episodic"),
+                          QStringLiteral("long_term_summary")};
         }
 
         need.sourceHint = needObject.value(QStringLiteral("source_hint")).toString();
@@ -159,7 +209,8 @@ bool MemoryRecallPlan::fromJson(const QJsonObject &object,
             }
             const QJsonObject timeObject = timeValue.toObject();
             if (!hasOnlyKeys(timeObject, {QStringLiteral("expression"),
-                                          QStringLiteral("target")})) {
+                                          QStringLiteral("target"),
+                                          QStringLiteral("frame")})) {
                 if (error) {
                     *error = QStringLiteral("unsupported_time_field");
                 }
@@ -184,6 +235,24 @@ bool MemoryRecallPlan::fromJson(const QJsonObject &object,
                 return false;
             }
             need.timeTarget = memoryTimeTargetFromString(target);
+            const QJsonValue frameValue = timeObject.value(QStringLiteral("frame"));
+            if (!frameValue.isUndefined() && !frameValue.isNull()) {
+                if (!frameValue.isObject()) {
+                    if (error) {
+                        *error = QStringLiteral("invalid_time_frame");
+                    }
+                    return false;
+                }
+                QString frameError;
+                if (!MemoryTimeFrame::fromJson(frameValue.toObject(),
+                                               &need.timeFrame, &frameError)) {
+                    if (error) {
+                        *error = frameError;
+                    }
+                    return false;
+                }
+                need.hasTimeFrame = true;
+            }
             need.hasTime = true;
         }
 

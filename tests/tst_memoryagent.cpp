@@ -11,6 +11,9 @@
 #include "memoryrecalltypes.h"
 #include "memorytimerange.h"
 #include "memorytimeresolver.h"
+#include "memorytimeframe.h"
+#include "timeframeresolver.h"
+#include "memoryoverview.h"
 
 namespace {
 
@@ -40,6 +43,43 @@ MemoryAgentScope ownerGroupScope(const QString &groupId, const QDateTime &now)
     scope.recentQueryTemplate.locationChannel = Channel::kQQGroup;
     scope.recentQueryTemplate.locationSessionId = groupId;
     scope.recentQueryTemplate.allowedGroupIds = {groupId};
+    scope.recentQueryTemplate.since = now.addSecs(-3600);
+    scope.recentQueryTemplate.perGroupCandidateLimit = 50;
+    scope.recentQueryTemplate.maxGroups = 2;
+    scope.recentQueryTemplate.itemLimit = 10;
+    scope.recentQueryTemplate.itemLimitOverview = 50;
+    scope.recentQueryTemplate.charBudget = 1200;
+    scope.recentQueryTemplate.overviewCharBudget = 2200;
+    scope.recentQueryTemplate.hotWindowItems = 10;
+    scope.recentQueryTemplate.warmLineMaxChars = 24;
+    return scope;
+}
+
+MemoryAgentScope ownerPrivateScope(const QDateTime &now, bool crossChannel)
+{
+    MemoryAgentScope scope;
+    scope.requestId = QStringLiteral("test-private");
+    scope.channel = Channel::kQQPrivate;
+    scope.sessionId = QStringLiteral("2014366825");
+    scope.viewerPersonId = QStringLiteral("owner");
+    scope.viewerIsOwner = true;
+    scope.allowedGroupIds = {QStringLiteral("30001")};
+    scope.membershipVerified = true;
+    scope.maxResults = 8;
+    scope.timeoutMs = 500;
+    scope.maxRounds = 2;
+    scope.ownerCrossChannelPrivate = crossChannel;
+    scope.access.viewerPersonId = QStringLiteral("owner");
+    scope.access.channel = Channel::kQQPrivate;
+    scope.access.sessionId = scope.sessionId;
+    scope.access.allowedGroupIds = scope.allowedGroupIds;
+    scope.access.viewerIsOwner = true;
+    scope.access.membershipVerified = true;
+    scope.recentQueryTemplate.viewerIds = {QStringLiteral("20001")};
+    scope.recentQueryTemplate.viewerPersonId = QStringLiteral("owner");
+    scope.recentQueryTemplate.locationChannel = Channel::kQQPrivate;
+    scope.recentQueryTemplate.locationSessionId = scope.sessionId;
+    scope.recentQueryTemplate.allowedGroupIds = scope.allowedGroupIds;
     scope.recentQueryTemplate.since = now.addSecs(-3600);
     scope.recentQueryTemplate.perGroupCandidateLimit = 50;
     scope.recentQueryTemplate.maxGroups = 2;
@@ -837,6 +877,237 @@ private slots:
         error.clear();
         tool.execute(QJsonObject{{QStringLiteral("needs"), tooMany}}, &error);
         QCOMPARE(error, QStringLiteral("invalid_arguments"));
+    }
+
+    void episodicAndLongSummaryRespectOwnerCrossChannelPolicy()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager mm(dir.filePath("cross_channel.db"));
+        mm.seedIdentity({QStringLiteral("20001")});
+        QVERIFY(mm.addEpisodicMemory(
+            QStringLiteral("七夕节用户与茉子约定永远在一起"),
+            QStringLiteral("event"), 0.8,
+            QDateTime(QDate(2026, 8, 19), QTime(23, 0)),
+            QStringLiteral("[]"), QStringLiteral("pet"),
+            QStringLiteral("private"), QStringLiteral("user"),
+            QStringLiteral("default")));
+        QVERIFY(mm.addLongTermSummary(
+            QStringLiteral("用户与茉子互道晚安，七夕互表爱意"),
+            1, QStringLiteral("[]"), Channel::kPet,
+            Channel::kDefaultSession));
+        RequestMeta petMeta;
+        petMeta.channel = Channel::kPet;
+        petMeta.sessionId = Channel::kDefaultSession;
+        petMeta.speaker = QStringLiteral("主人");
+        petMeta.subject = QStringLiteral("user");
+        QVERIFY(mm.saveQATurn(QStringLiteral("七夕那天我们说好要一直在一起"),
+                              QStringLiteral("{\"sentences\":[]}"), {},
+                              petMeta));
+
+        const QDateTime now = QDateTime::currentDateTime();
+        const QJsonObject args{
+            {QStringLiteral("needs"),
+             QJsonArray{QJsonObject{
+                 {QStringLiteral("id"), QStringLiteral("need-1")},
+                 {QStringLiteral("query"), QStringLiteral("七夕")},
+                 {QStringLiteral("kinds"),
+                  QJsonArray{QStringLiteral("episodic"),
+                             QStringLiteral("long_term_summary"),
+                             QStringLiteral("chat_history")}}}}}};
+
+        QString error;
+        MemoryRecallTool enabled(&mm, ownerPrivateScope(now, true));
+        const QJsonObject found = enabled.execute(args, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QVERIFY(found.value(QStringLiteral("items")).toArray().size() >= 2);
+
+        MemoryRecallTool disabled(&mm, ownerPrivateScope(now, false));
+        const QJsonObject hidden = disabled.execute(args, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QVERIFY(hidden.value(QStringLiteral("items")).toArray().isEmpty());
+
+        MemoryRecallTool group(&mm, ownerGroupScope(QStringLiteral("30001"), now));
+        const QJsonObject groupResult = group.execute(args, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QVERIFY(groupResult.value(QStringLiteral("items")).toArray().isEmpty());
+    }
+
+    void timeFrameResolvesFestivalAndRelativeExpressions()
+    {
+        MemoryTimeFrame festival;
+        QString error;
+        QVERIFY(MemoryTimeFrame::fromJson(
+            QJsonObject{
+                {QStringLiteral("anchor"),
+                 QJsonObject{{QStringLiteral("type"), QStringLiteral("festival")},
+                             {QStringLiteral("name"), QStringLiteral("七夕")}}},
+                {QStringLiteral("occurrence"),
+                 QJsonObject{{QStringLiteral("type"),
+                              QStringLiteral("most_recent_past")}}},
+                {QStringLiteral("span"),
+                 QJsonObject{{QStringLiteral("type"), QStringLiteral("day")}}}},
+            &festival, &error));
+        MemoryResolvedTime resolved = TimeFrameResolver::resolve(
+            QStringLiteral("七夕"), MemoryTimeTarget::MessageTime, festival,
+            QDateTime(QDate(2026, 11, 2), QTime(12, 0)),
+            QStringLiteral("Asia/Shanghai"));
+        QVERIFY2(resolved.valid, qPrintable(resolved.error));
+        QCOMPARE(resolved.from.date(), QDate(2026, 8, 19));
+        QCOMPARE(resolved.from.time(), QTime(0, 0));
+        QCOMPARE(resolved.to.date(), QDate(2026, 8, 20));
+
+        MemoryTimeFrame yesterdayAfternoon;
+        QVERIFY(MemoryTimeFrame::fromJson(
+            QJsonObject{
+                {QStringLiteral("anchor"),
+                 QJsonObject{{QStringLiteral("type"), QStringLiteral("relative_day")},
+                             {QStringLiteral("offset"), -1}}},
+                {QStringLiteral("period"), QStringLiteral("afternoon")}},
+            &yesterdayAfternoon, &error));
+        MemoryResolvedTime yesterday = TimeFrameResolver::resolve(
+            QStringLiteral("昨天下午"), MemoryTimeTarget::MessageTime,
+            yesterdayAfternoon,
+            QDateTime(QDate(2026, 11, 2), QTime(12, 0)),
+            QStringLiteral("Asia/Shanghai"));
+        QVERIFY2(yesterday.valid, qPrintable(yesterday.error));
+        QCOMPARE(yesterday.from.time(), QTime(12, 0));
+        QCOMPARE(yesterday.to.time(), QTime(18, 0));
+
+        MemoryTimeFrame unknown;
+        QVERIFY(MemoryTimeFrame::fromJson(
+            QJsonObject{
+                {QStringLiteral("anchor"),
+                 QJsonObject{{QStringLiteral("type"), QStringLiteral("festival")},
+                             {QStringLiteral("name"), QStringLiteral("不存在的节日")}}}},
+            &unknown, &error));
+        const MemoryResolvedTime unresolved = TimeFrameResolver::resolve(
+            QStringLiteral("不存在的节日"), MemoryTimeTarget::MessageTime,
+            unknown, QDateTime(QDate(2026, 11, 2), QTime(12, 0)),
+            QStringLiteral("Asia/Shanghai"));
+        QVERIFY(!unresolved.valid);
+    }
+
+    void overviewScansRangeAndExposesBuckets()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager mm(dir.filePath("overview.db"));
+        mm.seedIdentity({QStringLiteral("20001")});
+        const QDate today = QDate::currentDate();
+        for (int i = 0; i < 6; ++i) {
+            const QDateTime at(today, QTime(8 + i, 0));
+            const qlonglong id = makeInteractionAt(
+                mm, QStringLiteral("30001"), at,
+                QStringLiteral("今天群聊主题%1").arg(i),
+                QStringLiteral("20001"), QStringLiteral("主人"));
+            QVERIFY(id >= 0);
+            QVERIFY(mm.saveInteractionSummary(
+                id, QStringLiteral("今天群聊摘要%1").arg(i),
+                QStringLiteral("ready")));
+        }
+
+        const QDateTime now = QDateTime::currentDateTime();
+        const MemoryAgentScope scope =
+            ownerGroupScope(QStringLiteral("30001"), now);
+        MemoryRecallPlan plan;
+        QString error;
+        QVERIFY2(MemoryRecallPlan::fromJson(
+                     QJsonObject{
+                         {QStringLiteral("mode"), QStringLiteral("overview")},
+                         {QStringLiteral("needs"),
+                          QJsonArray{QJsonObject{
+                              {QStringLiteral("id"), QStringLiteral("overview-1")},
+                              {QStringLiteral("query"), QStringLiteral("今天群聊")},
+                              {QStringLiteral("time"),
+                               QJsonObject{{QStringLiteral("expression"),
+                                            QStringLiteral("今天")},
+                                           {QStringLiteral("target"),
+                                            QStringLiteral("message_time")}}}}}},
+                         {QStringLiteral("overview"),
+                          QJsonObject{{QStringLiteral("bucket_minutes"), 180},
+                                      {QStringLiteral("max_buckets"), 8}}}},
+                     &plan, &error),
+                 qPrintable(error));
+        const MemoryOverviewResult result =
+            buildMemoryOverview(&mm, scope, plan, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        const QJsonObject coverage =
+            result.payload.value(QStringLiteral("coverage")).toObject();
+        QCOMPARE(coverage.value(QStringLiteral("total_interactions")).toInt(), 6);
+        QCOMPARE(coverage.value(QStringLiteral("ready_summaries")).toInt(), 6);
+        QCOMPARE(coverage.value(QStringLiteral("scanned")).toInt(), 6);
+        QCOMPARE(coverage.value(QStringLiteral("aggregated")).toInt(), 6);
+        QVERIFY(!result.handles.isEmpty());
+        QVERIFY(!result.payload.value(QStringLiteral("buckets")).toArray().isEmpty());
+
+        MemoryRecallTool tool(&mm, scope);
+        const QJsonObject planJson{
+            {QStringLiteral("mode"), QStringLiteral("overview")},
+            {QStringLiteral("needs"),
+             QJsonArray{QJsonObject{
+                 {QStringLiteral("id"), QStringLiteral("overview-1")},
+                 {QStringLiteral("query"), QStringLiteral("今天群聊")},
+                 {QStringLiteral("time"),
+                  QJsonObject{{QStringLiteral("expression"), QStringLiteral("今天")},
+                              {QStringLiteral("target"),
+                               QStringLiteral("message_time")}}}}}},
+            {QStringLiteral("overview"),
+             QJsonObject{{QStringLiteral("bucket_minutes"), 180},
+                         {QStringLiteral("max_buckets"), 8}}}};
+        QVERIFY2(tool.execute(planJson, &error).value(QStringLiteral("coverage"))
+                     .toObject().value(QStringLiteral("scanned")).toInt() >= 6,
+                 qPrintable(error));
+        QStringList handles = result.handles.keys();
+        std::sort(handles.begin(), handles.end());
+        QJsonArray handleArray;
+        for (const QString &handle : handles) {
+            handleArray.append(handle);
+        }
+        const QJsonObject readResult = tool.read(
+            QJsonObject{{QStringLiteral("handles"), handleArray}}, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QVERIFY(readResult.value(QStringLiteral("items")).toArray().size() >= 6);
+    }
+
+    void planAcceptsFrameAndOverviewMode()
+    {
+        MemoryRecallPlan plan;
+        QString error;
+        QJsonObject anchor;
+        anchor.insert(QStringLiteral("type"), QStringLiteral("festival"));
+        anchor.insert(QStringLiteral("name"), QStringLiteral("七夕"));
+        QJsonObject occurrence;
+        occurrence.insert(QStringLiteral("type"), QStringLiteral("most_recent_past"));
+        QJsonObject span;
+        span.insert(QStringLiteral("type"), QStringLiteral("day"));
+        QJsonObject frame;
+        frame.insert(QStringLiteral("anchor"), anchor);
+        frame.insert(QStringLiteral("occurrence"), occurrence);
+        frame.insert(QStringLiteral("span"), span);
+        QJsonObject time;
+        time.insert(QStringLiteral("expression"), QStringLiteral("七夕"));
+        time.insert(QStringLiteral("target"), QStringLiteral("message_time"));
+        time.insert(QStringLiteral("frame"), frame);
+        QJsonObject need;
+        need.insert(QStringLiteral("id"), QStringLiteral("need-1"));
+        need.insert(QStringLiteral("query"), QStringLiteral("七夕约定"));
+        need.insert(QStringLiteral("time"), time);
+        QJsonObject overview;
+        overview.insert(QStringLiteral("bucket_minutes"), 180);
+        overview.insert(QStringLiteral("max_buckets"), 8);
+        QJsonObject object;
+        object.insert(QStringLiteral("mode"), QStringLiteral("overview"));
+        object.insert(QStringLiteral("overview"), overview);
+        object.insert(QStringLiteral("needs"), QJsonArray{need});
+        QVERIFY2(MemoryRecallPlan::fromJson(object, &plan, &error),
+                 qPrintable(error));
+        QCOMPARE(plan.mode, QStringLiteral("overview"));
+        QCOMPARE(plan.needs.size(), 1);
+        QVERIFY(plan.needs.first().hasTimeFrame);
+        QCOMPARE(plan.needs.first().timeFrame.anchor,
+                 MemoryTimeFrame::Anchor::Festival);
+        QCOMPARE(plan.needs.first().timeFrame.festival, QStringLiteral("七夕"));
     }
 
     void plannerOnlyRunsForQQMemoryQuestions()

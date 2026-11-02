@@ -17,6 +17,7 @@
 #include <algorithm>
 
 #include "memorymanager.h"
+#include "memorysourcepolicy.h"
 #include "memorytextutils.h"
 #include "memorytimerange.h"
 
@@ -338,7 +339,8 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
                             QStringLiteral("kinds"),
                             QStringLiteral("limit"),
                             QStringLiteral("time_from"),
-                            QStringLiteral("time_to")})) {
+                            QStringLiteral("time_to"),
+                            QStringLiteral("time_target")})) {
         if (error) {
             *error = QStringLiteral("invalid_arguments");
         }
@@ -369,7 +371,12 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
             const QString kind = value.toString();
             if (kind != QStringLiteral("recent")
                 && kind != QStringLiteral("summary")
-                && kind != QStringLiteral("claim")) {
+                && kind != QStringLiteral("group_recent")
+                && kind != QStringLiteral("interaction_summary")
+                && kind != QStringLiteral("claim")
+                && kind != QStringLiteral("episodic")
+                && kind != QStringLiteral("long_term_summary")
+                && kind != QStringLiteral("chat_history")) {
                 if (error) {
                     *error = QStringLiteral("invalid_arguments");
                 }
@@ -380,9 +387,17 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
         }
     }
     if (kinds.isEmpty()) {
-        kinds = {QStringLiteral("recent"), QStringLiteral("summary"),
-                 QStringLiteral("claim")};
+        kinds = {QStringLiteral("group_recent"),
+                 QStringLiteral("interaction_summary"),
+                 QStringLiteral("claim"),
+                 QStringLiteral("episodic"),
+                 QStringLiteral("long_term_summary")};
     }
+    const bool wantsRecent = kinds.contains(QStringLiteral("recent"))
+                             || kinds.contains(QStringLiteral("group_recent"));
+    const bool wantsInteractionSummary =
+        kinds.contains(QStringLiteral("summary"))
+        || kinds.contains(QStringLiteral("interaction_summary"));
 
     const int limit = boundedInt(
         args.value(QStringLiteral("limit")),
@@ -402,18 +417,18 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
     const MemoryTimeRange timeRange = agentTimeRange.valid
                                           ? agentTimeRange
                                           : parsedTimeRange;
+    const MemoryTimeTarget timeTarget = memoryTimeTargetFromString(
+        args.value(QStringLiteral("time_target")).toString());
 
     QJsonArray resultItems;
     QStringList terms = RecentContextPlanner::extractTerms(query);
 
     // 1) recent raw messages：复用只读时间窗检索，服务端 scope 固定。
-    const bool includeSummaries = kinds.contains(QStringLiteral("summary"))
-                                  || timeRange.valid;
+    const bool includeSummaries = wantsInteractionSummary || timeRange.valid;
     const int recentLimit = (timeRange.valid && includeSummaries)
                                 ? qMin(limit, 2)
                                 : limit;
-    if (kinds.contains(QStringLiteral("recent"))
-        && !m_scope.allowedGroupIds.isEmpty()) {
+    if (wantsRecent && !m_scope.allowedGroupIds.isEmpty()) {
         RecentContextQuery recentQuery = m_scope.recentQueryTemplate;
         recentQuery.allowedGroupIds = m_scope.allowedGroupIds;
         recentQuery.queryText = query;
@@ -568,6 +583,167 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
                 }
                 if (resultItems.size() >= limit) {
                     break;
+                }
+            }
+        }
+    }
+
+    // 4) episodic：事件/承诺/里程碑。message_time 不能拿 event_time 冒充；
+    // 没有 source 时间时只做 content 检索，由上层标记 partial。
+    if (kinds.contains(QStringLiteral("episodic"))
+        && resultItems.size() < limit && m_memoryManager) {
+        const QList<EpisodicMemory> memories =
+            m_memoryManager->getActiveEpisodicMemories(0.0, 200);
+        for (const EpisodicMemory &memory : memories) {
+            if (resultItems.size() >= limit) {
+                break;
+            }
+            if (!MemorySourcePolicy::canReadEpisodic(
+                    m_scope, memory.origin, memory.visibility,
+                    memory.subject, memory.sessionId)) {
+                continue;
+            }
+            if (!matchesTerms(memory.content, terms)) {
+                continue;
+            }
+            if (timeRange.valid
+                && timeTarget == MemoryTimeTarget::EventTime
+                && memory.eventTime.isValid()
+                && (memory.eventTime < timeRange.from
+                    || memory.eventTime >= timeRange.to)) {
+                continue;
+            }
+            MemoryAgentItem item;
+            item.id = QStringLiteral("episodic:%1").arg(memory.id);
+            item.kind = QStringLiteral("episodic");
+            item.text = MemoryTextUtils::sanitizePromptText(memory.content);
+            item.time = memory.eventTime;
+            item.source = memory.origin == QStringLiteral("pet")
+                              ? QStringLiteral("internal")
+                              : sourceLabelForSession(m_scope, memory.sessionId);
+            item.personId = memory.subject;
+            item.episodicId = memory.id;
+            item.sourceSessionId = memory.sessionId;
+            item.isViewer = memory.subject == QStringLiteral("user")
+                            || memory.subject == m_scope.viewerPersonId;
+            if (item.text.isEmpty()) {
+                continue;
+            }
+            const int before = m_ordered.size();
+            remember(item);
+            if (m_ordered.size() > before) {
+                resultItems.append(itemToJson(item));
+            }
+        }
+    }
+
+    // 5) long-term summary：没有可靠覆盖区间，不能把 createdAt 当 message_time。
+    if (kinds.contains(QStringLiteral("long_term_summary"))
+        && resultItems.size() < limit && m_memoryManager) {
+        QList<QPair<QString, QString>> sources;
+        if (MemorySourcePolicy::canReadLongTermSummary(
+                m_scope, Channel::kPet, Channel::kDefaultSession)) {
+            sources.append({Channel::kPet, Channel::kDefaultSession});
+        }
+        if (MemorySourcePolicy::canReadLongTermSummary(
+                m_scope, m_scope.channel, m_scope.sessionId)
+            && !sources.contains({m_scope.channel, m_scope.sessionId})) {
+            sources.append({m_scope.channel, m_scope.sessionId});
+        }
+        for (const auto &source : sources) {
+            if (resultItems.size() >= limit) {
+                break;
+            }
+            const QList<LongTermSummary> summaries =
+                m_memoryManager->getLatestSummaries(200, source.first,
+                                                    source.second);
+            for (const LongTermSummary &summary : summaries) {
+                if (resultItems.size() >= limit) {
+                    break;
+                }
+                if (!matchesTerms(summary.summaryText, terms)) {
+                    continue;
+                }
+                MemoryAgentItem item;
+                item.id = QStringLiteral("long_summary:%1").arg(summary.id);
+                item.kind = QStringLiteral("long_term_summary");
+                item.text = MemoryTextUtils::sanitizePromptText(
+                    summary.summaryText);
+                item.source = source.first == Channel::kPet
+                                  ? QStringLiteral("internal")
+                                  : sourceLabelForSession(m_scope, source.second);
+                item.longTermSummaryId = summary.id;
+                item.sourceSessionId = source.second;
+                if (item.text.isEmpty()) {
+                    continue;
+                }
+                const int before = m_ordered.size();
+                remember(item);
+                if (m_ordered.size() > before) {
+                    resultItems.append(itemToJson(item));
+                }
+            }
+        }
+    }
+
+    // 6) chat_history：原始对话；只把 user_input 作为事实证据，raw_reply
+    // 只用于匹配，不作为用户本人表达。
+    if (kinds.contains(QStringLiteral("chat_history"))
+        && resultItems.size() < limit && m_memoryManager) {
+        QList<QPair<QString, QString>> sources;
+        if (MemorySourcePolicy::canReadChatHistory(
+                m_scope, Channel::kPet, Channel::kDefaultSession)) {
+            sources.append({Channel::kPet, Channel::kDefaultSession});
+        }
+        if (MemorySourcePolicy::canReadChatHistory(
+                m_scope, m_scope.channel, m_scope.sessionId)
+            && !sources.contains({m_scope.channel, m_scope.sessionId})) {
+            sources.append({m_scope.channel, m_scope.sessionId});
+        }
+        for (const auto &source : sources) {
+            if (resultItems.size() >= limit) {
+                break;
+            }
+            const QList<HistoryTurn> turns =
+                m_memoryManager->getHistoryTurn(200, source.first,
+                                                source.second);
+            for (const HistoryTurn &turn : turns) {
+                if (resultItems.size() >= limit) {
+                    break;
+                }
+                if (turn.userInput.trimmed().isEmpty()) {
+                    continue;
+                }
+                const QString haystack = turn.userInput + QLatin1Char('\n')
+                                         + turn.rawReply;
+                if (!matchesTerms(haystack, terms)) {
+                    continue;
+                }
+                if (timeRange.valid && turn.timestamp.isValid()
+                    && (turn.timestamp < timeRange.from
+                        || turn.timestamp >= timeRange.to)) {
+                    continue;
+                }
+                MemoryAgentItem item;
+                item.id = QStringLiteral("chat:%1").arg(turn.id);
+                item.kind = QStringLiteral("chat_history");
+                item.text = MemoryTextUtils::sanitizePromptText(
+                    turn.userInput.trimmed());
+                item.time = turn.timestamp;
+                item.source = source.first == Channel::kPet
+                                  ? QStringLiteral("internal")
+                                  : sourceLabelForSession(m_scope, source.second);
+                item.personId = turn.subject;
+                item.historyTurnId = turn.id;
+                item.sourceSessionId = source.second;
+                item.isViewer = turn.subject == QStringLiteral("user");
+                if (item.text.isEmpty()) {
+                    continue;
+                }
+                const int before = m_ordered.size();
+                remember(item);
+                if (m_ordered.size() > before) {
+                    resultItems.append(itemToJson(item));
                 }
             }
         }
