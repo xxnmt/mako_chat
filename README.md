@@ -1,4 +1,4 @@
-# Windows_AI 桌面看板娘
+﻿# Windows_AI 桌面看板娘
 
 一款基于 Qt 框架开发的桌面看板娘应用，支持 AI 对话、立绘切换、语音交互等功能。
 
@@ -412,7 +412,7 @@ Windows_AI/
 │   ├── closer/              # 近景立绘
 │   ├── far/                 # 远景立绘
 │   └── default_config/      # 默认配置（prompt.txt）
-├── tests/                   # 单元测试（Qt Test + CTest，15 套件 / 153 个测试函数）
+├── tests/                   # 单元测试（Qt Test + CTest，15 套件 / 156 个测试函数）
 │   ├── tst_memorymanager.cpp
 │   ├── tst_configmanager.cpp
 │   ├── tst_memorypolicy.cpp

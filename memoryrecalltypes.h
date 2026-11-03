@@ -48,6 +48,11 @@ struct MemoryRecallPlan {
     static bool fromJson(const QJsonObject &object,
                          MemoryRecallPlan *plan,
                          QString *error);
+    // json_envelope 与 native tool 共用同一套参数语义：
+    // 保留 mode / overview / needs，避免回退协议丢掉 TimeFrame 或 Overview。
+    static bool fromEnvelope(const QJsonObject &content,
+                             MemoryRecallPlan *plan,
+                             QString *error);
 };
 
 struct MemoryNeedResult {

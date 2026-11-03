@@ -38,12 +38,12 @@ MemoryOverviewResult buildMemoryOverview(MemoryManager *manager,
         error->clear();
     }
     MemoryOverviewResult result;
-    if (!manager || plan.needs.isEmpty()) {
+    if (!manager || plan.needs.size() != 1) {
         if (error) {
             *error = QStringLiteral("invalid_overview_plan");
         }
         result.payload = errorPayload(QStringLiteral("invalid_overview_plan"),
-                                      QStringLiteral("overview needs one need"));
+                                      QStringLiteral("overview requires exactly one need"));
         return result;
     }
 
@@ -96,6 +96,15 @@ MemoryOverviewResult buildMemoryOverview(MemoryManager *manager,
                 QStringLiteral("no authorized group for overview"));
             return result;
         }
+        if (scope.allowedGroupIds.size() != 1) {
+            if (error) {
+                *error = QStringLiteral("overview_group_ambiguous");
+            }
+            result.payload = errorPayload(
+                QStringLiteral("overview_group_ambiguous"),
+                QStringLiteral("owner private overview requires one authorized group"));
+            return result;
+        }
         channel = Channel::kQQGroup;
         sessionId = scope.allowedGroupIds.first();
     }
@@ -121,10 +130,15 @@ MemoryOverviewResult buildMemoryOverview(MemoryManager *manager,
 
     const qint64 fromMs = time.from.toMSecsSinceEpoch();
     const qint64 toMs = time.to.toMSecsSinceEpoch();
-    const qint64 bucketMs = qint64(bucketMinutes) * 60 * 1000;
-    const int bucketCount = qMin(
-        maxBuckets,
-        qMax(1, int((toMs - fromMs + bucketMs - 1) / bucketMs)));
+    const qint64 totalMs = qMax<qint64>(1, toMs - fromMs);
+    const qint64 requestedMs = qint64(bucketMinutes) * 60 * 1000;
+    const qint64 requestedCount = qMax<qint64>(
+        1, (totalMs + requestedMs - 1) / requestedMs);
+    const int bucketCount = qMin(maxBuckets, int(requestedCount));
+    // 桶数被 maxBuckets 截断时，必须同步拉长桶跨度；否则长区间
+    // 后续记录会被硬塞进最后一个 3 小时桶，时间标签就不再真实。
+    const qint64 effectiveBucketMs =
+        qMax<qint64>(1, (totalMs + bucketCount - 1) / bucketCount);
 
     struct Bucket {
         qint64 fromMs = 0;
@@ -135,8 +149,8 @@ MemoryOverviewResult buildMemoryOverview(MemoryManager *manager,
     buckets.reserve(bucketCount);
     for (int i = 0; i < bucketCount; ++i) {
         Bucket bucket;
-        bucket.fromMs = fromMs + i * bucketMs;
-        bucket.toMs = qMin(toMs, fromMs + (i + 1) * bucketMs);
+        bucket.fromMs = fromMs + i * effectiveBucketMs;
+        bucket.toMs = qMin(toMs, fromMs + (i + 1) * effectiveBucketMs);
         buckets.append(bucket);
     }
 
@@ -146,7 +160,7 @@ MemoryOverviewResult buildMemoryOverview(MemoryManager *manager,
             continue;
         }
         const qint64 at = summary.endedAt.toMSecsSinceEpoch();
-        int index = int((at - fromMs) / bucketMs);
+        int index = int((at - fromMs) / effectiveBucketMs);
         index = qBound(0, index, buckets.size() - 1);
         buckets[index].summaries.append(summary);
         ++aggregated;

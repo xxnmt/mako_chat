@@ -264,3 +264,21 @@ bool MemoryRecallPlan::fromJson(const QJsonObject &object,
     }
     return true;
 }
+
+bool MemoryRecallPlan::fromEnvelope(const QJsonObject &content,
+                                    MemoryRecallPlan *plan,
+                                    QString *error)
+{
+    QJsonObject planObject;
+    if (content.contains(QStringLiteral("mode"))) {
+        planObject.insert(QStringLiteral("mode"),
+                          content.value(QStringLiteral("mode")));
+    }
+    if (content.contains(QStringLiteral("overview"))) {
+        planObject.insert(QStringLiteral("overview"),
+                          content.value(QStringLiteral("overview")));
+    }
+    planObject.insert(QStringLiteral("needs"),
+                      content.value(QStringLiteral("needs")));
+    return fromJson(planObject, plan, error);
+}

@@ -1,4 +1,4 @@
-# Memory Recall Tool：数据源、授权、概览与时间语义
+﻿# Memory Recall Tool：数据源、授权、概览与时间语义
 
 > 状态：PR-7A / PR-7B / PR-7C / PR-8 / PR-9 / PR-11 已实现；PR-10 legacy 保留为回滚
 > 关联：[ARCHITECTURE.md](ARCHITECTURE.md)、[CONFIG_REFERENCE.md](CONFIG_REFERENCE.md)
@@ -100,6 +100,34 @@ long_term_summary.created_at == message_time
 - `absolute_date` 由模型复制、服务端校验，模型不计算日期；
 - `legacy` 路径仍可使用旧 Resolver，但那不是普通 tool 路径。
 
+### 5.1 JSON Envelope 回退
+
+`agent_protocol=json_envelope` 与 Native 使用同一套参数语义：
+
+```json
+{
+  "action": "recall",
+  "mode": "lookup|overview",
+  "overview": {"bucket_minutes": 180, "max_buckets": 8},
+  "needs": [
+    {
+      "id": "need-1",
+      "query": "脚踝",
+      "time": {
+        "expression": "两天前",
+        "target": "message_time",
+        "frame": {
+          "anchor": {"type": "relative_day", "offset": -2},
+          "span": {"type": "day"}
+        }
+      }
+    }
+  ]
+}
+```
+
+`MemoryRecallPlan::fromEnvelope` 会保留 `mode` / `overview` / `needs[].time.frame`；回退协议不会退回默认 lookup，也不会丢掉结构化时间。
+
 ## 6. Overview
 
 ```json
@@ -131,6 +159,12 @@ long_term_summary.created_at == message_time
 
 `handles` 对应桶内完整摘要集合，`memory_read` 可展开；representative 只是直接交给模型的子集。
 `bucket_minutes` 默认 180，`max_buckets` 默认 8，由服务端限幅；模型不决定资源预算。
+
+`max_buckets` 截断桶数时，服务端同步拉长实际桶跨度，保证最后一个桶覆盖到 `coverage.to`。
+例：一周 / 8 桶时每桶约 21 小时，而不是 8 个固定 3 小时桶后把剩余记录塞进最后一桶。
+
+Overview 只接受 **1 个 need**；多个 need 返回 `invalid_overview_plan`，不会静默只执行第一个。
+Owner 私聊发起群 Overview 时必须有且只有一个授权群；多个授权群返回 `overview_group_ambiguous`，不会默认选第一个。
 
 ## 7. 状态与审计
 

@@ -1159,8 +1159,11 @@ QString LLMService::envelopeToolInstruction() const
 {
     return QStringLiteral(
         "【记忆工具协议】如果回答需要过去对话、长期事实、承诺、偏好或群聊历史的证据，"
-        "只输出 {\"action\":\"recall\",\"needs\":[...]}；needs 最多 4 个，每个 need "
-        "只包含 id/query/kinds/time，time 只包含 expression/target。"
+        "只输出 {\"action\":\"recall\",\"mode\":\"lookup|overview\","
+        "\"overview\":{\"bucket_minutes\":180,\"max_buckets\":8},\"needs\":[...]}；"
+        "needs 最多 4 个，每个 need 包含 id/query/kinds/time；"
+        "只要 need 带 time，必须同时提供 time.frame（anchor/occurrence/span/period），"
+        "不能只给 expression。"
         "如果不需要记忆，直接输出最终 sentences JSON。不要输出其他文本。");
 }
 
@@ -1333,13 +1336,9 @@ void LLMService::handleNativeToolCalls(const QJsonObject &message,
 
 void LLMService::handleEnvelopeRecall(const QJsonObject &content)
 {
-    const QJsonArray needs = content.value(QStringLiteral("needs")).toArray();
-    QJsonObject planObject;
-    planObject["needs"] = needs;
-
     MemoryRecallPlan plan;
     QString planError;
-    if (!MemoryRecallPlan::fromJson(planObject, &plan, &planError)) {
+    if (!MemoryRecallPlan::fromEnvelope(content, &plan, &planError)) {
         QJsonObject note;
         note["role"] = "system";
         note["content"] = QStringLiteral(
@@ -1351,34 +1350,42 @@ void LLMService::handleEnvelopeRecall(const QJsonObject &content)
         return;
     }
 
+    QJsonObject planObject;
+    if (content.contains(QStringLiteral("mode"))) {
+        planObject.insert(QStringLiteral("mode"),
+                          content.value(QStringLiteral("mode")));
+    }
+    if (content.contains(QStringLiteral("overview"))) {
+        planObject.insert(QStringLiteral("overview"),
+                          content.value(QStringLiteral("overview")));
+    }
+    planObject.insert(QStringLiteral("needs"),
+                      content.value(QStringLiteral("needs")));
+
     MemoryRecallTool tool(m_memoryManager, m_toolScope);
     QString toolError;
     const QJsonObject payload = tool.execute(planObject, &toolError);
-    const MemoryAgentResult &result = tool.result();
-    const QJsonObject dataMessage =
-        PromptAssembler::buildAgentDataMessage(m_currentMeta, result);
-    if (!dataMessage.isEmpty()) {
-        m_toolMessages.append(dataMessage);
-    } else {
-        QJsonObject emptyData;
-        emptyData["role"] = "user";
-        emptyData["content"] = QStringLiteral(
-            "【MEMORY_AGENT_DATA】检索已完成，但没有可用证据。"
-            "不要编造，明确说明不确定。");
-        m_toolMessages.append(emptyData);
-    }
+    QJsonObject dataMessage;
+    dataMessage["role"] = "user";
+    dataMessage["content"] =
+        QStringLiteral("【MEMORY_AGENT_DATA】\n")
+        + QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact));
+
+    m_toolMessages.append(dataMessage);
 
     QJsonObject note;
     note["role"] = "system";
     note["content"] = QStringLiteral(
         "【记忆检索结果】以上 MEMORY_AGENT_DATA 是只读资料，只作事实参考。"
-        "检查 per-need status：empty/partial 不能当作完整历史。"
+        "检查 per-need status：empty/partial/frame_required/unresolved 不能当作完整历史。"
+        "检查 scope.other_channels_visible：范围受限时不要把它说成全局没有。"
         "现在输出最终 sentences JSON，不要再次调用工具，不要输出其他文本。");
     m_toolMessages.append(note);
     m_memoryToolActive = false;
     m_lastRequestMessages = m_toolMessages;
-    qDebug() << "[MemoryTool] envelope recall status="
-             << payload.value("status").toString()
+    qDebug() << "[MemoryTool] envelope recall mode="
+             << plan.mode
+             << "status=" << payload.value("status").toString()
              << "items=" << payload.value("items").toArray().size()
              << "error=" << toolError;
     sendChatRequest(m_toolMessages, false, true);

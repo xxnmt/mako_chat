@@ -1,4 +1,4 @@
-# 开发路线图
+﻿# 开发路线图
 
 > 项目：Windows_AI 桌面看板娘（桌宠）
 > 版本：v0.7.0-rc7-dev（Phase 0/0.5、Phase 1 前置、QQ 文本、记忆系统 v5 R3 + Memory Recall Tool 完成）
@@ -250,7 +250,7 @@
 - [x] **PR-11 审计与时间主路径**：per-need expression/frame/resolver/scope 审计；tool 路径 TimeFrame 必填；范围受限语义；assistant 历史非事实
 - [ ] **PR-5 留存 UI 与生命周期**：保留期、observe-only、规则 UI、清理/删除传播 —— **下一项**
 
-**当前基线**：数据库 `user_version=9`（14 张表）；15 个 CTest 套件 / 153 个测试函数全绿。不引入向量库。
+**当前基线**：数据库 `user_version=9`（14 张表）；15 个 CTest 套件 / 156 个测试函数全绿。不引入向量库。
 
 ### v0.7.0 - 架构改进 & 独立存档
 **状态**：📋 待开始

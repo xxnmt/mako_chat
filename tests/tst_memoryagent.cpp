@@ -1037,6 +1037,168 @@ private slots:
         QVERIFY(resolved.needs.first().timeConstraintApplied);
     }
 
+    void envelopePlanPreservesModeOverviewAndFrame()
+    {
+        QJsonObject frame;
+        frame.insert(QStringLiteral("anchor"),
+                     QJsonObject{{QStringLiteral("type"),
+                                  QStringLiteral("relative_day")},
+                                 {QStringLiteral("offset"), -2}});
+        frame.insert(QStringLiteral("span"),
+                     QJsonObject{{QStringLiteral("type"), QStringLiteral("day")}});
+        QJsonObject time;
+        time.insert(QStringLiteral("expression"), QStringLiteral("两天前"));
+        time.insert(QStringLiteral("target"), QStringLiteral("message_time"));
+        time.insert(QStringLiteral("frame"), frame);
+        QJsonObject need;
+        need.insert(QStringLiteral("id"), QStringLiteral("need-1"));
+        need.insert(QStringLiteral("query"), QStringLiteral("脚踝"));
+        need.insert(QStringLiteral("time"), time);
+        QJsonObject content;
+        content.insert(QStringLiteral("action"), QStringLiteral("recall"));
+        content.insert(QStringLiteral("mode"), QStringLiteral("overview"));
+        content.insert(QStringLiteral("overview"),
+                       QJsonObject{{QStringLiteral("bucket_minutes"), 180},
+                                   {QStringLiteral("max_buckets"), 8}});
+        content.insert(QStringLiteral("needs"), QJsonArray{need});
+
+        MemoryRecallPlan plan;
+        QString error;
+        QVERIFY2(MemoryRecallPlan::fromEnvelope(content, &plan, &error),
+                 qPrintable(error));
+        QCOMPARE(plan.mode, QStringLiteral("overview"));
+        QCOMPARE(plan.overview.value(QStringLiteral("max_buckets")).toInt(), 8);
+        QCOMPARE(plan.needs.size(), 1);
+        QVERIFY(plan.needs.first().hasTimeFrame);
+        QCOMPARE(plan.needs.first().timeFrame.anchor,
+                 MemoryTimeFrame::Anchor::RelativeDay);
+        QCOMPARE(plan.needs.first().timeFrame.offset, -2);
+    }
+
+    void overviewLongRangeKeepsBucketLabelsHonest()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager mm(dir.filePath("overview-long.db"));
+        mm.seedIdentity({QStringLiteral("20001")});
+        const QDate monday = QDate::currentDate()
+                                 .addDays(1 - QDate::currentDate().dayOfWeek())
+                                 .addDays(-7);
+        for (int i = 0; i < 6; ++i) {
+            const QDateTime at(monday.addDays(i), QTime(12, 0));
+            const qlonglong id = makeInteractionAt(
+                mm, QStringLiteral("30001"), at,
+                QStringLiteral("上一周群聊主题%1").arg(i),
+                QStringLiteral("20001"), QStringLiteral("主人"));
+            QVERIFY(id >= 0);
+            QVERIFY(mm.saveInteractionSummary(
+                id, QStringLiteral("上一周群聊摘要%1").arg(i),
+                QStringLiteral("ready")));
+        }
+
+        MemoryAgentScope scope =
+            ownerGroupScope(QStringLiteral("30001"), QDateTime::currentDateTime());
+        scope.requireTimeFrame = true;
+        scope.accessScope = QStringLiteral("current_group");
+
+        QJsonObject frame;
+        frame.insert(QStringLiteral("anchor"),
+                     QJsonObject{{QStringLiteral("type"),
+                                  QStringLiteral("relative_day")},
+                                 {QStringLiteral("offset"), -7}});
+        frame.insert(QStringLiteral("span"),
+                     QJsonObject{{QStringLiteral("type"),
+                                  QStringLiteral("week_containing")}});
+        QJsonObject time;
+        time.insert(QStringLiteral("expression"), QStringLiteral("上一周"));
+        time.insert(QStringLiteral("target"), QStringLiteral("message_time"));
+        time.insert(QStringLiteral("frame"), frame);
+        QJsonObject need;
+        need.insert(QStringLiteral("id"), QStringLiteral("overview-1"));
+        need.insert(QStringLiteral("query"), QStringLiteral("上一周群聊"));
+        need.insert(QStringLiteral("time"), time);
+        QJsonObject overview;
+        overview.insert(QStringLiteral("bucket_minutes"), 180);
+        overview.insert(QStringLiteral("max_buckets"), 8);
+        QJsonObject planObject;
+        planObject.insert(QStringLiteral("mode"), QStringLiteral("overview"));
+        planObject.insert(QStringLiteral("needs"), QJsonArray{need});
+        planObject.insert(QStringLiteral("overview"), overview);
+
+        MemoryRecallPlan plan;
+        QString error;
+        QVERIFY2(MemoryRecallPlan::fromJson(planObject, &plan, &error),
+                 qPrintable(error));
+        const MemoryOverviewResult result =
+            buildMemoryOverview(&mm, scope, plan, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        const QJsonObject coverage =
+            result.payload.value(QStringLiteral("coverage")).toObject();
+        QCOMPARE(coverage.value(QStringLiteral("total_interactions")).toInt(), 6);
+        QCOMPARE(coverage.value(QStringLiteral("scanned")).toInt(), 6);
+        const QJsonArray buckets =
+            result.payload.value(QStringLiteral("buckets")).toArray();
+        QCOMPARE(buckets.size(), 8);
+        QCOMPARE(buckets.last().toObject().value(QStringLiteral("to")).toString(),
+                 coverage.value(QStringLiteral("to")).toString());
+    }
+
+    void overviewRejectsMultipleNeedsAndAmbiguousGroups()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager mm(dir.filePath("overview-shape.db"));
+        mm.seedIdentity({QStringLiteral("20001")});
+        MemoryAgentScope scope =
+            ownerGroupScope(QStringLiteral("30001"), QDateTime::currentDateTime());
+        scope.requireTimeFrame = true;
+        scope.accessScope = QStringLiteral("current_group");
+
+        QJsonObject frame;
+        frame.insert(QStringLiteral("anchor"),
+                     QJsonObject{{QStringLiteral("type"),
+                                  QStringLiteral("relative_day")},
+                                 {QStringLiteral("offset"), 0}});
+        frame.insert(QStringLiteral("span"),
+                     QJsonObject{{QStringLiteral("type"), QStringLiteral("day")}});
+        QJsonObject time;
+        time.insert(QStringLiteral("expression"), QStringLiteral("今天"));
+        time.insert(QStringLiteral("target"), QStringLiteral("message_time"));
+        time.insert(QStringLiteral("frame"), frame);
+        QJsonObject need;
+        need.insert(QStringLiteral("id"), QStringLiteral("overview-1"));
+        need.insert(QStringLiteral("query"), QStringLiteral("今天群聊"));
+        need.insert(QStringLiteral("time"), time);
+        QJsonObject secondNeed = need;
+        secondNeed.insert(QStringLiteral("id"), QStringLiteral("overview-2"));
+        secondNeed.insert(QStringLiteral("query"), QStringLiteral("今天群聊二"));
+        QJsonObject planObject;
+        planObject.insert(QStringLiteral("mode"), QStringLiteral("overview"));
+        planObject.insert(QStringLiteral("needs"), QJsonArray{need, secondNeed});
+        MemoryRecallPlan plan;
+        QString error;
+        QVERIFY2(MemoryRecallPlan::fromJson(planObject, &plan, &error),
+                 qPrintable(error));
+        MemoryOverviewResult result =
+            buildMemoryOverview(&mm, scope, plan, &error);
+        QCOMPARE(error, QStringLiteral("invalid_overview_plan"));
+        QVERIFY(result.payload.value(QStringLiteral("error")).isString());
+
+        MemoryAgentScope privateScope =
+            ownerPrivateScope(QDateTime::currentDateTime(), true);
+        privateScope.allowedGroupIds = {QStringLiteral("30001"),
+                                        QStringLiteral("30002")};
+        privateScope.requireTimeFrame = true;
+        privateScope.accessScope = QStringLiteral("owner_private_cross_channel");
+        privateScope.access.allowedGroupIds = privateScope.allowedGroupIds;
+        planObject.insert(QStringLiteral("needs"), QJsonArray{need});
+        QVERIFY2(MemoryRecallPlan::fromJson(planObject, &plan, &error),
+                 qPrintable(error));
+        result = buildMemoryOverview(&mm, privateScope, plan, &error);
+        QCOMPARE(error, QStringLiteral("overview_group_ambiguous"));
+        QVERIFY(result.payload.value(QStringLiteral("error")).isString());
+    }
+
     void overviewScansRangeAndExposesBuckets()
     {
         QTemporaryDir dir;

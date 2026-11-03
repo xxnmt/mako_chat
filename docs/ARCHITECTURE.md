@@ -1,4 +1,4 @@
-# 架构设计文档
+﻿# 架构设计文档
 
 > 项目：Windows_AI 桌面看板娘（桌宠）
 > 版本：v0.7.0-rc6-dev + Phase 0/0.5 + Phase 1（记忆库 v9 / R3）
@@ -1386,7 +1386,9 @@ LLMService::askDeepSeek
 
 **Overview**：
 - `mode=overview` 扫描完整时间范围，不返回 top-k；
-- 默认 3 小时桶、最多 8 桶，服务端限幅；
+- 默认 3 小时桶、最多 8 桶，服务端限幅；桶数被截断时实际桶跨度同步拉长，最后桶覆盖到 `coverage.to`；
+- Overview 只接受 1 个 need；多个 need 返回 `invalid_overview_plan`；
+- Owner 私聊 Overview 必须有且只有一个授权群；多个群返回 `overview_group_ambiguous`；
 - 返回 `coverage`（total/ready/scanned/aggregated/exposed/missing/complete/truncated）与 `buckets`；
 - `bucket:*` 句柄由 `memory_read` 展开完整摘要集合；
 - 扫描完整不等于模型看到全部原文，必须区分 `scan_complete/aggregation_complete/exposure_complete`。
@@ -1398,7 +1400,7 @@ LLMService::askDeepSeek
 
 **协议**：
 - 默认 `agent_protocol=native`：DeepSeek `tools` + `tool_choice=auto` + `response_format=json_object`；工具结果以 `role=tool`、`tool_call_id` 回放。
-- native 400/422 自动降级 `json_envelope`。
+- native 400/422 自动降级 `json_envelope`；envelope 与 native 共用 `mode/overview/needs/time.frame` 语义，回退不会退回默认 lookup 或丢掉 frame。
 - `memory_recall` + `memory_read` 两个只读工具；`memory_read` 只接受本次 run 的 `bucket:*`。
 
 **兼容路径**：`agent_mode=legacy` 保留旧 `agent_trigger` + 独立 Planner + `agent_plan_v2`，仅用于灰度回滚；主链路默认 `agent_mode=tool`。
@@ -1632,7 +1634,7 @@ image/
 
 | 阶段 | 版本 | 内容 |
 |------|------|------|
-| 当前 | v0.7.0-rc8-dev | Phase 1 QQ 文本 + 记忆 v5 R3：interactions/claims/persons/membership、近期群聊上下文、输出保护、Memory Recall Tool + 数据源/概览/TimeFrame（PR-7/8/9）；15 套件 / 153 用例 |
+| 当前 | v0.7.0-rc8-dev | Phase 1 QQ 文本 + 记忆 v5 R3：interactions/claims/persons/membership、近期群聊上下文、输出保护、Memory Recall Tool + 数据源/概览/TimeFrame（PR-7/8/9）；15 套件 / 156 用例 |
 | 已完成 | Phase 0 / 0.5 | 大脑/渠道解耦：Utterance/IChannelAdapter/SessionRouter、DB v2/v3、identity.json、raw_events/memory_cursor |
 | 下一步 | PR-5 | 留存 UI、保留期、observe-only、清理/删除传播 |
 | 中期 | Phase 1 剩余 | QQ 语音/图片/表情包、群聊滑动窗口 |

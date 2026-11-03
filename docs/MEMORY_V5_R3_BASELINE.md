@@ -1,4 +1,4 @@
-# 记忆系统 v5 R3 实施基线
+﻿# 记忆系统 v5 R3 实施基线
 
 > 状态：**PR-1a / PR-1b 已通过手工验收；PR-2 / PR-2.1 / PR-2.2 / PR-3.0 / PR-3.1 / PR-3.2a / PR-3.2a.1 / PR-3.2b / PR-3.2c / PR-4 / PR-6 / PR-7 / PR-8 / PR-9 / PR-11 已实现并通过单测。3.2a / 3.2a.1 成员生命周期已手工验证；3.2b / 3.2c 待手工验收。下一项 PR-5。**
 > 日期：2026-11-03
@@ -22,7 +22,7 @@
 
 - 数据库：`PRAGMA user_version = 9`，当前 14 张表。
 - 迁移链：v1 基础 5 表 → v2 多渠道 → v3 `raw_events`/`memory_cursor` → v4 `episodic.session_id` → v5 脱敏审计列 → v6 `interactions` → v7 `persons`/`person_identities` → v8 `memory_claims`/`summary_segments` → v9 `group_membership_*`。
-- 测试：15 个 CTest 套件 / 153 个测试函数全绿；`tst_memoryagent` 覆盖工具授权、多 need 契约、Resolver、Executor 去重/partial、最近对话上下文、时间范围与排序回归。
+- 测试：15 个 CTest 套件 / 156 个测试函数全绿；`tst_memoryagent` 覆盖工具授权、多 need 契约、Resolver、Executor 去重/partial、最近对话上下文、时间范围与排序回归。
 - 检索：`RecentContextPlanner` + `searchRecentGroupContext` 只读时间窗；claims 只注入 `shareable`。
 - 成员关系：连接/重连/定时刷新；入群/退群 notice；快照失败保留旧 period 但跨群 fail closed。
 - 明确不含：向量库、embedding、独立 agent runtime、第二套原始事件系统。
