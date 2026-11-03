@@ -62,7 +62,16 @@ struct MemoryNeedResult {
     QString evidenceState;   // found / empty / unresolved / denied / partial
     QString timeCertainty;   // exact / approximate / unknown
     QStringList sourceKinds;
+    bool framePresent = false;
+    QString anchorType;
+    int frameOffset = 0;
+    QString spanType;
+    QString resolverType;    // time_frame / legacy / none
+    QString resolverStatus;  // ok / unresolved / frame_required / unsupported
+    QString accessScopeStatus;
     bool timeConstraintApplied = false;
+    int expressionLength = 0;
+    QString expressionHash;
     int scannedCount = 0;
     int totalCandidates = 0;
     int resultCount = 0;

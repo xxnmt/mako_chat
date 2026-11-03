@@ -1,4 +1,4 @@
-﻿#include "promptassembler.h"
+#include "promptassembler.h"
 
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -405,7 +405,10 @@ QJsonArray PromptAssembler::buildHistoryMessages(const QList<HistoryTurn> &histo
 
     QJsonObject historyNote;
     historyNote["role"] = "system";
-    historyNote["content"] = "以下内容为短期对话记录。！！！仅提供对话信息，请勿参考其输出格式！！！";
+    historyNote["content"] =
+        "以下内容为短期对话记录。用户消息可作为用户事实候选；"
+        "assistant 消息是茉子过去的回复，可能不准确，不能自动当成已核实事实；"
+        "用户后来明确纠正的内容优先。仅提供对话信息，请勿参考其输出格式。";
     messages.append(historyNote);
 
     const bool group = isGroupChannel(meta);

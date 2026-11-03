@@ -48,6 +48,15 @@ MemoryOverviewResult buildMemoryOverview(MemoryManager *manager,
     }
 
     const MemoryRecallNeed &need = plan.needs.first();
+    if (need.hasTime && !need.hasTimeFrame && scope.requireTimeFrame) {
+        if (error) {
+            *error = QStringLiteral("time_frame_required");
+        }
+        result.payload = errorPayload(
+            QStringLiteral("time_frame_required"),
+            QStringLiteral("overview requires a structured time frame"));
+        return result;
+    }
     MemoryResolvedTime time;
     if (need.hasTime) {
         time = need.hasTimeFrame
@@ -240,6 +249,13 @@ MemoryOverviewResult buildMemoryOverview(MemoryManager *manager,
                             : (totalInteractions == 0 ? QStringLiteral("empty")
                                                       : QStringLiteral("partial")));
     payload.insert(QStringLiteral("untrusted"), true);
+    if (!scope.accessScope.isEmpty()) {
+        payload.insert(QStringLiteral("scope"),
+                       QJsonObject{{QStringLiteral("access_scope"),
+                                    scope.accessScope},
+                                   {QStringLiteral("other_channels_visible"),
+                                    scope.otherChannelsVisible}});
+    }
     payload.insert(QStringLiteral("coverage"), coverage);
     payload.insert(QStringLiteral("buckets"), bucketArray);
     result.payload = payload;

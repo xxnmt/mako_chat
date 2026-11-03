@@ -83,6 +83,28 @@ QJsonObject memoryAgentResultToJson(const MemoryAgentResult &result,
         if (!need.timeCertainty.isEmpty()) {
             needJson.insert(QStringLiteral("time_certainty"), need.timeCertainty);
         }
+        needJson.insert(QStringLiteral("expression_length"),
+                        need.expressionLength);
+        needJson.insert(QStringLiteral("expression_hash"),
+                        need.expressionHash);
+        needJson.insert(QStringLiteral("frame_present"), need.framePresent);
+        if (!need.anchorType.isEmpty()) {
+            needJson.insert(QStringLiteral("anchor_type"), need.anchorType);
+        }
+        needJson.insert(QStringLiteral("frame_offset"), need.frameOffset);
+        if (!need.spanType.isEmpty()) {
+            needJson.insert(QStringLiteral("span_type"), need.spanType);
+        }
+        if (!need.resolverType.isEmpty()) {
+            needJson.insert(QStringLiteral("resolver_type"), need.resolverType);
+        }
+        if (!need.resolverStatus.isEmpty()) {
+            needJson.insert(QStringLiteral("resolver_status"), need.resolverStatus);
+        }
+        if (!need.accessScopeStatus.isEmpty()) {
+            needJson.insert(QStringLiteral("access_scope_status"),
+                            need.accessScopeStatus);
+        }
         needJson.insert(QStringLiteral("time_constraint_applied"),
                         need.timeConstraintApplied);
         if (!need.sourceKinds.isEmpty()) {
@@ -134,6 +156,13 @@ QJsonObject memoryAgentResultToJson(const MemoryAgentResult &result,
     payload.insert(QStringLiteral("truncated"), truncated);
     payload.insert(QStringLiteral("has_empty"), hasEmptyNeed(result));
     payload.insert(QStringLiteral("untrusted"), true);
+    if (!result.accessScope.isEmpty()) {
+        payload.insert(QStringLiteral("scope"),
+                       QJsonObject{{QStringLiteral("access_scope"),
+                                    result.accessScope},
+                                   {QStringLiteral("other_channels_visible"),
+                                    result.otherChannelsVisible}});
+    }
     payload.insert(QStringLiteral("items"), items);
     if (!needs.isEmpty()) {
         payload.insert(QStringLiteral("needs"), needs);

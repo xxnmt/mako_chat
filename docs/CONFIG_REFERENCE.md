@@ -153,7 +153,7 @@ app_data/config/identity.json
 >
 > `mode=overview` 扫描完整时间段并返回 `coverage`、`buckets`、`handles`；默认 3 小时桶、最多 8 桶，服务端限幅。
 >
-> 时间：`time.expression + target + frame`。frame 支持 relative_day/week/month、absolute_date、festival、recent_window；公共节日在 `calendar/festivals.json`，不写 Resolver 关键词。`episodic.event_time` 不能冒充 message_time；long summary 的 `created_at` 不能冒充 message_time。`event_time` 无独立索引时保持 fallback；`fact_validity` 返回 `unsupported`。最大 31 天。
+> 时间：`time.expression + target + frame`。tool 路径只要带 `time` 就必须提供 `frame`，否则返回 `time_frame_required`；legacy 才走旧 Resolver。frame 支持 relative_day/week/month、absolute_date、festival、recent_window；公共节日在 `calendar/festivals.json`，不写 Resolver 关键词。`episodic.event_time` 不能冒充 message_time；long summary 的 `created_at` 不能冒充 message_time。`event_time` 无独立索引时保持 fallback；`fact_validity` 返回 `unsupported`。最大 31 天。
 
 ### 1.7 memory：隐私规则
 

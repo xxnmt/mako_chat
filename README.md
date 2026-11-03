@@ -29,7 +29,7 @@
   - 主 Conversation Agent 自主调用 `memory_recall`（原生 Tool Calling；同一上下文完成工具调用与最终回复）
   - 多 need 记忆检索（lookup）；`mode=overview` 覆盖完整时间段并返回覆盖率/时间桶/可展开句柄
   - 数据源：group_recent、interaction_summary、claim、episodic、long_term_summary、chat_history
-  - TimeFrame：模型表达 anchor/occurrence/span/period，服务端计算日期；公共节日数据驱动
+  - TimeFrame：模型表达 anchor/occurrence/span/period，服务端计算日期；公共节日数据驱动；tool 路径带时间必须提供 frame
   - Inline/Spill：档案与关系内联，历史记忆按需检索
   - `owner_cross_channel_private` 默认关闭；仅 Owner QQ 私聊可按开关读取自己的 pet/private 记忆
   - `agent_mode=legacy` 保留旧关键词门控 + 独立 Planner，作为灰度回滚
@@ -412,7 +412,7 @@ Windows_AI/
 │   ├── closer/              # 近景立绘
 │   ├── far/                 # 远景立绘
 │   └── default_config/      # 默认配置（prompt.txt）
-├── tests/                   # 单元测试（Qt Test + CTest，15 套件 / 152 个测试函数）
+├── tests/                   # 单元测试（Qt Test + CTest，15 套件 / 153 个测试函数）
 │   ├── tst_memorymanager.cpp
 │   ├── tst_configmanager.cpp
 │   ├── tst_memorypolicy.cpp

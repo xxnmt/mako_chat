@@ -4,9 +4,59 @@
 #include "memorytimeresolver.h"
 #include "timeframeresolver.h"
 
+#include <QCryptographicHash>
 #include <QElapsedTimer>
 #include <QJsonObject>
 #include <QSet>
+
+namespace {
+
+QString frameAnchorName(MemoryTimeFrame::Anchor anchor)
+{
+    switch (anchor) {
+    case MemoryTimeFrame::Anchor::RelativeDay:
+        return QStringLiteral("relative_day");
+    case MemoryTimeFrame::Anchor::RelativeWeek:
+        return QStringLiteral("relative_week");
+    case MemoryTimeFrame::Anchor::RelativeMonth:
+        return QStringLiteral("relative_month");
+    case MemoryTimeFrame::Anchor::AbsoluteDate:
+        return QStringLiteral("absolute_date");
+    case MemoryTimeFrame::Anchor::Festival:
+        return QStringLiteral("festival");
+    case MemoryTimeFrame::Anchor::RecentWindow:
+        return QStringLiteral("recent_window");
+    case MemoryTimeFrame::Anchor::None:
+    default:
+        return QStringLiteral("none");
+    }
+}
+
+QString frameSpanName(MemoryTimeFrame::Span span)
+{
+    switch (span) {
+    case MemoryTimeFrame::Span::WeekContaining:
+        return QStringLiteral("week_containing");
+    case MemoryTimeFrame::Span::SurroundingDays:
+        return QStringLiteral("surrounding_days");
+    case MemoryTimeFrame::Span::MonthContaining:
+        return QStringLiteral("month_containing");
+    case MemoryTimeFrame::Span::Day:
+    default:
+        return QStringLiteral("day");
+    }
+}
+
+QString expressionHash(const QString &expression)
+{
+    return QString::fromLatin1(
+        QCryptographicHash::hash(expression.toUtf8(),
+                                 QCryptographicHash::Sha256)
+            .left(8)
+            .toHex());
+}
+
+} // namespace
 
 MemoryExecutor::MemoryExecutor(MemoryManager *memoryManager,
                                const MemoryAgentScope &scope)
@@ -18,6 +68,8 @@ MemoryExecutor::MemoryExecutor(MemoryManager *memoryManager,
 MemoryAgentResult MemoryExecutor::execute(const MemoryRecallPlan &plan)
 {
     MemoryAgentResult result;
+    result.accessScope = m_scope.accessScope;
+    result.otherChannelsVisible = m_scope.otherChannelsVisible;
     result.needs.reserve(plan.needs.size());
     QHash<QString, int> itemIndexByToolId;
     int opaqueId = 0;
@@ -31,6 +83,20 @@ MemoryAgentResult MemoryExecutor::execute(const MemoryRecallPlan &plan)
         needResult.query = need.query;
         needResult.expression = need.timeExpression;
         needResult.timeTarget = need.timeTarget;
+        needResult.expressionLength = need.timeExpression.size();
+        needResult.expressionHash = expressionHash(need.timeExpression);
+        needResult.framePresent = need.hasTimeFrame;
+        needResult.accessScopeStatus = m_scope.accessScope;
+        if (need.hasTimeFrame) {
+            needResult.resolverType = QStringLiteral("time_frame");
+            needResult.anchorType = frameAnchorName(need.timeFrame.anchor);
+            needResult.frameOffset = need.timeFrame.offset;
+            needResult.spanType = frameSpanName(need.timeFrame.span);
+        } else {
+            needResult.resolverType = need.hasTime
+                                          ? QStringLiteral("legacy")
+                                          : QStringLiteral("none");
+        }
 
         QElapsedTimer timer;
         timer.start();
@@ -48,9 +114,24 @@ MemoryAgentResult MemoryExecutor::execute(const MemoryRecallPlan &plan)
 
         if (need.timeTarget == MemoryTimeTarget::FactValidity) {
             needResult.status = QStringLiteral("unsupported");
+            needResult.resolverStatus = QStringLiteral("unsupported");
             needResult.evidenceState = QStringLiteral("unresolved");
             needResult.timeCertainty = QStringLiteral("unknown");
             needResult.error = QStringLiteral("fact_validity_not_indexed");
+            anyFailure = true;
+            result.needs.append(needResult);
+            continue;
+        }
+
+        // tool 路径：有 time 必须由模型给出结构化 frame。旧 Resolver 仍可服务
+        // legacy 路径，但不能继续作为普通工具路径的默认后备。
+        if (need.hasTime && !need.hasTimeFrame && m_scope.requireTimeFrame) {
+            needResult.status = QStringLiteral("frame_required");
+            needResult.resolverType = QStringLiteral("none");
+            needResult.resolverStatus = QStringLiteral("frame_required");
+            needResult.evidenceState = QStringLiteral("unresolved");
+            needResult.timeCertainty = QStringLiteral("unknown");
+            needResult.error = QStringLiteral("time_frame_required");
             anyFailure = true;
             result.needs.append(needResult);
             continue;
@@ -85,6 +166,7 @@ MemoryAgentResult MemoryExecutor::execute(const MemoryRecallPlan &plan)
             needResult.interpretation = resolved.interpretation;
             if (!resolved.valid) {
                 needResult.status = QStringLiteral("unresolved");
+                needResult.resolverStatus = QStringLiteral("unresolved");
                 needResult.evidenceState = QStringLiteral("unresolved");
                 needResult.timeCertainty = QStringLiteral("unknown");
                 needResult.error = resolved.error;
@@ -92,6 +174,7 @@ MemoryAgentResult MemoryExecutor::execute(const MemoryRecallPlan &plan)
                 result.needs.append(needResult);
                 continue;
             }
+            needResult.resolverStatus = QStringLiteral("ok");
             needResult.timeConstraintApplied = true;
             args.insert(QStringLiteral("time_from"), resolved.from.toString(Qt::ISODate));
             args.insert(QStringLiteral("time_to"), resolved.to.toString(Qt::ISODate));
@@ -104,6 +187,8 @@ MemoryAgentResult MemoryExecutor::execute(const MemoryRecallPlan &plan)
                 needResult.timeCertainty = QStringLiteral("approximate");
                 anyFailure = true;
             }
+        } else {
+            needResult.resolverStatus = QStringLiteral("not_required");
         }
 
         MemoryAgentScope needScope = m_scope;

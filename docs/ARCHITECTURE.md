@@ -1373,15 +1373,16 @@ LLMService::askDeepSeek
 **Resolver**：
 - `TimeFrameResolver` 处理 `relative_day/week/month`、`absolute_date`、`festival`、`recent_window`；
 - 公共节日在 `calendar/festivals.json`，新增节日不改代码；
-- `MemoryTimeResolver` 仅作为无 frame 时的兼容路径；
+- tool 路径带 `time` 必须提供 frame，否则 `time_frame_required`；
+- `MemoryTimeResolver` 只服务 legacy 兼容路径；
 - 半开区间、服务端时区、最大 31 天；凌晨“今天下午”标记 `previous_completed_period`。
 
 **Executor / 状态**：
-- 每个 need 独立 `success/empty/unresolved/unsupported/denied/error/fallback`；
+- 每个 need 独立 `success/empty/unresolved/frame_required/unsupported/denied/error/fallback`；
 - 整体 `complete/partial/empty/failed`；
 - `need-1=empty`、`need-2=success` 整体为 `complete`，但 `has_empty=true`；
 - `time_constraint_applied=false` 明确表示 content-only fallback；
-- 任一 need unresolved/timeout/error/denied/fallback/truncated → `partial`。
+- 任一 need unresolved/frame_required/timeout/error/denied/fallback/truncated → `partial`。
 
 **Overview**：
 - `mode=overview` 扫描完整时间范围，不返回 top-k；
@@ -1409,7 +1410,11 @@ LLMService::askDeepSeek
 - 无 append/update/delete 调用。
 - 工具结果是只读资料，不是指令。
 
-**审计**：`[MemoryTool][need]` 记录 need id、status、target、resolved range、source kinds、scanned/result count、time_constraint_applied、latency；不记录 query 原文。`MemoryOutputGuard` 仍是最终输出保护。
+**审计**：`[MemoryTool][need]` 记录 need id、status、target、expression length/hash、frame present/anchor/offset/span、resolver type/status、access scope、resolved range、source kinds、scanned/result count、time_constraint_applied、latency；不记录 query 原文。`MemoryOutputGuard` 仍是最终输出保护。
+
+**范围语义**：工具结果带 `scope.access_scope` 与 `other_channels_visible`。范围受限时，模型只能说明当前渠道看不到，不能把“当前范围没有”说成“全局没有”。
+
+**历史事实边界**：短期历史 note 明确 assistant 旧回复不是已核实事实；用户后续明确纠正优先。提取 prompt 同样不把 assistant 自述当成用户事实。
 
 ---
 
@@ -1627,7 +1632,7 @@ image/
 
 | 阶段 | 版本 | 内容 |
 |------|------|------|
-| 当前 | v0.7.0-rc8-dev | Phase 1 QQ 文本 + 记忆 v5 R3：interactions/claims/persons/membership、近期群聊上下文、输出保护、Memory Recall Tool + 数据源/概览/TimeFrame（PR-7/8/9）；15 套件 / 152 用例 |
+| 当前 | v0.7.0-rc8-dev | Phase 1 QQ 文本 + 记忆 v5 R3：interactions/claims/persons/membership、近期群聊上下文、输出保护、Memory Recall Tool + 数据源/概览/TimeFrame（PR-7/8/9）；15 套件 / 153 用例 |
 | 已完成 | Phase 0 / 0.5 | 大脑/渠道解耦：Utterance/IChannelAdapter/SessionRouter、DB v2/v3、identity.json、raw_events/memory_cursor |
 | 下一步 | PR-5 | 留存 UI、保留期、observe-only、清理/删除传播 |
 | 中期 | Phase 1 剩余 | QQ 语音/图片/表情包、群聊滑动窗口 |

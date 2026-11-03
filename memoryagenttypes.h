@@ -31,6 +31,11 @@ struct MemoryAgentScope {
     bool planV2 = true;
     // 仅对 Owner QQ 私聊生效：允许读取自己的 pet/private 记忆。
     bool ownerCrossChannelPrivate = false;
+    // tool 模式下有 time 的 need 必须提供结构化 frame；legacy 不强制。
+    bool requireTimeFrame = false;
+    // 仅用于审计/回复边界，不包含敏感 ID。
+    QString accessScope;
+    bool otherChannelsVisible = false;
     QString timezone;
     QList<PlannerTurn> recentTurns;
     MemoryAccessContext access;
@@ -61,6 +66,8 @@ struct MemoryAgentResult {
     QList<MemoryAgentItem> items;
     QList<MemoryNeedResult> needs;
     bool truncated = false;
+    QString accessScope;
+    bool otherChannelsVisible = false;
     // complete / partial / empty / failed / timeout（timeout 仅 legacy）
     QString status;
 };

@@ -988,6 +988,55 @@ private slots:
         QVERIFY(!unresolved.valid);
     }
 
+    void toolPathRequiresFrameAndAuditsResolution()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager mm(dir.filePath("timeframe.db"));
+        mm.seedIdentity({QStringLiteral("20001")});
+        MemoryAgentScope scope =
+            ownerGroupScope(QStringLiteral("30001"), QDateTime::currentDateTime());
+        scope.requireTimeFrame = true;
+        scope.accessScope = QStringLiteral("current_group");
+        scope.otherChannelsVisible = false;
+
+        MemoryRecallPlan plan;
+        MemoryRecallNeed need;
+        need.id = QStringLiteral("need-1");
+        need.query = QStringLiteral("脚踝");
+        need.kinds = {QStringLiteral("group_recent")};
+        need.timeExpression = QStringLiteral("两天前");
+        need.hasTime = true;
+        plan.needs.append(need);
+
+        MemoryExecutor executor(&mm, scope);
+        MemoryAgentResult missingFrame = executor.execute(plan);
+        QCOMPARE(missingFrame.needs.size(), 1);
+        QCOMPARE(missingFrame.needs.first().status,
+                 QStringLiteral("frame_required"));
+        QCOMPARE(missingFrame.needs.first().resolverStatus,
+                 QStringLiteral("frame_required"));
+        QCOMPARE(missingFrame.needs.first().accessScopeStatus,
+                 QStringLiteral("current_group"));
+        QVERIFY(!missingFrame.needs.first().framePresent);
+        QVERIFY(!missingFrame.needs.first().expressionHash.isEmpty());
+
+        plan.needs[0].hasTimeFrame = true;
+        plan.needs[0].timeFrame.anchor = MemoryTimeFrame::Anchor::RelativeDay;
+        plan.needs[0].timeFrame.offset = -2;
+        plan.needs[0].timeFrame.span = MemoryTimeFrame::Span::Day;
+        MemoryAgentResult resolved = executor.execute(plan);
+        QCOMPARE(resolved.needs.size(), 1);
+        QCOMPARE(resolved.needs.first().resolverType,
+                 QStringLiteral("time_frame"));
+        QCOMPARE(resolved.needs.first().resolverStatus, QStringLiteral("ok"));
+        QCOMPARE(resolved.needs.first().anchorType,
+                 QStringLiteral("relative_day"));
+        QCOMPARE(resolved.needs.first().frameOffset, -2);
+        QVERIFY(!resolved.needs.first().resolvedFrom.isEmpty());
+        QVERIFY(resolved.needs.first().timeConstraintApplied);
+    }
+
     void overviewScansRangeAndExposesBuckets()
     {
         QTemporaryDir dir;
@@ -1008,26 +1057,35 @@ private slots:
         }
 
         const QDateTime now = QDateTime::currentDateTime();
-        const MemoryAgentScope scope =
-            ownerGroupScope(QStringLiteral("30001"), now);
+        MemoryAgentScope scope = ownerGroupScope(QStringLiteral("30001"), now);
+        scope.requireTimeFrame = true;
+        scope.accessScope = QStringLiteral("current_group");
+        QJsonObject frame;
+        frame.insert(QStringLiteral("anchor"),
+                     QJsonObject{{QStringLiteral("type"),
+                                  QStringLiteral("relative_day")},
+                                 {QStringLiteral("offset"), 0}});
+        frame.insert(QStringLiteral("span"),
+                     QJsonObject{{QStringLiteral("type"), QStringLiteral("day")}});
+        QJsonObject time;
+        time.insert(QStringLiteral("expression"), QStringLiteral("今天"));
+        time.insert(QStringLiteral("target"), QStringLiteral("message_time"));
+        time.insert(QStringLiteral("frame"), frame);
+        QJsonObject needJson;
+        needJson.insert(QStringLiteral("id"), QStringLiteral("overview-1"));
+        needJson.insert(QStringLiteral("query"), QStringLiteral("今天群聊"));
+        needJson.insert(QStringLiteral("time"), time);
+        QJsonObject overview;
+        overview.insert(QStringLiteral("bucket_minutes"), 180);
+        overview.insert(QStringLiteral("max_buckets"), 8);
+        QJsonObject planObject;
+        planObject.insert(QStringLiteral("mode"), QStringLiteral("overview"));
+        planObject.insert(QStringLiteral("needs"), QJsonArray{needJson});
+        planObject.insert(QStringLiteral("overview"), overview);
+
         MemoryRecallPlan plan;
         QString error;
-        QVERIFY2(MemoryRecallPlan::fromJson(
-                     QJsonObject{
-                         {QStringLiteral("mode"), QStringLiteral("overview")},
-                         {QStringLiteral("needs"),
-                          QJsonArray{QJsonObject{
-                              {QStringLiteral("id"), QStringLiteral("overview-1")},
-                              {QStringLiteral("query"), QStringLiteral("今天群聊")},
-                              {QStringLiteral("time"),
-                               QJsonObject{{QStringLiteral("expression"),
-                                            QStringLiteral("今天")},
-                                           {QStringLiteral("target"),
-                                            QStringLiteral("message_time")}}}}}},
-                         {QStringLiteral("overview"),
-                          QJsonObject{{QStringLiteral("bucket_minutes"), 180},
-                                      {QStringLiteral("max_buckets"), 8}}}},
-                     &plan, &error),
+        QVERIFY2(MemoryRecallPlan::fromJson(planObject, &plan, &error),
                  qPrintable(error));
         const MemoryOverviewResult result =
             buildMemoryOverview(&mm, scope, plan, &error);
@@ -1038,26 +1096,24 @@ private slots:
         QCOMPARE(coverage.value(QStringLiteral("ready_summaries")).toInt(), 6);
         QCOMPARE(coverage.value(QStringLiteral("scanned")).toInt(), 6);
         QCOMPARE(coverage.value(QStringLiteral("aggregated")).toInt(), 6);
+        QCOMPARE(result.payload.value(QStringLiteral("scope"))
+                     .toObject()
+                     .value(QStringLiteral("access_scope"))
+                     .toString(),
+                 QStringLiteral("current_group"));
         QVERIFY(!result.handles.isEmpty());
         QVERIFY(!result.payload.value(QStringLiteral("buckets")).toArray().isEmpty());
 
         MemoryRecallTool tool(&mm, scope);
-        const QJsonObject planJson{
-            {QStringLiteral("mode"), QStringLiteral("overview")},
-            {QStringLiteral("needs"),
-             QJsonArray{QJsonObject{
-                 {QStringLiteral("id"), QStringLiteral("overview-1")},
-                 {QStringLiteral("query"), QStringLiteral("今天群聊")},
-                 {QStringLiteral("time"),
-                  QJsonObject{{QStringLiteral("expression"), QStringLiteral("今天")},
-                              {QStringLiteral("target"),
-                               QStringLiteral("message_time")}}}}}},
-            {QStringLiteral("overview"),
-             QJsonObject{{QStringLiteral("bucket_minutes"), 180},
-                         {QStringLiteral("max_buckets"), 8}}}};
-        QVERIFY2(tool.execute(planJson, &error).value(QStringLiteral("coverage"))
+        const QJsonObject planJson = planObject;
+        const QJsonObject toolOverview = tool.execute(planJson, &error);
+        QVERIFY2(toolOverview.value(QStringLiteral("coverage"))
                      .toObject().value(QStringLiteral("scanned")).toInt() >= 6,
                  qPrintable(error));
+        QCOMPARE(toolOverview.value(QStringLiteral("scope"))
+                     .toObject().value(QStringLiteral("access_scope"))
+                     .toString(),
+                 QStringLiteral("current_group"));
         QStringList handles = result.handles.keys();
         std::sort(handles.begin(), handles.end());
         QJsonArray handleArray;

@@ -1,6 +1,6 @@
-﻿# Memory Recall Tool：数据源、授权、概览与时间语义
+# Memory Recall Tool：数据源、授权、概览与时间语义
 
-> 状态：PR-7A / PR-7B / PR-7C / PR-8 / PR-9 已实现；PR-10 legacy 保留为回滚
+> 状态：PR-7A / PR-7B / PR-7C / PR-8 / PR-9 / PR-11 已实现；PR-10 legacy 保留为回滚
 > 关联：[ARCHITECTURE.md](ARCHITECTURE.md)、[CONFIG_REFERENCE.md](CONFIG_REFERENCE.md)
 
 ## 1. 目标
@@ -95,15 +95,27 @@ long_term_summary.created_at == message_time
 - 最多 4 needs；每个 need 最多 8 条，总计最多 16 条；
 - `mode=lookup|overview`；
 - 不接受 `from/to`、viewer/owner/group/session/allowed_groups；
+- **只要 need 带 `time`，tool 路径就必须同时提供 `time.frame`**；只有 `expression` 时返回 `time_frame_required`，不再默认回退旧 Resolver；
 - `frame` 只接受受控字段，时区由服务端提供；
-- `absolute_date` 由模型复制、服务端校验，模型不计算日期。
+- `absolute_date` 由模型复制、服务端校验，模型不计算日期；
+- `legacy` 路径仍可使用旧 Resolver，但那不是普通 tool 路径。
 
 ## 6. Overview
 
 ```json
 {
   "mode": "overview",
-  "needs": [{"id": "overview-1", "query": "今天群聊", "time": {"expression": "今天"}}],
+  "needs": [{
+    "id": "overview-1",
+    "query": "今天群聊",
+    "time": {
+      "expression": "今天",
+      "frame": {
+        "anchor": {"type": "relative_day", "offset": 0},
+        "span": {"type": "day"}
+      }
+    }
+  }],
   "overview": {"bucket_minutes": 180, "max_buckets": 8}
 }
 ```
@@ -131,11 +143,28 @@ need：`success / empty / unresolved / unsupported / denied / error / fallback`�
 
 ```text
 status / target / evidence_state / time_certainty
+expression_length / expression_hash
+frame_present / anchor_type / frame_offset / span_type
+resolver_type / resolver_status
+access_scope_status
 resolved_from / resolved_to / time_constraint_applied
 source_kinds / scanned_count / result_count / latency_ms
 ```
 
-日志只记录 need id、状态、时间范围、来源、数量、耗时，不记录 query 原始文本。
+`resolver_type` 区分 `time_frame` / `legacy` / `none`；`resolver_status` 区分 `ok` / `unresolved` / `frame_required` / `unsupported`。
+
+日志只记录 need id、状态、时间摘要、解析器路径、范围、来源、数量、耗时，不记录 query 原文。时间表达式只记录长度和 hash。
+
+工具结果带 `scope`：
+
+```json
+"scope": {
+  "access_scope": "current_group",
+  "other_channels_visible": false
+}
+```
+
+`other_channels_visible=false` 时，用户问“另一个地方/QQ 私聊”只能说明当前渠道看不到，不能把范围受限说成全局没有，也不能确认私人记录是否存在。
 
 ## 8. TimeFrame
 

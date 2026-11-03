@@ -1,7 +1,7 @@
 # 记忆系统 v5 R3 实施基线
 
-> 状态：**PR-1a / PR-1b 已通过手工验收；PR-2 / PR-2.1 / PR-2.2 / PR-3.0 / PR-3.1 / PR-3.2a / PR-3.2a.1 / PR-3.2b / PR-3.2c / PR-4 / PR-6 / PR-7 / PR-8 / PR-9 已实现并通过单测。3.2a / 3.2a.1 成员生命周期已手工验证；3.2b / 3.2c 待手工验收。下一项 PR-5。**
-> 日期：2026-11-01
+> 状态：**PR-1a / PR-1b 已通过手工验收；PR-2 / PR-2.1 / PR-2.2 / PR-3.0 / PR-3.1 / PR-3.2a / PR-3.2a.1 / PR-3.2b / PR-3.2c / PR-4 / PR-6 / PR-7 / PR-8 / PR-9 / PR-11 已实现并通过单测。3.2a / 3.2a.1 成员生命周期已手工验证；3.2b / 3.2c 待手工验收。下一项 PR-5。**
+> 日期：2026-11-03
 > 冻结：`blocked` 默认不回复；`group_authorized` 下非白名单成员只记录、不回复、不写 `chat_history`。
 > 取代：[MEMORY_V5_DESIGN.md](MEMORY_V5_DESIGN.md) 的历史草案
 > 依据：R2 源码核对方案 + 本轮四项产品决策
@@ -22,13 +22,14 @@
 
 - 数据库：`PRAGMA user_version = 9`，当前 14 张表。
 - 迁移链：v1 基础 5 表 → v2 多渠道 → v3 `raw_events`/`memory_cursor` → v4 `episodic.session_id` → v5 脱敏审计列 → v6 `interactions` → v7 `persons`/`person_identities` → v8 `memory_claims`/`summary_segments` → v9 `group_membership_*`。
-- 测试：15 个 CTest 套件 / 152 个测试函数全绿；`tst_memoryagent` 覆盖工具授权、多 need 契约、Resolver、Executor 去重/partial、最近对话上下文、时间范围与排序回归。
+- 测试：15 个 CTest 套件 / 153 个测试函数全绿；`tst_memoryagent` 覆盖工具授权、多 need 契约、Resolver、Executor 去重/partial、最近对话上下文、时间范围与排序回归。
 - 检索：`RecentContextPlanner` + `searchRecentGroupContext` 只读时间窗；claims 只注入 `shareable`。
 - 成员关系：连接/重连/定时刷新；入群/退群 notice；快照失败保留旧 period 但跨群 fail closed。
 - 明确不含：向量库、embedding、独立 agent runtime、第二套原始事件系统。
 - PR-4 MemoryAgent（legacy）：QQ 记忆问句触发，pet 不进入；Planner 多 need、Resolver、Executor；旧工具循环回退；partial/去重/审计/P95。
 - PR-6 Memory Recall Tool：主 Conversation Agent 自主调用 `memory_recall`；原生 Tool Calling；Inline/Spill；per-need 状态与 `has_empty`；`agent_mode=tool` 默认。
 - PR-7/8/9：episodic/long_term_summary/chat_history 数据源；Owner 跨渠道开关；Overview 覆盖率/桶/句柄；TimeFrame + 公共节日数据。
+- PR-11：per-need 审计（expression hash/frame/resolver/scope）；tool 路径 TimeFrame 必填；范围受限语义；assistant 历史非事实。
 - 下一项 PR-5 留存 UI；持久化审计/UI 尚未开始。
 
 ---

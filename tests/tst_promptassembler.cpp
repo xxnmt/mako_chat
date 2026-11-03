@@ -424,6 +424,8 @@ private slots:
 
         QCOMPARE(messages.size(), 3);   // note + user + assistant
         QCOMPARE(messages.at(0).toObject()["role"].toString(), QStringLiteral("system"));
+        QVERIFY(messages.at(0).toObject()["content"].toString()
+                    .contains(QStringLiteral("不能自动当成已核实事实")));
         QCOMPARE(messages.at(1).toObject()["role"].toString(), QStringLiteral("user"));
         QVERIFY(messages.at(1).toObject()["content"].toString()
                     .contains(QStringLiteral("小明：在吗")));
