@@ -219,7 +219,7 @@ QJsonObject MemoryRecallTool::definition()
             "只读检索过去对话、用户长期事实、承诺、偏好或群聊历史。"
             "当用户询问“记得/之前/上次/昨天/谁说过/我说过什么/有没有提过”等"
             "需要证据的历史信息时调用；普通闲聊、当前情绪和不需要历史证据的问题不要调用。"
-            "一次调用可以拆分 1–4 个独立 needs，每个 need 独立解析时间并分别返回状态。"
+            "lookup 可以拆分 1–4 个独立 needs；overview 必须且只能有 1 个 need。"
             "只要 need 带 time，就必须同时提供 time.frame；只给自然语言 expression 会返回 time_frame_required。"
             "定点回忆用默认 mode=lookup；总结某个完整时间段（如“今天群里聊了什么”）"
             "使用 mode=overview，服务端会返回覆盖率和时间桶，而不是 8 条 top-k。"

@@ -1,4 +1,4 @@
-﻿# Memory Recall Tool：数据源、授权、概览与时间语义
+# Memory Recall Tool：数据源、授权、概览与时间语义
 
 > 状态：PR-7A / PR-7B / PR-7C / PR-8 / PR-9 / PR-11 已实现；PR-10 legacy 保留为回滚
 > 关联：[ARCHITECTURE.md](ARCHITECTURE.md)、[CONFIG_REFERENCE.md](CONFIG_REFERENCE.md)
@@ -92,7 +92,8 @@ long_term_summary.created_at == message_time
 
 约束：
 
-- 最多 4 needs；每个 need 最多 8 条，总计最多 16 条；
+- `lookup`：1–4 个 needs；`overview`：必须且只能有 1 个 need；
+- 每个 need 最多 8 条，总计最多 16 条；
 - `mode=lookup|overview`；
 - 不接受 `from/to`、viewer/owner/group/session/allowed_groups；
 - **只要 need 带 `time`，tool 路径就必须同时提供 `time.frame`**；只有 `expression` 时返回 `time_frame_required`，不再默认回退旧 Resolver；

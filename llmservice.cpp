@@ -333,7 +333,8 @@ void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> 
         toolInstruction["content"] = QStringLiteral(
             "【记忆工具】你可以调用 memory_recall 检索过去对话、长期事实、承诺和群聊历史。\n"
             "- 需要历史证据时调用；普通闲聊、当前情绪、不需要历史证据的问题不要调用。\n"
-            "- 一次调用可包含 1–4 个 needs，每个 need 独立解析时间。\n"
+            "- lookup：1–4 个 needs，每个 need 独立解析时间；"
+            "overview：必须且只能有 1 个 need。\n"
             "- 定点回忆用默认 mode=lookup；总结今天/某时间段全部群聊时用 mode=overview，"
             "返回的 bucket 句柄可用 memory_read 展开。\n"
             "- 只要 need 带 time，就必须同时提供 time.frame（anchor/occurrence/span/period）；"
@@ -1161,7 +1162,8 @@ QString LLMService::envelopeToolInstruction() const
         "【记忆工具协议】如果回答需要过去对话、长期事实、承诺、偏好或群聊历史的证据，"
         "只输出 {\"action\":\"recall\",\"mode\":\"lookup|overview\","
         "\"overview\":{\"bucket_minutes\":180,\"max_buckets\":8},\"needs\":[...]}；"
-        "needs 最多 4 个，每个 need 包含 id/query/kinds/time；"
+        "lookup 允许 1–4 个 needs；overview 必须且只能有 1 个 need；"
+        "每个 need 包含 id/query/kinds/time；"
         "只要 need 带 time，必须同时提供 time.frame（anchor/occurrence/span/period），"
         "不能只给 expression。"
         "如果不需要记忆，直接输出最终 sentences JSON。不要输出其他文本。");
