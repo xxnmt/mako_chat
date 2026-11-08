@@ -63,6 +63,7 @@ struct MemoryAgentItem {
 };
 
 struct MemoryAgentResult {
+    QString requestId;
     QList<MemoryAgentItem> items;
     QList<MemoryNeedResult> needs;
     bool truncated = false;

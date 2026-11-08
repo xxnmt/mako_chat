@@ -2,6 +2,7 @@
 #include "memorymanager.h"
 #include "configmanager.h"
 #include <QDebug>
+#include <QUuid>
 
 SessionRouter::SessionRouter(MemoryManager *memoryManager, QObject *parent)
     : QObject(parent), m_memoryManager(memoryManager)
@@ -39,7 +40,7 @@ bool SessionRouter::submitInput(const QString &channel, const QString &sessionId
                                 const QString &senderId,
                                 bool useShortContext,
                                 bool longTermMemory,
-                                bool sensitive)
+                                bool sensitive, const QDateTime &occurredAt)
 {
     if (text.trimmed().isEmpty()) {
         qDebug() << "[SessionRouter]空输入，忽略";
@@ -53,6 +54,10 @@ bool SessionRouter::submitInput(const QString &channel, const QString &sessionId
     }
 
     RequestMeta meta;
+    meta.eventId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    meta.runId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    meta.receivedAtUtc = QDateTime::currentDateTimeUtc();
+    meta.occurredAtUtc = occurredAt.isValid() ? occurredAt.toUTC() : meta.receivedAtUtc;
     meta.channel = channel;
     meta.sessionId = sessionId;
     meta.speaker = speaker;

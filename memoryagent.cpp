@@ -1284,6 +1284,7 @@ void MemoryAgent::finishWithResult(MemoryAgentResult result, bool timedOut)
              << "truncated=" << result.truncated
              << "latencyMs=" << latency
              << "p95=" << m_metrics.p95();
+    result.requestId = m_scope.requestId;
     emit finished(result);
 }
 
@@ -1327,7 +1328,7 @@ void MemoryAgent::failRun(const QString &reason, bool timedOut)
     appendAudit(QStringLiteral("run"), QJsonObject(), 0,
                 int(latency), timedOut ? QStringLiteral("timeout")
                                         : QStringLiteral("error"));
-    emit failed(reason);
+    emit failed(reason, m_scope.requestId);
 }
 
 void MemoryAgent::appendAudit(const QString &tool,

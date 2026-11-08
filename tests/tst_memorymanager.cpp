@@ -135,6 +135,107 @@ class TestMemoryManager : public QObject
     Q_OBJECT
 
 private slots:
+    void crossChannelCorrectionSurvivesRestart()
+    {
+        QTemporaryDir dir;
+        const QString path = dir.filePath("continuity.db");
+        RequestMeta group;
+        group.channel = Channel::kQQGroup;
+        group.actorId = "10101";
+        group.sessionId = "20202";
+        auto direct = group;
+        direct.channel = Channel::kQQPrivate;
+        direct.sessionId = group.actorId;
+        auto report = [](const QString &quote) {
+            return QString::fromUtf8(QJsonDocument(QJsonObject{{"state_updates",
+                QJsonArray{QJsonObject{{"topic","脚踝"},{"quote",quote}}}}}).toJson());
+        };
+        {
+            MemoryManager db(path);
+            QVERIFY(db.saveQATurn("脚踝还疼", report("脚踝还疼"), {}, group));
+            QVERIFY(db.saveQATurn("脚踝好了", report("脚踝好了"), {}, direct));
+            QVERIFY(db.saveQATurn("天气真好", report("脚踝又疼了"), {}, direct));
+        }
+        MemoryManager db(path);
+        const auto personal = db.currentUnderstanding(RequestMeta{}, "脚踝");
+        QCOMPARE(personal.size(), 1);
+        QCOMPARE(personal.first().toObject()["self_report"].toString(), QString("脚踝好了"));
+        const auto publicView = db.currentUnderstanding(group, "");
+        QCOMPARE(publicView.first().toObject()["avoid_stale_followup"].toString(), QString("脚踝"));
+        QVERIFY(!QJsonDocument(publicView).toJson().contains(QString("脚踝好了").toUtf8()));
+        group.subject = "qq:99999";
+        QVERIFY(db.currentUnderstanding(group, "").isEmpty());
+        RawEventWrite legacy;
+        legacy.platform = "qq";
+        legacy.channel = Channel::kQQPrivate;
+        legacy.sessionId = direct.sessionId;
+        legacy.senderId = direct.actorId;
+        legacy.eventType = "message";
+        legacy.content = "脚踝已经恢复";
+        QVERIFY(db.appendRawEvent(legacy));
+        const auto evidence = db.personalEvidence("user", {direct.actorId}, {"脚踝"});
+        QVERIFY(QJsonDocument(evidence).toJson().contains(legacy.content.toUtf8()));
+        QVERIFY(db.personalEvidence(group.subject, {group.subject.mid(3)}, {"脚踝"}).isEmpty());
+        QVERIFY(db.clearAllHistory());
+        QVERIFY(db.currentUnderstanding(RequestMeta{}, "").isEmpty());
+    }
+
+    void evidenceRetainsBothTimelineAndTopicMatches()
+    {
+        QTemporaryDir dir;
+        MemoryManager db(dir.filePath("recent.db"));
+        RawEventWrite event;
+        event.platform = "qq";
+        event.channel = Channel::kQQPrivate;
+        event.sessionId = event.senderId = "10101";
+        event.eventType = "message";
+        event.occurredAt = QDateTime::currentDateTime().addDays(-7);
+        for (int i = 0; i < 32; ++i) {
+            event.content = i < 16 ? QString("排练记录 %1").arg(i) : QString("日常记录 %1").arg(i);
+            event.occurredAt = event.occurredAt.addSecs(60);
+            event.messageId = QString::number(i);
+            QVERIFY(db.appendRawEvent(event));
+        }
+        event.messageId = "new";
+        event.content = "把工具还了";
+        event.channel = Channel::kQQGroup;
+        event.sessionId = "20002";
+        event.occurredAt = event.occurredAt.addSecs(60);
+        QVERIFY(db.appendRawEvent(event));
+        const auto items = db.personalEvidence("user", {event.senderId},
+            {"排练"}, true, Channel::kPet, Channel::kDefaultSession);
+        QStringList texts;
+        for (const auto &item : items)
+            texts.append(item.toObject()["text"].toString());
+        QVERIFY(texts.contains(event.content));
+        QVERIFY(texts.contains(QStringLiteral("排练记录 15")));
+    }
+
+    void privateThoughtReviewPersistsAndRespectsBudget()
+    {
+        QTemporaryDir dir;
+        const QString path = dir.filePath("thought.db");
+        qlonglong id;
+        {
+            MemoryManager db(path);
+            QVERIFY(db.saveQATurn("试试写诗", R"({"personal_interest":"想写雨声"})", {}));
+            auto thought = db.nextThought(true);
+            id = thought["id"].toInteger();
+            QVERIFY(id > 0);
+            QVERIFY(db.claimThoughtReview(id,1,900));
+            QVERIFY(!db.claimThoughtReview(id,1,900));
+            const QJsonObject review{{"status","completed"},{"reflection","写好了两句"},
+                                     {"draft","屋檐轻响，雨在窗上停了一停。"}};
+            QVERIFY(db.finishThoughtReview(id,0,review));
+            QVERIFY(!db.finishThoughtReview(id,0,review));
+        }
+        MemoryManager db(path);
+        QVERIFY(db.nextThought(true).isEmpty());
+        QCOMPARE(db.nextThought(false)["last_review"].toObject()["status"].toString(),QString("completed"));
+        QVERIFY(db.deleteTurnByID(id));
+        QVERIFY(db.nextThought(false).isEmpty());
+    }
+
     void legacyMigrationPreservesData()
     {
         QTemporaryDir dir;
@@ -149,7 +250,7 @@ private slots:
             QVERIFY(raw.open());
 
             // 版本推进到 v3
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 9);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 10);
 
             // 列扩展（v2 渠道 + v3 轮次）
             const QStringList historyCols = raw.columns("chat_history");
@@ -253,7 +354,7 @@ private slots:
             MemoryManager second(dbPath);
             RawDb raw(dbPath, "verify2");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 9);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 10);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM chat_history").toInt(), 1);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM relationship_state").toInt(), 2);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM long_term_summary").toInt(), 1);
@@ -270,7 +371,7 @@ private slots:
             MemoryManager mm(dbPath);
             RawDb raw(dbPath, "fresh");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 9);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 10);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('raw_events')").toInt() > 0);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('memory_cursor')").toInt() > 0);
 
@@ -477,7 +578,7 @@ private slots:
         Q_UNUSED(mm);
         RawDb raw(dbPath, "v2verify");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 9);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 10);
         QCOMPARE(raw.scalar("SELECT user_input FROM chat_history").toString(), QStringLiteral("旧输入"));
         QCOMPARE(raw.scalar("SELECT turn_kind FROM chat_history").toString(), QStringLiteral("reply"));
         QCOMPARE(raw.scalar("SELECT subject FROM chat_history").toString(), QStringLiteral("user"));

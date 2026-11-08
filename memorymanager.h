@@ -9,6 +9,7 @@
 #include <QDateTime>
 #include <QStringList>
 #include <QSet>
+#include <QJsonArray>
 #include "sentencedata.h"
 #include "historyturn.h"
 #include "utterance.h"
@@ -48,6 +49,15 @@ public:
                           const QString &rawReply,
                           const QList<SentenceText> &sentences,
                           const RequestMeta &meta = RequestMeta());
+
+    QJsonArray currentUnderstanding(const RequestMeta &audience, const QString &input) const;
+    QJsonArray personalEvidence(const QString &subject, const QStringList &accounts,
+                                const QStringList &terms, bool includeOthers = false,
+                                const QString &currentChannel = {}, const QString &currentSession = {}) const;
+
+    QJsonObject nextThought(bool dueOnly) const;
+    bool claimThoughtReview(qlonglong id, int dailyLimit, int cooldownSeconds);
+    bool finishThoughtReview(qlonglong id, int version, const QJsonObject &proposal);
 
 //历史对话crud
     QList<HistoryTurn> getHistoryTurn(int N, const QString &channel = Channel::kPet, const QString &sessionId = Channel::kDefaultSession);

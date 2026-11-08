@@ -83,7 +83,7 @@ public:
 
 signals:
     void finished(const MemoryAgentResult &result);
-    void failed(const QString &reason);
+    void failed(const QString &reason, const QString &requestId);
     void auditRecorded(const MemoryAgentAudit &audit);
 
 private:

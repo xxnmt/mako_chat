@@ -25,6 +25,7 @@
 #include "raweventprocessor.h"
 
 #include <QDebug>
+#include <QTimer>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -186,7 +187,7 @@ AppController::AppController(QObject *parent)
         m_sessionRouter->submitInput(message.channel, message.sessionId,
                                      message.speaker, sanitized.text, message.senderId,
                                      decision.persistChat, decision.persistRaw,
-                                     sanitized.redacted);
+                                     sanitized.redacted, message.occurredAt);
     });
     if (ConfigManager::instance().getQQConfig().enabled) {
         m_qqClient->start();
@@ -201,6 +202,36 @@ AppController::AppController(QObject *parent)
     m_llmService->registerStateProvider([this](){return m_appearance->getCurrentStateDescription();});
 
     initConnections();
+    m_idle.start();
+    auto *reviewTimer = new QTimer(this);
+    connect(reviewTimer, &QTimer::timeout, this, [this] {
+        if (canReviewThought())
+            m_llmService->reviewDueThought();
+    });
+    reviewTimer->start(60000);
+    connect(m_llmService, &LLMService::draftReadyToShare, this, [this](const QString &draft) {
+        if (!canReviewThought())
+            return;
+        auto &cfg = ConfigManager::instance();
+        const auto targets = cfg.getProactiveConfig().targets;
+        for (const auto &target : targets) {
+            Utterance u;
+            u.channel = target.first;
+            u.sessionId = target.second;
+            u.text = draft;
+            if (cfg.isBlindZone(u.channel,u.sessionId))
+                continue;
+            if (u.channel == Channel::kPet && u.sessionId == Channel::kDefaultSession) {
+                m_petChannel->sendUtterance(u);
+                break;
+            }
+            if (u.channel == Channel::kQQPrivate && cfg.isMasterQQ(u.sessionId)
+                && m_qqClient->isConnected()) {
+                m_qqChannel->sendUtterance(u);
+                break;
+            }
+        }
+    });
 
     m_timeManager->start();
 
@@ -270,14 +301,15 @@ void AppController::startApp()
 
 }
 
-void AppController::handleMakoReply(const QList<SentenceText> &sentences, const QString &rawReply)
+void AppController::handleMakoReply(const QList<SentenceText> &sentences, const QString &rawReply,
+                                    const QString &userInput, const RequestMeta &meta)
 {
     // TD-034：本轮回复入队 TTS，记下它属于哪一轮（退火门控用）
-    m_lastPlaybackRound = m_roundSeq;
-    if (m_lastMeta.persistTurn) {
-        m_memoryManager->saveQATurn(m_lastUserInput, rawReply, sentences, m_lastMeta);
+    m_lastPlaybackRound = m_active.sequence;
+    if (meta.persistTurn) {
+        m_memoryManager->saveQATurn(userInput, rawReply, sentences, meta);
     }
-    if (m_lastMeta.channel == Channel::kPet) {
+    if (meta.channel == Channel::kPet) {
         m_ttsService->enqueueSentences(sentences);
     } else {
         // QQ：文字回复走 QQ 渠道；情绪写入全局（D1 控制是否驱动桌宠立绘），
@@ -285,24 +317,24 @@ void AppController::handleMakoReply(const QList<SentenceText> &sentences, const 
         QStringList replyParts;
         for (const SentenceText &sentence : sentences) {
             replyParts << sentence.zhText;
-            m_globalMood->applyTags(sentence.rawTags, m_lastMeta.channel);
+            m_globalMood->applyTags(sentence.rawTags, meta.channel);
         }
         Utterance utterance;
-        utterance.channel = m_lastMeta.channel;
-        utterance.sessionId = m_lastMeta.sessionId;
-        utterance.speaker = m_lastMeta.speaker;
+        utterance.channel = meta.channel;
+        utterance.sessionId = meta.sessionId;
+        utterance.speaker = meta.speaker;
         utterance.text = replyParts.join(QString());
         m_qqChannel->sendUtterance(utterance);
     }
 
-    if (!m_lastMeta.persistTurn || !m_lastMeta.longTermMemoryEnabled) {
+    if (!meta.persistTurn || !meta.longTermMemoryEnabled) {
         return;
     }
 
     qlonglong lastEndId = -1;
     QList<qlonglong> sourceIds;
     QList<HistoryTurn> unsummarizedTurns = m_memoryManager->getUnsummarizedTurns(lastEndId, sourceIds,
-                                                                                m_lastMeta.channel, m_lastMeta.sessionId);
+                                                                                meta.channel, meta.sessionId);
 
 
     // 长期记忆自动摘轮数（TD-037：由设置界面独立配置，默认与短期记忆同为 15）
@@ -310,15 +342,49 @@ void AppController::handleMakoReply(const QList<SentenceText> &sentences, const 
     if (unsummarizedTurns.size() >= SUMMARY_THRESHOLD) {
         qDebug()<<"[AppController]未摘要对话达到阈值，开始触发后台记忆提取...";
         // 按本轮主体取已有档案（群聊=qq:<uin>；桌宠=user），并附上茉子人设
-        QList<CharacterProfile> existingProfiles = m_memoryManager->getCharacterProfiles(m_lastMeta.subject);
+        QList<CharacterProfile> existingProfiles = m_memoryManager->getCharacterProfiles(meta.subject);
         existingProfiles.append(m_memoryManager->getCharacterProfiles("mako"));
         QList<EpisodicMemory> existingMemories = m_memoryManager->getActiveEpisodicMemories(
-            0.2, 20, m_lastMeta.channel, QString(), m_lastMeta.sessionId);
+            0.2, 20, meta.channel, QString(), meta.sessionId);
         m_llmService->extractMemoryAsync(unsummarizedTurns, lastEndId, sourceIds,
-                                         existingProfiles, existingMemories, m_lastMeta);
+                                         existingProfiles, existingMemories, meta);
     }
 }
 
+
+bool AppController::canReviewThought() const
+{
+    const auto cfg = ConfigManager::instance().getProactiveConfig();
+    if (!cfg.enabled || m_processing || m_idle.elapsed()/1000 < cfg.idleSeconds)
+        return false;
+    const auto now = QTime::currentTime();
+    const auto start = QTime::fromString(cfg.quietStart, "HH:mm");
+    const auto end = QTime::fromString(cfg.quietEnd, "HH:mm");
+    return start < end ? (now < start || now >= end)
+                       : (start == end || (now < start && now >= end));
+}
+
+void AppController::startNextRequest()
+{
+    if (m_processing || m_pending.isEmpty())
+        return;
+    m_processing = true;
+    m_active = m_pending.dequeue();
+    const RequestMeta &meta = m_active.meta;
+    const auto history = meta.persistTurn
+        ? m_memoryManager->getHistoryTurn(ConfigManager::instance().getShortMemoryLength(),
+                                          meta.channel, meta.sessionId)
+        : QList<HistoryTurn>{};
+    m_llmService->askDeepSeek(m_active.text, history, meta);
+}
+
+void AppController::finishRequest()
+{
+    QMetaObject::invokeMethod(this, [this] {
+        m_processing = false;
+        startNextRequest();
+    }, Qt::QueuedConnection);
+}
 
 void AppController::handleSystemError(const QString &errorMsg)
 {
@@ -407,14 +473,17 @@ void AppController::initConnections()
     });
 
     connect(m_llmService,&LLMService::sentencesReady,this,&AppController::handleMakoReply);
+    connect(m_llmService,&LLMService::sentencesReady,this,&AppController::finishRequest);
+    connect(m_llmService,&LLMService::replyAbnormal,this,&AppController::finishRequest);
+    connect(m_llmService,&LLMService::internetErrorSignal,this,&AppController::finishRequest);
     // 输入路由：渠道 → SessionRouter（身份解析+历史组装）→ 大脑
     connect(m_sessionRouter, &SessionRouter::requestReply, this,
             [this](const QString &userText, const QList<HistoryTurn> &history, const RequestMeta &meta) {
-        m_lastUserInput = userText;
-        ++m_roundSeq;   // TD-034：用户开口即开启新一轮
-        m_lastMeta = meta;
+        Q_UNUSED(history);
+        m_idle.restart();
+        m_pending.enqueue({userText, meta, ++m_roundSeq});
         m_timeManager->notifyUserInputStarted();
-        m_llmService->askDeepSeek(userText, history, meta);
+        startNextRequest();
     });
     connect(m_chatWidget,&ChatWidget::textSubmitted,this,[this](const QString &text){
         const MemoryPolicyConfig memoryPolicy =

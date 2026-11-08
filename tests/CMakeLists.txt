@@ -113,6 +113,10 @@ target_link_libraries(tst_groupmembership PRIVATE Qt6::WebSockets Qt6::Network)
 
 add_phase0_test(tst_memoryagent
     tst_memoryagent.cpp
+    ${PROJECT_SOURCE_DIR}/llmservice.cpp
+    ${PROJECT_SOURCE_DIR}/memoryoutputguard.cpp
+    ${PROJECT_SOURCE_DIR}/configmanager.cpp
+    ${PROJECT_SOURCE_DIR}/promptassembler.cpp
     ${CALENDAR_RESOURCES}
     ${PROJECT_SOURCE_DIR}/memoryagenttypes.h
     ${PROJECT_SOURCE_DIR}/memoryagent.h

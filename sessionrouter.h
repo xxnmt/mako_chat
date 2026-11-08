@@ -25,7 +25,8 @@ public:
                      const QString &senderId = QString(),
                      bool useShortContext = true,
                      bool longTermMemory = true,
-                     bool sensitive = false);
+                     bool sensitive = false,
+                     const QDateTime &occurredAt = {});
 
 signals:
     // 交给大脑侧（AppController → LLMService::askDeepSeek）

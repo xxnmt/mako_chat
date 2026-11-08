@@ -3,6 +3,7 @@
 
 #include <QString>
 #include <QMetaType>
+#include <QDateTime>
 #include <QMap>
 
 // 渠道常量（与 DB 的 channel 列、config 的 [memory] blindZones 取值保持一致）
@@ -16,6 +17,10 @@ namespace Channel {
 
 // 输入侧请求元数据：随 askDeepSeek 走完整链路，直至记忆写入
 struct RequestMeta {
+    QString eventId;
+    QString runId;
+    QDateTime receivedAtUtc;
+    QDateTime occurredAtUtc;
     QString channel = Channel::kPet;            // 渠道
     QString sessionId = Channel::kDefaultSession; // 桌宠恒 default；QQ=对方QQ号/群号
     QString speaker;                            // 桌宠="欧尼酱"；群聊=对方昵称

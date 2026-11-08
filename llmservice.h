@@ -21,7 +21,8 @@ class LLMService : public QObject
 {
     Q_OBJECT
 public:
-    explicit LLMService(const QString& apiKey,QObject *parent = nullptr);
+    explicit LLMService(const QString& apiKey,QObject *parent = nullptr,
+                        QUrl endpoint = QUrl(QStringLiteral("https://api.deepseek.com/chat/completions")));
     //config
     void setApiKey(const QString &apiKey);
     //chat
@@ -29,6 +30,7 @@ public:
                      const RequestMeta &meta = RequestMeta());
     void registerStateProvider(std::function<QString()> provider);
     void setMemoryManager(MemoryManager *manager);
+    void reviewDueThought();
     //Extract
     void extractMemoryAsync(const QList<HistoryTurn> &turns, qlonglong lastEndId, const QList<qlonglong> &sourceIds,
                             const QList<CharacterProfile> &existingProfiles = {},
@@ -41,7 +43,9 @@ public:
 
 signals:
     //chat
-    void sentencesReady(const QList<SentenceText> &sentences,const QString &rawReply);
+    void sentencesReady(const QList<SentenceText> &sentences, const QString &rawReply,
+                        const QString &userInput, const RequestMeta &meta);
+    void draftReadyToShare(const QString &draft);
     void internetErrorSignal(const QString &errorMessage);
     //chat 回复内容异常（空/乱码/缺中文/缺日文/缺标签），不入库不走TTS
     void replyAbnormal(const QString &reason);
@@ -60,10 +64,13 @@ private slots:
     // void onExtractReplyFinished(QNetworkReply* reply);
     // PR-4: MemoryAgent 完成/失败后继续主回复或回退 top-k
     void onMemoryAgentFinished(const MemoryAgentResult &result);
-    void onMemoryAgentFailed(const QString &reason);
+    void onMemoryAgentFailed(const QString &reason, const QString &requestId);
 
 private:
     //处理提示词的两个函数
+    void prepareReply(const QString &userInput, const QList<HistoryTurn> &historyQA,
+                      const RequestMeta &meta, const QJsonArray &privateEvidence,
+                      const QString &socialGuidance);
     void initializePromptFile();
     QString loadSystemPrompt();
     void sendChatRequest(const QJsonArray &messages,
@@ -94,10 +101,13 @@ private:
     static bool isSentenceValid(const QJsonObject &sentenceObj, QString &reason);
 
 
+    bool m_reviewActive = false;
     QNetworkAccessManager* m_networkManager;
     QNetworkAccessManager* m_extractManager;
     QNetworkAccessManager* m_interactionManager;
     QString m_apiKey;
+    QString m_requestInput;
+    QUrl m_endpoint;
 
     QString m_localPromptPath;
     QString m_systemPromptCache;

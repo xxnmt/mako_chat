@@ -3,6 +3,9 @@
 #include <QSignalSpy>
 #include <QTemporaryDir>
 #include <QTimer>
+#include <QTcpServer>
+#include <QTcpSocket>
+#include "llmservice.h"
 
 #include "memoryagent.h"
 #include "memoryexecutor.h"
@@ -153,6 +156,63 @@ class TestMemoryAgent : public QObject
     Q_OBJECT
 
 private slots:
+    void privateReflectionDoesNotEnterPublicReply()
+    {
+        QTemporaryDir dir;
+        MemoryManager db(dir.filePath("reflection.db"));
+        RequestMeta meta;
+        meta.channel = Channel::kQQPrivate;
+        meta.sessionId = meta.actorId = "10101";
+        const QString secret = "脚踝已经恢复，仅在这里说";
+        const auto proposal = QJsonDocument(QJsonObject{{"state_updates",QJsonArray{
+            QJsonObject{{"topic","脚踝"},{"quote",secret}}}}}).toJson();
+        QVERIFY(db.saveQATurn(secret, QString::fromUtf8(proposal), {}, meta));
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QByteArray> bodies;
+        connect(&server,&QTcpServer::newConnection,this,[&] {
+            auto *socket = server.nextPendingConnection();
+            connect(socket,&QTcpSocket::readyRead,socket,[socket,&bodies] {
+                const auto bytes = socket->peek(socket->bytesAvailable());
+                const auto header = bytes.indexOf("\r\n\r\n");
+                if (header < 0)
+                    return;
+                const auto length = QRegularExpression("content-length: (\\d+)",
+                    QRegularExpression::CaseInsensitiveOption).match(QString::fromLatin1(bytes.left(header)));
+                if (!length.hasMatch() || bytes.size()-header-4 < length.captured(1).toInt())
+                    return;
+                socket->readAll();
+                bodies.append(bytes.mid(header+4));
+                const QString answer = bodies.size()==1 ? QStringLiteral(R"({"decision":"skip_old_concern"})")
+                    : QStringLiteral(R"({"sentences":[{"zh_text":"好呀","ja_text":"いいよ","tags":{"emotion":"happy"}}]})");
+                QJsonObject msg{{"message",QJsonObject{{"content",answer}}}};
+                const auto body = QJsonDocument(QJsonObject{{"choices",QJsonArray{msg}}}).toJson();
+                socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "
+                              + QByteArray::number(body.size()) + "\r\n\r\n" + body);
+                socket->disconnectFromHost();
+            });
+        });
+        LLMService service("test",nullptr,QUrl(QString("http://127.0.0.1:%1/").arg(server.serverPort())));
+        service.setMemoryManager(&db);
+        QSignalSpy replies(&service,&LLMService::sentencesReady);
+        meta.channel = Channel::kQQGroup;
+        meta.sessionId = "20202";
+        meta.runId = "group";
+        service.askDeepSeek("周末出去玩吗",{},meta);
+        QTRY_COMPARE_WITH_TIMEOUT(replies.size(),1,5000);
+        QCOMPARE(bodies.size(),2);
+        QCOMPARE(replies.at(0).at(2).toString(), QString("周末出去玩吗"));
+        QCOMPARE(replies.at(0).at(3).value<RequestMeta>().runId, meta.runId);
+        QCOMPARE(replies.at(0).at(3).value<RequestMeta>().sessionId, meta.sessionId);
+        QVERIFY(bodies[0].contains(secret.toUtf8()));
+        QVERIFY(!bodies[1].contains(secret.toUtf8()));
+        QVERIFY(bodies[1].contains(QString("别按以前的情况主动追问").toUtf8()));
+        service.askDeepSeek("我上次说脚踝怎么了",{},RequestMeta{});
+        QTRY_COMPARE_WITH_TIMEOUT(replies.size(),2,5000);
+        QCOMPARE(bodies.size(),3);
+        QVERIFY(bodies.last().contains(secret.toUtf8()));
+    }
+
     void initTestCase()
     {
         qRegisterMetaType<MemoryAgentResult>("MemoryAgentResult");

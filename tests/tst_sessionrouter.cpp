@@ -185,10 +185,15 @@ private slots:
         QCOMPARE(captured.count, 1);
         QCOMPARE(captured.meta.subject, QStringLiteral("user"));
 
+        const auto firstRun = captured.meta.runId;
+        QVERIFY(!firstRun.isEmpty());
+        QVERIFY(captured.meta.eventId != firstRun);
+        QVERIFY(captured.meta.receivedAtUtc.isValid());
         // 未知群友：qq:<uin>
         QVERIFY(router.submitInput(Channel::kQQGroup, "group:1", QStringLiteral("小明"),
                                    QStringLiteral("hi"), QStringLiteral("30001")));
         QCOMPARE(captured.count, 2);
+        QVERIFY(firstRun != captured.meta.runId);
         QCOMPARE(captured.meta.subject, QStringLiteral("qq:30001"));
 
         // 桌宠（无 senderId）：恒为主人

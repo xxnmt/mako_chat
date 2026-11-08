@@ -90,11 +90,37 @@ bool MemoryManager::saveQATurn(const QString &userInput, const QString &rawReply
     rootObj["sentences"]=sentencesArray;
     QString JsonStr = QJsonDocument(rootObj).toJson(QJsonDocument::Compact);
 
-    // 执行原子行入库（渠道分桶 + 轮次语义：user_input 可为 NULL，TD-034/v3）
+    QString thought;
+    QJsonArray updates;
+    if (meta.longTermMemoryEnabled && meta.persistTurn && !meta.sensitive
+        && meta.turnKind == "reply" && !meta.subject.isEmpty()
+        && (meta.channel == Channel::kPet || !meta.actorId.isEmpty())) {
+        const auto response = QJsonDocument::fromJson(rawReply.toUtf8()).object();
+        if (meta.subject == "user" && (meta.channel == Channel::kPet || meta.channel == Channel::kQQPrivate)) {
+            const auto candidate = response["personal_interest"].toString().trimmed();
+            if (!candidate.isEmpty() && candidate.size() <= 120)
+                thought = candidate;
+        }
+        const auto proposals = response["state_updates"].toArray();
+        for (const auto &proposal : proposals) {
+            const auto obj = proposal.toObject();
+            const auto topic = obj["topic"].toString().trimmed();
+            const auto quote = obj["quote"].toString().trimmed();
+            if (topic.size() < 2 || topic.size() > 32 || quote.isEmpty() || quote.size() > 180
+                || !userInput.contains(quote))
+                continue;
+            updates.append(QJsonObject{{"topic", topic}, {"quote", quote}});
+            if (updates.size() == 4)
+                break;
+        }
+    }
     QSqlQuery query(m_db);
     query.prepare("INSERT INTO chat_history "
-                  "(user_input, raw_reply, channel, session_id, speaker, sensitive, turn_kind, trigger_event_ids, subject) "
-                  "VALUES (:user_input, :raw_reply, :channel, :session_id, :speaker, :sensitive, :turn_kind, :trigger_event_ids, :subject)");
+                  "(user_input, raw_reply, channel, session_id, speaker, sensitive, turn_kind, trigger_event_ids, subject, state_updates, thought) "
+                  "VALUES (:user_input, :raw_reply, :channel, :session_id, :speaker, :sensitive, :turn_kind, :trigger_event_ids, :subject, :updates, :thought)");
+    query.bindValue(":thought", thought);
+    query.bindValue(":updates", updates.isEmpty() ? QVariant(QMetaType(QMetaType::QString))
+        : QVariant(QString::fromUtf8(QJsonDocument(updates).toJson(QJsonDocument::Compact))));
     // 主动/感知轮次没有用户输入：绑定 SQL NULL，而不是空串
     query.bindValue(":user_input", userInput.isEmpty() ? QVariant(QMetaType(QMetaType::QString)) : QVariant(userInput));
     query.bindValue(":raw_reply", JsonStr);
@@ -114,6 +140,186 @@ bool MemoryManager::saveQATurn(const QString &userInput, const QString &rawReply
     qDebug()<<"[MemoryManager]:成功保存本轮对话"<<"channel="<<meta.channel<<"session="<<meta.sessionId;
     return true;
 
+}
+
+QJsonObject MemoryManager::nextThought(bool dueOnly) const
+{
+    QSqlQuery q(m_db);
+    q.prepare(R"(
+        SELECT id,thought,thought_version,thought_result FROM chat_history
+        WHERE thought IS NOT NULL AND thought<>'' AND subject='user' AND sensitive=0
+          AND (:due=0 OR (coalesce(json_extract(thought_result,'$.status'),'active')='active'
+               AND coalesce(review_after,0)<=unixepoch()))
+        ORDER BY CASE WHEN :due=1 THEN coalesce(review_after,0) ELSE 0 END,
+                 id DESC LIMIT 1
+    )");
+    q.bindValue(":due", int(dueOnly));
+    if (!q.exec() || !q.next())
+        return {};
+    return {{"id",q.value(0).toLongLong()},{"interest",q.value(1).toString()},
+            {"version",q.value(2).toInt()},
+            {"last_review",QJsonDocument::fromJson(q.value(3).toByteArray()).object()}};
+}
+
+bool MemoryManager::claimThoughtReview(qlonglong id, int dailyLimit, int cooldownSeconds)
+{
+    if (dailyLimit <= 0 || !m_db.transaction())
+        return false;
+    QSqlQuery q(m_db);
+    q.prepare(R"(
+        INSERT INTO thought_review_log(turn_id,started_at)
+        SELECT id,unixepoch() FROM chat_history WHERE id=? AND thought IS NOT NULL
+        AND coalesce(review_after,0)<=unixepoch()
+        AND (SELECT count(*) FROM thought_review_log
+             WHERE date(started_at,'unixepoch','localtime')=date('now','localtime')) < ?
+        AND coalesce((SELECT max(started_at) FROM thought_review_log),0)+?<=unixepoch()
+    )");
+    q.addBindValue(id);
+    q.addBindValue(dailyLimit);
+    q.addBindValue(qMax(60,cooldownSeconds));
+    if (q.exec() && q.numRowsAffected()==1) {
+        q.prepare("UPDATE chat_history SET review_after=unixepoch()+1800 WHERE id=?");
+        q.addBindValue(id);
+        if (q.exec() && m_db.commit())
+            return true;
+    }
+    m_db.rollback();
+    return false;
+}
+
+bool MemoryManager::finishThoughtReview(qlonglong id, int version, const QJsonObject &proposal)
+{
+    const auto status = proposal["status"].toString();
+    if (status != "active" && status != "completed" && status != "abandoned")
+        return false;
+    QJsonObject result{{"status",status}};
+    for (const auto &key : {"reflection","goal","draft","mood"}) {
+        const QString value = proposal[key].toString().trimmed().left(800);
+        if (!value.isEmpty())
+            result[key] = value;
+    }
+    if (!result.contains("reflection"))
+        return false;
+    const int hours = qBound(1, proposal["review_hours"].toInt(24), 168);
+    QSqlQuery q(m_db);
+    q.prepare("UPDATE chat_history SET thought_result=json_patch(coalesce(thought_result,'{}'),?),thought_version=thought_version+1,"
+              "review_after=unixepoch()+? WHERE id=? AND thought_version=? AND thought IS NOT NULL");
+    q.addBindValue(QString::fromUtf8(QJsonDocument(result).toJson(QJsonDocument::Compact)));
+    q.addBindValue(hours*3600);
+    q.addBindValue(id);
+    q.addBindValue(version);
+    return q.exec() && q.numRowsAffected()==1;
+}
+
+QJsonArray MemoryManager::personalEvidence(const QString &subject, const QStringList &accounts,
+                                           const QStringList &terms, bool includeOthers,
+                                           const QString &currentChannel, const QString &currentSession) const
+{
+    // raw_events already reflects the inbound retention decision. Historical short-only
+    // chat rows lack this provenance and must not be promoted during migration.
+    QSqlQuery query(m_db);
+    query.prepare(R"(
+        WITH evidence AS (
+            SELECT content AS text,occurred_at AS time,channel,session_id AS session,
+                   sender_id IN (SELECT value FROM json_each(:accounts)) AS own,
+                   sender_id AS speaker
+            FROM raw_events WHERE direction='in' AND event_type='message' AND sensitive=0
+              AND redaction_status='none' AND content IS NOT NULL
+              AND (:all_people OR sender_id IN (SELECT value FROM json_each(:accounts)))
+            UNION ALL
+            SELECT content,event_time,origin,session_id,subject=:subject,subject FROM episodic_memory
+            WHERE (subject=:subject OR :all_people) AND origin='pet' AND status='active'
+            UNION ALL
+            SELECT safe_summary,ended_at,channel,session_id,0,'summary' FROM interactions
+            WHERE :all_people AND summary_status='ready' AND safe_summary IS NOT NULL
+            UNION ALL
+            SELECT summary_text,created_at,channel,session_id,0,'summary' FROM long_term_summary
+            WHERE :all_people AND is_dirty=0
+            UNION ALL
+            SELECT statement,valid_time_start,source_channel,source_session_id,0,'claim'
+            FROM memory_claims WHERE :all_people AND claim_status='active' AND privacy_level<3
+            UNION ALL
+            SELECT json_extract(j.value,'$.quote'),h.timestamp,h.channel,h.session_id,h.subject=:subject,h.subject
+            FROM chat_history h,json_each(h.state_updates) j
+            WHERE (h.subject=:subject OR :all_people) AND h.state_updates IS NOT NULL AND h.sensitive=0
+        ), candidates AS (
+            SELECT DISTINCT *,
+                (SELECT count(*) FROM json_each(:terms) WHERE instr(text,value)>0) AS matches
+            FROM evidence WHERE text <> ''
+              AND NOT (channel=:current_channel AND session=:current_session)
+        ), ranked AS (
+            SELECT *,
+                row_number() OVER (ORDER BY matches DESC,own DESC,datetime(time) DESC,channel,session,speaker,text) AS topic_rank,
+                row_number() OVER (PARTITION BY own ORDER BY datetime(time) DESC,channel,session,speaker,text) AS timeline_rank
+            FROM candidates WHERE own OR matches>0
+        )
+        SELECT substr(text,1,360),time,channel,session,own,speaker FROM ranked
+        ORDER BY CASE WHEN own THEN min(topic_rank,timeline_rank) ELSE topic_rank END,
+                 topic_rank LIMIT 12
+    )");
+    auto json = [](const QStringList &strings) {
+        return QString::fromUtf8(QJsonDocument(QJsonArray::fromStringList(strings)).toJson(QJsonDocument::Compact));
+    };
+    query.bindValue(":subject", subject);
+    query.bindValue(":accounts", json(accounts));
+    query.bindValue(":all_people", int(includeOthers));
+    query.bindValue(":current_channel", currentChannel.isNull() ? QStringLiteral("") : currentChannel);
+    query.bindValue(":current_session", currentSession.isNull() ? QStringLiteral("") : currentSession);
+    query.bindValue(":terms", json(terms));
+    QJsonArray evidence;
+    if (query.exec()) {
+        while (query.next())
+            evidence.append(QJsonObject{{"text",query.value(0).toString()},
+                                        {"time",query.value(1).toString()},
+                                        {"channel",query.value(2).toString()},
+                                        {"session",query.value(3).toString()},
+                                        {"own",query.value(4).toBool()}, {"speaker",query.value(5).toString()}});
+    }
+    return evidence;
+}
+
+QJsonArray MemoryManager::currentUnderstanding(const RequestMeta &audience, const QString &input) const
+{
+    QJsonArray result;
+    if ((!audience.longTermMemoryEnabled && audience.channel != Channel::kQQGroup)
+        || audience.sensitive || audience.subject.isEmpty()
+        || (audience.channel != Channel::kPet && audience.actorId.isEmpty()))
+        return result;
+    QSqlQuery query(m_db);
+    query.prepare(R"(
+        WITH evidence AS (
+            SELECT h.id,h.timestamp,json_extract(j.value,'$.topic') AS topic,
+                   json_extract(j.value,'$.quote') AS quote,
+                   (h.channel=:channel AND h.session_id=:session) AS local
+            FROM chat_history h,json_each(h.state_updates) j
+            WHERE h.subject=:subject AND h.state_updates IS NOT NULL AND h.sensitive=0
+        ), ranked AS (
+            SELECT *,row_number() OVER (PARTITION BY topic ORDER BY id DESC) AS pos,
+                   max(local) OVER (PARTITION BY topic) AS mentioned_here FROM evidence
+        )
+        SELECT topic,quote,timestamp,local,mentioned_here FROM ranked WHERE pos=1
+        ORDER BY (instr(:input,topic)>0) DESC,id DESC LIMIT 32
+    )");
+    query.bindValue(":channel", audience.channel);
+    query.bindValue(":session", audience.sessionId);
+    query.bindValue(":subject", audience.subject);
+    query.bindValue(":input", input);
+    if (!query.exec())
+        return result;
+
+    while (query.next()) {
+        const auto topic = query.value(0).toString();
+        if (audience.channel == Channel::kQQGroup && !query.value(3).toBool()) {
+
+            if (query.value(4).toBool() || input.contains(topic))
+                result.append(QJsonObject{{"avoid_stale_followup", topic}});
+        } else {
+            result.append(QJsonObject{{"topic", topic}, {"self_report", query.value(1).toString()},
+                                      {"reported_at", query.value(2).toString()}});
+        }
+    }
+
+    return result;
 }
 
 QList<HistoryTurn> MemoryManager::getHistoryTurn(int N, const QString &channel, const QString &sessionId)
@@ -3089,6 +3295,19 @@ void MemoryManager::initDatabase(const QString &dbFilePath)
             qDebug() << "[MemoryManager]数据库结构升级完成,版本:" << currentVersion;
         }
 
+        if (currentVersion < 10) {
+            if (!query.exec("ALTER TABLE chat_history ADD COLUMN state_updates TEXT")
+                || !query.exec("CREATE INDEX idx_state_subject ON chat_history(subject,id) WHERE state_updates IS NOT NULL")
+                || !query.exec("ALTER TABLE chat_history ADD COLUMN thought TEXT")
+                || !query.exec("ALTER TABLE chat_history ADD COLUMN thought_version INTEGER NOT NULL DEFAULT 0")
+                || !query.exec("ALTER TABLE chat_history ADD COLUMN thought_result TEXT")
+                || !query.exec("ALTER TABLE chat_history ADD COLUMN review_after INTEGER")
+                || !query.exec("CREATE TABLE thought_review_log(turn_id INTEGER,started_at INTEGER NOT NULL)")
+                || !query.exec("CREATE INDEX idx_thought_review_time ON thought_review_log(started_at)")
+                || !query.exec("PRAGMA user_version=10"))
+                throw query.lastError();
+            currentVersion = 10;
+        }
         m_db.commit();
         qDebug()<<"[MemoryManager]数据库初始化完成,结构版本为:"<<currentVersion;
     }

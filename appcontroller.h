@@ -4,6 +4,7 @@
 #include <QObject>
 #include <QQueue>
 #include <QMap>
+#include <QElapsedTimer>
 #include "sentencedata.h"
 #include "utterance.h"
 
@@ -37,7 +38,8 @@ public:
     void startApp();
 
 private slots:
-    void handleMakoReply(const QList<SentenceText> &sentences,const QString &rawReply);
+    void handleMakoReply(const QList<SentenceText> &sentences, const QString &rawReply,
+                         const QString &userInput, const RequestMeta &meta);
     void handleSystemError(const QString &errorMsg);
     void handleAbnormalReply(const QString &reason);
     void onPlayAudioAction(const QString &zhText, const QMap<QString, QString> &tags);
@@ -48,7 +50,18 @@ private:
     void applyTimeSettings();   // 把 ConfigManager 的时间/退火配置应用到 TimeManager
     void applyPetTags(const QMap<QString, QString> &tags); // 桌宠：立绘 + 全局情绪同步
 
-    QString m_lastUserInput;
+    struct ForegroundRequest {
+        QString text;
+        RequestMeta meta;
+        quint64 sequence;
+    };
+    QQueue<ForegroundRequest> m_pending;
+    QElapsedTimer m_idle;
+    bool m_processing = false;
+    ForegroundRequest m_active;
+    void startNextRequest();
+    void finishRequest();
+    bool canReviewThought() const;
 
     CharacterWidget *m_character;
     BubbleWidget *m_bubble;
@@ -68,7 +81,7 @@ private:
     SessionRouter *m_sessionRouter;     // 输入路由（渠道→大脑）
     RawEventProcessor *m_rawEventProcessor; // raw_events → interactions → summary
     GroupMembershipService *m_membershipService; // 群成员关系快照
-    RequestMeta m_lastMeta;             // 最近一轮请求元数据（回复入库时随存）
+
     quint64 m_roundSeq = 0;             // 对话轮次序号：每次用户输入 +1（TD-034）
     quint64 m_lastPlaybackRound = 0;    // 最近一次入队 TTS 的轮次（退火门控用）
 };
