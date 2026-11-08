@@ -1,10 +1,12 @@
-﻿# Windows_AI 桌面看板娘
+# Windows_AI 桌面看板娘
 
 一款基于 Qt 框架开发的桌面看板娘应用，支持 AI 对话、立绘切换、语音交互等功能。
 
 ## 📁 项目简介
 
-这是一个可爱的桌面看板娘（桌宠）应用，名为「千岛茉子」。她可以与你对话、切换表情和服装、甚至未来还能与你语音交流。
+这是一个可爱的桌面看板娘（桌宠）应用，名为「千岛茉子」。她可以与你对话、切换表情和服装、甚至通过 GPT-SoVITS 合成语音。
+
+2026-11-08：已接入请求隔离、实验性跨渠道认识和空闲回顾。真实对话仍存在更正丢失，详见 [当前状态](docs/ARCHITECTURE.md) 和 [后续任务](docs/ROADMAP.md)。
 
 ## ✨ 功能特性
 
@@ -15,7 +17,7 @@
 - 🖱️ **拖拽移动**：支持自由拖动角色窗口
 - 📍 **位置锚点**：气泡和聊天窗口自动跟随角色
 - ⚙️ **AI 资源管理**：配置文件持久化（JSON格式）、系统提示词外部化（prompt.txt）
-- 🧠 **AI 记忆系统**（五层记忆架构 + R3 关系/授权层，SQLite数据库，`user_version=9`）：
+- 🧠 **AI 记忆系统**（五层记忆架构 + R3 关系/授权层，SQLite数据库，`user_version=10`）：
   - 短期记忆（最近N轮对话上下文，默认15轮）
   - 角色档案（character_profile，区分用户/茉子主体的稳定特质）
   - 情景记忆（episodic_memory，事件/承诺/冲突，按重要度衰减）
@@ -140,30 +142,9 @@ POST /tts
 - 🌤️ **智能助手**：天气查询、日程提醒等
 - 👥 **多角色支持**：可切换不同角色
 
-## 🏆 项目优势
+## 项目文档
 
-相比同类项目（如 LingChat），本项目具有以下独特优势：
-
-| 优势 | 说明 |
-|------|------|
-| **科学的记忆系统设计** | 五层记忆架构（短期记忆+角色档案+情景记忆+长期摘要+关系状态）+ 情景记忆重要度衰减，比简单的"永久记忆"更符合 AI 记忆的实际需求 |
-| **系统化的状态管理** | `AppearanceManager` 四维状态（emotion/blush/distance/clothing）设计，状态管理清晰可扩展 |
-| **C++/Qt 性能优势** | 桌宠应用常驻后台，C++ 的内存占用和性能比 Electron/Tauri 方案更优 |
-| **代码结构清晰** | 模块划分明确，便于维护和迭代 |
-
-## 🛠️ 架构改进计划
-
-### 当前架构问题
-- **AppController 职责过重**（上帝对象）：承担了消息分发、记忆协调、UI更新、错误处理等过多职责
-- ~~**LLMService 头文件依赖**~~：已用 `class MemoryManager;` 前向声明（TD-015 已修复）
-- ~~**AnchorManager 内存泄漏风险**~~：非问题，仅持弱引用，widget 所有权归 AppController（TD-014 已结案）
-
-### 改进方案
-1. **信号路由分离**：将信号槽连接逻辑抽离到 `SignalRouter` 类
-2. **记忆协调分离**：将记忆系统协调逻辑抽离到 `MemoryCoordinator` 类
-3. **错误处理分离**：将错误处理逻辑抽离到 `ErrorHandler` 类
-4. ~~**依赖优化**：使用前向声明减少头文件依赖~~（已完成）
-5. ~~**内存管理**：使用 Qt 父对象机制或显式所有权管理解决内存泄漏~~（核查为非问题）
+安装和操作说明见本文。当前架构、配置、记忆接口、开发任务及历史记录从 [文档索引](docs/README.md) 进入。
 
 ## 🛠️ 技术栈
 
@@ -173,7 +154,7 @@ POST /tts
 - **AI 服务**: DeepSeek API (deepseek-v4-flash)
 - **语音合成**: GPT-SoVITS（API 已接入，策略模式封装）
 - **音频播放**: IPcmPlayer 抽象（StreamPlayer 流式 / FilePlayer 文件，QAudioSink + QBuffer）
-- **数据库**: SQLite（`user_version=9`，14 张表：`chat_history` + `raw_events` + 蒸馏记忆（角色档案/情景记忆/长期摘要/关系状态）+ `memory_cursor` + R3 关系层（`interactions`/`interaction_participants`/`persons`/`person_identities`/`memory_claims`/`group_membership_periods`/`group_membership_snapshots`））
+- **数据库**: SQLite（`user_version=10`，14 张表：`chat_history` + `raw_events` + 蒸馏记忆（角色档案/情景记忆/长期摘要/关系状态）+ `memory_cursor` + R3 关系层（`interactions`/`interaction_participants`/`persons`/`person_identities`/`memory_claims`/`group_membership_periods`/`group_membership_snapshots`））
 
 ## 📦 安装与构建
 
@@ -313,7 +294,7 @@ cmake --build . --config Release
 
 规则：按 uin 绑定（与昵称无关）；`self` 消息直接丢弃、`master` → `user`、未知 QQ → `qq:<uin>`；应用启动时加载，日志输出 `identity.json 加载完成: self N 个 / master N 个`。
 
-可选项：`memory.blind_zones`（不入长期记忆的渠道/会话）与 `proactive.*`（Phase 2 主动对话预留，当前只解析不调度）也在该文件中配置，详见 [CONFIG_REFERENCE.md](docs/CONFIG_REFERENCE.md)。
+可选项：`memory.blind_zones`（不入长期记忆的渠道/会话）与 `proactive.*`（空闲念头回顾及配置目标的草稿分享，默认关闭）也在该文件中配置，详见 [CONFIG_REFERENCE.md](docs/CONFIG_REFERENCE.md)。
 
 ### QQ 接入（可选）
 
@@ -379,116 +360,19 @@ SnowLuma 提供 OneBot v11 WebSocket 服务端；在 `setting.json` 的 `qq` 段
 
 **存储分层（v9）**：`raw_events` 存全量原始事件（QQ / B 站 / 窥屏 / 主动触发；`message_id` 去重，默认不进上下文；带 `redaction_status` / `redaction_rules` / `policy_version` / `person_id`）；`chat_history` 存对话轮次（`turn_kind` = reply/proactive/perception，`user_input` 可为 NULL，`trigger_event_ids` 关联原始事件，`subject` 标记对话对象）；`interactions` 由 `RawEventProcessor` 按会话和时间窗消费 `raw_events` 生成，`interaction_participants` 保留参与者 person_id；`episodic_memory` / `long_term_summary` / `character_profile` / `relationship_state` 存蒸馏产物（情景记忆带 `origin` / `visibility` / `subject` / `session_id`，按渠道+会话隔离）；`memory_claims` 存可独立授权的长期事实；`group_membership_*` 存成员区间与快照状态。`memory_cursor` 按 `channel + session_id` 记录蒸馏进度。提取时按「长期有效 / 本人明确陈述 / 非敏感」决定是否提升为角色档案。
 
-**R3 披露规则**：`MemoryAccessPolicy` 把事实分为 `shareable / owner_candidate / known_only / forbidden` 四态；群聊只使用当前群公开内容与 viewer 自己的可披露表达；第三方私聊、secret、非共同群信息保持 `forbidden`。成员快照失败或过期时，跨群检索 fail closed。完整契约见 [MEMORY_V5_R3_BASELINE.md](docs/MEMORY_V5_R3_BASELINE.md)。
+**R3 披露规则**：MemoryAccessState 定义四个状态，当前 evaluate 实际返回 Shareable 或 Forbidden。既有披露工具只注入可披露事实，并检查当前群、主体、成员关系和来源。新增内部证据路径见 [架构](docs/ARCHITECTURE.md)，早期设计见 [R3 历史基线](docs/MEMORY_V5_R3_BASELINE.md)。
 
 **时间检索与文本安全**：v2 Planner 先拆多个 recall need，`MemoryTimeResolver` 独立解析“昨晚 / 上周三晚上 / 今天下午”等表达；`MemoryExecutor` 负责去重、partial 和权限。旧 `MemoryTimeRangePlanner` 仅作 fallback。昵称进入 prompt 前会去除控制字符、双向控制符和零宽字符，但数据库保留原始昵称；受异常昵称影响的失败摘要会在启动时按需重新排队。
 
 ## 📁 项目结构
 
-```
-Windows_AI/
-├── docs/                    # 项目文档
-│   ├── ARCHITECTURE.md      # 架构设计文档
-│   ├── ROADMAP.md           # 开发路线图
-│   ├── HUMANIZATION_PLAN.md # 类人化升级方案
-│   ├── MEMORY_V5_R3_BASELINE.md # 记忆 v5 R3 实施基线
-│   ├── MEMORY_RECALL_TOOL.md # 主模型 memory_recall 工具契约
-│   ├── CONFIG_REFERENCE.md  # setting.json / identity.json 字段说明
-│   └── OutDoc/              # 外部文档（API文档等）
-├── app_data/                # 应用数据（运行时生成）
-│   ├── config/              # 配置文件
-│   │   ├── setting.json     # 配置文件（JSON格式）
-│   │   ├── identity.json    # 身份绑定（self/master QQ，可选）
-│   │   └── prompt.txt       # 系统提示词
-│   ├── memory/              # 记忆数据（SQLite数据库）
-│   │   └── QianDaoMoZi_memory.db  # 14 张表（user_version=9）：对话/原始事件/蒸馏记忆 + R3 身份/交互/claims/成员关系
-│   ├── reference_audio/    # 参考音频文件（GPT-SoVITS用）
-│   │   ├── happy_idle_01.wav
-│   │   ├── happy_more_01.wav
-│   │   ├── loving_01.wav
-│   │   └── ...
-│   └── temp_audio/         # TTS合成临时音频（自动清理）
-├── image/                   # 立绘资源目录
-│   ├── closer/              # 近景立绘
-│   ├── far/                 # 远景立绘
-│   └── default_config/      # 默认配置（prompt.txt）
-├── tests/                   # 单元测试（Qt Test + CTest，15 套件 / 156 个测试函数）
-│   ├── tst_memorymanager.cpp
-│   ├── tst_configmanager.cpp
-│   ├── tst_memorypolicy.cpp
-│   ├── tst_recentcontext.cpp
-│   ├── tst_memorytextutils.cpp
-│   ├── tst_memoryaccesspolicy.cpp
-│   ├── tst_groupmembership.cpp
-│   ├── tst_memoryagent.cpp
-│   ├── tst_interactionsegmenter.cpp
-│   ├── tst_memoryoutputguard.cpp
-│   ├── tst_sessionrouter.cpp
-│   ├── tst_promptassembler.cpp
-│   ├── tst_qqreplypolicy.cpp
-│   ├── tst_qqmessageparser.cpp
-│   └── tst_globalmoodstate.cpp
-├── image.qrc                # Qt 资源文件
-├── CMakeLists.txt           # CMake 构建配置
-├── main.cpp                 # 入口函数
-├── appcontroller.h/cpp      # 应用中枢控制器
-├── characterwidget.h/cpp    # 角色主组件
-├── bubblewidget.h/cpp/ui    # 对话气泡组件
-├── chatwidget.h/cpp         # 聊天输入窗口
-├── anchormanager.h/cpp      # 位置锚点管理
-├── anchorstrategy.h         # 锚点策略枚举
-├── llmservice.h/cpp         # AI 服务模块
-├── promptassembler.h/cpp    # 上下文组装（渠道可见性 C3 / 轮次渲染）
-├── utterance.h              # 统一输出协议（Utterance/RequestMeta/Channel 常量）
-├── ichanneladapter.h        # 渠道抽象接口（IChannelAdapter）
-├── petchanneladapter.h/cpp  # 桌宠渠道适配器（气泡/播放跟读）
-├── qqprotocolclient.h/cpp   # OneBot v11 WS 客户端（连接/重连/动作/事件）
-├── qqmessageparser.h/cpp    # QQ 入站事件解析
-├── qqreplypolicy.h/cpp      # QQ 白名单/@ 门控
-├── qqchanneladapter.h/cpp   # QQ 文本输出
-├── sessionrouter.h/cpp      # 输入路由（身份解析 + 双键历史组装）
-├── ttsservice.h/cpp         # TTS 合成服务（策略模式；播放交 IAudioSink）
-├── iaudiosink.h             # 音频输出抽象接口
-├── petaudiosink.h/cpp       # 桌宠音频输出（播放器 + 播放队列）
-├── globalmoodstate.h/cpp    # 全局情绪（D2；外部情绪驱动立绘受 D1 控制）
-├── ittsprovider.h           # TTS 抽象接口（策略模式基类）
-├── apittsprovider.h/cpp    # GPT-SoVITS API 实现
-├── mockttsprovider.h/cpp   # Mock 模拟实现
-├── ttsreference.h          # 参考音频数据结构
-├── ttsreferencemanager.h/cpp # 按情绪加载参考音频映射（tts_map.json）
-├── ipcmplayer.h/cpp        # 播放器抽象接口（静态工厂 + 统一信号）
-├── streamplayer.h/cpp      # 流式 PCM 播放器
-├── fileplayer.h/cpp        # 文件型 WAV 播放器
-├── ttsprocessmanager.h/cpp # GPT-SoVITS 进程管理/孤儿进程清理
-├── timemanager.h/cpp       # 时间管理（退火 + 昼夜服装切换）
-├── appearancemanager.h/cpp  # 外观管理器
-├── configmanager.h/cpp      # 配置管理器（单例）
-├── memorymanager.h/cpp      # AI 记忆系统（SQLite / R3 schema）
-├── memoryagenttypes.h       # MemoryAgent scope/result/audit 数据结构
-├── memoryagent.h/cpp        # legacy 关键词门控 + Planner
-├── memoryrecalltool.h/cpp   # 主模型 memory_recall 工具
-├── memoryresultjson.h/cpp   # per-need 状态/结果序列化
-├── memoryrecalltypes.h/cpp  # 多 need plan/status 数据结构
-├── memorytimeframe.h/cpp    # 结构化时间帧
-├── festivalcalendar.h/cpp   # 公共节日数据
-├── timeframeresolver.h/cpp  # 时间帧 -> 日期范围
-├── memorysourcepolicy.h/cpp # 数据源授权矩阵
-├── memoryoverview.h/cpp     # 区间概览/覆盖率/桶
-├── memorytimeresolver.h/cpp # 独立时间表达解析（legacy/兼容）
-├── memoryexecutor.h/cpp     # 多 need 确定性检索/去重/partial
-├── memorytimerange.h/cpp    # 旧规则 fallback
-├── memorypolicy.h/cpp       # 入站策略、脱敏、隐私规则
-├── memoryaccesspolicy.h/cpp # claims 四态授权（shareable/known_only/forbidden）
-├── recentcontext.h/cpp      # 近期群聊上下文检索与预算
-├── raweventprocessor.h/cpp  # raw_events → interactions → summary/claims
-├── interactionsegmenter.h/cpp # 群聊交互分段
-├── groupmembershipservice.h/cpp # 成员快照/生命周期
-├── memoryoutputguard.h/cpp  # 最终输出隐私保护
-├── memorytextutils.h        # P1/P2 标签替换等文本工具
-├── historyturn.h            # 历史/交互/claim 数据结构
-├── settingswidget.h/cpp/ui  # 设置界面
-└── sentencedata.h           # 句子数据结构
-```
+- 仓库根目录：Qt/C++ 源码、CMakeLists.txt 与资源清单。
+- image/、calendar/：角色与日历资源。
+- tests/：Qt Test 与 CTest。
+- docs/：架构、配置、协议、路线图和历史。
+- build/：构建产物；其中 app_data/ 保存对应可执行文件使用的配置、记忆和日志。
+
+具体职责见 [架构](docs/ARCHITECTURE.md)，文档目录见 [索引](docs/README.md)。
 
 ## 📡 API 参考
 
@@ -546,7 +430,7 @@ Windows_AI/
 
 ### GPT-SoVITS API（详细文档）
 
-参考项目文档 `docs/OutDoc/API_DOC.md` 和 `docs/OutDoc/MODULE_CALL_DOC.md`。
+参见 [GPT-SoVITS 参考](docs/GPT_SOVITS_REFERENCE.md)。
 
 ## ⚠️ 已知限制
 
@@ -555,7 +439,7 @@ Windows_AI/
 3. **无网络状态检测**：应用启动时不会检测网络连接状态
 4. **立绘切换无过渡动画**：换图时直接切换，没有淡入淡出效果
 5. **仅支持单角色**：当前仅支持「千岛茉子」一个角色
-6. **外部渠道**：QQ 文本、群记忆、成员关系已接入；QQ 语音/图片/表情包、群聊滑动窗口与主动转述待后续（主动转述设计见 `docs/HUMANIZATION_PLAN.md` 6.4–6.6）
+6. **外部渠道**：QQ 文本、群记忆、成员关系已接入；QQ 语音/图片/表情包、群聊滑动窗口与主动转述待后续，具体范围见 [路线图](docs/ROADMAP.md)
 7. **R3 手工验收未完成项**：PR-3.2b/3.2c 的 claim 三主体激活与跨群 viewer 过滤已通过单测，仍待真实账号手工验收；PR-4 legacy MemoryAgent 与 PR-6/7/8/9 Memory Recall Tool 已实现并通过单测，PR-5 留存 UI 尚未开始
 
 ## 🔧 故障排除

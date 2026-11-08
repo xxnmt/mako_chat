@@ -3,6 +3,8 @@
 > 状态：PR-7A / PR-7B / PR-7C / PR-8 / PR-9 / PR-11 已实现；PR-10 legacy 保留为回滚
 > 关联：[ARCHITECTURE.md](ARCHITECTURE.md)、[CONFIG_REFERENCE.md](CONFIG_REFERENCE.md)
 
+> 本文只负责既有 recall/read 工具契约。personalEvidence/currentUnderstanding 的内部证据准备路径见 [架构](ARCHITECTURE.md)，未来重构任务见 [路线图](ROADMAP.md)。
+
 ## 1. 目标
 
 主 Conversation Agent 自主决定是否调用记忆工具；服务端负责数据源范围、逐条披露、时间计算、覆盖率和审计。

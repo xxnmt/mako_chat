@@ -1,8 +1,10 @@
 # 配置参考：setting.json / identity.json
 
-> 适用版本：v0.7.0-rc6-dev（记忆库 v9 / 记忆 v5 R3）
-> 更新日期：2026-10-31
+> 源码基准：54a0be1（记忆库 v10 / R3 披露工具与连续性实验）
+> 更新日期：2026-11-09
 > 关联：[README](../README.md)、[ARCHITECTURE](ARCHITECTURE.md)、[MEMORY_V5_R3_BASELINE](MEMORY_V5_R3_BASELINE.md)
+
+> 2026-11-08 补充：当前请求串行化、跨渠道候选和空闲回顾已接入，仍存在真实对话更正丢失。实现与限制见 [连续性现状](ARCHITECTURE.md)，下一阶段见 [开发任务](ROADMAP.md)。下文 R3 授权描述适用于既有披露工具路径，不能覆盖新增内部证据路径。
 
 ---
 
@@ -136,7 +138,7 @@ app_data/config/identity.json
 | `agent_enabled` | `true` | bool | 是否允许 QQ 记忆检索；pet 永不进入 |
 | `agent_mode` | `"tool"` | `tool` / `legacy` | `tool`：主 Conversation Agent 自主调用 `memory_recall`；`legacy`：旧关键词门控 + 独立 Planner |
 | `agent_protocol` | `"native"` | `native` / `json_envelope` | 原生 DeepSeek tools，或 JSON 动作协议兜底 |
-| `owner_cross_channel_private` | `false` | bool | 仅 Owner QQ 私聊：允许读取自己的 pet/private 记忆；群聊/非 Owner 永远不开放 |
+| `owner_cross_channel_private` | `false` | bool | 既有检索工具的 Owner QQ 私聊跨渠道开关；新增 personalEvidence/currentUnderstanding 不受此开关控制，受全局长期记忆、身份、敏感及盲区检查约束 |
 | `agent_plan_v2` | `true` | bool | 仅 legacy 路径：多 need Planner；false 回退旧 `tool_calls` |
 | `agent_trigger` | `"memory_question"` | `memory_question` / `always` | 仅 legacy 路径使用 |
 | `agent_timeout_ms` | `6000` | 1000–15000 | 单次工具检索预算 |
@@ -256,7 +258,7 @@ app_data/config/identity.json
 | `prompt_text` | 空 | 参考音频对应文本 |
 | `prompt_lang` | `"ja"` | 参考音频语言 |
 
-参考音频与情绪映射由 `TTSReferenceManager` 读取 `tts_map.json`；具体资源要求见 [README](../README.md#tts-语音系统说明)。
+参考音频与情绪映射由 `TTSReferenceManager` 读取 `tts_map.json`；具体资源要求见 [README](GPT_SOVITS_REFERENCE.md)。
 
 ---
 
@@ -300,15 +302,15 @@ app_data/config/identity.json
 | `identity.master.qq` | `[]` | 主人 QQ 列表；全部归一为 `subject='user'` / `person_id='owner'` |
 | `memory.blind_zones` | `[]` | 不入长期记忆的渠道/会话；元素为 `{channel, session_id}` |
 | `appearance.follow_external_mood` | `true` | D1：QQ 等外部渠道情绪是否驱动桌宠立绘 |
-| `proactive.enabled` | `false` | Phase 2 主动对话预留；当前只解析不调度 |
-| `proactive.daily_limit` | `3` | 每日主动上限（预留） |
-| `proactive.cooldown_seconds` | `900` | 两次主动最小间隔（预留） |
-| `proactive.idle_seconds` | `1800` | 闲聊冷却（预留） |
-| `proactive.quiet_hours` | `23:00`–`08:00` | 免打扰时段（预留） |
-| `proactive.targets` | `[pet/default]` | 主动投递目标（预留） |
+| `proactive.enabled` | `false` | 启用空闲时的到期念头回顾，默认关闭 |
+| `proactive.daily_limit` | `3` | 每日后台回顾尝试上限；尝试额度持久化 |
+| `proactive.cooldown_seconds` | `900` | 后台回顾尝试最小间隔，服务端至少 60 秒 |
+| `proactive.idle_seconds` | `1800` | 开始回顾所需的前台输入空闲时长 |
+| `proactive.quiet_hours` | `23:00`–`08:00` | 暂停后台回顾及主动分享的时段 |
+| `proactive.targets` | `[]` | 明确配置的草稿分享目标；仅 Pet/default 或主人 QQ 私聊，最多选择一个可用目标 |
 | `proactive.schedule` | `[]` | 定时项：`at` + `type=fixed/random`（预留） |
 
-> `ProactiveConfig` 当前不会自动发起对话；Phase 2 接入 `ChatPlanner` 后才生效。
+> 空闲回顾与草稿分享已接入；schedule 字段仍只解析。targets 缺省为空，未配置目标时不会主动投递草稿。
 
 ---
 
