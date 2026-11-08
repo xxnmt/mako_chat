@@ -135,6 +135,131 @@ class TestMemoryManager : public QObject
     Q_OBJECT
 
 private slots:
+    void interruptedV11MigrationRollsBack()
+    {
+        QTemporaryDir dir;
+        const auto path = dir.filePath("migration.db");
+        RawDb raw(path,"migration");
+        QVERIFY(raw.open());
+        QVERIFY(raw.exec("CREATE TABLE chat_history(id INTEGER PRIMARY KEY, state_updates TEXT)"));
+        QVERIFY(raw.exec("INSERT INTO chat_history VALUES(1,'[]')"));
+        QVERIFY(raw.exec("PRAGMA user_version=10"));
+        QVERIFY(raw.exec("CREATE TABLE matter_revision(conflict INTEGER)"));
+        {
+            MemoryManager db(path);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),10);
+            QVERIFY(!raw.columns("chat_history").contains("cognitive_event"));
+            QVERIFY(raw.columns("cognitive_source").isEmpty());
+        }
+        QVERIFY(raw.exec("DROP TABLE matter_revision"));
+        for (int reopen=0; reopen<2; ++reopen) {
+            MemoryManager db(path);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),11);
+            QCOMPARE(raw.scalar("SELECT state_updates FROM chat_history").toString(),QString("[]"));
+            QVERIFY(db.matterHeads("user").isEmpty());
+        }
+    }
+
+    void revisionReplay()
+    {
+        QTemporaryDir dir;
+        const auto path = dir.filePath("replay.db");
+        RequestMeta meta;
+        meta.eventId = "first";
+        meta.channel = Channel::kQQGroup;
+        meta.sessionId = "group";
+        meta.actorId = "actor";
+        auto change = [](const QString &quote) {
+            return QJsonObject{{"matter",""},{"version",0},{"topic","活动安排"},{"quote",quote},
+                {"status","confirmed"},{"understanding",quote},{"kind","self_report"}};
+        };
+        auto proposal = [](QJsonArray changes) {
+            return QJsonObject{{"outcome","updated"},{"changes",changes}};
+        };
+        {
+            MemoryManager db(path);
+            QVERIFY(db.enqueueObservation(meta,"周二读书，周三上课"));
+            QVERIFY(db.enqueueObservation(meta,"周二读书，周三上课"));
+            const auto source = db.pendingObservation()["source"].toInteger();
+            QVERIFY(!db.commitObservation(source,proposal({change("周二读书"),change("不存在")})));
+            QVERIFY(db.matterHeads(meta.subject).isEmpty());
+            QVERIFY(db.commitObservation(source,proposal({change("周二读书"),change("周三上课")})));
+            QCOMPARE(db.matterHeads(meta.subject).size(),2);
+            QVERIFY(db.pendingObservation().isEmpty());
+            QVERIFY(!db.commitObservation(source,proposal({change("周二读书")})));
+        }
+        MemoryManager db(path);
+        const auto group = meta;
+        meta.channel = Channel::kQQPrivate;
+        meta.eventId = "revision";
+        auto revise = change("课可能延期");
+        const auto head = db.matterHeads(meta.subject).last().toObject();
+        QCOMPARE(head["quote"].toString(),QString("周三上课"));
+        revise["matter"] = head["matter"];
+        revise["status"] = "tentative";
+        QVERIFY(db.enqueueObservation(meta,"课可能延期"));
+        QVERIFY(db.saveQATurn("课可能延期","{}",{},meta));
+        const auto source = db.pendingObservation()["source"].toInteger();
+        QVERIFY(!db.commitObservation(source,proposal({revise})));
+        revise["version"] = 1;
+        QVERIFY(db.commitObservation(source,proposal({revise})));
+        const auto heads = db.matterHeads(meta.subject);
+        QCOMPARE(heads.size(),2);
+        QCOMPARE(heads.first().toObject()["version"].toInteger(),source);
+        QCOMPARE(heads.first().toObject()["status"].toString(),QString("tentative"));
+        const auto projection = QJsonDocument(db.currentUnderstanding(group,"")).toJson();
+        QVERIFY(!projection.contains(QString("延期").toUtf8()));
+        QVERIFY(projection.contains("avoid_unprompted_followup"));
+        meta.eventId = "other";
+        meta.subject = "other";
+        QVERIFY(db.enqueueObservation(meta,"课可能延期"));
+        revise["version"] = heads.first().toObject()["version"];
+        const auto other = db.pendingObservation()["source"].toInteger();
+        QVERIFY(!db.commitObservation(other,proposal({revise})));
+        QCOMPARE(heads.first().toObject()["initial_quote"].toString(),QString("周三上课"));
+        QVERIFY(db.commitObservation(other,QJsonObject{{"outcome","no_change"},{"changes",QJsonArray{}}}));
+        auto restore = group;
+        restore.eventId = "restore";
+        QVERIFY(db.enqueueObservation(restore,"还是照旧"));
+        const auto restoredSource = db.pendingObservation()["source"].toInteger();
+        revise["quote"] = "还是照旧";
+        revise["understanding"] = head["quote"];
+        revise["status"] = "confirmed";
+        QVERIFY(db.commitObservation(restoredSource,proposal({revise})));
+        QCOMPARE(db.matterHeads(group.subject).first().toObject()["understanding"],head["quote"]);
+        QVERIFY(db.deleteTurnByID(1));
+        QCOMPARE(db.matterHeads(group.subject).last().toObject()["version"].toInt(),1);
+        QVERIFY(db.clearAllHistory());
+        QVERIFY(!db.commitObservation(other,proposal({revise})));
+        QVERIFY(db.matterHeads(group.subject).isEmpty());
+    }
+
+    void rejectedSourceDoesNotBlockLaterEvents()
+    {
+        QTemporaryDir dir;
+        const auto path = dir.filePath("queue.db");
+        RequestMeta meta;
+        meta.eventId = "malformed";
+        {
+            MemoryManager db(path);
+            QVERIFY(db.enqueueObservation(meta,"前一个事件"));
+            const auto source = db.pendingObservation()["source"].toInteger();
+            meta.eventId = "next";
+            QVERIFY(db.enqueueObservation(meta,"后来一条消息"));
+            db.deferObservation(source,"network_error");
+            QVERIFY(db.pendingObservation().isEmpty());
+            for (int i=0; i<3; ++i)
+                db.deferObservation(source,"invalid_proposal",true);
+        }
+        MemoryManager db(path);
+        const auto next = db.pendingObservation();
+        QCOMPARE(next["input"].toString(),QString("后来一条消息"));
+        QVERIFY(db.commitObservation(next["source"].toInteger(),
+            QJsonObject{{"outcome","needs_evidence"},{"changes",QJsonArray{}}}));
+        QVERIFY(db.pendingObservation().isEmpty());
+        QVERIFY(db.matterHeads(meta.subject).isEmpty());
+    }
+
     void crossChannelCorrectionSurvivesRestart()
     {
         QTemporaryDir dir;
@@ -250,7 +375,7 @@ private slots:
             QVERIFY(raw.open());
 
             // 版本推进到 v3
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 10);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 11);
 
             // 列扩展（v2 渠道 + v3 轮次）
             const QStringList historyCols = raw.columns("chat_history");
@@ -354,7 +479,7 @@ private slots:
             MemoryManager second(dbPath);
             RawDb raw(dbPath, "verify2");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 10);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 11);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM chat_history").toInt(), 1);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM relationship_state").toInt(), 2);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM long_term_summary").toInt(), 1);
@@ -371,7 +496,7 @@ private slots:
             MemoryManager mm(dbPath);
             RawDb raw(dbPath, "fresh");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 10);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 11);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('raw_events')").toInt() > 0);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('memory_cursor')").toInt() > 0);
 
@@ -578,7 +703,7 @@ private slots:
         Q_UNUSED(mm);
         RawDb raw(dbPath, "v2verify");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 10);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 11);
         QCOMPARE(raw.scalar("SELECT user_input FROM chat_history").toString(), QStringLiteral("旧输入"));
         QCOMPARE(raw.scalar("SELECT turn_kind FROM chat_history").toString(), QStringLiteral("reply"));
         QCOMPARE(raw.scalar("SELECT subject FROM chat_history").toString(), QStringLiteral("user"));

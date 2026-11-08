@@ -31,6 +31,7 @@ public:
     void registerStateProvider(std::function<QString()> provider);
     void setMemoryManager(MemoryManager *manager);
     void reviewDueThought();
+    void processObservation();
     //Extract
     void extractMemoryAsync(const QList<HistoryTurn> &turns, qlonglong lastEndId, const QList<qlonglong> &sourceIds,
                             const QList<CharacterProfile> &existingProfiles = {},
@@ -101,6 +102,7 @@ private:
     static bool isSentenceValid(const QJsonObject &sentenceObj, QString &reason);
 
 
+    bool m_observationActive = false;
     bool m_reviewActive = false;
     QNetworkAccessManager* m_networkManager;
     QNetworkAccessManager* m_extractManager;

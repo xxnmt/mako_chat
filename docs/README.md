@@ -5,7 +5,7 @@
 | 要了解的内容 | 文档 |
 |---|---|
 | 安装、构建、操作和常见问题 | [项目 README](../README.md) |
-| 当前组件、记忆路径、v10、真实验证与限制 | [架构与当前实现](ARCHITECTURE.md) |
+| 当前组件、记忆路径、v11、真实验证与限制 | [架构与当前实现](ARCHITECTURE.md) |
 | 后续认知内核任务、依赖和验收 | [开发路线图](ROADMAP.md) |
 | setting.json、identity.json 与配置默认值 | [配置参考](CONFIG_REFERENCE.md) |
 | memory_recall/read、时间框架、状态与概览 | [记忆检索接口](MEMORY_RECALL_TOOL.md) |

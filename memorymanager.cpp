@@ -101,7 +101,7 @@ bool MemoryManager::saveQATurn(const QString &userInput, const QString &rawReply
             if (!candidate.isEmpty() && candidate.size() <= 120)
                 thought = candidate;
         }
-        const auto proposals = response["state_updates"].toArray();
+        const auto proposals = meta.eventId.isEmpty() ? response["state_updates"].toArray() : QJsonArray{};
         for (const auto &proposal : proposals) {
             const auto obj = proposal.toObject();
             const auto topic = obj["topic"].toString().trimmed();
@@ -116,8 +116,9 @@ bool MemoryManager::saveQATurn(const QString &userInput, const QString &rawReply
     }
     QSqlQuery query(m_db);
     query.prepare("INSERT INTO chat_history "
-                  "(user_input, raw_reply, channel, session_id, speaker, sensitive, turn_kind, trigger_event_ids, subject, state_updates, thought) "
-                  "VALUES (:user_input, :raw_reply, :channel, :session_id, :speaker, :sensitive, :turn_kind, :trigger_event_ids, :subject, :updates, :thought)");
+                  "(user_input, raw_reply, channel, session_id, speaker, sensitive, turn_kind, trigger_event_ids, subject, state_updates, thought, cognitive_event) "
+                  "VALUES (:user_input, :raw_reply, :channel, :session_id, :speaker, :sensitive, :turn_kind, :trigger_event_ids, :subject, :updates, :thought, :event)");
+    query.bindValue(":event", meta.eventId);
     query.bindValue(":thought", thought);
     query.bindValue(":updates", updates.isEmpty() ? QVariant(QMetaType(QMetaType::QString))
         : QVariant(QString::fromUtf8(QJsonDocument(updates).toJson(QJsonDocument::Compact))));
@@ -222,38 +223,46 @@ QJsonArray MemoryManager::personalEvidence(const QString &subject, const QString
         WITH evidence AS (
             SELECT content AS text,occurred_at AS time,channel,session_id AS session,
                    sender_id IN (SELECT value FROM json_each(:accounts)) AS own,
-                   sender_id AS speaker
+                   sender_id AS speaker,'raw/'||rowid AS ref
             FROM raw_events WHERE direction='in' AND event_type='message' AND sensitive=0
               AND redaction_status='none' AND content IS NOT NULL
               AND (:all_people OR sender_id IN (SELECT value FROM json_each(:accounts)))
             UNION ALL
-            SELECT content,event_time,origin,session_id,subject=:subject,subject FROM episodic_memory
+            SELECT content,event_time,origin,session_id,subject=:subject,subject,'episode/'||rowid FROM episodic_memory
             WHERE (subject=:subject OR :all_people) AND origin='pet' AND status='active'
             UNION ALL
-            SELECT safe_summary,ended_at,channel,session_id,0,'summary' FROM interactions
+            SELECT safe_summary,ended_at,channel,session_id,0,'summary','interaction/'||rowid FROM interactions
             WHERE :all_people AND summary_status='ready' AND safe_summary IS NOT NULL
             UNION ALL
-            SELECT summary_text,created_at,channel,session_id,0,'summary' FROM long_term_summary
+            SELECT summary_text,created_at,channel,session_id,0,'summary','summary/'||rowid FROM long_term_summary
             WHERE :all_people AND is_dirty=0
             UNION ALL
-            SELECT statement,valid_time_start,source_channel,source_session_id,0,'claim'
+            SELECT statement,valid_time_start,source_channel,source_session_id,0,'claim','claim/'||rowid
             FROM memory_claims WHERE :all_people AND claim_status='active' AND privacy_level<3
             UNION ALL
-            SELECT json_extract(j.value,'$.quote'),h.timestamp,h.channel,h.session_id,h.subject=:subject,h.subject
+            SELECT input,reported,channel,session,1,subject,'source/'||id FROM cognitive_source
+            WHERE subject=:subject AND outcome IS NULL
+            UNION ALL
+            SELECT r.quote,s.reported,s.channel,s.session,s.subject=:subject,s.subject,'revision/'||r.matter||'/'||r.version
+            FROM cognitive_source s JOIN matter_revision r ON r.source=s.id
+            WHERE (s.subject=:subject OR :all_people)
+            UNION ALL
+            SELECT json_extract(j.value,'$.quote'),h.timestamp,h.channel,h.session_id,h.subject=:subject,h.subject,'legacy/'||h.id||'/'||j.key
             FROM chat_history h,json_each(h.state_updates) j
             WHERE (h.subject=:subject OR :all_people) AND h.state_updates IS NOT NULL AND h.sensitive=0
         ), candidates AS (
-            SELECT DISTINCT *,
+            SELECT text,time,channel,session,own,speaker,min(ref) AS ref,
                 (SELECT count(*) FROM json_each(:terms) WHERE instr(text,value)>0) AS matches
             FROM evidence WHERE text <> ''
               AND NOT (channel=:current_channel AND session=:current_session)
+            GROUP BY text,time,channel,session,own,speaker
         ), ranked AS (
             SELECT *,
                 row_number() OVER (ORDER BY matches DESC,own DESC,datetime(time) DESC,channel,session,speaker,text) AS topic_rank,
                 row_number() OVER (PARTITION BY own ORDER BY datetime(time) DESC,channel,session,speaker,text) AS timeline_rank
             FROM candidates WHERE own OR matches>0
         )
-        SELECT substr(text,1,360),time,channel,session,own,speaker FROM ranked
+        SELECT substr(text,1,360),time,channel,session,own,speaker,ref FROM ranked
         ORDER BY CASE WHEN own THEN min(topic_rank,timeline_rank) ELSE topic_rank END,
                  topic_rank LIMIT 12
     )");
@@ -271,6 +280,7 @@ QJsonArray MemoryManager::personalEvidence(const QString &subject, const QString
         while (query.next())
             evidence.append(QJsonObject{{"text",query.value(0).toString()},
                                         {"time",query.value(1).toString()},
+                                        {"reference",query.value(6).toString()},
                                         {"channel",query.value(2).toString()},
                                         {"session",query.value(3).toString()},
                                         {"own",query.value(4).toBool()}, {"speaker",query.value(5).toString()}});
@@ -290,15 +300,22 @@ QJsonArray MemoryManager::currentUnderstanding(const RequestMeta &audience, cons
         WITH evidence AS (
             SELECT h.id,h.timestamp,json_extract(j.value,'$.topic') AS topic,
                    json_extract(j.value,'$.quote') AS quote,
-                   (h.channel=:channel AND h.session_id=:session) AS local
+                   (h.channel=:channel AND h.session_id=:session) AS local,
+                   'legacy:'||json_extract(j.value,'$.topic') AS matter,0 AS version,
+                   NULL AS status,NULL AS kind,NULL AS understanding
             FROM chat_history h,json_each(h.state_updates) j
             WHERE h.subject=:subject AND h.state_updates IS NOT NULL AND h.sensitive=0
+              AND NOT EXISTS (SELECT 1 FROM cognitive_source WHERE event=h.cognitive_event)
+            UNION ALL
+            SELECT s.id,s.reported,r.topic,r.quote,(s.channel=:channel AND s.session=:session),
+                   r.matter,r.version,r.status,r.kind,r.understanding
+            FROM matter_revision r JOIN cognitive_source s ON s.id=r.source WHERE s.subject=:subject
         ), ranked AS (
-            SELECT *,row_number() OVER (PARTITION BY topic ORDER BY id DESC) AS pos,
-                   max(local) OVER (PARTITION BY topic) AS mentioned_here FROM evidence
+            SELECT *,row_number() OVER (PARTITION BY matter ORDER BY version DESC,id DESC) AS pos,
+                   max(local) OVER (PARTITION BY matter) AS mentioned_here FROM evidence
         )
-        SELECT topic,quote,timestamp,local,mentioned_here FROM ranked WHERE pos=1
-        ORDER BY (instr(:input,topic)>0) DESC,id DESC LIMIT 32
+        SELECT topic,quote,timestamp,local,mentioned_here,version,status,kind,understanding,id FROM ranked WHERE pos=1
+        ORDER BY (instr(:input,topic)>0) DESC,datetime(timestamp) DESC,id DESC LIMIT 32
     )");
     query.bindValue(":channel", audience.channel);
     query.bindValue(":session", audience.sessionId);
@@ -307,17 +324,36 @@ QJsonArray MemoryManager::currentUnderstanding(const RequestMeta &audience, cons
     if (!query.exec())
         return result;
 
+    QStringList selected;
     while (query.next()) {
+        const auto count = result.size();
         const auto topic = query.value(0).toString();
         if (audience.channel == Channel::kQQGroup && !query.value(3).toBool()) {
 
-            if (query.value(4).toBool() || input.contains(topic))
-                result.append(QJsonObject{{"avoid_stale_followup", topic}});
+            if (query.value(4).toBool() || input.contains(topic)) {
+                if (query.value(5).toInt() > 0)
+                    result.append(QJsonObject{{"avoid_unprompted_followup", true}});
+                else
+                    result.append(QJsonObject{{"avoid_stale_followup", topic}});
+            }
+        } else if (query.value(5).toInt() > 0) {
+            QJsonObject record{{"quote", query.value(1).toString()}, {"reported_at", query.value(2).toString()}};
+            if (audience.channel != Channel::kQQGroup) {
+                record["topic"] = topic;
+                record["understanding"] = query.value(8).toString();
+                record["status"] = query.value(6).toString();
+                record["source_kind"] = query.value(7).toString();
+            }
+            result.append(record);
         } else {
             result.append(QJsonObject{{"topic", topic}, {"self_report", query.value(1).toString()},
                                       {"reported_at", query.value(2).toString()}});
         }
+        if (result.size() > count)
+            selected << QString("%1/%2").arg(query.value(9).toLongLong()).arg(query.value(5).toLongLong());
     }
+    if (!audience.runId.isEmpty())
+        qInfo() << "[Cognition] context run=" << audience.runId << "source/version=" << selected;
 
     return result;
 }
@@ -443,8 +479,10 @@ bool MemoryManager::clearAllHistory()
         return false;
     }
     QSqlQuery query(m_db);
+    if (!m_db.transaction()) return false;
     query.prepare("DELETE FROM chat_history");
-    if (!query.exec()) {
+    if (!query.exec() || !query.exec("DELETE FROM cognitive_source") || !m_db.commit()) {
+        m_db.rollback();
         qDebug()<<"[MemoryManager]清空记录失败:"<<query.lastError();
         return false;
     }
@@ -2757,7 +2795,7 @@ void MemoryManager::initDatabase(const QString &dbFilePath)
         }
     }
     qDebug()<<"[MemoryManager]当前数据库版本:"<<currentVersion;
-    m_db.transaction();
+    if (!m_db.transaction()) return;
 
     try {
         if (currentVersion<1) {
@@ -3308,7 +3346,28 @@ void MemoryManager::initDatabase(const QString &dbFilePath)
                 throw query.lastError();
             currentVersion = 10;
         }
-        m_db.commit();
+        if (currentVersion < 11) {
+            const QStringList statements = {
+                "ALTER TABLE chat_history ADD COLUMN cognitive_event TEXT",
+                "CREATE TABLE cognitive_source(id INTEGER PRIMARY KEY AUTOINCREMENT,event TEXT NOT NULL UNIQUE,"
+                "run TEXT,subject TEXT NOT NULL,channel TEXT NOT NULL,session TEXT NOT NULL,input TEXT NOT NULL,"
+                "reported TEXT NOT NULL,outcome TEXT,last_error TEXT,rejections INTEGER NOT NULL DEFAULT 0,attempts INTEGER NOT NULL DEFAULT 0,due INTEGER NOT NULL DEFAULT 0)",
+                "CREATE INDEX cognitive_pending ON cognitive_source(subject,id) WHERE outcome IS NULL",
+                "CREATE TABLE matter_revision(matter TEXT NOT NULL,version INTEGER NOT NULL,source INTEGER NOT NULL,"
+                "topic TEXT NOT NULL,status TEXT NOT NULL,quote TEXT NOT NULL,kind TEXT NOT NULL,event_time TEXT,understanding TEXT NOT NULL,"
+                "recorded TEXT DEFAULT CURRENT_TIMESTAMP,PRIMARY KEY(matter,version),UNIQUE(matter,source))",
+                "CREATE INDEX matter_source ON matter_revision(source)",
+                "CREATE TRIGGER forget_turn AFTER DELETE ON chat_history BEGIN "
+                "DELETE FROM cognitive_source WHERE event=OLD.cognitive_event; END",
+                "CREATE TRIGGER forget_observation BEFORE DELETE ON cognitive_source BEGIN "
+                "DELETE FROM matter_revision WHERE (matter,version) IN (SELECT r.matter,r.version FROM matter_revision r JOIN matter_revision d ON d.matter=r.matter AND r.version>=d.version WHERE d.source=OLD.id); END",
+                "PRAGMA user_version=11"
+            };
+            for (const QString &statement : statements)
+                if (!query.exec(statement)) throw query.lastError();
+            currentVersion = 11;
+        }
+        if (!m_db.commit()) throw m_db.lastError();
         qDebug()<<"[MemoryManager]数据库初始化完成,结构版本为:"<<currentVersion;
     }
     catch(const QSqlError &error){

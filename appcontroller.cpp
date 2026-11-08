@@ -481,6 +481,10 @@ void AppController::initConnections()
             [this](const QString &userText, const QList<HistoryTurn> &history, const RequestMeta &meta) {
         Q_UNUSED(history);
         m_idle.restart();
+        auto &config = ConfigManager::instance();
+        if (config.getMemoryPolicyConfig().longTermMemoryEnabled && !config.isBlindZone(meta.channel, meta.sessionId)
+            && m_memoryManager->enqueueObservation(meta, userText))
+            m_llmService->processObservation();
         m_pending.enqueue({userText, meta, ++m_roundSeq});
         m_timeManager->notifyUserInputStarted();
         startNextRequest();

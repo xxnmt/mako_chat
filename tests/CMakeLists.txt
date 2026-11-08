@@ -6,6 +6,7 @@ qt6_add_resources(CALENDAR_RESOURCES ${PROJECT_SOURCE_DIR}/calendar.qrc)
 set(PHASE0_CORE_SOURCES
     ${PROJECT_SOURCE_DIR}/memorymanager.h
     ${PROJECT_SOURCE_DIR}/memorymanager.cpp
+    ${PROJECT_SOURCE_DIR}/matterstore.cpp
     ${PROJECT_SOURCE_DIR}/configmanager.h
     ${PROJECT_SOURCE_DIR}/configmanager.cpp
     ${PROJECT_SOURCE_DIR}/memorypolicy.h
@@ -46,6 +47,7 @@ add_phase0_test(tst_memorymanager
     tst_memorymanager.cpp
     ${PROJECT_SOURCE_DIR}/memorymanager.h
     ${PROJECT_SOURCE_DIR}/memorymanager.cpp
+    ${PROJECT_SOURCE_DIR}/matterstore.cpp
     ${PROJECT_SOURCE_DIR}/recentcontext.h
     ${PROJECT_SOURCE_DIR}/recentcontext.cpp
     ${PROJECT_SOURCE_DIR}/qqmessageparser.h
@@ -98,6 +100,7 @@ add_phase0_test(tst_groupmembership
     ${PROJECT_SOURCE_DIR}/qqprotocolclient.cpp
     ${PROJECT_SOURCE_DIR}/memorymanager.h
     ${PROJECT_SOURCE_DIR}/memorymanager.cpp
+    ${PROJECT_SOURCE_DIR}/matterstore.cpp
     ${PROJECT_SOURCE_DIR}/recentcontext.h
     ${PROJECT_SOURCE_DIR}/recentcontext.cpp
     ${PROJECT_SOURCE_DIR}/qqmessageparser.h
@@ -143,6 +146,7 @@ add_phase0_test(tst_memoryagent
     ${PROJECT_SOURCE_DIR}/memoryexecutor.cpp
     ${PROJECT_SOURCE_DIR}/memorymanager.h
     ${PROJECT_SOURCE_DIR}/memorymanager.cpp
+    ${PROJECT_SOURCE_DIR}/matterstore.cpp
     ${PROJECT_SOURCE_DIR}/memoryaccesspolicy.h
     ${PROJECT_SOURCE_DIR}/memoryaccesspolicy.cpp
     ${PROJECT_SOURCE_DIR}/memorytimerange.h

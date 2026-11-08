@@ -1,5 +1,6 @@
 #include <QtTest>
 #include <QJsonDocument>
+#include <QFile>
 #include <QSignalSpy>
 #include <QTemporaryDir>
 #include <QTimer>
@@ -156,6 +157,22 @@ class TestMemoryAgent : public QObject
     Q_OBJECT
 
 private slots:
+    void privateReflectionDoesNotEnterPublicReply_data()
+    {
+        QTest::addColumn<QString>("secret");
+        QTest::addColumn<QString>("status");
+        QTest::addColumn<QString>("followup");
+        QFile file(QFINDTESTDATA("fixtures/cognitive_replay.json"));
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        const auto scenarios = QJsonDocument::fromJson(file.readAll()).array();
+        QVERIFY(!scenarios.isEmpty());
+        for (auto scenario : scenarios) {
+            const auto row = scenario.toObject();
+            QTest::newRow(qPrintable(row["name"].toString())) << row["report"].toString()
+                << row["status"].toString() << row["followup"].toString();
+        }
+    }
+
     void privateReflectionDoesNotEnterPublicReply()
     {
         QTemporaryDir dir;
@@ -163,16 +180,23 @@ private slots:
         RequestMeta meta;
         meta.channel = Channel::kQQPrivate;
         meta.sessionId = meta.actorId = "10101";
-        const QString secret = "脚踝已经恢复，仅在这里说";
-        const auto proposal = QJsonDocument(QJsonObject{{"state_updates",QJsonArray{
-            QJsonObject{{"topic","脚踝"},{"quote",secret}}}}}).toJson();
-        QVERIFY(db.saveQATurn(secret, QString::fromUtf8(proposal), {}, meta));
+        QFETCH(QString, secret);
+        QFETCH(QString, status);
+        QFETCH(QString, followup);
+        const QJsonObject change{{"matter",""},{"version",0},{"topic","近况"},{"status",status},
+            {"kind","self_report"},{"quote",secret},{"understanding",secret}};
+        const QString update = QString::fromUtf8(QJsonDocument(QJsonObject{{"outcome","updated"},
+            {"changes",QJsonArray{change}}}).toJson(QJsonDocument::Compact));
+        meta.eventId = "replay-report";
+        meta.runId = "replay-private";
+        QVERIFY(db.enqueueObservation(meta, secret));
+        QVERIFY(db.saveQATurn(secret, "{}", {}, meta));
         QTcpServer server;
         QVERIFY(server.listen(QHostAddress::LocalHost));
         QList<QByteArray> bodies;
         connect(&server,&QTcpServer::newConnection,this,[&] {
             auto *socket = server.nextPendingConnection();
-            connect(socket,&QTcpSocket::readyRead,socket,[socket,&bodies] {
+            connect(socket,&QTcpSocket::readyRead,socket,[socket,&bodies,update] {
                 const auto bytes = socket->peek(socket->bytesAvailable());
                 const auto header = bytes.indexOf("\r\n\r\n");
                 if (header < 0)
@@ -183,7 +207,8 @@ private slots:
                     return;
                 socket->readAll();
                 bodies.append(bytes.mid(header+4));
-                const QString answer = bodies.size()==1 ? QStringLiteral(R"({"decision":"skip_old_concern"})")
+                const QString answer = bodies.size()==1 ? update
+                    : bodies.size()==2 ? QStringLiteral(R"({"decision":"skip_old_concern"})")
                     : QStringLiteral(R"({"sentences":[{"zh_text":"好呀","ja_text":"いいよ","tags":{"emotion":"happy"}}]})");
                 QJsonObject msg{{"message",QJsonObject{{"content",answer}}}};
                 const auto body = QJsonDocument(QJsonObject{{"choices",QJsonArray{msg}}}).toJson();
@@ -194,22 +219,24 @@ private slots:
         });
         LLMService service("test",nullptr,QUrl(QString("http://127.0.0.1:%1/").arg(server.serverPort())));
         service.setMemoryManager(&db);
+        service.processObservation();
+        QTRY_COMPARE_WITH_TIMEOUT(db.matterHeads(meta.subject).size(),1,5000);
         QSignalSpy replies(&service,&LLMService::sentencesReady);
         meta.channel = Channel::kQQGroup;
         meta.sessionId = "20202";
         meta.runId = "group";
-        service.askDeepSeek("周末出去玩吗",{},meta);
+        service.askDeepSeek(followup,{},meta);
         QTRY_COMPARE_WITH_TIMEOUT(replies.size(),1,5000);
-        QCOMPARE(bodies.size(),2);
-        QCOMPARE(replies.at(0).at(2).toString(), QString("周末出去玩吗"));
+        QCOMPARE(bodies.size(),3);
+        QCOMPARE(replies.at(0).at(2).toString(), followup);
         QCOMPARE(replies.at(0).at(3).value<RequestMeta>().runId, meta.runId);
         QCOMPARE(replies.at(0).at(3).value<RequestMeta>().sessionId, meta.sessionId);
-        QVERIFY(bodies[0].contains(secret.toUtf8()));
-        QVERIFY(!bodies[1].contains(secret.toUtf8()));
-        QVERIFY(bodies[1].contains(QString("别按以前的情况主动追问").toUtf8()));
-        service.askDeepSeek("我上次说脚踝怎么了",{},RequestMeta{});
+        QVERIFY(bodies[1].contains(secret.toUtf8()));
+        QVERIFY(!bodies[2].contains(secret.toUtf8()));
+        QVERIFY(bodies[2].contains(QString("别按以前的情况主动追问").toUtf8()));
+        service.askDeepSeek("我刚才说了什么",{},RequestMeta{});
         QTRY_COMPARE_WITH_TIMEOUT(replies.size(),2,5000);
-        QCOMPARE(bodies.size(),3);
+        QCOMPARE(bodies.size(),4);
         QVERIFY(bodies.last().contains(secret.toUtf8()));
     }
 

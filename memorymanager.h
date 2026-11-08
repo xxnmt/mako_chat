@@ -10,6 +10,7 @@
 #include <QStringList>
 #include <QSet>
 #include <QJsonArray>
+#include <QJsonObject>
 #include "sentencedata.h"
 #include "historyturn.h"
 #include "utterance.h"
@@ -49,6 +50,12 @@ public:
                           const QString &rawReply,
                           const QList<SentenceText> &sentences,
                           const RequestMeta &meta = RequestMeta());
+
+    bool enqueueObservation(const RequestMeta &meta, const QString &input);
+    QJsonObject pendingObservation() const;
+    QJsonArray matterHeads(const QString &subject) const;
+    bool commitObservation(qint64 source, const QJsonObject &proposal, QString *failure = nullptr);
+    void deferObservation(qint64 source, const QString &reason, bool rejected = false);
 
     QJsonArray currentUnderstanding(const RequestMeta &audience, const QString &input) const;
     QJsonArray personalEvidence(const QString &subject, const QStringList &accounts,

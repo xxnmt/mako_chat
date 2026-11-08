@@ -1,0 +1,23 @@
+[
+    {
+        "name": "recovery",
+        "report": "上周扭伤的手腕已经恢复",
+        "status": "confirmed",
+        "followup": "现在怎么样了",
+        "baseline": {"source": "user_report", "observed": "换渠道后仍按先前身体状况追问。", "stage": "undetermined"}
+    },
+    {
+        "name": "uncertain-plan",
+        "report": "看展时间可能要往后挪",
+        "status": "tentative",
+        "followup": "周末怎么安排",
+        "baseline": {"source": "logs_20261108.txt#2184,2353,2368", "observed": "追问调整时回答原计划，并表示没有听说调整。旧日志不足以判定更正在哪一步丢失。", "stage": "undetermined"}
+    },
+    {
+        "name": "pause-discussion",
+        "report": "这件事我想明天再谈",
+        "status": "tentative",
+        "followup": "今晚就聊到这里",
+        "baseline": {"source": "logs_20261108.txt#2593,2603,2623", "observed": "结束交谈的意图进入最终请求，回复先认可暂停，随后再次提醒。", "stage": "expression"}
+    }
+]

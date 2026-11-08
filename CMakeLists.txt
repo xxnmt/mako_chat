@@ -46,7 +46,7 @@ qt_add_executable(Windows_AI
     chatwidget.h chatwidget.cpp
     anchorstrategy.h
     anchormanager.h anchormanager.cpp
-    memorymanager.h memorymanager.cpp
+    memorymanager.h memorymanager.cpp matterstore.cpp
     historyturn.h
     utterance.h
     ichanneladapter.h
