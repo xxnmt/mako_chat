@@ -49,15 +49,24 @@ public:
     bool saveQATurn(const QString &userInput,
                           const QString &rawReply,
                           const QList<SentenceText> &sentences,
-                          const RequestMeta &meta = RequestMeta());
+                          const RequestMeta &meta = RequestMeta(), qint64 receivedTurn = 0);
 
+    qint64 recordInput(const QString &input, const RequestMeta &meta, bool observe = false);
+    bool recordQuiet(qint64 turn, const QString &action);
+    bool interruptTurn(qint64 turn, const QString &reason);
     bool enqueueObservation(const RequestMeta &meta, const QString &input);
-    QJsonObject pendingObservation() const;
-    QJsonArray matterHeads(const QString &subject) const;
-    bool commitObservation(qint64 source, const QJsonObject &proposal, QString *failure = nullptr);
+    QJsonObject pendingObservation(qint64 source = 0) const;
+    QJsonArray matterHeads(const QString &subject, const QStringList &terms = {}) const;
+    bool commitObservation(qint64 source, const QJsonObject &proposal, QString *failure = nullptr,
+                           const QJsonArray &historyEvidence = {});
+    QJsonArray historicalReports(const QString &subject, const QString &channel, const QString &session,
+                                 const QString &before, const QStringList &terms, bool forRevision) const;
     void deferObservation(qint64 source, const QString &reason, bool rejected = false);
 
-    QJsonArray currentUnderstanding(const RequestMeta &audience, const QString &input) const;
+    QJsonArray currentUnderstanding(const RequestMeta &audience, const QString &input,
+                                    QStringList *keys = nullptr, const QStringList &only = {}) const;
+    QJsonArray matterEvidence(const RequestMeta &audience, const QString &matter) const;
+    QString conversationPhase(const RequestMeta &audience) const;
     QJsonArray personalEvidence(const QString &subject, const QStringList &accounts,
                                 const QStringList &terms, bool includeOthers = false,
                                 const QString &currentChannel = {}, const QString &currentSession = {}) const;
@@ -67,7 +76,7 @@ public:
     bool finishThoughtReview(qlonglong id, int version, const QJsonObject &proposal);
 
 //历史对话crud
-    QList<HistoryTurn> getHistoryTurn(int N, const QString &channel = Channel::kPet, const QString &sessionId = Channel::kDefaultSession);
+    QList<HistoryTurn> getHistoryTurn(int N, const QString &channel = Channel::kPet, const QString &sessionId = Channel::kDefaultSession, qint64 beforeTurn = 0);
     QList<HistoryTurn> getHistoryTurn(int offset,int limit); // 管理界面分页，跨渠道浏览
     qlonglong getTotalHistoryCount();
     bool deleteTurnByID(int id);
@@ -191,7 +200,7 @@ public:
                             qlonglong lastEventId, qlonglong lastTurnId);
     qlonglong getMemoryCursorEventId(const QString &channel, const QString &sessionId);
     QList<HistoryTurn> getUnsummarizedTurns(qlonglong &outLastEndId,QList<qlonglong> &outSourceIds,
-                                            const QString &channel = Channel::kPet, const QString &sessionId = Channel::kDefaultSession);
+                                            const QString &channel = Channel::kPet, const QString &sessionId = Channel::kDefaultSession, qint64 throughTurn = 0);
 
 //角色档案crud (v4)
     bool upsertCharacterProfile(const QString &subject, const QString &key, const QString &value);
@@ -229,6 +238,10 @@ public:
     bool upsertRelationshipState(const QString &dimension, double delta, const QString &subject = QStringLiteral("user"));
     QList<RelationshipState> getRelationshipStates(const QString &subject = QStringLiteral("user"));
     bool initRelationshipState();
+
+    bool recordCognitiveAudit(const QString &kind, const QString &run, qint64 source, const QJsonObject &data);
+signals:
+    void understandingChanged();
 
 private:
     void initDatabase(const QString &dbFilePath);

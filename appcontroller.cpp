@@ -241,6 +241,11 @@ AppController::AppController(QObject *parent)
 
 AppController::~AppController()
 {
+    if (m_processing && m_active.turnId)
+        m_memoryManager->interruptTurn(m_active.turnId, "shutdown");
+    for (const auto &request : std::as_const(m_pending))
+        if (request.turnId) m_memoryManager->interruptTurn(request.turnId, "shutdown");
+
     //1. 优先析构 AnchorManager（因为它持有了 m_character 及各个 UI 窗口的指针）
     if (m_anchorManager) {
         delete m_anchorManager;
@@ -305,11 +310,8 @@ void AppController::handleMakoReply(const QList<SentenceText> &sentences, const 
                                     const QString &userInput, const RequestMeta &meta)
 {
     // TD-034：本轮回复入队 TTS，记下它属于哪一轮（退火门控用）
-    m_lastPlaybackRound = m_active.sequence;
-    if (meta.persistTurn) {
-        m_memoryManager->saveQATurn(userInput, rawReply, sentences, meta);
-    }
     if (meta.channel == Channel::kPet) {
+        m_lastPlaybackRound = m_active.sequence;
         m_ttsService->enqueueSentences(sentences);
     } else {
         // QQ：文字回复走 QQ 渠道；情绪写入全局（D1 控制是否驱动桌宠立绘），
@@ -317,24 +319,31 @@ void AppController::handleMakoReply(const QList<SentenceText> &sentences, const 
         QStringList replyParts;
         for (const SentenceText &sentence : sentences) {
             replyParts << sentence.zhText;
-            m_globalMood->applyTags(sentence.rawTags, meta.channel);
         }
         Utterance utterance;
         utterance.channel = meta.channel;
         utterance.sessionId = meta.sessionId;
         utterance.speaker = meta.speaker;
         utterance.text = replyParts.join(QString());
-        m_qqChannel->sendUtterance(utterance);
+        if (!m_qqChannel->sendUtterance(utterance)) {
+            recordInterruption("channel_unavailable");
+            return;
+        }
+        for (const auto &sentence : sentences) m_globalMood->applyTags(sentence.rawTags, meta.channel);
     }
 
-    if (!meta.persistTurn || !meta.longTermMemoryEnabled) {
+    if (m_active.turnId && !m_memoryManager->saveQATurn(userInput, rawReply, sentences, meta, m_active.turnId)) {
+        qWarning() << "[Conversation] handoff not recorded" << meta.runId;
+        return;
+    }
+    if (!m_active.turnId || !meta.longTermMemoryEnabled) {
         return;
     }
 
     qlonglong lastEndId = -1;
     QList<qlonglong> sourceIds;
     QList<HistoryTurn> unsummarizedTurns = m_memoryManager->getUnsummarizedTurns(lastEndId, sourceIds,
-                                                                                meta.channel, meta.sessionId);
+                                                                                meta.channel, meta.sessionId, m_active.turnId);
 
 
     // 长期记忆自动摘轮数（TD-037：由设置界面独立配置，默认与短期记忆同为 15）
@@ -355,7 +364,7 @@ void AppController::handleMakoReply(const QList<SentenceText> &sentences, const 
 bool AppController::canReviewThought() const
 {
     const auto cfg = ConfigManager::instance().getProactiveConfig();
-    if (!cfg.enabled || m_processing || m_idle.elapsed()/1000 < cfg.idleSeconds)
+    if (!cfg.enabled || m_processing || !m_pending.isEmpty() || m_idle.elapsed()/1000 < cfg.idleSeconds)
         return false;
     const auto now = QTime::currentTime();
     const auto start = QTime::fromString(cfg.quietStart, "HH:mm");
@@ -373,9 +382,24 @@ void AppController::startNextRequest()
     const RequestMeta &meta = m_active.meta;
     const auto history = meta.persistTurn
         ? m_memoryManager->getHistoryTurn(ConfigManager::instance().getShortMemoryLength(),
-                                          meta.channel, meta.sessionId)
+                                          meta.channel, meta.sessionId, m_active.turnId)
         : QList<HistoryTurn>{};
     m_llmService->askDeepSeek(m_active.text, history, meta);
+}
+
+void AppController::resumeMoodTimers()
+{
+    m_timeManager->notifyRoundEnded({{"emotion",m_globalMood->getEmotion()},
+                                     {"distance",m_globalMood->getDistance()},
+                                     {"blush",m_globalMood->getBlush()}});
+}
+
+void AppController::recordInterruption(const QString &reason)
+{
+    qInfo() << "[Conversation] interrupted run=" << m_active.meta.runId << "reason=" << reason;
+    resumeMoodTimers();
+    if (m_processing && m_active.turnId && !m_memoryManager->interruptTurn(m_active.turnId, reason))
+        qWarning() << "[Conversation] interruption not recorded" << m_active.meta.runId;
 }
 
 void AppController::finishRequest()
@@ -388,27 +412,18 @@ void AppController::finishRequest()
 
 void AppController::handleSystemError(const QString &errorMsg)
 {
+    recordInterruption("network_error");
     qDebug() << "[AppController 拦截到系统错误]：" << errorMsg;
-    m_bubble->showMessage("啊哦，欧尼酱，网络好像断开了呢，茉子联系不到服务器啦...");
-    QMap<QString, QString> errorTags;
-    errorTags.insert("emotion", "sad");
-    errorTags.insert("blush", "unblushing");
-    applyPetTags(errorTags);
-    //按最终状态启动退火：sad 表情 15 秒后自动恢复 happyIdle
-    m_timeManager->notifyRoundEnded(errorTags);
+    m_bubble->showMessage(QStringLiteral("网络请求失败，本轮处理已中断。"));
+
 }
 
 void AppController::handleAbnormalReply(const QString &reason)
 {
+    recordInterruption(reason);
     qDebug() << "[AppController 拦截到异常回复]：" << reason;
-    m_bubble->showMessage("啊哦……茉子的脑袋突然一片空白，刚才想到什么忘掉了啦！");
-    QMap<QString, QString> errorTags;
-    errorTags.insert("emotion", "sad");
-    errorTags.insert("blush", "unblushing");
-    applyPetTags(errorTags);
+    m_bubble->showMessage(QStringLiteral("本轮处理已中断（%1）。").arg(reason));
 
-    //反馈后按最终状态启动退火：sad≠happyIdle → 15秒后自动恢复
-    m_timeManager->notifyRoundEnded(errorTags);
 }
 
 void AppController::onPlayAudioAction(const QString &zhText, const QMap<QString, QString> &tags)
@@ -473,6 +488,14 @@ void AppController::initConnections()
     });
 
     connect(m_llmService,&LLMService::sentencesReady,this,&AppController::handleMakoReply);
+    connect(m_llmService,&LLMService::replyQuiet,this,[this](const QString &action,const QString &input,const RequestMeta &meta) {
+        if (!m_processing || m_active.meta.runId != meta.runId) return;
+        Q_UNUSED(input);
+        if (m_active.turnId && !m_memoryManager->recordQuiet(m_active.turnId, action))
+            qWarning() << "[Conversation] quiet decision not recorded" << meta.runId;
+        resumeMoodTimers();
+        finishRequest();
+    });
     connect(m_llmService,&LLMService::sentencesReady,this,&AppController::finishRequest);
     connect(m_llmService,&LLMService::replyAbnormal,this,&AppController::finishRequest);
     connect(m_llmService,&LLMService::internetErrorSignal,this,&AppController::finishRequest);
@@ -482,12 +505,13 @@ void AppController::initConnections()
         Q_UNUSED(history);
         m_idle.restart();
         auto &config = ConfigManager::instance();
-        if (config.getMemoryPolicyConfig().longTermMemoryEnabled && !config.isBlindZone(meta.channel, meta.sessionId)
-            && m_memoryManager->enqueueObservation(meta, userText))
-            m_llmService->processObservation();
-        m_pending.enqueue({userText, meta, ++m_roundSeq});
+        const bool observe = config.getMemoryPolicyConfig().longTermMemoryEnabled
+            && !config.isBlindZone(meta.channel, meta.sessionId);
+        const qint64 turnId = m_memoryManager->recordInput(userText, meta, observe);
+        m_pending.enqueue({userText, meta, ++m_roundSeq, turnId});
         m_timeManager->notifyUserInputStarted();
         startNextRequest();
+        if (observe && turnId) m_llmService->processObservation();
     });
     connect(m_chatWidget,&ChatWidget::textSubmitted,this,[this](const QString &text){
         const MemoryPolicyConfig memoryPolicy =

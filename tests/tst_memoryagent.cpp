@@ -21,6 +21,31 @@
 
 namespace {
 
+void serveCompletions(QTcpServer &server,QList<QByteArray> &bodies,std::function<QString(int)> respond)
+{
+    QObject::connect(&server,&QTcpServer::newConnection,&server,[&server,&bodies,respond] {
+        auto *socket = server.nextPendingConnection();
+        QObject::connect(socket,&QTcpSocket::readyRead,socket,[socket,&bodies,respond] {
+            const auto bytes = socket->peek(socket->bytesAvailable());
+            const auto header = bytes.indexOf("\r\n\r\n");
+            if (header < 0)
+                return;
+            const auto length = QRegularExpression("content-length: (\\d+)",
+                QRegularExpression::CaseInsensitiveOption).match(QString::fromLatin1(bytes.left(header)));
+            if (!length.hasMatch() || bytes.size()-header-4 < length.captured(1).toInt())
+                return;
+            socket->readAll();
+            bodies.append(bytes.mid(header+4));
+            const QString answer = respond(bodies.size());
+            QJsonObject msg{{"message",QJsonObject{{"content",answer}}}};
+            const auto body = QJsonDocument(QJsonObject{{"choices",QJsonArray{msg}}}).toJson();
+            socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "
+                          + QByteArray::number(body.size()) + "\r\n\r\n" + body);
+            socket->disconnectFromHost();
+        });
+    });
+}
+
 MemoryAgentScope ownerGroupScope(const QString &groupId, const QDateTime &now)
 {
     MemoryAgentScope scope;
@@ -157,6 +182,124 @@ class TestMemoryAgent : public QObject
     Q_OBJECT
 
 private slots:
+    void conversationDecision_data()
+    {
+        QTest::addColumn<QString>("scenario");
+        for (const auto *name : {"direct_pending", "consult", "related", "unrelated", "churn", "quiet", "invalid_ref"})
+            QTest::newRow(name) << QString(name);
+    }
+
+    void conversationDecision()
+    {
+        QFETCH(QString, scenario);
+        QTemporaryDir dir;
+        MemoryManager db(dir.filePath("decision.db"));
+        RequestMeta meta;
+        meta.runId = "foreground";
+        int event = 0;
+        const auto observe = [&](const QString &text, const QJsonObject &head, bool commit) {
+            meta.eventId = QString::number(++event);
+            if (!db.enqueueObservation(meta, text)) return false;
+            if (!commit) return true;
+            const QJsonObject change{{"matter",head["matter"].toString()},{"version",head["version"].toInteger()},
+                {"topic","预约"},{"quote",text},{"status","tentative"},{"understanding",text},{"kind","self_report"}};
+            return db.commitObservation(db.pendingObservation()["source"].toInteger(),
+                {{"outcome","updated"},{"changes",QJsonArray{change}}});
+        };
+        QVERIFY(observe("初始时间", {}, true));
+        if (scenario == "direct_pending") QVERIFY(observe("待整理", {}, false));
+
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QByteArray> bodies;
+        bool updatesOk = true;
+        serveCompletions(server, bodies, [&](int count) -> QString {
+            if (count == 1) {
+                if (scenario == "quiet") return R"({"conversation_action":"defer","sentences":[]})";
+                if (scenario == "invalid_ref") return R"({"action":"consult","refs":[100]})";
+                if (scenario != "direct_pending") return R"({"action":"consult","refs":[1]})";
+            }
+            if (count == 2 && scenario == "unrelated")
+                updatesOk &= observe("另一事项", {}, true);
+            if ((count == 2 && scenario == "related") || (count >= 2 && scenario == "churn"))
+                updatesOk &= observe(QString("更新%1").arg(count), db.matterHeads("user").first().toObject(), true);
+            return QString(R"({"sentences":[{"zh_text":"答复%1","ja_text":"いいよ","tags":{"emotion":"happy"}}]})").arg(count);
+        });
+        LLMService service("test",nullptr,QUrl(QString("http://127.0.0.1:%1/").arg(server.serverPort())));
+        service.setMemoryManager(&db);
+        QSignalSpy spoken(&service,&LLMService::sentencesReady);
+        QSignalSpy quiet(&service,&LLMService::replyQuiet);
+        QSignalSpy failed(&service,&LLMService::replyAbnormal);
+        service.askDeepSeek("继续吗",{},meta);
+        QTRY_COMPARE_WITH_TIMEOUT(spoken.size()+quiet.size()+failed.size(),1,5000);
+        QVERIFY(updatesOk);
+        if (scenario == "quiet") {
+            QCOMPARE(quiet.size(),1);
+            QCOMPARE(bodies.size(),1);
+        } else if (scenario == "invalid_ref" || scenario == "churn") {
+            QCOMPARE(failed.size(),1);
+            QCOMPARE(failed.first().first().toString(), scenario == "churn" ?
+                QString("referenced_matter_changed") : QString("unknown_matter_ref"));
+        } else {
+            QCOMPARE(spoken.size(),1);
+            const int requests = scenario == "direct_pending" ? 1 : scenario == "related" ? 3 : 2;
+            QCOMPARE(bodies.size(),requests);
+            QVERIFY(spoken.first().at(1).toString().contains(QString("答复%1").arg(requests)));
+            if (requests >= 2) QVERIFY(bodies.at(1).contains(QString("初始时间").toUtf8()));
+            if (requests == 3) QVERIFY(bodies.last().contains(QString("更新2").toUtf8()));
+        }
+    }
+
+    void understandingSnapshotAcrossReflection_data()
+    {
+        QTest::addColumn<bool>("updateDuringReflection");
+        QTest::newRow("visible update before final prompt") << true;
+        QTest::newRow("hidden update during final generation") << false;
+    }
+
+    void understandingSnapshotAcrossReflection()
+    {
+        QFETCH(bool, updateDuringReflection);
+        QTemporaryDir dir;
+        MemoryManager db(dir.filePath("snapshot.db"));
+        RequestMeta report;
+        report.eventId = "private-report";
+        QVERIFY(db.enqueueObservation(report, "预约延期"));
+        const auto source = db.pendingObservation()["source"].toInteger();
+
+        RequestMeta group;
+        group.channel = Channel::kQQGroup;
+        group.sessionId = "group";
+        group.actorId = "owner";
+        group.eventId = "group-message";
+        group.runId = "snapshot";
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QByteArray> bodies;
+        bool committed = false;
+        serveCompletions(server, bodies, [&](int count) -> QString {
+            if (count == (updateDuringReflection ? 1 : 2)) {
+                const QJsonObject change{{"matter",""},{"version",0},{"topic","预约"},{"quote","预约延期"},
+                    {"status","tentative"},{"understanding","预约日期待定"},{"kind","self_report"}};
+                committed = db.commitObservation(source, {{"outcome","updated"},{"changes",QJsonArray{change}}});
+            }
+            if (count == 1) return R"({"decision":"normal"})";
+            return R"({"sentences":[{"zh_text":"好呀","ja_text":"いいよ","tags":{"emotion":"happy"}}]})";
+        });
+        LLMService service("test", nullptr, QUrl(QString("http://127.0.0.1:%1/").arg(server.serverPort())));
+        service.setMemoryManager(&db);
+        QSignalSpy spoken(&service, &LLMService::sentencesReady);
+        QSignalSpy quiet(&service, &LLMService::replyQuiet);
+        service.askDeepSeek(updateDuringReflection ? "预约" : "最近如何", {}, group);
+        QTRY_COMPARE_WITH_TIMEOUT(spoken.size() + quiet.size(), 1, 5000);
+        QVERIFY(committed);
+        QCOMPARE(bodies.size(), 2);
+        QVERIFY(bodies.first().contains(QStringLiteral("预约延期").toUtf8()));
+        QVERIFY(!bodies.last().contains(QStringLiteral("预约延期").toUtf8()));
+        QCOMPARE(bodies.last().contains("CURRENT_UNDERSTANDING\\n"), updateDuringReflection);
+        QCOMPARE(spoken.size(), 1);
+    }
+
     void privateReflectionDoesNotEnterPublicReply_data()
     {
         QTest::addColumn<QString>("secret");
@@ -189,55 +332,60 @@ private slots:
             {"changes",QJsonArray{change}}}).toJson(QJsonDocument::Compact));
         meta.eventId = "replay-report";
         meta.runId = "replay-private";
+        meta.occurredAtUtc = QDateTime::currentDateTimeUtc();
+        const bool needsHistory = status == "tentative";
+        const QString earlier = QStringLiteral("上次我们谈到同一件事");
+        if (needsHistory) {
+            auto previous = meta;
+            previous.eventId = "earlier-event";
+            previous.occurredAtUtc = meta.occurredAtUtc.addSecs(-60);
+            QVERIFY(db.enqueueObservation(previous,earlier));
+            QVERIFY(db.saveQATurn(earlier,"{}",{},previous));
+            QVERIFY(db.commitObservation(db.pendingObservation()["source"].toInteger(),
+                QJsonObject{{"outcome","no_change"},{"changes",QJsonArray{}}}));
+        }
         QVERIFY(db.enqueueObservation(meta, secret));
         QVERIFY(db.saveQATurn(secret, "{}", {}, meta));
         QTcpServer server;
         QVERIFY(server.listen(QHostAddress::LocalHost));
         QList<QByteArray> bodies;
-        connect(&server,&QTcpServer::newConnection,this,[&] {
-            auto *socket = server.nextPendingConnection();
-            connect(socket,&QTcpSocket::readyRead,socket,[socket,&bodies,update] {
-                const auto bytes = socket->peek(socket->bytesAvailable());
-                const auto header = bytes.indexOf("\r\n\r\n");
-                if (header < 0)
-                    return;
-                const auto length = QRegularExpression("content-length: (\\d+)",
-                    QRegularExpression::CaseInsensitiveOption).match(QString::fromLatin1(bytes.left(header)));
-                if (!length.hasMatch() || bytes.size()-header-4 < length.captured(1).toInt())
-                    return;
-                socket->readAll();
-                bodies.append(bytes.mid(header+4));
-                const QString answer = bodies.size()==1 ? update
-                    : bodies.size()==2 ? QStringLiteral(R"({"decision":"skip_old_concern"})")
+        serveCompletions(server,bodies,[&](int count) {
+                const int step = count-int(needsHistory);
+                return step==0 ? QStringLiteral(R"({"outcome":"needs_evidence","changes":[]})")
+                    : step==1 ? update : step==2 ? QStringLiteral(R"({"decision":"skip_old_concern"})")
                     : QStringLiteral(R"({"sentences":[{"zh_text":"好呀","ja_text":"いいよ","tags":{"emotion":"happy"}}]})");
-                QJsonObject msg{{"message",QJsonObject{{"content",answer}}}};
-                const auto body = QJsonDocument(QJsonObject{{"choices",QJsonArray{msg}}}).toJson();
-                socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "
-                              + QByteArray::number(body.size()) + "\r\n\r\n" + body);
-                socket->disconnectFromHost();
-            });
         });
         LLMService service("test",nullptr,QUrl(QString("http://127.0.0.1:%1/").arg(server.serverPort())));
         service.setMemoryManager(&db);
         service.processObservation();
         QTRY_COMPARE_WITH_TIMEOUT(db.matterHeads(meta.subject).size(),1,5000);
+        if (needsHistory) {
+            QCOMPARE(bodies.size(),2);
+            QVERIFY(!bodies.first().contains(earlier.toUtf8()));
+            QVERIFY(bodies.last().contains(earlier.toUtf8()));
+        }
         QSignalSpy replies(&service,&LLMService::sentencesReady);
         meta.channel = Channel::kQQGroup;
         meta.sessionId = "20202";
         meta.runId = "group";
         service.askDeepSeek(followup,{},meta);
         QTRY_COMPARE_WITH_TIMEOUT(replies.size(),1,5000);
-        QCOMPARE(bodies.size(),3);
+        QCOMPARE(bodies.size(),3+int(needsHistory));
         QCOMPARE(replies.at(0).at(2).toString(), followup);
         QCOMPARE(replies.at(0).at(3).value<RequestMeta>().runId, meta.runId);
         QCOMPARE(replies.at(0).at(3).value<RequestMeta>().sessionId, meta.sessionId);
-        QVERIFY(bodies[1].contains(secret.toUtf8()));
-        QVERIFY(!bodies[2].contains(secret.toUtf8()));
-        QVERIFY(bodies[2].contains(QString("别按以前的情况主动追问").toUtf8()));
+        QVERIFY(bodies[bodies.size()-2].contains(secret.toUtf8()));
+        QVERIFY(!bodies.last().contains(secret.toUtf8()));
+        QVERIFY(bodies.last().contains(QString("别按以前的情况主动追问").toUtf8()));
         service.askDeepSeek("我刚才说了什么",{},RequestMeta{});
         QTRY_COMPARE_WITH_TIMEOUT(replies.size(),2,5000);
-        QCOMPARE(bodies.size(),4);
+        QCOMPARE(bodies.size(),4+int(needsHistory));
         QVERIFY(bodies.last().contains(secret.toUtf8()));
+        if (needsHistory) {
+            QVERIFY(db.deleteTurnByID(1));
+            QVERIFY(db.matterHeads(meta.subject).isEmpty());
+            QCOMPARE(db.pendingObservation()["input"].toString(),secret);
+        }
     }
 
     void initTestCase()

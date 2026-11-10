@@ -17,7 +17,8 @@
 - 🖱️ **拖拽移动**：支持自由拖动角色窗口
 - 📍 **位置锚点**：气泡和聊天窗口自动跟随角色
 - ⚙️ **AI 资源管理**：配置文件持久化（JSON格式）、系统提示词外部化（prompt.txt）
-- 🧠 **AI 记忆系统**（五层记忆架构 + R3 关系/授权层，SQLite数据库，`user_version=10`）：
+- 🧠 **AI 记忆系统**（五层记忆架构 + R3 关系/授权层，SQLite数据库，`user_version=14`）：
+  - 输入即时留存，按需核对跨渠道事项。历史区分渠道交接、主动安静与处理中断。
   - 短期记忆（最近N轮对话上下文，默认15轮）
   - 角色档案（character_profile，区分用户/茉子主体的稳定特质）
   - 情景记忆（episodic_memory，事件/承诺/冲突，按重要度衰减）
@@ -154,7 +155,7 @@ POST /tts
 - **AI 服务**: DeepSeek API (deepseek-v4-flash)
 - **语音合成**: GPT-SoVITS（API 已接入，策略模式封装）
 - **音频播放**: IPcmPlayer 抽象（StreamPlayer 流式 / FilePlayer 文件，QAudioSink + QBuffer）
-- **数据库**: SQLite（`user_version=10`，14 张表：`chat_history` + `raw_events` + 蒸馏记忆（角色档案/情景记忆/长期摘要/关系状态）+ `memory_cursor` + R3 关系层（`interactions`/`interaction_participants`/`persons`/`person_identities`/`memory_claims`/`group_membership_periods`/`group_membership_snapshots`））
+- **数据库**：SQLite（user_version=14）。会话、认知来源、事项修订和历史依据的结构见 [架构与当前实现](docs/ARCHITECTURE.md)。
 
 ## 📦 安装与构建
 

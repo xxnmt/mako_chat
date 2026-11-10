@@ -25,7 +25,7 @@ public:
     bool isConnected() const;
 
     // 发送 OneBot 动作（自动带 echo）
-    void sendAction(const QString &action, const QJsonObject &params = QJsonObject(),
+    bool sendAction(const QString &action, const QJsonObject &params = QJsonObject(),
                     const QString &echo = QString());
 
 signals:
@@ -45,7 +45,7 @@ private slots:
 private:
     void openSocket();
     void scheduleReconnect();
-    void sendPayload(const QString &action, const QJsonObject &params, const QString &echo);
+    bool sendPayload(const QString &action, const QJsonObject &params, const QString &echo);
 
     QWebSocket m_socket;
     QTimer m_reconnectTimer;

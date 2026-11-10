@@ -1,6 +1,41 @@
 #include "memorymanager.h"
 #include <QSqlError>
 #include <QSqlQuery>
+#include <QJsonDocument>
+
+QJsonArray MemoryManager::historicalReports(const QString &subject, const QString &channel, const QString &session,
+                                           const QString &before, const QStringList &terms, bool forRevision) const
+{
+    QSqlQuery q(m_db);
+    q.prepare(R"(
+        WITH candidates AS (
+            SELECT h.id,coalesce(s.reported,h.timestamp) AS reported,user_input,
+                (SELECT count(*) FROM json_each(:terms) WHERE instr(user_input,value)>0) matches
+            FROM chat_history h LEFT JOIN cognitive_source s ON s.event=h.cognitive_event
+            WHERE h.subject=:subject AND h.channel=:channel AND session_id=:session
+              AND h.sensitive=0 AND h.turn_kind='reply' AND length(user_input)>0
+              AND (:revision=0 OR s.id IS NOT NULL OR h.state_updates IS NOT NULL OR h.thought IS NOT NULL)
+              AND coalesce(julianday(s.reported),julianday(h.timestamp,'utc'))<julianday(:before)
+        ), ranked AS (
+            SELECT *,row_number() OVER (ORDER BY matches DESC,id DESC) topic_rank,
+                     row_number() OVER (ORDER BY id DESC) recent_rank FROM candidates
+        )
+        SELECT id,reported,user_input FROM ranked ORDER BY min(topic_rank,recent_rank),topic_rank LIMIT 6
+    )");
+    q.bindValue(":subject",subject);
+    q.bindValue(":revision",int(forRevision));
+    q.bindValue(":channel",channel);
+    q.bindValue(":session",session);
+    q.bindValue(":before",before);
+    q.bindValue(":terms",QString::fromUtf8(QJsonDocument(QJsonArray::fromStringList(terms)).toJson(QJsonDocument::Compact)));
+    QJsonArray reports;
+    if (q.exec()) {
+        while (q.next())
+            reports.append(QJsonObject{{"turn",q.value(0).toLongLong()},{"reported_at",q.value(1).toString()},
+                                       {"text",q.value(2).toString()}});
+    }
+    return reports;
+}
 
 bool MemoryManager::enqueueObservation(const RequestMeta &meta, const QString &input)
 {
@@ -28,13 +63,15 @@ bool MemoryManager::enqueueObservation(const RequestMeta &meta, const QString &i
     return false;
 }
 
-QJsonObject MemoryManager::pendingObservation() const
+QJsonObject MemoryManager::pendingObservation(qint64 source) const
 {
     QSqlQuery q(m_db);
-    if (!q.exec("SELECT id,run,subject,input,reported,channel,session FROM cognitive_source s "
-                "WHERE outcome IS NULL AND due<=unixepoch() AND NOT EXISTS "
+    q.prepare("SELECT id,run,subject,input,reported,channel,session FROM cognitive_source s "
+                "WHERE (:source=0 OR id=:source) AND outcome IS NULL AND due<=unixepoch() AND NOT EXISTS "
                 "(SELECT 1 FROM cognitive_source p WHERE p.subject=s.subject AND p.outcome IS NULL AND p.id<s.id) "
-                "ORDER BY id LIMIT 1") || !q.next())
+                "ORDER BY id LIMIT 1");
+    q.bindValue(":source",source);
+    if (!q.exec() || !q.next())
         return {};
     return {{"source",q.value(0).toLongLong()},{"run",q.value(1).toString()},
             {"subject",q.value(2).toString()},{"input",q.value(3).toString()},
@@ -42,7 +79,7 @@ QJsonObject MemoryManager::pendingObservation() const
             {"session",q.value(6).toString()}};
 }
 
-QJsonArray MemoryManager::matterHeads(const QString &subject) const
+QJsonArray MemoryManager::matterHeads(const QString &subject, const QStringList &terms) const
 {
     QSqlQuery q(m_db);
     q.prepare("SELECT matter,version,topic,status,quote,kind,reported,event_time,understanding,initial_quote,initial_reported FROM "
@@ -50,8 +87,11 @@ QJsonArray MemoryManager::matterHeads(const QString &subject) const
               "first_value(reported) OVER history AS initial_reported,row_number() OVER(PARTITION BY matter ORDER BY version DESC) pos "
               "FROM matter_revision r JOIN cognitive_source s ON s.id=r.source WHERE s.subject=? "
               "WINDOW history AS (PARTITION BY matter ORDER BY version)) "
-              "WHERE pos=1 ORDER BY source DESC,matter LIMIT 48");
+              "WHERE pos=1 ORDER BY (SELECT count(*) FROM json_each(?) WHERE "
+              "instr(topic,value)>0 OR instr(understanding,value)>0 OR instr(initial_quote,value)>0) DESC,"
+              "source DESC,matter LIMIT 48");
     q.addBindValue(subject);
+    q.addBindValue(QString::fromUtf8(QJsonDocument(QJsonArray::fromStringList(terms)).toJson(QJsonDocument::Compact)));
     QJsonArray heads;
     if (q.exec()) {
         while (q.next())
@@ -77,7 +117,8 @@ void MemoryManager::deferObservation(qint64 source, const QString &reason, bool 
     if (!q.exec()) qWarning() << "[Cognition] retry_schedule_failed source=" << source;
 }
 
-bool MemoryManager::commitObservation(qint64 source, const QJsonObject &proposal, QString *failure)
+bool MemoryManager::commitObservation(qint64 source, const QJsonObject &proposal, QString *failure,
+                                      const QJsonArray &historyEvidence)
 {
     if (failure) *failure = QStringLiteral("invalid_proposal");
     const QString outcome = proposal["outcome"].toString();
@@ -140,10 +181,23 @@ bool MemoryManager::commitObservation(qint64 source, const QJsonObject &proposal
             q.addBindValue(value);
         if (!q.exec()) return abort("storage_error");
     }
-    q.prepare("UPDATE cognitive_source SET outcome=?,last_error=NULL,input=CASE WHEN ?='no_change' THEN '' ELSE input END WHERE id=? AND outcome IS NULL");
+    for (const auto &item : historyEvidence) {
+        const auto report = item.toObject();
+        q.prepare("INSERT INTO observation_history(source,turn) SELECT ?,id FROM chat_history "
+                  "WHERE id=? AND subject=? AND sensitive=0 AND instr(user_input,?)=1");
+        q.addBindValue(source);
+        q.addBindValue(report["turn"].toInteger());
+        q.addBindValue(subject);
+        q.addBindValue(report["text"].toString());
+        if (!q.exec()) return abort("storage_error");
+        if (q.numRowsAffected()!=1) return abort("evidence_changed");
+    }
+    q.prepare("UPDATE cognitive_source SET outcome=?,last_error=NULL,input=CASE WHEN ?='no_change' "
+              "AND NOT EXISTS(SELECT 1 FROM observation_history WHERE source=cognitive_source.id) THEN '' ELSE input END WHERE id=? AND outcome IS NULL");
     q.addBindValue(outcome);
     q.addBindValue(outcome);
     q.addBindValue(source);
     if (!q.exec() || q.numRowsAffected()!=1 || !m_db.commit()) return abort("storage_error");
+    if (outcome == "updated") emit understandingChanged();
     return true;
 }

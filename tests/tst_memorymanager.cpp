@@ -154,10 +154,122 @@ private slots:
         QVERIFY(raw.exec("DROP TABLE matter_revision"));
         for (int reopen=0; reopen<2; ++reopen) {
             MemoryManager db(path);
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),11);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),14);
             QCOMPARE(raw.scalar("SELECT state_updates FROM chat_history").toString(),QString("[]"));
             QVERIFY(db.matterHeads("user").isEmpty());
         }
+    }
+
+    void conversationClosureSurvivesRestartAndReopens()
+    {
+        QTemporaryDir dir;
+        const auto path = dir.filePath("phase.db");
+        RequestMeta meta;
+        {
+            MemoryManager db(path);
+            meta.eventId = "closed";
+            const auto closed = db.recordInput("先聊到这里", meta);
+            QVERIFY(closed > 0);
+            QVERIFY(db.recordQuiet(closed,"close"));
+            QVERIFY(!db.interruptTurn(closed,"late_error"));
+        }
+        MemoryManager db(path);
+        QCOMPARE(db.conversationPhase(meta),QString("close"));
+        auto elsewhere = meta;
+        elsewhere.channel = Channel::kQQPrivate;
+        QVERIFY(db.conversationPhase(elsewhere).isEmpty());
+        meta.eventId = "interrupted";
+        const auto interrupted = db.recordInput("我想问件事", meta);
+        QVERIFY(db.interruptTurn(interrupted, "network_error"));
+        QCOMPARE(db.conversationPhase(meta),QString("close"));
+        meta.eventId = "reopened";
+        const auto reopened = db.recordInput("我还想接着聊", meta);
+        QCOMPARE(db.getHistoryTurn(10,meta.channel,meta.sessionId,reopened).size(),2);
+        SentenceText answer;
+        answer.zhText = "好呀";
+        QVERIFY(db.saveQATurn("我还想接着聊","{}",{answer},meta,reopened));
+        QVERIFY(!db.saveQATurn("我还想接着聊","{}",{answer},meta,reopened));
+        QCOMPARE(db.getTotalHistoryCount(),3);
+        const auto turns = db.getHistoryTurn(0,10);
+        QCOMPARE(turns[1].state,QString("interrupted"));
+        QVERIFY(turns[1].rawReply.isEmpty());
+        QVERIFY(turns[2].rawReply.isEmpty());
+        QCOMPARE(turns[0].state,QString("handed_off"));
+        QVERIFY(db.conversationPhase(meta).isEmpty());
+    }
+
+    void responseFailureRecoveryPreservesAudit()
+    {
+        QTemporaryDir dir;
+        const auto path = dir.filePath("recovery.db");
+        RequestMeta meta;
+        meta.eventId = "response-failed";
+        {
+            MemoryManager db(path);
+            QVERIFY(db.recordInput("一条有效输入",meta,true)>0);
+            const auto source = db.pendingObservation()["source"].toInteger();
+            for (int i=0;i<3;++i) db.deferObservation(source,"empty_content",true);
+            RawDb raw(path,"downgrade-recovery");
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec("DROP TRIGGER forget_cognitive_audit"));
+            QVERIFY(raw.exec("DROP TRIGGER forget_answer_audit"));
+            QVERIFY(raw.exec("DROP TABLE cognitive_audit"));
+            QVERIFY(raw.exec("PRAGMA user_version=13"));
+        }
+        MemoryManager db(path);
+        QVERIFY(!db.pendingObservation().isEmpty());
+        RawDb raw(path,"verify-recovery");
+        QVERIFY(raw.open());
+        QCOMPARE(raw.scalar("SELECT count(*) FROM cognitive_audit WHERE kind='legacy_response_failure'").toInt(),1);
+        QCOMPARE(raw.scalar("SELECT json_extract(data,'$.attempts') FROM cognitive_audit").toInt(),3);
+        QCOMPARE(raw.scalar("SELECT last_error FROM cognitive_source").toString(),QString("empty_content"));
+        QVERIFY(db.deleteTurnByID(1));
+        QCOMPARE(raw.scalar("SELECT count(*) FROM cognitive_audit").toInt(),0);
+    }
+
+    void receiptAndLegacyHistory()
+    {
+        QTemporaryDir dir;
+        MemoryManager db(dir.filePath("receipts.db"));
+        RequestMeta meta;
+        // v12 could store exactly this payload after a coordinator interruption.
+        QVERIFY(db.saveQATurn("旧输入",R"({"conversation_action":"defer","sentences":[]})",{},meta));
+        QVERIFY(db.conversationPhase(meta).isEmpty());
+        meta.eventId = "receive-once";
+        const auto id = db.recordInput("新输入",meta,true);
+        QVERIFY(id > 0);
+        QCOMPARE(db.pendingObservation()["input"].toString(),QString("新输入"));
+        QCOMPARE(db.recordInput("重试",meta,true),0);
+        QCOMPARE(db.getTotalHistoryCount(),2);
+        QVERIFY(db.deleteTurnByID(id));
+        QVERIFY(db.pendingObservation().isEmpty());
+        QVERIFY(!db.recordQuiet(id,"defer"));
+        SentenceText stale;
+        stale.zhText = "迟到";
+        QVERIFY(!db.saveQATurn("新输入","{}",{stale},meta,id));
+        QCOMPARE(db.getTotalHistoryCount(),1);
+        meta.persistTurn = false;
+        QCOMPARE(db.recordInput("未授权留存",meta,true),0);
+        QVERIFY(db.pendingObservation().isEmpty());
+    }
+
+    void historyEvidenceHonoursScopeAndRetention()
+    {
+        QTemporaryDir dir;
+        MemoryManager db(dir.filePath("evidence.db"));
+        RequestMeta local;
+        QVERIFY(db.saveQATurn("仅有会话记录","{}",{},local));
+        auto sensitive = local;
+        sensitive.sensitive = true;
+        QVERIFY(db.saveQATurn("敏感记录","{}",{},sensitive));
+        auto other = local;
+        other.subject = "other";
+        QVERIFY(db.saveQATurn("另一位发言者","{}",{},other));
+        const auto future = QDateTime::currentDateTimeUtc().addSecs(60).toString(Qt::ISODateWithMs);
+        const auto reports = db.historicalReports(local.subject,local.channel,local.sessionId,future,{},false);
+        QCOMPARE(reports.size(),1);
+        QCOMPARE(reports.first().toObject()["text"].toString(),QString("仅有会话记录"));
+        QVERIFY(db.historicalReports(local.subject,local.channel,local.sessionId,future,{},true).isEmpty());
     }
 
     void revisionReplay()
@@ -375,7 +487,7 @@ private slots:
             QVERIFY(raw.open());
 
             // 版本推进到 v3
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 11);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 14);
 
             // 列扩展（v2 渠道 + v3 轮次）
             const QStringList historyCols = raw.columns("chat_history");
@@ -479,7 +591,7 @@ private slots:
             MemoryManager second(dbPath);
             RawDb raw(dbPath, "verify2");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 11);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 14);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM chat_history").toInt(), 1);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM relationship_state").toInt(), 2);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM long_term_summary").toInt(), 1);
@@ -496,7 +608,7 @@ private slots:
             MemoryManager mm(dbPath);
             RawDb raw(dbPath, "fresh");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 11);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 14);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('raw_events')").toInt() > 0);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('memory_cursor')").toInt() > 0);
 
@@ -703,7 +815,7 @@ private slots:
         Q_UNUSED(mm);
         RawDb raw(dbPath, "v2verify");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 11);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 14);
         QCOMPARE(raw.scalar("SELECT user_input FROM chat_history").toString(), QStringLiteral("旧输入"));
         QCOMPARE(raw.scalar("SELECT turn_kind FROM chat_history").toString(), QStringLiteral("reply"));
         QCOMPARE(raw.scalar("SELECT subject FROM chat_history").toString(), QStringLiteral("user"));

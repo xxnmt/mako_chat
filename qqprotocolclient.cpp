@@ -119,12 +119,12 @@ void QQProtocolClient::scheduleReconnect()
     m_backoffMs = qMin(m_backoffMs * 2, 30000);
 }
 
-void QQProtocolClient::sendAction(const QString &action, const QJsonObject &params,
+bool QQProtocolClient::sendAction(const QString &action, const QJsonObject &params,
                                   const QString &echo)
 {
     if (!isConnected()) {
         qDebug() << "[QQ]动作发送失败（未连接）:" << action;
-        return;
+        return false;
     }
     const QString actualEcho = echo.isEmpty()
         ? QString("%1-%2").arg(action).arg(QDateTime::currentMSecsSinceEpoch())
@@ -133,17 +133,19 @@ void QQProtocolClient::sendAction(const QString &action, const QJsonObject &para
         m_pendingActions.insert(actualEcho, PendingAction{action, params, 0});
     }
     qDebug() << "[QQ]发送动作:" << action << "echo=" << actualEcho;
-    sendPayload(action, params, actualEcho);
+    if (sendPayload(action, params, actualEcho)) return true;
+    m_pendingActions.remove(actualEcho);
+    return false;
 }
 
-void QQProtocolClient::sendPayload(const QString &action, const QJsonObject &params,
+bool QQProtocolClient::sendPayload(const QString &action, const QJsonObject &params,
                                    const QString &echo)
 {
     QJsonObject root;
     root["action"] = action;
     root["params"] = params;
     root["echo"] = echo;
-    m_socket.sendTextMessage(QString::fromUtf8(QJsonDocument(root).toJson(QJsonDocument::Compact)));
+    return m_socket.sendTextMessage(QString::fromUtf8(QJsonDocument(root).toJson(QJsonDocument::Compact))) > 0;
 }
 
 void QQProtocolClient::onTextMessageReceived(const QString &message)

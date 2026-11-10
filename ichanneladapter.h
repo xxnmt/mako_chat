@@ -16,7 +16,7 @@ public:
 
     // 消费一句话：渠道私有表现（气泡/IM发送/语音消息等）
     // 立绘与情绪联动是全局层（AppController），不属于任何渠道
-    virtual void sendUtterance(const Utterance &u) = 0;
+    virtual bool sendUtterance(const Utterance &u) = 0;
 };
 
 #endif // ICHANNELADAPTER_H

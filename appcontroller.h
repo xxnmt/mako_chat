@@ -54,11 +54,14 @@ private:
         QString text;
         RequestMeta meta;
         quint64 sequence;
+        qint64 turnId;
     };
     QQueue<ForegroundRequest> m_pending;
     QElapsedTimer m_idle;
     bool m_processing = false;
-    ForegroundRequest m_active;
+    ForegroundRequest m_active{};
+    void resumeMoodTimers();
+    void recordInterruption(const QString &reason);
     void startNextRequest();
     void finishRequest();
     bool canReviewThought() const;

@@ -12,6 +12,8 @@ struct HistoryTurn {
     qlonglong id = -1;//id
     QDateTime timestamp;//时间戳
     QString userInput;//用户输入；主动/感知轮次为 SQL NULL（读取后为空串）
+    QString state;
+    QString detail;
     QString rawReply;//未处理回复
     QString turnKind = QStringLiteral("reply");// reply / proactive / perception
     QString subject = QStringLiteral("user");// 本轮对象：user / qq:<uin> / group:<群号>

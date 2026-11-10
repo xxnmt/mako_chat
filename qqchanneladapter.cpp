@@ -32,14 +32,14 @@ void QQChannelAdapter::setClient(QQProtocolClient *client)
     m_client = client;
 }
 
-void QQChannelAdapter::sendUtterance(const Utterance &u)
+bool QQChannelAdapter::sendUtterance(const Utterance &u)
 {
     if (!m_client || !m_client->isConnected()) {
         qDebug() << "[QQChannel]未连接，消息未发送:" << u.channel << u.sessionId;
-        return;
+        return false;
     }
     if (u.text.trimmed().isEmpty()) {
-        return;
+        return false;
     }
 
     QJsonObject params;
@@ -53,15 +53,16 @@ void QQChannelAdapter::sendUtterance(const Utterance &u)
         params["user_id"] = u.sessionId.toLongLong();
     } else {
         qDebug() << "[QQChannel]未知渠道，忽略:" << u.channel;
-        return;
+        return false;
     }
 
     params["message"] = buildTextMessage(u.text);
     // 群聊场景可带 auto_escape，保持纯文本
-    m_client->sendAction(action, params);
+    if (!m_client->sendAction(action, params)) return false;
     qDebug() << "[QQChannel]发送:" << u.channel << u.sessionId
              << "chars=" << u.text.size();
     if (debugFullLogsEnabled()) {
         qDebug().noquote() << "[QQChannel][debug] 发送:" << u.text;
     }
+    return true;
 }

@@ -431,7 +431,7 @@ QJsonArray PromptAssembler::buildHistoryMessages(const QList<HistoryTurn> &histo
                 userMessage["content"] = QString("%1：%2").arg(speaker, turn.userInput);
             } else {
                 userMessage["name"] = QString("用户 [%1]").arg(timestampLabel(turn.timestamp));
-                userMessage["content"] = turn.userInput;
+                userMessage["content"] = QString("[发言时间 %1]\n%2").arg(timestampLabel(turn.timestamp), turn.userInput);
             }
             messages.append(userMessage);
         }
@@ -441,8 +441,11 @@ QJsonArray PromptAssembler::buildHistoryMessages(const QList<HistoryTurn> &histo
         const QString makoName = assistantOnly ? QStringLiteral("茉子（主动/感知）")
                                                : QStringLiteral("茉子");
         makoMessage["name"] = QString("%1 [%2]").arg(makoName, timestampLabel(turn.timestamp));
-        makoMessage["content"] = extractReplyText(turn.rawReply);
-        messages.append(makoMessage);
+        const auto replyText = extractReplyText(turn.rawReply);
+        if (!replyText.isEmpty()) {
+            makoMessage["content"] = replyText;
+            messages.append(makoMessage);
+        }
     }
 
     return messages;

@@ -1,4 +1,7 @@
 #include "settingswidget.h"
+#include <QJsonDocument>
+#include <QJsonArray>
+#include <QJsonObject>
 #include "ui_settingswidget.h"
 #include "configmanager.h"
 #include "memorymanager.h"
@@ -489,6 +492,14 @@ void SettingsWidget::loadHistoryPage(int page)
         userItem->setToolTip(turn.userInput);  // 悬停显示完整内容
         //茉子
         QString replyText = turn.rawReply;
+        if (turn.state == "quiet") replyText = QStringLiteral("主动安静 · ") + turn.detail;
+        else if (turn.state == "interrupted") replyText = QStringLiteral("处理中断 · ") + turn.detail;
+        else if (turn.state == "received") replyText = QStringLiteral("已收到输入，未记录处理结果");
+        else if (turn.state == "legacy") {
+            const auto legacy = QJsonDocument::fromJson(turn.rawReply.toUtf8()).object();
+            if (legacy["sentences"].isArray() && legacy["sentences"].toArray().isEmpty())
+                replyText = QStringLiteral("历史输入，未记录表达原因");
+        }
         if (replyText.length() > 600) {
             replyText = replyText.left(600) + "...";
         }

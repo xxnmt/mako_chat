@@ -18,7 +18,7 @@ public:
     explicit PetChannelAdapter(BubbleWidget *bubble, QObject *parent = nullptr);
 
     QString channelName() const override;
-    void sendUtterance(const Utterance &u) override;
+    bool sendUtterance(const Utterance &u) override;
 
     // 桌宠音频输出（由 AppController 注入 TTSService）
     IAudioSink *audioSink() const;

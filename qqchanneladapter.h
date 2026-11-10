@@ -17,7 +17,7 @@ public:
 
     void setClient(QQProtocolClient *client);
     QString channelName() const override;
-    void sendUtterance(const Utterance &u) override;
+    bool sendUtterance(const Utterance &u) override;
 
     // 纯格式化：文字消息段（供单测/复用）
     static QJsonArray buildTextMessage(const QString &text);

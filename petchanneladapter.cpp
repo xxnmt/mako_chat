@@ -20,7 +20,7 @@ IAudioSink *PetChannelAdapter::audioSink() const
     return m_audioSink;
 }
 
-void PetChannelAdapter::sendUtterance(const Utterance &u)
+bool PetChannelAdapter::sendUtterance(const Utterance &u)
 {
     // 桌宠渠道目前只有文本气泡一种表达
     if (m_bubble) {
@@ -30,6 +30,7 @@ void PetChannelAdapter::sendUtterance(const Utterance &u)
     if (debugFullLogsEnabled()) {
         qDebug().noquote() << "[PetChannel][debug] 气泡:" << u.text;
     }
+    return m_bubble != nullptr;
 }
 
 void PetChannelAdapter::onAudioReady(const QString &zhText, const QMap<QString, QString> &tags)

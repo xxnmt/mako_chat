@@ -1,6 +1,6 @@
 # 架构与当前实现
 
-> 更新：2026-11-09。源码核对基准 54a0be1。本文负责现状，未来变更只维护在 [开发路线图](ROADMAP.md)。入口见 [文档索引](README.md)。
+> 更新：2026-11-10。包含当前工作区的 v13 实现。本文负责现状，未来变更只维护在 [开发路线图](ROADMAP.md)。入口见 [文档索引](README.md)。
 
 ## 组件与职责
 
@@ -26,15 +26,15 @@
 
 ## 正常对话路径
 
-渠道输入经 SessionRouter 生成 RequestMeta 后，AppController 将请求排入前台队列。实际启动时重读当前会话历史，再调用 LLMService。LLMService 先准备跨渠道证据，必要时做私下判断，再组装最终上下文并进入聊天及记忆工具循环。前台结果携带对应输入和元数据，AppController 保存本轮、投递到原渠道，并按阈值触发后台记忆提取。
+渠道输入经 SessionRouter 生成 RequestMeta 后，AppController 将请求排入前台队列。实际启动时重读当前会话历史，再调用 LLMService。LLMService 先准备跨渠道证据，必要时做私下判断，再组装最终上下文并进入聊天及记忆工具循环。前台结果携带对应输入和元数据，AppController 将正文交给原渠道，回填对应输入行，并按阈值触发后台记忆提取。
 
-LLMService 仍保留单份活动请求状态，当前应用依靠前台串行队列保证其调用边界。成功结果携带上下文不等于服务已支持任意并发调用。MemoryAgent 的结果及失败带请求 ID；主网络回复校验 runId。原生工具拒绝时可回退 JSON Envelope，输出异常与空回复执行有限重试。
+LLMService 仍保留单份活动请求状态，当前应用依靠前台串行队列保证其调用边界。成功结果携带上下文不等于服务已支持任意并发调用。MemoryAgent 的结果及失败带请求 ID；主网络回复校验运行代次。原生工具拒绝时可回退 JSON Envelope，输出异常与空回复执行有限重试。
 
 Pet 走语音合成和音频 sink，QQ 走文本发送。QQ 情绪可按配置影响立绘。播放收尾通过轮次序号约束退火，昼夜与退火属于表现管理。
 
 ## 记忆与持久化
 
-当前 SQLite user_version 为 11。基础表包括 chat_history、character_profile、episodic_memory、long_term_summary、relationship_state；多渠道之后增加 raw_events、memory_cursor、interactions、人物身份、claims 和群成员关系。完整字段以 MemoryManager::initDatabase 为准，v10 在 chat_history 中增加 state_updates、thought、thought_version、thought_result、review_after，并增加 thought_review_log 与索引。
+当前 SQLite user_version 为 14。基础表包括 chat_history、character_profile、episodic_memory、long_term_summary、relationship_state；多渠道之后增加 raw_events、memory_cursor、interactions、人物身份、claims 和群成员关系。完整字段以 MemoryManager::initDatabase 为准，v10 在 chat_history 中增加 state_updates、thought、thought_version、thought_result、review_after，并增加 thought_review_log 与索引。
 
 会话短期历史按 channel/session_id 分桶。稳定档案和关系可内联；tool 模式下历史事实主要按需检索。跨渠道 personalEvidence 与 currentUnderstanding 另行接入最终请求前的上下文准备。原始事件、聊天轮次和派生证据有各自删除边界，删除聊天记录不会自动删除独立 raw_events。
 
@@ -46,7 +46,7 @@ Pet 走语音合成和音频 sink，QQ 走文本发送。QQ 情绪可按配置�
 
 最近一次开发验证中，Windows Debug 构建曾成功，15 个自动测试套件通过。后续召回排序修改也通过全部套件；运行中的原名可执行文件会阻止覆盖链接。测试覆盖的是受控输入下的数据与请求行为，不能据此宣称真实模型已能稳定理解更正。下述已实现路径表示源码已接入。
 
-v11 的认识更新独立于对话回复。语义关联仍由模型负责，近期候选限于该主体最后修订的 48 个事项。历史证据检索仍有数量上限，群聊表达仍使用有限的私下判断。连续两条消息之间可能尚未完成后台提交，当前状态按已提交版本读取，提取器也可能将更正误判为无变化。
+v11 的认识更新独立于对话回复。语义关联仍由模型负责，每次最多选取该主体 48 个事项，按输入词匹配及修订顺序排序。历史证据检索仍有数量上限，群聊表达仍使用有限的私下判断。连续两条消息之间可能尚未完成后台提交，当前状态按已提交版本读取，提取器也可能将更正误判为无变化。
 
 当前排序同时保留主题相关性与本人时间线的候选机会，未针对私聊设置固定的一天窗口。时间字段包含消息时间、事件时间和摘要整理时间，现有聚合候选尚未完整区分这些语义，这是后续重构需要处理的缺口。
 
@@ -63,9 +63,9 @@ v11 的认识更新独立于对话回复。语义关联仍由模型负责，近�
 
 ## 启用和验收
 
-跨渠道认识跟随全局长期记忆开关。要辨认跨渠道的主人，请在身份配置中登记本人的 QQ 账号。首次打开旧库时，SQLite 以事务迁移到 v11。v10 主题继续作为历史证据，已有行不重新提交给提取模型。更早版本先执行已有迁移。升级前如需保留旧版运行环境，可在应用关闭时备份记忆库。
+跨渠道认识跟随全局长期记忆开关。要辨认跨渠道的主人，请在身份配置中登记本人的 QQ 账号。首次打开旧库时，SQLite 以事务迁移到 v14。v10 主题继续作为历史证据，已有行不重新提交给提取模型。更早版本先执行已有迁移。升级前如需保留旧版运行环境，可在应用关闭时备份记忆库。
 
-认识更新在前台回复之外异步运行，每条符合条件的消息通常增加一次模型请求。无工作时只查询本地队列。同一主体的输入顺序处理，网络错误从 30 秒开始退避，最长一小时。协议、证据或基版本连续被拒的事件累计三次后记录为 review_required，后续事件可以继续。needs_evidence 表示现有证据不足，自动回查属于下一批任务。新增 [Cognition] 日志使用 run、来源序号、候选事项及版本、退出原因和耗时关联提案与上下文，正文仍受原有聊天调试日志设置影响。
+认识更新在前台回复之外异步运行，每条符合条件的消息通常增加一次模型请求。无工作时只查询本地队列。同一主体的输入顺序处理，网络错误从 30 秒开始退避，最长一小时。协议、证据或基版本连续被拒的事件累计三次后记录为 review_required，后续事件可以继续。needs_evidence 触发一次历史补查，有可用依据才再请求一次模型。第二次仍无法判断时保存未决结果。同会话较早事件的聊天记录晚到时可重新排队。升级到 v12 时，保有输入的旧 needs_evidence 和 review_required 各重新排队一次。新增 [Cognition] 日志使用 run、来源序号、候选事项及版本、退出原因和耗时关联提案与上下文，正文仍受原有聊天调试日志设置影响。
 
 安静回顾使用现有身份配置中的 `proactive.enabled`、`idle_seconds`、`daily_limit`、`cooldown_seconds` 和 `quiet_hours`。想让她主动展示作品，可在 `targets` 中明确加入 `{"channel":"pet","session_id":"default"}`。没有分享目标也能在后台写作，之后在私人对话中聊起作品。日历式主动问候与空闲回顾是两种不同的触发条件，本次接入空闲回顾。
 
@@ -85,3 +85,42 @@ v11 的认识更新独立于对话回复。语义关联仍由模型负责，近�
 配置形状、默认值与开关范围只维护在 [配置参考](CONFIG_REFERENCE.md)。app_data 位于可执行文件目录，包含用户配置、记忆与日志。运行数据保持 Git 忽略。UI、TTS 和资源部署见 [项目 README](../README.md)，GPT-SoVITS 补充材料见 [语音参考](GPT_SOVITS_REFERENCE.md)。
 
 构建入口为根 CMakeLists.txt，自动测试注册在 tests/CMakeLists.txt。测试的临时库与正式 app_data 应隔离。本次文档整理未执行新的构建或模型调用。真实对话是否改善需记录运行版本、输入、证据和最终回复，已有测试结果保留其发生日期。
+
+## v12 历史依据与重算
+
+主人 QQ 私聊启用 owner_cross_channel_private 时，回复准备阶段从 Pet 历史中读取同一主体在消息时间之前的发言。每个来源会话最多六条，按匹配度和近况选取。旧聊天行可在这一授权范围内作为临时背景。用于持久化修订的补查另需具备认知来源、旧版状态报告或念头等保存依据。群聊补查限本群当前主体。补查再次应用盲区和敏感内容规则。
+
+observation_history 记录补查轮次实际提供的聊天行。删除其中任一行时，事务撤销依赖结果，并沿同事项的后续修订传递，相关输入重新进入队列。对没有显式来源引用的旧自由文本推断，尚无法恢复完整依赖关系。
+## v13 前台交谈与历史
+
+后续 v14 继续使用本节的输入留存、渠道交接和中断状态。
+
+接受消息后，允许留存的输入立即写入 chat_history，获得一条 turn_state 为 received 的记录。允许后台观察时，同一事务先尝试登记认知来源。前台按接收顺序工作，读取本条输入之前的会话历史，单独传入当前消息。摘要也以本次完成的行号为上界。模型可直接接话、澄清或主动收尾。后台观察有独立的重试周期，前台可以使用当前消息里的更正。
+
+CURRENT_UNDERSTANDING 提供本轮可见事项目录。模型需要核对现状时，先返回带 refs 的 consult 动作。程序将本轮编号映射到内部事项，按同一听众重新读取相应记录，再请求表达。群聊私下判断只产生交谈指引。历史事件检索仍使用 memory_recall/read。直接回应无需额外进行事项核对。
+
+数据库提交认识或删除依据后，程序比较已选择事项对当前听众的投影。可见依据有变化时取消旧生成，用新资料重新表达一次。网络回调也会复核，覆盖提交与回调次序互换的情况。再次变化会结束处理并记录 referenced_matter_changed。未整理的输入是否涉及某件事仍需语义判断。当前变更通知覆盖已提交的事项，短期历史、跨渠道原始资料和历史工具结果尚无同等粒度的动态订阅。
+
+| turn_state | 含义与读取方式 |
+|---|---|
+| received | 已保存用户输入，尚无持久化处理结果。进程被强制终止后可能保留此状态。 |
+| handed_off | Pet 的句子已入语音队列，或 QQ 消息已提交本地 WebSocket。raw_reply 保存表达内容。播放完成和远端送达仍需独立回执。 |
+| quiet | 模型显式选择 close 或 defer 并返回空句。turn_detail 保存决定，历史只展示用户发言。带正文的 close 按正常表达保存。 |
+| interrupted | 网络、输出协议、持续变化的已选依据、渠道交接失败或正常退出终止了处理。turn_detail 保存原因，历史只展示用户发言。 |
+| legacy | v12 及以前的记录保留原文和来源。历史空句的表达原因未知。 |
+
+前台完成只能更新同一条 received 记录。交谈阶段按渠道、会话和主体读取，主动决定及已交接的正文可推进阶段。技术中断不会产生角色发言或沉默决定。设置窗口分别显示安静决定、中断原因和旧空行。重启后不会自动重发未确认交接的请求。
+
+## v14 证据与回答契约
+
+事项目录携带当前状态与报告时间。前台按输入提取检索词，最多为四个匹配事项内联完整认识。其余事项通过 consult 核对。词匹配用于上下文预算选择，语义关联与证据充分性由模型判断。内联事项与显式核对事项共同参与生成期间的变更检查。
+
+认识保留 quote、source_kind、reported_at、event_time_expression 和 interpretation_recorded_at，并提供 source/N 编号。effective_at 无法证明时为 null。发言时间、事件时间和认识生效时间分别解释，事件时间原文继续保留。consult 最多返回每事项八条可见修订，群聊原文链限定本群。短期用户发言在正文中注明发言时间。旧助手回复只证明曾经发生过该表达。
+
+前台 evidence_decision 报告 question、question_type、used_evidence、evidence_status、basis、unresolved_conflicts 和 consult_required。具体事实可由明确的直接证据支持，最新决定需关注后续修订，范围概览需覆盖，未命中不足以支持不存在断言。partial 仅描述检索覆盖。basis 只保存简短证据依据。
+
+cognitive_audit 将决策标记为 model_reported 或 missing，并记录来源编号检查结果。编号检查通过表明引用来自提供的资料或已核对事项，语义充分性仍属模型报告。未知编号记录 unknown_references 和 unverified。模型省略审计字段时记录 missing，避免补造理由。
+
+后台区分 missing_choice、missing_content、empty_completed、response_truncated、invalid_json、网络错误及提案校验错误。响应失败和基版本变化进入退避重试，每次重新读取来源与基版本。提案合法性拒绝累计后进入 review_required。观察审计记录 finish_reason、usage、基版本与耗时。v14 迁移先记录旧 empty_content 的失败次数、错误及原结果，再恢复因空响应被搁置且仍有输入的事件。
+
+审计遵守敏感与留存开关。删除聊天记录清除其回答审计，删除来源清除其处理审计。当前仍需完善规范化事件区间、认识生效时间推导、派生摘要的完整逐条来源映射，以及模型决策依据的稳定性。

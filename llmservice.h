@@ -7,6 +7,7 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QScopedPointer>
+#include <QPointer>
 
 #include "sentencedata.h"
 #include "historyturn.h"
@@ -43,6 +44,7 @@ public:
                                    const QList<RawEvent> &events);
 
 signals:
+    void replyQuiet(const QString &action, const QString &userInput, const RequestMeta &meta);
     //chat
     void sentencesReady(const QList<SentenceText> &sentences, const QString &rawReply,
                         const QString &userInput, const RequestMeta &meta);
@@ -68,6 +70,10 @@ private slots:
     void onMemoryAgentFailed(const QString &reason, const QString &requestId);
 
 private:
+    QJsonArray observationHistory(const QString &subject, const QString &channel, const QString &session,
+                                  const QString &before, const QStringList &terms, bool includeLocal) const;
+    void proposeObservation(const QJsonObject &job, const QJsonArray &history = {},
+                            const QStringList &searchTerms = {});
     //处理提示词的两个函数
     void prepareReply(const QString &userInput, const QList<HistoryTurn> &historyQA,
                       const RequestMeta &meta, const QJsonArray &privateEvidence,
@@ -77,6 +83,11 @@ private:
     void sendChatRequest(const QJsonArray &messages,
                          bool withMemoryTool = false,
                          bool jsonResponse = true);
+    bool refreshConsultation();
+    QPointer<QNetworkReply> m_consultationReply;
+    bool consultMatters(const QJsonObject &decision);
+    QJsonObject readConsultedMatters() const;
+    void generateWithMatters(const QJsonObject &records);
     void sendSafeRetry();
     void sendEmptyReplyRetry();
     void sendPendingReply(const QJsonObject &agentMessage = QJsonObject(),
@@ -94,7 +105,7 @@ private:
     void switchMemoryToolToEnvelope();
     QString envelopeToolInstruction() const;
 
-    QPair<QList<SentenceText>, QString> parseJsonReply(const QString &replyText);
+    QPair<QList<SentenceText>, QString> parseJsonReply(const QString &replyText, QJsonObject &decision);
 
     //回复内容合法性校验（异常回复整轮抛弃）
     static bool containsHan(const QString &text);      //是否含中文（CJK汉字）
@@ -108,7 +119,6 @@ private:
     QNetworkAccessManager* m_extractManager;
     QNetworkAccessManager* m_interactionManager;
     QString m_apiKey;
-    QString m_requestInput;
     QUrl m_endpoint;
 
     QString m_localPromptPath;
@@ -117,7 +127,16 @@ private:
 
     MemoryManager *m_memoryManager = nullptr;
     MemoryAgent *m_memoryAgent = nullptr;
-    RequestMeta m_currentMeta;   // 当前轮次元数据（askDeepSeek 设置，prompt 组装与记忆注入使用）
+    struct ForegroundRun {
+        RequestMeta meta;
+        QString input;
+        QStringList catalogKeys;
+        QStringList consultedKeys;
+        QJsonObject consultedRecords;
+        QJsonArray consultationMessages;
+        bool refreshed = false;
+        bool consultationUsed = false;
+    } m_run;
     QJsonArray m_lastRequestMessages;
     QJsonArray m_pendingMessages; // legacy：等待 MemoryAgent 的主请求
     quint64 m_agentGeneration = 0;
