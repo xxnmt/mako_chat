@@ -85,6 +85,7 @@ private:
                          bool jsonResponse = true);
     bool refreshConsultation();
     QPointer<QNetworkReply> m_consultationReply;
+    void registerToolEvidence(const QJsonObject &payload);
     bool consultMatters(const QJsonObject &decision);
     QJsonObject readConsultedMatters() const;
     void generateWithMatters(const QJsonObject &records);
@@ -130,6 +131,8 @@ private:
     struct ForegroundRun {
         RequestMeta meta;
         QString input;
+        QJsonObject evidence;
+        QJsonObject beforeConsultation;
         QStringList catalogKeys;
         QStringList consultedKeys;
         QJsonObject consultedRecords;

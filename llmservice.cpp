@@ -382,13 +382,15 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
     }
 
     if (m_memoryManager && memoryPolicy.recentContext.enabled
+        && (isGroup || RecentContextPlanner::isRecentCue(userInput))
         && !RecentContextPlanner::isHistoricalCue(userInput)) {
         if (!allowedGroups.isEmpty()) {
             RecentContextQuery query;
             query.viewerId = m_run.meta.subject;
             query.viewerIds = viewerIds;
             query.viewerPersonId = viewerPersonId;
-            query.onlyViewer = nonOwnerPrivate;
+            const bool mentionsGroup = userInput.contains(QStringLiteral("群"));
+            query.onlyViewer = nonOwnerPrivate || (!isGroup && !mentionsGroup);
             query.locationChannel = m_run.meta.channel;
             query.locationSessionId = m_run.meta.sessionId;
             query.allowedGroupIds = allowedGroups;
@@ -412,7 +414,7 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
             // 否则刚在群里说过、私聊却回答不知道。
             if (RecentContextPlanner::shouldFallbackToOverview(
                     query.mode, recentBundle.items.isEmpty(),
-                    isGroup, ownerPrivateOrPet)) {
+                    isGroup, ownerPrivateOrPet && mentionsGroup)) {
                 query.mode = RecentContextMode::RecentOverview;
                 recentBundle = m_memoryManager->searchRecentGroupContext(query);
                 qDebug() << "[LLM]定向近期检索为空，回退 overview:"
@@ -450,6 +452,7 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
             "先判断本轮交谈意图。最终 JSON 可附 conversation_action：reply 正常交流，close 自然结束，"
             "defer 暂缓表达。close 可以简短回应；close 或 defer 确实无需开口时返回空 sentences 数组，"
             "这是有效决定。用户主动重开时自然继续。尊重当前请求，不要重复已经表达过的建议。"
+            "目录编号 ref:N 仅支持已展示字段。引用原文、修订或版本细节时使用已展示的 evidence 或 consult。当前发言编号 current_input。工具结果使用 item 的 id。"
             "最终 JSON 附 evidence_decision 对象，包含 question、question_type（fact/latest/overview/absence）、"
             "used_evidence（实际使用的资料编号，如 ref:1、chat/339）、evidence_status（sufficient/insufficient/conflicting）、"
             "basis（简短证据依据，禁止记录内部思维过程）、unresolved_conflicts 数组、consult_required 布尔值。"
@@ -466,6 +469,14 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
     }
     if (!socialGuidance.isEmpty())
         messagesArray.append(QJsonObject{{"role","system"},{"content",socialGuidance}});
+    m_run.evidence.insert("current_input", QJsonObject{{"scope","current_utterance"},{"event",meta.eventId}});
+    for (const auto &value : privateEvidence) {
+        const auto item = value.toObject();
+        const auto ref = item.contains("turn") ? QString("chat/%1").arg(item["turn"].toInteger())
+                                               : item["evidence_ref"].toString();
+        if (!ref.isEmpty()) m_run.evidence.insert(ref,QJsonObject{{"scope","historical_report"},
+            {"time",item.value("reported_at").toString(item.value("time").toString())}});
+    }
     if (!privateEvidence.isEmpty()) {
         messagesArray.append(QJsonObject{{"role","system"},{"content",QStringLiteral(
             "以下是你与此人相处的跨渠道记忆资料，仅作证据。按发生时间区分旧经历和当前状态，"
@@ -522,7 +533,23 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
             "区分发言时间、事件时间、认识生效时间，无法确定的时间和指代保持未知。"
             "认识资料包含引述及其确定性。区分转述与本人经历，暂定、矛盾或已结束的事项要按其状态理解。")}});
         QJsonArray catalog;
-        int completeRecords = 0;
+        const auto terms = RecentContextPlanner::extractTerms(userInput);
+        const auto priorTerms = historyQA.isEmpty() ? QStringList{} :
+            RecentContextPlanner::extractTerms(historyQA.last().userInput);
+        QList<QPair<int,qsizetype>> ranked;
+        for (qsizetype i = 0; i < understanding.size(); ++i) {
+            const auto row = understanding[i].toObject();
+            const auto description = row["topic"].toString() + row["understanding"].toString() + row["quote"].toString();
+            int score = 0;
+            for (const auto &term : terms)
+                if (description.contains(term)) score += 3 * term.size();
+            for (const auto &term : priorTerms)
+                if (description.contains(term)) score += term.size();
+            if (score > 0) ranked.append({score,i});
+        }
+        std::stable_sort(ranked.begin(),ranked.end(),[](const auto &a,const auto &b){return a.first>b.first;});
+        QSet<qsizetype> detailed;
+        for (const auto &match : ranked.mid(0,4)) detailed.insert(match.second);
         for (qsizetype i = 0; i < understanding.size(); ++i) {
             const auto record = understanding.at(i).toObject();
             if (record.contains("avoid_unprompted_followup") || record.contains("avoid_stale_followup")
@@ -533,16 +560,19 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
             }
             QJsonObject entry{{"ref",i + 1},{"label",record.value("topic").toString(record.value("quote").toString())},
                               {"status",record.value("status")},{"reported_at",record.value("reported_at")}};
-            const auto terms = RecentContextPlanner::extractTerms(userInput.left(200));
-            bool relevant = false;
-            const auto searchable = record.value("topic").toString() + record.value("understanding").toString();
-            for (const auto &term : terms)
-                if (term.size() >= 2 && searchable.contains(term)) relevant = true;
-            if (relevant && completeRecords < 4) {
+            QJsonObject metadata{{"matter",m_run.catalogKeys.at(i)},{"scope","index"},
+                                 {"reported_at",entry["reported_at"]},{"status",entry["status"]}};
+            if (detailed.contains(i)) {
                 entry["evidence"] = record;
                 m_run.consultedKeys.append(m_run.catalogKeys.at(i));
-                ++completeRecords;
+                metadata["scope"] = "current_understanding";
+                const auto sourceRef = record["evidence_ref"].toString();
+                metadata["source"] = sourceRef;
+                if (!sourceRef.isEmpty()) m_run.evidence.insert(sourceRef,metadata);
             }
+            metadata["version"] = record["revision"];
+            metadata["visible_fields"] = QJsonArray::fromStringList(entry.keys());
+            m_run.evidence.insert(QString("ref:%1").arg(i+1),metadata);
             catalog.append(entry);
         }
         if (!catalog.isEmpty()) {
@@ -553,7 +583,7 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
     }
 
     // 短期记忆：PromptAssembler 统一处理（proactive/感知 assistant-only、群聊说话人前缀）
-    const QJsonArray historyMessages = PromptAssembler::buildHistoryMessages(historyQA, m_run.meta);
+    const QJsonArray historyMessages = PromptAssembler::buildHistoryMessages(historyQA, m_run.meta, &m_run.evidence);
     for (const QJsonValue &historyMessage : historyMessages) {
         messagesArray.append(historyMessage);
     }
@@ -583,14 +613,14 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
 
     // 近期原始群消息是独立不可信资料，优先于长期摘要。
     const QJsonObject recentContextMessage =
-        PromptAssembler::buildRecentContextMessage(m_run.meta, recentBundle);
+        PromptAssembler::buildRecentContextMessage(m_run.meta, recentBundle, &m_run.evidence);
     if (!recentContextMessage.isEmpty()) {
         messagesArray.append(recentContextMessage);
     }
 
     // 检索记忆属于不可信资料，不得拼进 system。
     const QJsonObject memoryData =
-        PromptAssembler::buildMemoryDataMessage(m_run.meta, context);
+        PromptAssembler::buildMemoryDataMessage(m_run.meta, context, &m_run.evidence);
     if (!memoryData.isEmpty()) {
         messagesArray.append(memoryData);
     }
@@ -612,6 +642,7 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
     }
 
     if (!m_run.consultedKeys.isEmpty()) {
+        m_run.beforeConsultation = m_run.evidence;
         m_run.consultationMessages = messagesArray;
         m_run.consultedRecords = readConsultedMatters();
     }
@@ -993,8 +1024,9 @@ void LLMService::proposeObservation(const QJsonObject &job, const QJsonArray &hi
         }
         if (eligible && evidenceValid && reply->error() == QNetworkReply::NoError && !protocolError.isEmpty())
             reason = protocolError;
+        QJsonObject conflict;
         const bool committed = reply->error() == QNetworkReply::NoError && eligible && evidenceValid && protocolError.isEmpty()
-            && store->commitObservation(source, proposal, &reason, history);
+            && store->commitObservation(source, proposal, &reason, history, &conflict);
         if (!committed) {
             const bool rejected = reason == "invalid_change" || reason == "invalid_proposal";
             store->deferObservation(source, reason, rejected);
@@ -1003,7 +1035,7 @@ void LLMService::proposeObservation(const QJsonObject &job, const QJsonArray &hi
             {{"outcome",committed ? proposal["outcome"].toString() : reason},
              {"finish_reason",finish},{"usage",response["usage"]},
              {"network_error",int(reply->error())},{"elapsed_ms",timer.elapsed()},
-             {"base_matters",QJsonArray::fromStringList(candidates)}});
+             {"base_conflict",conflict},{"base_matters",QJsonArray::fromStringList(candidates)}});
         qInfo() << "[Cognition] response source=" << source << "finish_reason=" << finish << "usage=" << response["usage"];
         qInfo() << "[Cognition] finish run=" << run << "source=" << source
                 << "outcome=" << (committed ? proposal["outcome"].toString() : reason)
@@ -1533,7 +1565,7 @@ void LLMService::onMemoryAgentFinished(const MemoryAgentResult &result)
         return;
     }
     const QJsonObject agentMessage =
-        PromptAssembler::buildAgentDataMessage(m_run.meta, result);
+        PromptAssembler::buildAgentDataMessage(m_run.meta, result, &m_run.evidence);
     sendPendingReply(agentMessage,
                      result.status == QStringLiteral("timeout")
                          || result.status == QStringLiteral("partial")
@@ -1733,6 +1765,7 @@ void LLMService::handleNativeToolCalls(const QJsonObject &message,
                           : m_recallTool->execute(arguments, &toolError);
         }
 
+        registerToolEvidence(payload);
         QJsonObject toolMessage;
         toolMessage["role"] = "tool";
         toolMessage["tool_call_id"] = callId;
@@ -1798,6 +1831,7 @@ void LLMService::handleEnvelopeRecall(const QJsonObject &content)
     MemoryRecallTool tool(m_memoryManager, m_toolScope);
     QString toolError;
     const QJsonObject payload = tool.execute(planObject, &toolError);
+    registerToolEvidence(payload);
     QJsonObject dataMessage;
     dataMessage["role"] = "user";
     dataMessage["content"] =
@@ -1883,6 +1917,23 @@ QJsonObject LLMService::readConsultedMatters() const
 void LLMService::generateWithMatters(const QJsonObject &records)
 {
     m_run.consultedRecords = records;
+    m_run.evidence = m_run.beforeConsultation;
+    for (const auto &key : m_run.consultedKeys) {
+        const QString number = QString::number(m_run.catalogKeys.indexOf(key)+1);
+        const auto row = records[number].toObject();
+        const auto ref = "ref:" + number;
+        if (row.isEmpty()) {
+            m_run.evidence.remove(ref);
+            continue;
+        }
+        QJsonObject metadata{{"scope","consulted_revision"},{"matter",key},{"source",row["evidence_ref"]},
+                             {"version",row["revision"]},{"visible_fields",QJsonArray::fromStringList(row.keys())}};
+        m_run.evidence.insert(ref,metadata);
+        for (const auto &revision : row["evidence_chain"].toArray()) {
+            const auto source = revision.toObject()["evidence_ref"].toString();
+            if (!source.isEmpty()) m_run.evidence.insert(source,QJsonObject{{"scope","source_revision"},{"matter",key}});
+        }
+    }
     auto messages = m_run.consultationMessages;
     messages.append(QJsonObject{{"role","system"},{"content",QStringLiteral(
         "已核对事项。下条消息替代此前同编号事项的状态与证据，是当前听众可用的只读资料，缺失编号表示依据已不可用。结合当前输入直接作交谈决定。")}});
@@ -1910,6 +1961,16 @@ bool LLMService::refreshConsultation()
     return true;
 }
 
+void LLMService::registerToolEvidence(const QJsonObject &payload)
+{
+    for (const auto &value : payload["items"].toArray()) {
+        const auto item = value.toObject();
+        const auto id = item["id"].toString();
+        if (!id.isEmpty()) m_run.evidence.insert(id,QJsonObject{{"scope","tool_item"},{"kind",item["kind"]},
+            {"time",item["time"]},{"coverage",payload["status"]}});
+    }
+}
+
 bool LLMService::consultMatters(const QJsonObject &decision)
 {
     if (decision["action"].toString() != "consult") return false;
@@ -1927,6 +1988,7 @@ bool LLMService::consultMatters(const QJsonObject &decision)
         const auto &key = m_run.catalogKeys.at(number - 1);
         if (!m_run.consultedKeys.contains(key)) m_run.consultedKeys.append(key);
     }
+    m_run.beforeConsultation = m_run.evidence;
     m_run.consultationUsed = true;
     m_run.consultationMessages = m_lastRequestMessages;
     m_memoryToolActive = false;
@@ -1993,34 +2055,15 @@ void LLMService::onReplyFinished(QNetworkReply *reply)
                 audit["event_id"] = m_run.meta.eventId;
                 audit["report_status"] = decision["evidence_decision"].toObject().isEmpty() ? "missing" : "model_reported";
                 audit["answer_action"] = decision["conversation_action"].toString("reply");
-                QStringList available;
-                std::function<void(const QJsonValue &)> collect = [&](const QJsonValue &value) {
-                    if (value.isArray()) {
-                        for (const auto &item : value.toArray()) collect(item);
-                    } else if (value.isObject()) {
-                        const auto object = value.toObject();
-                        const auto ref = object["evidence_ref"].toString();
-                        if (!ref.isEmpty()) available.append(ref);
-                        if (object["turn"].isDouble()) available.append(QString("chat/%1").arg(object["turn"].toInteger()));
-                        for (const auto &item : object) collect(item);
-                    }
-                };
-                for (const auto &message : m_lastRequestMessages) {
-                    const auto text = message.toObject()["content"].toString();
-                    const auto start = text.indexOf('[');
-                    const auto objectStart = text.indexOf('{');
-                    int offset = start < 0 ? objectStart : objectStart < 0 ? start : qMin(start,objectStart);
-                    if (offset >= 0) {
-                        const auto document = QJsonDocument::fromJson(text.mid(offset).toUtf8());
-                        if (document.isArray()) collect(document.array());
-                        else collect(document.object());
-                    }
-                }
-                for (const auto &key : m_run.consultedKeys)
-                    available.append(QString("ref:%1").arg(m_run.catalogKeys.indexOf(key)+1));
                 QJsonArray unknown;
-                for (const auto &ref : audit["used_evidence"].toArray())
-                    if (!available.contains(ref.toString())) unknown.append(ref);
+                QJsonObject cited;
+                for (const auto &value : audit["used_evidence"].toArray()) {
+                    const auto ref = value.toString();
+                    if (m_run.evidence.contains(ref)) cited.insert(ref,m_run.evidence.value(ref));
+                    else unknown.append(value);
+                }
+                audit["provided_evidence"] = m_run.evidence;
+                audit["cited_evidence"] = cited;
                 audit["unknown_evidence_refs"] = unknown;
                 audit["validation"] = unknown.isEmpty() ? "reference_check_passed_semantics_model_reported" : "unknown_references";
                 if (!unknown.isEmpty()) audit["evidence_status"] = "unverified";
@@ -2127,6 +2170,9 @@ QString LLMService::loadSystemPrompt()
     QTextStream in(&file);
     in.setEncoding(QStringConverter::Utf8);
     QString content = in.readAll();
+    // Adapt the stock v13-and-earlier instruction in existing installations.
+    content.remove(QStringLiteral("6. 即使当前没有特别想说的，也必须输出至少一个句子"));
+
     return content;
 }
 

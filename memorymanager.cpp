@@ -459,6 +459,7 @@ QJsonArray MemoryManager::currentUnderstanding(const RequestMeta &audience, cons
                 record["understanding"] = query.value(8).toString();
                 record["status"] = query.value(6).toString();
                 record["source_kind"] = query.value(7).toString();
+                record["revision"] = query.value(5).toLongLong();
                 record["evidence_ref"] = QString("source/%1").arg(query.value(9).toLongLong());
                 record["event_time_expression"] = query.value(11).toString();
                 record["interpretation_recorded_at"] = query.value(12).toString();
@@ -493,7 +494,7 @@ QList<HistoryTurn> MemoryManager::getHistoryTurn(int N, const QString &channel, 
 
     QSqlQuery query(m_db);
     QString sql = R"(
-        SELECT user_input, raw_reply, timestamp, turn_kind, subject, speaker
+        SELECT id, user_input, raw_reply, timestamp, turn_kind, subject, speaker
         FROM (
             SELECT id, user_input, raw_reply, timestamp, turn_kind, subject, speaker
             FROM chat_history
@@ -512,6 +513,7 @@ QList<HistoryTurn> MemoryManager::getHistoryTurn(int N, const QString &channel, 
     }
     while(query.next()){
         HistoryTurn turn;
+        turn.id = query.value("id").toLongLong();
         turn.userInput = query.value("user_input").toString();
         turn.rawReply = query.value("raw_reply").toString();
         turn.timestamp = query.value("timestamp").toDateTime();

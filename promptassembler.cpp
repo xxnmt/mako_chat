@@ -119,6 +119,7 @@ QJsonArray buildMemoryItems(const RequestMeta &meta,
         }
         QJsonObject item;
         item["kind"] = "profile";
+        if (profile.id > 0) item["evidence_ref"] = QString("profile/%1").arg(profile.id);
         item["subject"] = profile.subject;
         item["key"] = profile.key;
         item["value"] = profile.value;
@@ -131,6 +132,7 @@ QJsonArray buildMemoryItems(const RequestMeta &meta,
         }
         QJsonObject item;
         item["kind"] = "episodic";
+        if (memory.id > 0) item["evidence_ref"] = QString("episodic/%1").arg(memory.id);
         item["time"] = memory.eventTime.toString("yyyy-MM-dd HH:mm:ss");
         item["type"] = memory.type;
         item["status"] = memory.status;
@@ -141,6 +143,7 @@ QJsonArray buildMemoryItems(const RequestMeta &meta,
     for (const InteractionSummary &summary : context.interactionSummaries) {
         QJsonObject item;
         item["kind"] = "interaction_summary";
+        if (summary.id > 0) item["evidence_ref"] = QString("interaction_summary/%1").arg(summary.id);
         item["time"] = summary.endedAt.toString("yyyy-MM-dd HH:mm:ss");
         QString rendered = summary.summaryText;
         if (summary.summaryFormat == QStringLiteral("person_refs")
@@ -173,6 +176,7 @@ QJsonArray buildMemoryItems(const RequestMeta &meta,
     for (const MemoryClaim &claim : context.claims) {
         QJsonObject item;
         item["kind"] = "claim";
+        if (claim.id > 0) item["evidence_ref"] = QString("claim/%1").arg(claim.id);
         item["text"] = claim.statement;
         if (claim.validTimeStart.isValid()) {
             item["time"] = claim.validTimeStart.toString("yyyy-MM-dd HH:mm:ss");
@@ -183,6 +187,7 @@ QJsonArray buildMemoryItems(const RequestMeta &meta,
     for (const LongTermSummary &summary : context.summaries) {
         QJsonObject item;
         item["kind"] = "summary";
+        if (summary.id > 0) item["evidence_ref"] = QString("summary/%1").arg(summary.id);
         item["text"] = summary.summaryText;
         items.append(item);
     }
@@ -191,6 +196,7 @@ QJsonArray buildMemoryItems(const RequestMeta &meta,
         for (const RelationshipState &relationship : context.relationships) {
             QJsonObject item;
             item["kind"] = "relationship";
+            item["evidence_ref"] = "relationship/" + relationship.subject + "/" + relationship.dimension;
             item["dimension"] = relationship.dimension;
             item["value"] = relationship.value;
             items.append(item);
@@ -250,7 +256,7 @@ QString PromptAssembler::buildSystemPrompt(const QString &basePrompt,
 }
 
 QJsonObject PromptAssembler::buildMemoryDataMessage(const RequestMeta &meta,
-                                                     const MemoryContext &context)
+                                                     const MemoryContext &context, QJsonObject *evidence)
 {
     const QJsonArray items = buildMemoryItems(meta, context);
     if (items.isEmpty()) {
@@ -259,6 +265,13 @@ QJsonObject PromptAssembler::buildMemoryDataMessage(const RequestMeta &meta,
 
     QJsonObject payload;
     payload["items"] = items;
+    if (evidence) {
+        for (const auto &value : items) {
+            const auto item = value.toObject();
+            const auto ref = item["evidence_ref"].toString();
+            if (!ref.isEmpty()) evidence->insert(ref,QJsonObject{{"scope","derived_memory"},{"kind",item["kind"]}});
+        }
+    }
     const QString json = QString::fromUtf8(
         QJsonDocument(payload).toJson(QJsonDocument::Compact));
 
@@ -273,7 +286,7 @@ QJsonObject PromptAssembler::buildMemoryDataMessage(const RequestMeta &meta,
 
 QJsonObject PromptAssembler::buildRecentContextMessage(
     const RequestMeta &meta,
-    const RecentContextBundle &bundle)
+    const RecentContextBundle &bundle, QJsonObject *evidence)
 {
     Q_UNUSED(meta);
     if (bundle.items.isEmpty()) {
@@ -284,6 +297,11 @@ QJsonObject PromptAssembler::buildRecentContextMessage(
     for (const RecentContextItem &item : bundle.items) {
         QJsonObject json;
         json["kind"] = "recent_group_message";
+        if (item.rawEventId > 0) {
+            const auto ref = QString("raw/%1").arg(item.rawEventId);
+            json["evidence_ref"] = ref;
+            if (evidence) evidence->insert(ref,QJsonObject{{"scope","group_message"},{"is_viewer",item.isViewer}});
+        }
         json["group"] = item.sourceGroupId;
         json["time"] = item.occurredAt.toString("yyyy-MM-dd HH:mm:ss");
         json["person_id"] = item.personId;
@@ -315,10 +333,17 @@ QJsonObject PromptAssembler::buildRecentContextMessage(
 
 QJsonObject PromptAssembler::buildAgentDataMessage(
     const RequestMeta &meta,
-    const MemoryAgentResult &result)
+    const MemoryAgentResult &result, QJsonObject *evidence)
 {
     Q_UNUSED(meta);
     QJsonObject payload = memoryAgentResultToJson(result);
+    if (evidence) {
+        for (const auto &value : payload["items"].toArray()) {
+            const auto item = value.toObject();
+            const auto id = item["id"].toString();
+            if (!id.isEmpty()) evidence->insert(id,QJsonObject{{"scope","tool_item"},{"kind",item["kind"]},{"coverage",payload["status"]}});
+        }
+    }
     if (payload.value(QStringLiteral("items")).toArray().isEmpty()
         && payload.value(QStringLiteral("needs")).toArray().isEmpty()) {
         return QJsonObject();
@@ -396,7 +421,7 @@ QString PromptAssembler::buildViewerIdentityBlock(
 }
 
 QJsonArray PromptAssembler::buildHistoryMessages(const QList<HistoryTurn> &history,
-                                                 const RequestMeta &meta)
+                                                 const RequestMeta &meta, QJsonObject *evidence)
 {
     QJsonArray messages;
     if (history.isEmpty()) {
@@ -433,6 +458,11 @@ QJsonArray PromptAssembler::buildHistoryMessages(const QList<HistoryTurn> &histo
                 userMessage["name"] = QString("用户 [%1]").arg(timestampLabel(turn.timestamp));
                 userMessage["content"] = QString("[发言时间 %1]\n%2").arg(timestampLabel(turn.timestamp), turn.userInput);
             }
+            if (turn.id > 0) {
+                const auto ref = QString("chat/%1").arg(turn.id);
+                userMessage["name"] = userMessage["name"].toString() + " " + ref;
+                if (evidence) evidence->insert(ref,QJsonObject{{"scope","historical_report"}});
+            }
             messages.append(userMessage);
         }
 
@@ -444,6 +474,11 @@ QJsonArray PromptAssembler::buildHistoryMessages(const QList<HistoryTurn> &histo
         const auto replyText = extractReplyText(turn.rawReply);
         if (!replyText.isEmpty()) {
             makoMessage["content"] = replyText;
+            if (turn.id > 0) {
+                const auto ref = QString("reply/%1").arg(turn.id);
+                makoMessage["name"] = makoMessage["name"].toString() + " " + ref;
+                if (evidence) evidence->insert(ref,QJsonObject{{"scope","prior_assistant_expression"}});
+            }
             messages.append(makoMessage);
         }
     }

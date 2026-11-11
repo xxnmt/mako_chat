@@ -312,7 +312,12 @@ private slots:
         QVERIFY(db.enqueueObservation(meta,"课可能延期"));
         QVERIFY(db.saveQATurn("课可能延期","{}",{},meta));
         const auto source = db.pendingObservation()["source"].toInteger();
-        QVERIFY(!db.commitObservation(source,proposal({revise})));
+        QJsonObject conflict;
+        QVERIFY(!db.commitObservation(source,proposal({revise}),nullptr,{},&conflict));
+        QCOMPARE(conflict["matter"],head["matter"]);
+        QCOMPARE(conflict["expected_version"].toInteger(),0);
+        QCOMPARE(conflict["actual_version"].toInteger(),1);
+        QCOMPARE(conflict["reason"].toString(),QString("version_mismatch"));
         revise["version"] = 1;
         QVERIFY(db.commitObservation(source,proposal({revise})));
         const auto heads = db.matterHeads(meta.subject);

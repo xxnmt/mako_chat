@@ -1,4 +1,5 @@
 #include <QtTest>
+#include <QSqlQuery>
 #include <QJsonDocument>
 #include <QFile>
 #include <QSignalSpy>
@@ -185,7 +186,7 @@ private slots:
     void conversationDecision_data()
     {
         QTest::addColumn<QString>("scenario");
-        for (const auto *name : {"direct_pending", "consult", "related", "unrelated", "churn", "quiet", "invalid_ref"})
+        for (const auto *name : {"direct_pending", "index_ref", "consult", "related", "unrelated", "churn", "quiet", "invalid_ref"})
             QTest::newRow(name) << QString(name);
     }
 
@@ -215,6 +216,7 @@ private slots:
         bool updatesOk = true;
         serveCompletions(server, bodies, [&](int count) -> QString {
             if (count == 1) {
+                if (scenario == "index_ref") return R"({"evidence_decision":{"used_evidence":["ref:1","ref:999"]},"sentences":[{"zh_text":"好呀","ja_text":"いいよ","tags":{"emotion":"happy"}}]})";
                 if (scenario == "quiet") return R"({"conversation_action":"defer","sentences":[]})";
                 if (scenario == "invalid_ref") return R"({"action":"consult","refs":[100]})";
                 if (scenario != "direct_pending") return R"({"action":"consult","refs":[1]})";
@@ -233,6 +235,16 @@ private slots:
         service.askDeepSeek("继续吗",{},meta);
         QTRY_COMPARE_WITH_TIMEOUT(spoken.size()+quiet.size()+failed.size(),1,5000);
         QVERIFY(updatesOk);
+        if (scenario == "index_ref") {
+            QCOMPARE(spoken.size(),1);
+            QSqlQuery audit(QSqlDatabase::database("memory_db_connection"));
+            QVERIFY(audit.exec("SELECT data FROM cognitive_audit WHERE kind='answer_decision'"));
+            QVERIFY(audit.next());
+            const auto decision = QJsonDocument::fromJson(audit.value(0).toByteArray()).object();
+            QCOMPARE(decision["unknown_evidence_refs"].toArray(), QJsonArray{"ref:999"});
+            QCOMPARE(decision["cited_evidence"].toObject()["ref:1"].toObject()["scope"].toString(),QString("index"));
+            return;
+        }
         if (scenario == "quiet") {
             QCOMPARE(quiet.size(),1);
             QCOMPARE(bodies.size(),1);

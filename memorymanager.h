@@ -58,7 +58,7 @@ public:
     QJsonObject pendingObservation(qint64 source = 0) const;
     QJsonArray matterHeads(const QString &subject, const QStringList &terms = {}) const;
     bool commitObservation(qint64 source, const QJsonObject &proposal, QString *failure = nullptr,
-                           const QJsonArray &historyEvidence = {});
+                           const QJsonArray &historyEvidence = {}, QJsonObject *conflict = nullptr);
     QJsonArray historicalReports(const QString &subject, const QString &channel, const QString &session,
                                  const QString &before, const QStringList &terms, bool forRevision) const;
     void deferObservation(qint64 source, const QString &reason, bool rejected = false);

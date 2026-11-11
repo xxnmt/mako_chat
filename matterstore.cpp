@@ -118,8 +118,9 @@ void MemoryManager::deferObservation(qint64 source, const QString &reason, bool 
 }
 
 bool MemoryManager::commitObservation(qint64 source, const QJsonObject &proposal, QString *failure,
-                                      const QJsonArray &historyEvidence)
+                                      const QJsonArray &historyEvidence, QJsonObject *conflict)
 {
+    if (conflict) *conflict = {};
     if (failure) *failure = QStringLiteral("invalid_proposal");
     const QString outcome = proposal["outcome"].toString();
     const auto changes = proposal["changes"].toArray();
@@ -170,9 +171,18 @@ bool MemoryManager::commitObservation(qint64 source, const QJsonObject &proposal
                       "WHERE r.matter=? ORDER BY version DESC LIMIT 1");
             q.addBindValue(matter);
             if (!q.exec()) return abort("storage_error");
-            if (!q.next() || q.value(0).toLongLong()!=version
-                || q.value(1).toString()!=subject || q.value(2).toLongLong()>=source)
+            const bool found = q.next();
+            QString mismatch;
+            if (!found) mismatch = "missing_matter";
+            else if (q.value(1).toString()!=subject) mismatch = "subject_mismatch";
+            else if (q.value(0).toLongLong()!=version) mismatch = "version_mismatch";
+            else if (q.value(2).toLongLong()>=source) mismatch = "source_order";
+            if (!mismatch.isEmpty()) {
+                if (conflict) *conflict = {{"change_index",i},{"matter",matter},{"expected_version",version},
+                    {"actual_version",found ? QJsonValue(q.value(0).toLongLong()) : QJsonValue::Null},
+                    {"reason",mismatch}};
                 return abort("base_mismatch");
+            }
             q.finish();
         }
         q.prepare("INSERT INTO matter_revision(matter,version,source,topic,status,quote,kind,event_time,understanding) "

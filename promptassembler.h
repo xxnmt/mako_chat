@@ -38,15 +38,15 @@ public:
     // 检索到的记忆（档案/情景/摘要/关系）作为独立不可信数据消息。
     // 无可披露内容时返回空对象。
     static QJsonObject buildMemoryDataMessage(const RequestMeta &meta,
-                                               const MemoryContext &context);
+                                               const MemoryContext &context, QJsonObject *evidence = nullptr);
 
     // PR-2.1：近期原始群消息作为独立不可信数据消息。
     static QJsonObject buildRecentContextMessage(const RequestMeta &meta,
-                                                 const RecentContextBundle &bundle);
+                                                 const RecentContextBundle &bundle, QJsonObject *evidence = nullptr);
 
     // PR-4：MemoryAgent 只读检索结果作为独立不可信数据消息。
     static QJsonObject buildAgentDataMessage(const RequestMeta &meta,
-                                             const MemoryAgentResult &result);
+                                             const MemoryAgentResult &result, QJsonObject *evidence = nullptr);
 
     // PR-2.2：当前用户身份与群昵称别名（可信 system 信息）。
     static QString buildViewerIdentityBlock(const RequestMeta &meta,
@@ -55,7 +55,7 @@ public:
 
     // 短期记忆 messages（含 history note；proactive/perception 不生成空 user 消息）
     static QJsonArray buildHistoryMessages(const QList<HistoryTurn> &history,
-                                           const RequestMeta &meta);
+                                           const RequestMeta &meta, QJsonObject *evidence = nullptr);
 
     // 可见性规则
     static bool isEpisodicVisible(const EpisodicMemory &memory, const RequestMeta &meta);
