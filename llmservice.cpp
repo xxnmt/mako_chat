@@ -251,15 +251,46 @@ void LLMService::considerEvidence(const QJsonArray &background, const QJsonArray
     request.setHeader(QNetworkRequest::ContentTypeHeader,"application/json");
     request.setRawHeader("Authorization",("Bearer "+m_apiKey).toUtf8());
     QJsonObject body{{"model","deepseek-v4-flash"},{"messages",messages},{"reasoning_effort","low"},
-                     {"response_format",QJsonObject{{"type","json_object"}}},{"max_tokens",1536}};
+                     {"response_format",QJsonObject{{"type","json_object"}}},
+                     {"max_tokens",m_run.projectionError=="truncated" ? 3072 : 1536}};
     auto *reply = m_extractManager->post(request,QJsonDocument(body).toJson(QJsonDocument::Compact));
     connect(reply,&QNetworkReply::finished,this,[this,reply,background,personal,matters,chain,generation=m_agentGeneration] {
         reply->deleteLater();
         if (generation != m_agentGeneration) return;
-        const auto choices = QJsonDocument::fromJson(reply->readAll()).object()["choices"].toArray();
-        const auto plan = choices.isEmpty() || reply->error()!=QNetworkReply::NoError ? QJsonObject{} :
-            QJsonDocument::fromJson(choices.first().toObject()["message"].toObject()["content"].toString().toUtf8()).object();
+        QJsonParseError envelopeError;
+        const auto envelope = QJsonDocument::fromJson(reply->readAll(), &envelopeError).object();
+        const auto choices = envelope["choices"].toArray();
+        const auto choice = choices.isEmpty() ? QJsonObject{} : choices.first().toObject();
+        const auto finish = choice["finish_reason"].toString();
+        const auto content = choice["message"].toObject()["content"].toString().trimmed();
+        QJsonParseError contentError;
+        const auto plan = QJsonDocument::fromJson(content.toUtf8(), &contentError).object();
         const auto decision = plan["decision"].toString();
+        static const QSet<QString> decisions{"normal","skip_old_concern","clarify","private_only","consult","respond"};
+        const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        QString failure;
+        if (reply->error()!=QNetworkReply::NoError) failure = status>=400 ? "http_error" : "network_error";
+        else if (envelopeError.error!=QJsonParseError::NoError) failure = "invalid_envelope";
+        else if (choices.isEmpty()) failure = "missing_choices";
+        else if (finish=="length") failure = "truncated";
+        else if (finish=="content_filter") failure = "content_filtered";
+        else if (content.isEmpty()) failure = "empty_content";
+        else if (contentError.error!=QJsonParseError::NoError) failure = "invalid_json";
+        else if (decision.isEmpty()) failure = "missing_decision";
+        else if (!decisions.contains(decision)) failure = "unknown_decision";
+        if (!failure.isEmpty()) {
+            const bool retry = m_run.projectionError.isEmpty() && failure!="content_filtered"
+                && (status<400 || status==408 || status==429 || status>=500);
+            if (m_run.meta.persistTurn && !m_run.meta.sensitive && m_memoryManager)
+                m_memoryManager->recordCognitiveAudit("expression_failure",m_run.meta.runId,0,
+                    {{"reason",failure},{"http_status",status},{"network_error",int(reply->error())},
+                     {"finish_reason",finish},{"usage",envelope["usage"]},{"retry",retry}});
+            if (retry) {
+                m_run.projectionError = failure;
+                considerEvidence(background,personal,matters,chain);
+            } else emit replyAbnormal("expression_"+failure);
+            return;
+        }
         const auto refs = plan["refs"].toArray();
         QStringList keys;
         bool valid = !refs.isEmpty() && refs.size()<=4;
@@ -328,11 +359,16 @@ void LLMService::considerEvidence(const QJsonArray &background, const QJsonArray
             m_run.expression = {};
             m_run.expressionBases = {};
             selected = {};
-            if (m_run.projectionError.isEmpty() && !chain.isEmpty()) {
+            if (m_run.projectionError.isEmpty()) {
                 m_run.projectionError = rejection;
                 considerEvidence(background,personal,matters,chain);
                 return;
             }
+            if (m_run.meta.persistTurn && !m_run.meta.sensitive && m_memoryManager)
+                m_memoryManager->recordCognitiveAudit("expression_failure",m_run.meta.runId,0,
+                    {{"reason",rejection},{"retry",false}});
+            emit replyAbnormal("expression_"+rejection);
+            return;
         }
         if (decision=="private_only") guidance = QStringLiteral("交谈决定：把这个话题留到私下。自然、简短地提议私下聊；无需解释原因、复述事实或询问细节。");
         else if (decision=="clarify") guidance = QStringLiteral("当前情况不确定，如确有需要，只就眼前话题自然询问。");

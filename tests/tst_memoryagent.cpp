@@ -428,7 +428,8 @@ private slots:
         QVERIFY(server.listen(QHostAddress::LocalHost));
         QList<QByteArray> bodies;
         serveCompletions(server,bodies,[](int count) -> QString {
-            if (count<3) return R"({"decision":"respond","intent":"self_recall","disclosure":"ordinary_self_report","certainty":"reported","refs":[1],"evidence_versions":{"1":1},"reference_status":"plausible","excerpts":{"1":"陶艺课取消了"}})";
+            if (count==1 || count>4) return QStringLiteral("{}");
+            if (count<4) return R"({"decision":"respond","intent":"self_recall","disclosure":"ordinary_self_report","certainty":"reported","refs":[1],"evidence_versions":{"1":1},"reference_status":"plausible","excerpts":{"1":"陶艺课取消了"}})";
             return R"({"sentences":[{"zh_text":"记得，你说课取消了。","ja_text":"そうだね","tags":{"emotion":"happy"}}]})";
         });
         LLMService model("test",nullptr,QUrl(QString("http://127.0.0.1:%1/").arg(server.serverPort())));
@@ -441,13 +442,21 @@ private slots:
         QSignalSpy spoken(&model,&LLMService::sentencesReady);
         model.askDeepSeek("还记得我那个安排后来怎么样了吗",{},group);
         QTRY_COMPARE_WITH_TIMEOUT(spoken.count(),1,5000);
-        QCOMPARE(bodies.size(),3);
-        QVERIFY(bodies.at(1).contains(original.toUtf8()));
+        QCOMPARE(bodies.size(),4);
+        QVERIFY(bodies.at(1).contains("missing_decision"));
+        QVERIFY(bodies.at(2).contains(original.toUtf8()));
         QVERIFY(bodies.last().contains("context/1"));
         QVERIFY(!bodies.last().contains(QStringLiteral("课程已经取消").toUtf8()));
         QVERIFY(bodies.last().contains(QStringLiteral("陶艺课取消了").toUtf8()));
         QVERIFY(bodies.last().contains("answer_and_confirm"));
         QVERIFY(!bodies.last().contains(original.toUtf8()));
+        QSignalSpy interrupted(&model,&LLMService::replyAbnormal);
+        group.runId = group.eventId = "invalid-repeat";
+        model.askDeepSeek("再想想",{},group);
+        QTRY_COMPARE_WITH_TIMEOUT(interrupted.size(),1,5000);
+        QCOMPARE(interrupted.first().first().toString(),QString("expression_missing_decision"));
+        QCOMPARE(bodies.size(),6);
+        QCOMPARE(spoken.size(),1);
         group.subject = "qq:other";
         QVERIFY(db.internalMatters(group,{}).isEmpty());
     }
