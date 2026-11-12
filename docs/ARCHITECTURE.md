@@ -1,6 +1,9 @@
 # 架构与当前实现
 
-> 更新于 2026-11-11，覆盖 v14 的运行路径和前台证据登记。后续任务见 [开发路线图](ROADMAP.md)。入口见 [文档索引](README.md)。
+> 更新于 2026-11-12，覆盖 v14 的运行路径和前台证据登记。
+> 先读 [当前状态](STATUS.md)；后续任务见 [开发路线图](ROADMAP.md)；入口见 [文档索引](README.md)。
+> 本文只描述当前实现。文中 PR/R3 编号是历史工作包，不代表当前路线图。
+> 当前实现一句话：v14 证据契约 + 两阶段生成（私下判断/公开表达）+ `memory_recall` 工具 + 跨渠道 `personalEvidence` / `currentUnderstanding`。
 
 ## 组件与职责
 
@@ -123,7 +126,7 @@ CURRENT_UNDERSTANDING 提供本轮可见事项目录。模型需要核对现状�
 
 认识保留 quote、source_kind、reported_at、event_time_expression 和 interpretation_recorded_at，并提供 source/N 编号。effective_at 无法证明时为 null。发言时间、事件时间和认识生效时间分别解释，事件时间原文继续保留。consult 最多返回每事项八条可见修订，群聊原文链限定本群。短期用户发言在正文中注明发言时间。旧助手回复只证明曾经发生过该表达。
 
-前台 evidence_decision 报告 question、question_type、used_evidence、evidence_status、basis、unresolved_conflicts 和 consult_required。具体事实可由明确的直接证据支持，最新决定需关注后续修订，范围概览需覆盖，未命中不足以支持不存在断言。partial 仅描述检索覆盖。basis 只保存简短证据依据。
+前台 evidence_decision 报告 question、question_type、used_evidence、evidence_status、basis、unresolved_conflicts 和 consult_required。具体事实可由明确的直接证据支持，最新决定需关注后续修订，范围概览需覆盖，未命中不足以支持不存在断言。partial 表示检索覆盖、时间精度或截断等不完全；需结合逐项状态解释。basis 只保存简短证据依据。
 
 cognitive_audit 将决策标记为 model_reported 或 missing，并记录来源编号检查结果。编号检查通过表明引用来自提供的资料或已核对事项，语义充分性仍属模型报告。未知编号记录 unknown_references 和 unverified。模型省略审计字段时记录 missing，避免补造理由。
 

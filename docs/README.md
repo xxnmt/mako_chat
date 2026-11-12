@@ -1,23 +1,49 @@
 # 文档索引
 
-> 更新于 2026-11-11。每个主题保留一个主要维护入口。
+> 更新：2026-11-12。**先读 [当前状态](STATUS.md)**；本文只负责“去哪找”。
+
+## 阅读顺序
+
+1. [当前状态](STATUS.md) — 现在在哪、下一步做什么。
+2. [开发路线图](ROADMAP.md) — 能力清单、阶段 A/B、B1–B5、验收。
+3. [架构与当前实现](ARCHITECTURE.md) — 当前组件、数据流、v14、已知限制。
+4. [配置参考](CONFIG_REFERENCE.md) / [记忆检索接口](MEMORY_RECALL_TOOL.md) / [语音参考](GPT_SOVITS_REFERENCE.md) — 按需查。
+5. [开发历史](HISTORY.md) / [R3 历史基线](MEMORY_V5_R3_BASELINE.md) — 只用于追溯，不要当当前实现。
+
+## 文档地图
 
 | 要了解的内容 | 文档 |
 |---|---|
-| 安装、构建、操作和常见问题 | [项目 README](../README.md) |
-| 当前组件、记忆路径、v14、真实验证与限制 | [架构与当前实现](ARCHITECTURE.md) |
-| 愿景校准、下一阶段 A/B、认知内核任务与验收 | [开发路线图](ROADMAP.md) |
-| setting.json、identity.json 与配置默认值 | [配置参考](CONFIG_REFERENCE.md) |
-| memory_recall/read、时间框架、状态与概览 | [记忆检索接口](MEMORY_RECALL_TOOL.md) |
-| 既有 R3 入站、留存、授权和成员关系契约 | [R3 历史基线](MEMORY_V5_R3_BASELINE.md) |
-| GPT-SoVITS HTTP 与备选模块调用参考 | [语音参考](GPT_SOVITS_REFERENCE.md) |
-| 历史阶段、决策与文档合并去向 | [开发历史](HISTORY.md) |
+| 现在在哪、里程碑 M1–M4、下一步 | [当前状态](STATUS.md) |
+| 能力清单、阶段 A/B/C、B1–B5、验收 | [开发路线图](ROADMAP.md) |
+| 组件职责、正常对话路径、记忆与持久化、v14 | [架构与当前实现](ARCHITECTURE.md) |
+| `setting.json`、`identity.json` 与默认值 | [配置参考](CONFIG_REFERENCE.md) |
+| `memory_recall` / `memory_read`、时间框架、概览 | [记忆检索接口](MEMORY_RECALL_TOOL.md) |
+| R3 旧基线、PR 编号来源 | [R3 历史基线](MEMORY_V5_R3_BASELINE.md) |
+| GPT-SoVITS HTTP 与备选调用 | [语音参考](GPT_SOVITS_REFERENCE.md) |
+| 历史阶段、决策、文档合并去向 | [开发历史](HISTORY.md) |
+| 安装、构建、操作、常见问题 | [项目 README](../README.md) |
 
-架构文档记录源码现状，路线图记录待开发内容，配置默认值以 ConfigManager 源码核对。旧文档中的通过记录只适用于当时的版本；历史设计不能替代当前实现说明。
+## 编号约定
+
+这些编号是不同年代留下的，不要再混用：
+
+| 编号 | 含义 | 用在哪 |
+|---|---|---|
+| **M1–M4** | 里程碑：地基 / 跨渠道表达 / 生活引擎 / 外部世界 | 主入口，给人看 |
+| **任务 1–6** | 工程能力：回放、契约、提交、循环、表达、行动 | ROADMAP 的能力清单 |
+| **阶段 A/B/C** | 交付批次：跨渠道表达 / 连续生活 / 未定义 | ROADMAP 的交付顺序 |
+| **A1–A5 / B1–B5** | 阶段子项 | ROADMAP 的勾选项 |
+| **PR-n** | 旧 R3 施工单 | 只作历史，不再新增 |
+| **v14** | 数据库结构版本 | ARCHITECTURE / 配置 |
+
+当前状态：**M1 已完成，M2 进行中，M3 下一步，M4 以后**。旧 PR 的尾巴（PR-3.2b/3.2c、PR-5）并进 A5 和 B2/B5，不单开任务。
 
 ## 文档维护约定
 
+- 状态变化先改 [STATUS.md](STATUS.md)，再改 ROADMAP / ARCHITECTURE；不要各写一份“当前状态”。
 - 新增能力时更新对应主文档，避免另建一份完整架构或平行路线图。
-- 阶段完成与测试结果记入开发历史，标明日期、版本和验证层级。
-- 新文档与代码一样通过 Git 审查。本次新增文件会显示为未追踪，提交时应和删除旧文档的变更一起纳入。
-- 原先被 Git 忽略的四份本地记录已汇入 local/DEVELOPMENT_NOTES.md，继续保持忽略。构建目录和运行时 app_data 文档不作为仓库开发说明维护。
+- 阶段完成与测试结果记入 [HISTORY.md](HISTORY.md)，标明日期、版本和验证层级。
+- 历史文档只追加、不重写结论；过期内容在文首加“历史”横幅。
+- 新工作不再使用 PR 编号；需要追溯旧 R3 工作时才引用。
+- 新文档与代码一样通过 Git 审查；构建目录和运行时 `app_data` 不作为仓库开发说明维护。

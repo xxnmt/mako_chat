@@ -1,7 +1,8 @@
 # Memory Recall Tool：数据源、授权、概览与时间语义
 
-> 状态：PR-7A / PR-7B / PR-7C / PR-8 / PR-9 / PR-11 已实现；PR-10 legacy 保留为回滚
-> 关联：[ARCHITECTURE.md](ARCHITECTURE.md)、[CONFIG_REFERENCE.md](CONFIG_REFERENCE.md)
+> 接口参考；PR-7A / PR-7B / PR-7C / PR-8 / PR-9 / PR-11 是历史工作包，不代表当前路线图。
+> 当前状态见 [STATUS.md](STATUS.md)，当前实现见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+> 关联：[CONFIG_REFERENCE.md](CONFIG_REFERENCE.md)
 
 > 本文只负责既有 recall/read 工具契约。personalEvidence/currentUnderstanding 的内部证据准备路径见 [架构](ARCHITECTURE.md)，未来重构任务见 [路线图](ROADMAP.md)。
 
@@ -33,7 +34,7 @@
 | `long_term_summary` | `long_term_summary` |
 | `chat_history` | `chat_history` 原始对话 |
 
-为兼容 PR-6，`recent` / `summary` 作为旧别名继续接受；新调用使用新名称。
+为兼容旧调用，`recent` / `summary` 作为旧别名继续接受；新调用使用新名称。
 `profile` / `relationship` 继续 Inline，不进入检索。
 
 ## 3. 授权矩阵

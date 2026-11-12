@@ -217,7 +217,7 @@ app_data/config/identity.json
 | `group_memory_allow` | `[]` | 群号数组 | 允许进入群记忆的群 |
 | `group_memory_mode` | `{}` | map | 群号 → `strict_whitelist` / `group_authorized`；缺省 strict |
 | `group_sender_allowlist` | `{}` | map | 群号 → 允许“记录+回复”的成员 QQ 列表 |
-| `group_retention_days` | `30` | 1–3650 | 群记忆保留期；清理逻辑在 PR-5 接入 |
+| `group_retention_days` | `30` | 1–3650 | 群记忆保留期；清理逻辑尚未接入，见 [当前状态](STATUS.md) |
 | `membership_refresh_minutes` | `30` | 0–1440 | 成员快照刷新间隔；`0` 关闭定时刷新 |
 | `membership_max_age_minutes` | `1440` | 1–10080 | 快照超过该时长视为过期；跨群检索 fail closed |
 
