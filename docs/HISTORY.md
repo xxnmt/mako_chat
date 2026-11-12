@@ -15,6 +15,8 @@ Windows Debug 构建成功，15/15 个 CTest 套件通过。独立临时数据�
 
 2026-11-12 晚：`6a6a73d` 补上私下判断的空决定与解析失败分类（网络、空正文、非法 JSON、缺 decision、未知 decision 等），可恢复错误重试一次；第二次失败走 `expression_*` 技术中断，不再把内部失败说成“我忘了”。真实渠道复验仍归 A5。
 
+2026-11-12 晚（第二段）：接入 `self_report` 原话与 `attribution_check` 三层审计、`care` 按事项绑定、`Situation` 场景事实、`thought_result` 活动进度/暂停/恢复与 ID+版本条件操作、`draftReadyToShare` 分享前 guard、`proactive.private_writing` 与主动联系拆分。未新增数据库表；15/15 CTest 套件通过。真实群聊、私聊归属/收尾和跨重启活动仍待实际使用验收。
+
 ## 已有阶段
 
 | 阶段 | 形成的能力或决策 | 状态依据 |

@@ -53,6 +53,10 @@ public:
                                             const RecentContextBundle &recentContext,
                                             const QStringList &knownAliases = {});
 
+    // 当前场景事实：surface / speaker / audience / about / modality / privacy。
+    // 只提供事实，不要求不同渠道使用不同语气。
+    static QString buildSituationBlock(const RequestMeta &meta, bool voiceAvailable);
+
     // 短期记忆 messages（含 history note；proactive/perception 不生成空 user 消息）
     static QJsonArray buildHistoryMessages(const QList<HistoryTurn> &history,
                                            const RequestMeta &meta, QJsonObject *evidence = nullptr);

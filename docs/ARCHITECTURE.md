@@ -47,6 +47,14 @@ Pet 走语音合成和音频 sink，QQ 走文本发送。QQ 情绪可按配置�
 
 既有 R3 披露工具契约见 [R3 基线](MEMORY_V5_R3_BASELINE.md)，工具 JSON、状态和时间框架见 [检索接口](MEMORY_RECALL_TOOL.md)。R3 文档中的 v9 快照只描述当时路径，新增内部证据路径不能套用旧矩阵推断其全部行为。MemoryAccessState 定义四个枚举，当前 evaluate 实际返回 Shareable 或 Forbidden；KnownOnly/OwnerCandidate 不能据枚举定义视为完整实现。
 
+## 2026-11-12 归属、场景与文字活动
+
+- **承诺归属**：`currentUnderstanding` 为每个事项保留 `self_report`（最近一次本人原话、版本、`source/N`、`speaker_role=user`）。`prepareReply` 把 `self_report` 放进 `CURRENT_UNDERSTANDING` 目录；证据元数据补 `speaker_role` / `source_kind`。`attribution_check` 分三层：编号有效、说话人正确、语义是否蕴含（`semantic_review_required`，由验收样本判断）。
+- **关心收尾**：`considerEvidence` 可返回 `care` 数组（topic / user_response / care_action），只绑定用户实际回应的那件事；不把“上床”扩展成“已入睡/已洗澡/作息已调整”。无 `considerEvidence` 的普通私聊由 turn instruction 的通用规则兜底。
+- **场景事实**：`PromptAssembler::buildSituationBlock` 注入 surface / speaker / audience / about / modality / privacy。它只说明在哪里、对谁、能用什么形式，不要求不同渠道换一种说法；`about` 未确认时写 `unknown`，不把当前对话对象当成事情主体；pet 只有在 TTS 为 `api` 时才标 `voice+text`。
+- **文字活动**：复用 `chat_history.thought` + `thought_result`，不新增表。`finishThoughtReview` 支持 `paused` 与 `progress/next_step/paused_reason`；`applyThoughtAction(id, expectedVersion, action)` 条件更新并递增 `thought_version`，迟到写作回调因版本不匹配被丢弃。`draftReadyToShare(activityRef, version, draft)` 在发送前再次检查 `canShareThought`。
+- **开关拆分**：`proactive.private_writing` 控制后台写作/回顾，`proactive.enabled` 控制主动联系/分享；`quiet_hours` 只暂停后者。
+
 ## 实际验证与当前限制
 
 2026-11-08 本机启动日志确认记忆库从 v9 升至 v10、QQ 连接和成员快照成功。当天实际对话中，QQ 私聊的用餐安排曾被 Pet 正确召回；同一安排在 Pet 中被描述为可能改期后，QQ 仍回答原安排，追问调整也未找到更正。群聊曾出现 memory_recall 参数错误及零结果，最终回复把检索不足说成没有记住。因此当前版本应标为实验性连续性实现，尚未达到跨渠道认知一致的验收标准。

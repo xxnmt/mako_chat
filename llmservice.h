@@ -49,7 +49,7 @@ signals:
     //chat
     void sentencesReady(const QList<SentenceText> &sentences, const QString &rawReply,
                         const QString &userInput, const RequestMeta &meta);
-    void draftReadyToShare(const QString &draft);
+    void draftReadyToShare(const QString &activityRef, int version, const QString &draft);
     void internetErrorSignal(const QString &errorMessage);
     //chat 回复内容异常（空/乱码/缺中文/缺日文/缺标签），不入库不走TTS
     void replyAbnormal(const QString &reason);

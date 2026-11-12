@@ -61,6 +61,7 @@ private slots:
 
         QJsonObject proactive;
         proactive.insert("enabled", true);
+        proactive.insert("private_writing", true);
         proactive.insert("daily_limit", 5);
         proactive.insert("cooldown_seconds", 600);
         proactive.insert("idle_seconds", 900);
@@ -115,6 +116,7 @@ private slots:
     {
         const ProactiveConfig cfg = ConfigManager::instance().getProactiveConfig();
         QVERIFY(cfg.enabled);
+        QVERIFY(cfg.privateWriting);
         QCOMPARE(cfg.dailyLimit, 5);
         QCOMPARE(cfg.cooldownSeconds, 600);
         QCOMPARE(cfg.idleSeconds, 900);

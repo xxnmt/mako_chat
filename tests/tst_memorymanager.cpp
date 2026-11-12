@@ -478,6 +478,108 @@ private slots:
         QVERIFY(db.nextThought(false).isEmpty());
     }
 
+    void currentUnderstandingRetainsLatestSelfReport()
+    {
+        QTemporaryDir dir;
+        MemoryManager db(dir.filePath("self-report.db"));
+        RequestMeta meta;
+        meta.channel = Channel::kQQPrivate;
+        meta.sessionId = meta.actorId = "2014366825";
+        meta.eventId = "promise";
+
+        QVERIFY(db.enqueueObservation(meta, "我答应茉子，会努力调整作息"));
+        const auto firstSource = db.pendingObservation()["source"].toInteger();
+        const QJsonObject promise{{"matter",""},{"version",0},{"topic","作息"},
+            {"quote","我答应茉子，会努力调整作息"},{"status","confirmed"},
+            {"understanding","答应努力调整作息"},{"kind","self_report"}};
+        QVERIFY(db.commitObservation(firstSource,
+            QJsonObject{{"outcome","updated"},{"changes",QJsonArray{promise}}}));
+        const auto head = db.matterHeads("user").first().toObject();
+
+        meta.eventId = "followup";
+        QVERIFY(db.enqueueObservation(meta, "还记得我刚才答应你什么了吗"));
+        const auto secondSource = db.pendingObservation()["source"].toInteger();
+        const QJsonObject inference{{"matter",head["matter"]},{"version",head["version"]},
+            {"topic","作息"},{"quote","还记得我刚才答应你什么了吗"},
+            {"status","confirmed"},{"understanding","可能在追问之前的承诺"},
+            {"kind","inference"}};
+        QVERIFY(db.commitObservation(secondSource,
+            QJsonObject{{"outcome","updated"},{"changes",QJsonArray{inference}}}));
+
+        const auto records = db.currentUnderstanding(meta, "作息");
+        QVERIFY(!records.isEmpty());
+        const auto record = records.first().toObject();
+        QCOMPARE(record["source_kind"].toString(), QString("inference"));
+        const auto selfReport = record["self_report"].toObject();
+        QCOMPARE(selfReport["quote"].toString(), QString("我答应茉子，会努力调整作息"));
+        QCOMPARE(selfReport["version"].toInteger(), qint64(1));
+        QCOMPARE(selfReport["speaker_role"].toString(), QString("user"));
+        QVERIFY(selfReport["evidence_ref"].toString().startsWith("source/"));
+    }
+
+    void activityActionsRequireExpectedVersion()
+    {
+        QTemporaryDir dir;
+        const QString path = dir.filePath("activity.db");
+        {
+            MemoryManager db(path);
+            RequestMeta meta;
+            QVERIFY(db.saveQATurn("试试写诗", R"({"personal_interest":"想写雨声"})", {}, meta));
+            auto thought = db.nextThought(true);
+            const qlonglong id = thought["id"].toInteger();
+            const int version = thought["version"].toInt();
+            QVERIFY(id > 0);
+
+            QVERIFY(db.finishThoughtReview(id, version,
+                QJsonObject{{"status","active"},{"reflection","继续写"},
+                            {"progress","写了两句"},{"next_step","写第三句"},
+                            {"draft","屋檐轻响，雨在窗上停了一停。"},
+                            {"review_hours",24}}));
+            auto after = db.nextThought(false);
+            const int v2 = after["version"].toInt();
+            QCOMPARE(v2, version + 1);
+
+            QVERIFY(db.applyThoughtAction(id, v2, "pause"));
+            QVERIFY(db.nextThought(true).isEmpty());
+            QVERIFY(!db.canShareThought(id, v2 + 1));
+            QVERIFY(!db.finishThoughtReview(id, v2,
+                QJsonObject{{"status","active"},{"reflection","迟到的写作"}}));
+
+            QVERIFY(db.applyThoughtAction(id, v2 + 1, "resume"));
+            auto resumed = db.nextThought(true);
+            QCOMPARE(resumed["id"].toInteger(), id);
+            const int v3 = resumed["version"].toInt();
+
+            QVERIFY(db.applyThoughtAction(id, v3, "abandon"));
+            QVERIFY(!db.hasActiveThought("user"));
+            QVERIFY(db.nextThought(true).isEmpty());
+        }
+    }
+
+    void activityActionAppliesFromReply()
+    {
+        QTemporaryDir dir;
+        MemoryManager db(dir.filePath("activity-reply.db"));
+        RequestMeta meta;
+        meta.channel = Channel::kQQPrivate;
+        meta.sessionId = meta.actorId = "2014366825";
+        meta.eventId = "activity-a";
+        QVERIFY(db.saveQATurn("想写点东西", R"({"personal_interest":"写雨声"})", {}, meta));
+        auto thought = db.nextThought(true);
+        const qlonglong id = thought["id"].toInteger();
+        const int version = thought["version"].toInt();
+        QVERIFY(id > 0);
+        QVERIFY(db.applyThoughtAction(id, version, "pause"));
+
+        meta.eventId = "activity-b";
+        const QString reply = QStringLiteral(
+            R"({"activity_action":{"action":"resume","activity_ref":"thought/%1","expected_version":%2}})")
+            .arg(id).arg(version + 1);
+        QVERIFY(db.saveQATurn("继续写", reply, {}, meta));
+        auto resumed = db.nextThought(true);
+        QCOMPARE(resumed["id"].toInteger(), id);
+    }
+
     void legacyMigrationPreservesData()
     {
         QTemporaryDir dir;

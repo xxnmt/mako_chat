@@ -78,6 +78,12 @@ public:
     QJsonObject nextThought(bool dueOnly) const;
     bool claimThoughtReview(qlonglong id, int dailyLimit, int cooldownSeconds);
     bool finishThoughtReview(qlonglong id, int version, const QJsonObject &proposal);
+    // Activity actions are conditional on a stable row id and the expected
+    // thought_version, so a late review callback cannot revive a paused or
+    // abandoned activity.
+    bool applyThoughtAction(qlonglong id, int expectedVersion, const QString &action);
+    bool hasActiveThought(const QString &subject = QStringLiteral("user")) const;
+    bool canShareThought(qlonglong id, int expectedVersion) const;
 
 //历史对话crud
     QList<HistoryTurn> getHistoryTurn(int N, const QString &channel = Channel::kPet, const QString &sessionId = Channel::kDefaultSession, qint64 beforeTurn = 0);

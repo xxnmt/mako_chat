@@ -1,8 +1,8 @@
 # 配置参考：setting.json / identity.json
 
-> 源码基准：54a0be1（记忆库 v10 / R3 披露工具与连续性实验）
-> 更新日期：2026-11-09
-> 关联：[README](../README.md)、[ARCHITECTURE](ARCHITECTURE.md)、[MEMORY_V5_R3_BASELINE](MEMORY_V5_R3_BASELINE.md)
+> 源码基准：2026-11-12 工作树（基于 `6a6a73d`；记忆库 v14）
+> 更新日期：2026-11-12
+> 关联：[README](../README.md)、[ARCHITECTURE](ARCHITECTURE.md)、[STATUS](STATUS.md)
 
 > 2026-11-08 补充：当前请求串行化、跨渠道候选和空闲回顾已接入，仍存在真实对话更正丢失。实现与限制见 [连续性现状](ARCHITECTURE.md)，下一阶段见 [开发任务](ROADMAP.md)。下文 R3 授权描述适用于既有披露工具路径，不能覆盖新增内部证据路径。
 
@@ -282,6 +282,7 @@ app_data/config/identity.json
   },
   "proactive": {
     "enabled": false,
+    "private_writing": false,
     "daily_limit": 3,
     "cooldown_seconds": 900,
     "idle_seconds": 1800,
@@ -302,15 +303,16 @@ app_data/config/identity.json
 | `identity.master.qq` | `[]` | 主人 QQ 列表；全部归一为 `subject='user'` / `person_id='owner'` |
 | `memory.blind_zones` | `[]` | 不入长期记忆的渠道/会话；元素为 `{channel, session_id}` |
 | `appearance.follow_external_mood` | `true` | D1：QQ 等外部渠道情绪是否驱动桌宠立绘 |
-| `proactive.enabled` | `false` | 启用空闲时的到期念头回顾，默认关闭 |
-| `proactive.daily_limit` | `3` | 每日后台回顾尝试上限；尝试额度持久化 |
-| `proactive.cooldown_seconds` | `900` | 后台回顾尝试最小间隔，服务端至少 60 秒 |
-| `proactive.idle_seconds` | `1800` | 开始回顾所需的前台输入空闲时长 |
-| `proactive.quiet_hours` | `23:00`–`08:00` | 暂停后台回顾及主动分享的时段 |
+| `proactive.enabled` | `false` | 启用主动联系与草稿分享，默认关闭 |
+| `proactive.private_writing` | `false` | 允许后台私下写作/回顾；与主动联系分开授权。关闭后仍保留已有草稿 |
+| `proactive.daily_limit` | `3` | 每日后台回顾/写作尝试上限；尝试额度持久化 |
+| `proactive.cooldown_seconds` | `900` | 后台回顾/写作尝试最小间隔，服务端至少 60 秒 |
+| `proactive.idle_seconds` | `1800` | 开始回顾/写作所需的前台输入空闲时长 |
+| `proactive.quiet_hours` | `23:00`–`08:00` | 暂停主动联系与分享的时段；不阻止私下写作 |
 | `proactive.targets` | `[]` | 明确配置的草稿分享目标；仅 Pet/default 或主人 QQ 私聊，最多选择一个可用目标 |
 | `proactive.schedule` | `[]` | 定时项：`at` + `type=fixed/random`（预留） |
 
-> 空闲回顾与草稿分享已接入；schedule 字段仍只解析。targets 缺省为空，未配置目标时不会主动投递草稿。
+> 私下写作与主动联系分开：`private_writing` 控制回顾/写作，`enabled` 控制主动联系/分享。`targets` 缺省为空时不会主动投递草稿；`schedule` 仍只解析。
 
 ---
 

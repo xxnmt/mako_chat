@@ -710,6 +710,7 @@ void ConfigManager::ensureIdentityLoaded() const
     // 主动对话配置（Phase 0 只解析不调度）
     QJsonObject proObj = rootObj.value("proactive").toObject();
     m_proactive.enabled = proObj.value("enabled").toBool(false);
+    m_proactive.privateWriting = proObj.value("private_writing").toBool(false);
     m_proactive.dailyLimit = proObj.value("daily_limit").toInt(3);
     m_proactive.cooldownSeconds = proObj.value("cooldown_seconds").toInt(900);
     m_proactive.idleSeconds = proObj.value("idle_seconds").toInt(1800);

@@ -211,8 +211,13 @@ AppController::AppController(QObject *parent)
             m_llmService->reviewDueThought();
     });
     reviewTimer->start(60000);
-    connect(m_llmService, &LLMService::draftReadyToShare, this, [this](const QString &draft) {
-        if (!canReviewThought())
+    connect(m_llmService, &LLMService::draftReadyToShare, this, [this](const QString &activityRef, int version, const QString &draft) {
+        if (!canContactNow())
+            return;
+        const qlonglong activityId = activityRef.startsWith(QStringLiteral("thought/"))
+            ? activityRef.mid(QStringLiteral("thought/").size()).toLongLong()
+            : 0;
+        if (activityId <= 0 || !m_memoryManager->canShareThought(activityId, version))
             return;
         auto &cfg = ConfigManager::instance();
         const auto targets = cfg.getProactiveConfig().targets;
@@ -361,7 +366,16 @@ void AppController::handleMakoReply(const QList<SentenceText> &sentences, const 
 bool AppController::canReviewThought() const
 {
     const auto cfg = ConfigManager::instance().getProactiveConfig();
-    if (!cfg.enabled || m_coordinator->busy() || m_idle.elapsed()/1000 < cfg.idleSeconds)
+    if (!cfg.privateWriting || m_coordinator->busy() || m_idle.elapsed()/1000 < cfg.idleSeconds)
+        return false;
+    return true;
+}
+
+bool AppController::canContactNow() const
+{
+    const auto cfg = ConfigManager::instance().getProactiveConfig();
+    if (!cfg.enabled || !cfg.privateWriting || m_coordinator->busy()
+        || m_idle.elapsed()/1000 < cfg.idleSeconds)
         return false;
     const auto now = QTime::currentTime();
     const auto start = QTime::fromString(cfg.quietStart, "HH:mm");

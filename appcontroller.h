@@ -56,6 +56,7 @@ private:
     void resumeMoodTimers();
     void recordInterruption(const QString &reason);
     bool canReviewThought() const;
+    bool canContactNow() const;
 
     CharacterWidget *m_character;
     BubbleWidget *m_bubble;

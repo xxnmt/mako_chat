@@ -401,6 +401,83 @@ private slots:
         }
     }
 
+    void privatePromiseKeepsSpeakerAndCareScope()
+    {
+        QTemporaryDir dir;
+        MemoryManager db(dir.filePath("attribution.db"));
+        RequestMeta seed;
+        seed.channel = Channel::kQQPrivate;
+        seed.sessionId = seed.actorId = QStringLiteral("2014366825");
+        seed.runId = seed.eventId = QStringLiteral("seed");
+        const QString assistantReply = QStringLiteral(
+            R"({"sentences":[{"zh_text":"今晚能不能试着早一点点睡呀？","ja_text":"いいよ","tags":{"emotion":"caring"}}]})");
+        QList<SentenceText> seedSentences;
+        SentenceText seedSentence;
+        seedSentence.zhText = QStringLiteral("今晚能不能试着早一点点睡呀？");
+        seedSentence.jaText = QStringLiteral("いいよ");
+        seedSentence.rawTags.insert(QStringLiteral("emotion"), QStringLiteral("caring"));
+        seedSentences.append(seedSentence);
+        QVERIFY(db.saveQATurn("我答应茉子，会努力调整作息", assistantReply, seedSentences, seed));
+        QVERIFY(db.enqueueObservation(seed, "我答应茉子，会努力调整作息"));
+        const auto source = db.pendingObservation()["source"].toInteger();
+        const QJsonObject promise{{"matter",""},{"version",0},{"topic","作息"},
+            {"quote","我答应茉子，会努力调整作息"},{"status","confirmed"},
+            {"understanding","答应努力调整作息"},{"kind","self_report"}};
+        QVERIFY(db.commitObservation(source,
+            QJsonObject{{"outcome","updated"},{"changes",QJsonArray{promise}}}));
+
+        RawEventWrite groupEvent;
+        groupEvent.platform = QStringLiteral("qq");
+        groupEvent.channel = Channel::kQQGroup;
+        groupEvent.sessionId = QStringLiteral("999");
+        groupEvent.senderId = QStringLiteral("999");
+        groupEvent.senderName = QStringLiteral("群友");
+        groupEvent.eventType = QStringLiteral("message");
+        groupEvent.content = QStringLiteral("已经躺下");
+        groupEvent.occurredAt = QDateTime::currentDateTime();
+        QVERIFY(db.appendRawEvent(groupEvent));
+
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QByteArray> bodies;
+        serveCompletions(server, bodies, [&](int) -> QString {
+            if (bodies.last().contains("speaker_is_owner"))
+                return QStringLiteral(
+                    R"({"decision":"normal","care":[{"topic":"上床","user_response":"done","care_action":"acknowledge"}]})");
+            return QStringLiteral(
+                R"({"sentences":[{"zh_text":"你答应过要早点睡","ja_text":"いいよ","tags":{"emotion":"caring"}}],"evidence_decision":{"used_evidence":["reply/1"],"claims":[{"sentence_index":0,"refs":["reply/1"],"relation":"reported_fact"}],"evidence_status":"sufficient","basis":"test"}})");
+        });
+        LLMService service("test", nullptr,
+            QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.serverPort())));
+        service.setMemoryManager(&db);
+        RequestMeta meta = seed;
+        meta.runId = meta.eventId = QStringLiteral("final");
+        const auto history = db.getHistoryTurn(10, meta.channel, meta.sessionId);
+        QSignalSpy spoken(&service, &LLMService::sentencesReady);
+        QSignalSpy failed(&service, &LLMService::replyAbnormal);
+        service.askDeepSeek("已经躺下了", history, meta);
+        QTRY_VERIFY_WITH_TIMEOUT(spoken.size() + failed.size() > 0, 5000);
+        if (spoken.isEmpty())
+            qDebug() << "[test] attribution bodies" << bodies.size() << "failed" << failed.size()
+                     << (failed.isEmpty() ? QString{} : failed.first().first().toString());
+        QCOMPARE(spoken.size(), 1);
+
+        const QString finalRequest = QString::fromUtf8(bodies.last());
+        QVERIFY(finalRequest.contains(QStringLiteral("当前场景")));
+        QVERIFY(finalRequest.contains(QStringLiteral("self_report")));
+        QVERIFY(finalRequest.contains(QStringLiteral("用户已经回应")));
+        QVERIFY(finalRequest.contains(QStringLiteral("不要推断其他事项已完成")));
+
+        QSqlQuery audit(QSqlDatabase::database("memory_db_connection"));
+        QVERIFY(audit.exec("SELECT data FROM cognitive_audit WHERE kind='answer_decision' ORDER BY id DESC LIMIT 1"));
+        QVERIFY(audit.next());
+        const auto decision = QJsonDocument::fromJson(audit.value(0).toByteArray()).object();
+        const auto attribution = decision["attribution_check"].toObject();
+        QCOMPARE(attribution["speaker_check"].toString(), QStringLiteral("assistant_expression"));
+        QVERIFY(attribution["issues"].toArray().contains(
+            QJsonValue(QStringLiteral("assistant_suggestion_as_user_promise"))));
+    }
+
     void projectionUsesCheckedOwnReport()
     {
         QTemporaryDir dir;

@@ -420,6 +420,33 @@ QString PromptAssembler::buildViewerIdentityBlock(
     return block;
 }
 
+QString PromptAssembler::buildSituationBlock(const RequestMeta &meta, bool voiceAvailable)
+{
+    const bool group = isGroupChannel(meta);
+    const bool owner = isMasterMeta(meta);
+    const QString surface = meta.channel;
+    const QString speaker = owner ? QStringLiteral("owner") : meta.subject;
+    const QString audience = group ? QStringLiteral("group")
+        : (owner ? QStringLiteral("owner") : meta.subject);
+    // subject 是记忆归属/当前对话对象，不是本轮事情涉及的人。
+    // 服务端没有单独确认 about 时，明确保持 unknown，避免把 speaker 当成事情主体。
+    const QString about = QStringLiteral("unknown");
+    const QString modality = (meta.channel == Channel::kPet && voiceAvailable)
+        ? QStringLiteral("voice+text") : QStringLiteral("text");
+    const QString privacy = group ? QStringLiteral("public") : QStringLiteral("private");
+    return QStringLiteral(
+        "# 当前场景（服务端事实）\n"
+        "- surface: %1\n"
+        "- speaker: %2\n"
+        "- audience: %3\n"
+        "- about: %4\n"
+        "- modality: %5\n"
+        "- privacy: %6\n"
+        "- about=unknown 表示服务端没有确认本轮事情涉及谁；不要把 speaker 当成事情主体。\n"
+        "- 场景只说明在哪里、对谁、能用什么形式；不要求不同渠道换一种说法。\n")
+        .arg(surface, speaker, audience, about, modality, privacy);
+}
+
 QJsonArray PromptAssembler::buildHistoryMessages(const QList<HistoryTurn> &history,
                                                  const RequestMeta &meta, QJsonObject *evidence)
 {
@@ -432,7 +459,8 @@ QJsonArray PromptAssembler::buildHistoryMessages(const QList<HistoryTurn> &histo
     historyNote["role"] = "system";
     historyNote["content"] =
         "以下内容为短期对话记录。用户消息可作为用户事实候选；"
-        "assistant 消息是茉子过去的回复，可能不准确，不能自动当成已核实事实；"
+        "assistant 消息是茉子过去的回复或建议，不是用户的承诺；"
+        "可能不准确，不能自动当成已核实事实；"
         "用户后来明确纠正的内容优先。仅提供对话信息，请勿参考其输出格式。";
     messages.append(historyNote);
 
@@ -461,7 +489,7 @@ QJsonArray PromptAssembler::buildHistoryMessages(const QList<HistoryTurn> &histo
             if (turn.id > 0) {
                 const auto ref = QString("chat/%1").arg(turn.id);
                 userMessage["name"] = userMessage["name"].toString() + " " + ref;
-                if (evidence) evidence->insert(ref,QJsonObject{{"scope","historical_report"}});
+                if (evidence) evidence->insert(ref,QJsonObject{{"scope","historical_report"},{"speaker_role","user"}});
             }
             messages.append(userMessage);
         }
@@ -477,7 +505,7 @@ QJsonArray PromptAssembler::buildHistoryMessages(const QList<HistoryTurn> &histo
             if (turn.id > 0) {
                 const auto ref = QString("reply/%1").arg(turn.id);
                 makoMessage["name"] = makoMessage["name"].toString() + " " + ref;
-                if (evidence) evidence->insert(ref,QJsonObject{{"scope","prior_assistant_expression"}});
+                if (evidence) evidence->insert(ref,QJsonObject{{"scope","prior_assistant_expression"},{"speaker_role","assistant"}});
             }
             messages.append(makoMessage);
         }

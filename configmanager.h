@@ -31,9 +31,11 @@ struct ScheduleItem {
     QString type;    // "fixed" | "random"（random=在窗口内随机）
 };
 
-// 主动对话配置（Phase 0 只解析不调度；Phase 2 接入 ChatPlanner）
+// 主动对话/私下写作配置：enabled 控制主动联系/分享，privateWriting 控制后台写作/回顾。
 struct ProactiveConfig {
     bool enabled = false;
+    // Private writing/review is authorized separately from proactive contact.
+    bool privateWriting = false;
     QList<QPair<QString, QString>> targets;  // 发起对象 (channel, sessionId)，默认 [pet/default]
     int dailyLimit = 3;                      // 每日主动上限
     int cooldownSeconds = 900;               // 两次主动的最小间隔

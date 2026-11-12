@@ -11,6 +11,42 @@ class TestPromptAssembler : public QObject
     Q_OBJECT
 
 private slots:
+    void situationBlockDescribesFacts()
+    {
+        RequestMeta pet;
+        pet.channel = Channel::kPet;
+        pet.subject = QStringLiteral("user");
+        pet.speaker = QStringLiteral("欧尼酱");
+        const QString voice = PromptAssembler::buildSituationBlock(pet, true);
+        QVERIFY(voice.contains(QStringLiteral("surface: pet")));
+        QVERIFY(voice.contains(QStringLiteral("speaker: owner")));
+        QVERIFY(voice.contains(QStringLiteral("audience: owner")));
+        QVERIFY(voice.contains(QStringLiteral("about: unknown")));
+        QVERIFY(voice.contains(QStringLiteral("modality: voice+text")));
+        QVERIFY(voice.contains(QStringLiteral("privacy: private")));
+        const QString textOnly = PromptAssembler::buildSituationBlock(pet, false);
+        QVERIFY(textOnly.contains(QStringLiteral("modality: text")));
+
+        RequestMeta group;
+        group.channel = Channel::kQQGroup;
+        group.sessionId = QStringLiteral("123456");
+        group.subject = QStringLiteral("user");
+        const QString groupBlock = PromptAssembler::buildSituationBlock(group, false);
+        QVERIFY(groupBlock.contains(QStringLiteral("surface: qq_group")));
+        QVERIFY(groupBlock.contains(QStringLiteral("audience: group")));
+        QVERIFY(groupBlock.contains(QStringLiteral("privacy: public")));
+
+        RequestMeta other;
+        other.channel = Channel::kQQPrivate;
+        other.sessionId = QStringLiteral("2014366825");
+        other.subject = QStringLiteral("qq:2014366825");
+        other.speaker = QStringLiteral("朋友");
+        const QString otherBlock = PromptAssembler::buildSituationBlock(other, false);
+        QVERIFY(otherBlock.contains(QStringLiteral("speaker: qq:2014366825")));
+        QVERIFY(otherBlock.contains(QStringLiteral("audience: qq:2014366825")));
+        QVERIFY(otherBlock.contains(QStringLiteral("privacy: private")));
+    }
+
     void petPromptKeepsAllSections()
     {
         RequestMeta meta;
