@@ -45,6 +45,9 @@ endfunction()
 
 add_phase0_test(tst_memorymanager
     tst_memorymanager.cpp
+    ${PROJECT_SOURCE_DIR}/configmanager.cpp
+    ${PROJECT_SOURCE_DIR}/memorypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/qqreplypolicy.cpp
     ${PROJECT_SOURCE_DIR}/memorymanager.h
     ${PROJECT_SOURCE_DIR}/memorymanager.cpp
     ${PROJECT_SOURCE_DIR}/matterstore.cpp
@@ -115,6 +118,7 @@ add_phase0_test(tst_groupmembership
 target_link_libraries(tst_groupmembership PRIVATE Qt6::WebSockets Qt6::Network)
 
 add_phase0_test(tst_memoryagent
+    ${PROJECT_SOURCE_DIR}/cognitivecoordinator.cpp
     tst_memoryagent.cpp
     ${PROJECT_SOURCE_DIR}/llmservice.cpp
     ${PROJECT_SOURCE_DIR}/memoryoutputguard.cpp

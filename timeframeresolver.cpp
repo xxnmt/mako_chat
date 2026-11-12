@@ -126,19 +126,20 @@ MemoryResolvedTime TimeFrameResolver::resolve(
                                : QTimeZone(timezone.toUtf8());
     const QTimeZone effectiveZone = zone.isValid() ? zone : QTimeZone::systemTimeZone();
 
-    QDate date = anchor.date();
+    const auto localAnchor = anchor.toTimeZone(effectiveZone);
+    QDate date = localAnchor.date();
     bool periodAdjusted = false;
 
     switch (frame.anchor) {
     case MemoryTimeFrame::Anchor::RelativeDay:
-        date = anchor.date().addDays(frame.offset);
+        date = localAnchor.date().addDays(frame.offset);
         break;
     case MemoryTimeFrame::Anchor::RelativeWeek:
-        date = mondayOf(anchor.date())
+        date = mondayOf(localAnchor.date())
                    .addDays(frame.offset * 7 + (frame.weekday - 1));
         break;
     case MemoryTimeFrame::Anchor::RelativeMonth:
-        date = QDate(anchor.date().year(), anchor.date().month(), 1)
+        date = QDate(localAnchor.date().year(), localAnchor.date().month(), 1)
                    .addMonths(frame.offset);
         break;
     case MemoryTimeFrame::Anchor::AbsoluteDate:
@@ -149,8 +150,8 @@ MemoryResolvedTime TimeFrameResolver::resolve(
         }
         break;
     case MemoryTimeFrame::Anchor::RecentWindow:
-        result.from = anchor.addSecs(-frame.offset * 60);
-        result.to = anchor.addSecs(1);
+        result.from = localAnchor.addSecs(-frame.offset * 60);
+        result.to = localAnchor.addSecs(1);
         result.valid = true;
         result.interpretation = QStringLiteral("recent_window");
         return result;
@@ -172,7 +173,7 @@ MemoryResolvedTime TimeFrameResolver::resolve(
 
     // 凌晨问“今天下午/晚上”时，回忆语境下解释为最近一个已结束的时段。
     if (frame.anchor == MemoryTimeFrame::Anchor::RelativeDay
-        && frame.offset == 0 && anchor.time() < QTime(6, 0)
+        && frame.offset == 0 && localAnchor.time() < QTime(6, 0)
         && (frame.period == QStringLiteral("afternoon")
             || frame.period == QStringLiteral("evening"))) {
         date = date.addDays(-1);
@@ -218,6 +219,12 @@ MemoryResolvedTime TimeFrameResolver::resolve(
     }
     if (result.from.secsTo(result.to) > 31 * 24 * 3600) {
         result.error = QStringLiteral("range_too_large");
+        return result;
+    }
+    static const QStringList presentExpressions{"现在","此刻","当前","此时","眼下","now","right now"};
+    if (presentExpressions.contains(expression.trimmed().toLower())
+        && (localAnchor < result.from || localAnchor >= result.to)) {
+        result.error = "present_outside_requested_frame";
         return result;
     }
     if (periodAdjusted) {

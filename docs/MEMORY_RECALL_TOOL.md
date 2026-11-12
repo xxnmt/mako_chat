@@ -255,3 +255,7 @@ source_kinds / scanned_count / result_count / latency_ms
 | “某个时候” | unresolved，不猜测 |
 | bucket handle | `memory_read` 能展开桶内完整摘要 |
 | 工具参数伪造权限 | 拒绝 |
+
+## 单轮补查预算（阶段 A）
+
+前台每轮最多三次不同补查，内部事项历史、公开工具及事项 consult 共用预算。重复请求不增加可用资料。时间检索审计关联本轮与解析范围；“现在”的时间窗若不包含请求时刻，不按错误区间返回命中。后台观察的重试预算独立。

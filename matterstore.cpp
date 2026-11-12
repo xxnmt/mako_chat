@@ -1,4 +1,5 @@
 #include "memorymanager.h"
+#include "configmanager.h"
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QJsonDocument>
@@ -101,6 +102,61 @@ QJsonArray MemoryManager::matterHeads(const QString &subject, const QStringList 
                 {"initial_quote",q.value(9).toString()},{"initial_reported_at",q.value(10).toString()}});
     }
     return heads;
+}
+
+QJsonArray MemoryManager::internalMatters(const RequestMeta &meta, const QStringList &terms,
+                                          const QStringList &historyOf) const
+{
+    auto &config = ConfigManager::instance();
+    const auto policy = config.getMemoryPolicyConfig();
+    QJsonArray result;
+    if (meta.sensitive || meta.subject.isEmpty() || !policy.longTermMemoryEnabled ||
+        config.isBlindZone(meta.channel,meta.sessionId) ||
+        (meta.channel != Channel::kPet && meta.actorId.isEmpty())) return result;
+
+    QSqlQuery q(m_db);
+    q.prepare(R"(
+        WITH revisions AS (
+            SELECT r.*,s.reported,s.channel,s.session,s.input,
+                   row_number() OVER(PARTITION BY matter ORDER BY version DESC) pos
+            FROM matter_revision r JOIN cognitive_source s ON s.id=r.source
+            WHERE s.subject=:subject
+              AND (:heads OR matter IN (SELECT value FROM json_each(:matters)))
+        )
+        SELECT matter,version,topic,quote,kind,status,understanding,event_time,reported,channel,session,input
+        FROM revisions WHERE pos<=:depth
+        ORDER BY (SELECT count(*) FROM json_each(:terms)
+            WHERE instr(topic,value)>0 OR instr(quote,value)>0 OR instr(understanding,value)>0) DESC,
+            version DESC,matter LIMIT 32
+    )");
+    q.bindValue(":subject",meta.subject);
+    q.bindValue(":heads",historyOf.isEmpty());
+    q.bindValue(":depth",historyOf.isEmpty() ? 1 : 8);
+    q.bindValue(":matters",QString::fromUtf8(QJsonDocument(QJsonArray::fromStringList(historyOf)).toJson(QJsonDocument::Compact)));
+    q.bindValue(":terms",QString::fromUtf8(QJsonDocument(QJsonArray::fromStringList(terms)).toJson(QJsonDocument::Compact)));
+    if (!q.exec()) return result;
+    QSet<QString> restricted;
+    while (q.next()) {
+        if (config.isBlindZone(q.value(9).toString(),q.value(10).toString())) {
+            restricted.insert(q.value(0).toString());
+            continue;
+        }
+        QJsonObject row{{"matter",q.value(0).toString()},{"version",q.value(1).toLongLong()},
+            {"topic",q.value(2).toString()},{"quote",q.value(3).toString()},
+            {"kind",q.value(4).toString()},{"status",q.value(5).toString()},
+            {"understanding",q.value(6).toString()},{"event_time_expression",q.value(7).toString()},
+            {"reported_at",q.value(8).toString()},{"original_report",q.value(11).toString()}};
+        bool allowed = true;
+        for (const auto &key : {"topic","quote","understanding","original_report","event_time_expression"}) {
+            const auto scan = SensitiveContentFilter::sanitize(row[key].toString(),{},policy.privacyRules);
+            if (scan.blocked || scan.redacted) { allowed = false; break; }
+        }
+        if (allowed) result.append(row);
+        else restricted.insert(row["matter"].toString());
+    }
+    for (qsizetype i=result.size(); i>0; --i)
+        if (restricted.contains(result.at(i-1).toObject()["matter"].toString())) result.removeAt(i-1);
+    return result;
 }
 
 void MemoryManager::deferObservation(qint64 source, const QString &reason, bool rejected)

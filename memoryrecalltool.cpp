@@ -106,6 +106,7 @@ QJsonObject MemoryRecallTool::definition()
 
     QJsonObject periodSchema;
     periodSchema.insert(QStringLiteral("type"), QStringLiteral("string"));
+    periodSchema.insert(QStringLiteral("description"),QStringLiteral("morning=06-12, afternoon=12-18, evening=18-24, night=00-06。现在/刚才的近期消息使用 recent_window 和 minutes。"));
     periodSchema.insert(QStringLiteral("enum"),
                         QJsonArray{QStringLiteral("morning"),
                                    QStringLiteral("afternoon"),

@@ -8,6 +8,7 @@
 #include <QTcpServer>
 #include <QTcpSocket>
 #include "llmservice.h"
+#include "cognitivecoordinator.h"
 
 #include "memoryagent.h"
 #include "memoryexecutor.h"
@@ -398,6 +399,91 @@ private slots:
             QVERIFY(db.matterHeads(meta.subject).isEmpty());
             QCOMPARE(db.pendingObservation()["input"].toString(),secret);
         }
+    }
+
+    void projectionUsesCheckedOwnReport()
+    {
+        QTemporaryDir dir;
+        MemoryManager db(dir.filePath("projection.db"));
+        RequestMeta seed;
+        seed.eventId = "private";
+        const QString original = "我的陶艺课取消了，细节以后再讲";
+        QVERIFY(db.recordInput(original,seed,true)>0);
+        const QJsonObject change{{"matter",""},{"version",0},{"topic","兴趣课"},{"quote","陶艺课取消了"},
+            {"status","cancelled"},{"understanding","课程已经取消"},{"kind","self_report"}};
+        QVERIFY(db.commitObservation(db.pendingObservation()["source"].toInteger(),
+            {{"outcome","updated"},{"changes",QJsonArray{change}}}));
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QByteArray> bodies;
+        serveCompletions(server,bodies,[](int count) -> QString {
+            if (count<3) return R"({"decision":"respond","intent":"self_recall","disclosure":"ordinary_self_report","certainty":"reported","refs":[1]})";
+            return R"({"sentences":[{"zh_text":"记得，你说课取消了。","ja_text":"そうだね","tags":{"emotion":"happy"}}]})";
+        });
+        LLMService model("test",nullptr,QUrl(QString("http://127.0.0.1:%1/").arg(server.serverPort())));
+        model.setMemoryManager(&db);
+        RequestMeta group;
+        group.channel = Channel::kQQGroup;
+        group.sessionId = "group";
+        group.actorId = "owner";
+        group.runId = group.eventId = "followup";
+        QSignalSpy spoken(&model,&LLMService::sentencesReady);
+        model.askDeepSeek("还记得我那个安排后来怎么样了吗",{},group);
+        QTRY_COMPARE_WITH_TIMEOUT(spoken.count(),1,5000);
+        QCOMPARE(bodies.size(),3);
+        QVERIFY(bodies.first().contains(original.toUtf8()));
+        QVERIFY(bodies.last().contains("context/1"));
+        QVERIFY(bodies.last().contains(QStringLiteral("课程已经取消").toUtf8()));
+        QVERIFY(!bodies.last().contains(original.toUtf8()));
+        group.subject = "qq:other";
+        QVERIFY(db.internalMatters(group,{}).isEmpty());
+    }
+
+    void presentFrameMustIncludeRequestTime()
+    {
+        const auto now = QDateTime::fromString("2026-11-11T22:52:00+08:00",Qt::ISODate);
+        MemoryTimeFrame frame;
+        frame.anchor = MemoryTimeFrame::Anchor::RelativeDay;
+        frame.period = "night";
+        const auto invalid = TimeFrameResolver::resolve("现在",MemoryTimeTarget::MessageTime,frame,now,"Asia/Shanghai");
+        QCOMPARE(invalid.error,QString("present_outside_requested_frame"));
+        const auto dawn = TimeFrameResolver::resolve("今天凌晨",MemoryTimeTarget::MessageTime,frame,now,"Asia/Shanghai");
+        QVERIFY(dawn.valid);
+        frame.anchor = MemoryTimeFrame::Anchor::RecentWindow;
+        frame.offset = 30;
+        frame.period.clear();
+        const auto recent = TimeFrameResolver::resolve("现在",MemoryTimeTarget::MessageTime,frame,now,"Asia/Shanghai");
+        QVERIFY(recent.valid && recent.from <= now && recent.to > now);
+    }
+
+    void coordinatorCompletesBeforeAdvancing()
+    {
+        QTemporaryDir dir;
+        MemoryManager db(dir.filePath("coordinator.db"));
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QByteArray> bodies;
+        serveCompletions(server,bodies,[](int count) -> QString {
+            if (count==1) return R"({"conversation_action":"close","sentences":[]})";
+            return R"({"sentences":[{"zh_text":"好呀","ja_text":"いいよ","tags":{"emotion":"happy"}}]})";
+        });
+        LLMService model("test",nullptr,QUrl(QString("http://127.0.0.1:%1/").arg(server.serverPort())));
+        model.setMemoryManager(&db);
+        CognitiveCoordinator coordinator(db,model,nullptr);
+        connect(&model,&LLMService::sentencesReady,this,[&](const QList<SentenceText> &s,const QString &raw,
+            const QString &input,const RequestMeta &meta){ QVERIFY(coordinator.handedOff(input,raw,s,meta)); });
+        RequestMeta meta;
+        meta.longTermMemoryEnabled=false;
+        meta.eventId=meta.runId="first";
+        coordinator.submit("下次聊",meta);
+        meta.eventId=meta.runId="second";
+        coordinator.submit("还有一件事",meta);
+        QTRY_VERIFY_WITH_TIMEOUT(!coordinator.busy(),5000);
+        const auto rows=db.getHistoryTurn(0,10);
+        QCOMPARE(rows.size(),2);
+        QCOMPARE(rows.first().state,QString("handed_off"));
+        QCOMPARE(rows.last().state,QString("quiet"));
+        QCOMPARE(bodies.size(),2);
     }
 
     void initTestCase()

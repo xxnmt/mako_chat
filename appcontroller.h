@@ -8,6 +8,7 @@
 #include "sentencedata.h"
 #include "utterance.h"
 
+class CognitiveCoordinator;
 class CharacterWidget;
 class BubbleWidget;
 class LLMService;
@@ -50,20 +51,10 @@ private:
     void applyTimeSettings();   // 把 ConfigManager 的时间/退火配置应用到 TimeManager
     void applyPetTags(const QMap<QString, QString> &tags); // 桌宠：立绘 + 全局情绪同步
 
-    struct ForegroundRequest {
-        QString text;
-        RequestMeta meta;
-        quint64 sequence;
-        qint64 turnId;
-    };
-    QQueue<ForegroundRequest> m_pending;
+    CognitiveCoordinator *m_coordinator;
     QElapsedTimer m_idle;
-    bool m_processing = false;
-    ForegroundRequest m_active{};
     void resumeMoodTimers();
     void recordInterruption(const QString &reason);
-    void startNextRequest();
-    void finishRequest();
     bool canReviewThought() const;
 
     CharacterWidget *m_character;
@@ -85,7 +76,6 @@ private:
     RawEventProcessor *m_rawEventProcessor; // raw_events → interactions → summary
     GroupMembershipService *m_membershipService; // 群成员关系快照
 
-    quint64 m_roundSeq = 0;             // 对话轮次序号：每次用户输入 +1（TD-034）
     quint64 m_lastPlaybackRound = 0;    // 最近一次入队 TTS 的轮次（退火门控用）
 };
 

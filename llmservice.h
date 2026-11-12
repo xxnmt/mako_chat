@@ -8,6 +8,7 @@
 #include <QJsonObject>
 #include <QScopedPointer>
 #include <QPointer>
+#include <QSet>
 
 #include "sentencedata.h"
 #include "historyturn.h"
@@ -78,6 +79,10 @@ private:
     void prepareReply(const QString &userInput, const QList<HistoryTurn> &historyQA,
                       const RequestMeta &meta, const QJsonArray &privateEvidence,
                       const QString &socialGuidance);
+    void considerEvidence(const QJsonArray &background, const QJsonArray &personal,
+                          const QJsonArray &matters, const QJsonArray &chain = {});
+    bool takeLookup(const QString &purpose, const QJsonObject &arguments);
+    bool expressionBasisCurrent() const;
     void initializePromptFile();
     QString loadSystemPrompt();
     void sendChatRequest(const QJsonArray &messages,
@@ -85,7 +90,7 @@ private:
                          bool jsonResponse = true);
     bool refreshConsultation();
     QPointer<QNetworkReply> m_consultationReply;
-    void registerToolEvidence(const QJsonObject &payload);
+    void registerToolEvidence(const QJsonObject &payload, const QJsonObject &arguments);
     bool consultMatters(const QJsonObject &decision);
     QJsonObject readConsultedMatters() const;
     void generateWithMatters(const QJsonObject &records);
@@ -138,7 +143,15 @@ private:
         QJsonObject consultedRecords;
         QJsonArray consultationMessages;
         bool refreshed = false;
-        bool consultationUsed = false;
+        QList<HistoryTurn> history;
+        QJsonArray expression;
+        QJsonObject expressionBases;
+        QSet<QByteArray> lookups;
+        QSet<QByteArray> retrievedItems;
+        int lookupsWithoutNewItems = 0;
+        QSet<QString> expandedMatters;
+        bool lookupFinalRequested = false;
+        bool expressionRefreshed = false;
     } m_run;
     QJsonArray m_lastRequestMessages;
     QJsonArray m_pendingMessages; // legacy：等待 MemoryAgent 的主请求

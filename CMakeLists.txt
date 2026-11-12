@@ -39,6 +39,7 @@ qt_add_executable(Windows_AI
     llmservice.h llmservice.cpp
     promptassembler.h promptassembler.cpp
     appcontroller.h appcontroller.cpp
+    cognitivecoordinator.h cognitivecoordinator.cpp
     sentencedata.h
     appearancemanager.h appearancemanager.cpp
     globalmoodstate.h globalmoodstate.cpp

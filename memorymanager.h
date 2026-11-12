@@ -63,6 +63,10 @@ public:
                                  const QString &before, const QStringList &terms, bool forRevision) const;
     void deferObservation(qint64 source, const QString &reason, bool rejected = false);
 
+    // Internal consideration of this speaker's retained observations. Never serialize
+    // these records directly into the audience-facing prompt.
+    QJsonArray internalMatters(const RequestMeta &meta, const QStringList &terms,
+                               const QStringList &historyOf = {}) const;
     QJsonArray currentUnderstanding(const RequestMeta &audience, const QString &input,
                                     QStringList *keys = nullptr, const QStringList &only = {}) const;
     QJsonArray matterEvidence(const RequestMeta &audience, const QString &matter) const;
