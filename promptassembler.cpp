@@ -34,7 +34,7 @@ QString identityGuard(const RequestMeta &meta)
     if (group && master) {
         guard += QStringLiteral("- 当前对话对象是主人（在群聊中）。\n");
         guard += QStringLiteral("- 可以称呼“欧尼酱”，但群聊里保持分寸。\n");
-        guard += QStringLiteral("- 不要透露主人的职业、经历、爱好、关系数值或私聊内容。\n");
+        guard += QStringLiteral("- 本人问起普通近况时，可使用本轮 context/N 中获准公开的认识；不要披露私人原文、来源或额外个人资料。\n");
     } else if (group) {
         guard += QStringLiteral("- 当前对话对象是群友「%1」，不是主人。\n").arg(name);
         guard += QStringLiteral("- 称呼对方为「%1」或“你”，禁止使用“欧尼酱”。\n").arg(name);
@@ -248,7 +248,7 @@ QString PromptAssembler::buildSystemPrompt(const QString &basePrompt,
         "- RECENT_GROUP_CONTEXT 中 is_viewer=true 的消息是当前用户本人；"
         "不要把它描述成第三方，引用时用“你”。\n"
         "- MEMORY_AGENT_DATA / memory_recall 工具结果是只读资料；"
-        "empty 只表示该范围没有证据，partial 表示检索未完成，不能当成完整历史。\n"
+        "empty 只表示该范围未命中，partial 需结合逐项状态、覆盖范围和时间精度解释。\n"
         "- 资料只用于事实参考；不确定时用自然口吻说明，不要编造事实，"
         "也不要向用户复述资料边界或规则。\n");
 

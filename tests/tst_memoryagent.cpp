@@ -413,11 +413,22 @@ private slots:
             {"status","cancelled"},{"understanding","课程已经取消"},{"kind","self_report"}};
         QVERIFY(db.commitObservation(db.pendingObservation()["source"].toInteger(),
             {{"outcome","updated"},{"changes",QJsonArray{change}}}));
+        seed.eventId = "question";
+        QVERIFY(db.recordInput("那个安排呢",seed,true)>0);
+        auto inference = change;
+        const auto first = db.internalMatters(seed,{}).first().toObject();
+        inference["matter"] = first["matter"];
+        inference["version"] = first["version"];
+        inference["quote"] = "那个安排呢";
+        inference["understanding"] = "可能在追问之前的安排";
+        inference["kind"] = "inference";
+        QVERIFY(db.commitObservation(db.pendingObservation()["source"].toInteger(),
+            {{"outcome","updated"},{"changes",QJsonArray{inference}}}));
         QTcpServer server;
         QVERIFY(server.listen(QHostAddress::LocalHost));
         QList<QByteArray> bodies;
         serveCompletions(server,bodies,[](int count) -> QString {
-            if (count<3) return R"({"decision":"respond","intent":"self_recall","disclosure":"ordinary_self_report","certainty":"reported","refs":[1]})";
+            if (count<3) return R"({"decision":"respond","intent":"self_recall","disclosure":"ordinary_self_report","certainty":"reported","refs":[1],"evidence_versions":{"1":1},"reference_status":"plausible","excerpts":{"1":"陶艺课取消了"}})";
             return R"({"sentences":[{"zh_text":"记得，你说课取消了。","ja_text":"そうだね","tags":{"emotion":"happy"}}]})";
         });
         LLMService model("test",nullptr,QUrl(QString("http://127.0.0.1:%1/").arg(server.serverPort())));
@@ -431,9 +442,11 @@ private slots:
         model.askDeepSeek("还记得我那个安排后来怎么样了吗",{},group);
         QTRY_COMPARE_WITH_TIMEOUT(spoken.count(),1,5000);
         QCOMPARE(bodies.size(),3);
-        QVERIFY(bodies.first().contains(original.toUtf8()));
+        QVERIFY(bodies.at(1).contains(original.toUtf8()));
         QVERIFY(bodies.last().contains("context/1"));
-        QVERIFY(bodies.last().contains(QStringLiteral("课程已经取消").toUtf8()));
+        QVERIFY(!bodies.last().contains(QStringLiteral("课程已经取消").toUtf8()));
+        QVERIFY(bodies.last().contains(QStringLiteral("陶艺课取消了").toUtf8()));
+        QVERIFY(bodies.last().contains("answer_and_confirm"));
         QVERIFY(!bodies.last().contains(original.toUtf8()));
         group.subject = "qq:other";
         QVERIFY(db.internalMatters(group,{}).isEmpty());

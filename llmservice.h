@@ -152,6 +152,7 @@ private:
         QSet<QString> expandedMatters;
         bool lookupFinalRequested = false;
         bool expressionRefreshed = false;
+        QString projectionError;
     } m_run;
     QJsonArray m_lastRequestMessages;
     QJsonArray m_pendingMessages; // legacy：等待 MemoryAgent 的主请求
