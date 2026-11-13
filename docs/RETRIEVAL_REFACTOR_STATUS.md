@@ -9,11 +9,11 @@
 | 阶段 | 状态 | 已完成 | 未完成 |
 |---|---|---|---|
 | P0 基线 | 完成 | 调用图、缺口、备份/回放、契约草案 | — |
-| P1 契约/入口 | 大部分完成 | `MemorySituation`/`MemoryEvidence`/`RetrievalRequest`/`Result`；Pet/QQ 自动证据同服务；工具助手证据、说话人字段；Pet 工具入口 | `MemoryAgentTools::search` 仍逐源查询；时间只给一个 `time` |
+| P1 契约/入口 | 大部分完成 | `MemorySituation`/`MemoryEvidence`/`RetrievalRequest`/`Result`；Pet/QQ 自动证据同服务；工具助手证据、说话人字段；Pet 工具入口；recent / chat / interaction_summary / long_term_summary / claim / episodic 走统一服务；owner 群可按配置检索跨渠道私聊 | 时间只给一个 `time`；`recent` 保留专用回退 |
 | P2 检索 | 部分完成 | v15 四张索引表；`--rebuild-memory-index` / `--memory-index-status`；增量写入；词面 BM25；可选向量；RRF；启发式重排；旧适配器回退；删除触发器 | 真实 Embedding/Reranker Provider；断点续跑；生产级中文 FTS；规模性能；索引代次切换 |
 | P3 感知 | 部分完成 | `considerEvidence` 把 background + personal 给表达模型；`currentUnderstanding` audience-private；同渠道历史进入候选 | 真实模型语义验收；输出泄露实测；完整去重 |
 | P4 迁移/验收 | 部分完成 | v15 迁移、命令重建、后台 Worker、增量写入、备份文档、删除失效测试 | 真实库副本回填；断点续跑；真实 QQ/Pet 渠道；性能/费用 |
-| P5 收尾 | 部分完成 | 文档、状态、旧路径标注 | 旧 `personalEvidence`/`context/N` 清理；默认路径切换；最终验收报告 |
+| P5 收尾 | 部分完成 | 文档、状态、工具六类来源统一、辅助来源显式化 | 旧 `personalEvidence`/`context/N` 清理；默认路径切换；最终验收报告 |
 
 ## 关键事实
 

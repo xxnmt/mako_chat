@@ -35,7 +35,9 @@ qt_add_executable(Windows_AI
     memoryagenttypes.h memoryagent.h memoryagent.cpp
     memoryevidence.h memoryevidence.cpp
     memoryretrieval.h memoryretrieval.cpp
+    memoryretrievalworker.h memoryretrievalworker.cpp
     memoryembedding.h memoryembedding.cpp
+    memorydashscope.h memorydashscope.cpp
     memoryindexworker.h memoryindexworker.cpp
     memoryresultjson.h memoryresultjson.cpp
     memoryrecalltool.h memoryrecalltool.cpp

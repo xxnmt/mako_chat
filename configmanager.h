@@ -63,6 +63,10 @@ public:
 
     QString getApiKey() const;
     void setApiKey(const QString &apiKey);
+    QString getDashScopeApiKey() const;
+    void setDashScopeApiKey(const QString &apiKey);
+    QString getDashScopeBaseUrl() const;
+    void setDashScopeBaseUrl(const QString &baseUrl);
 
     QString getTTSUrl() const;
     void setTTSUrl(const QString &ttsUrl);
@@ -128,6 +132,8 @@ private:
     void initAppDataPath();
 
     QString m_apiKey;
+    QString m_dashscopeApiKey;
+    QString m_dashscopeBaseUrl;
 
     QString m_ttsUrl;
     QString m_ttsMode = "api";

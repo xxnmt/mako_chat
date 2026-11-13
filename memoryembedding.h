@@ -2,6 +2,7 @@
 #define MEMORYEMBEDDING_H
 
 #include <QString>
+#include <QStringList>
 #include <QVector>
 
 // 向量 Provider 只负责“文本 -> 向量”，不参与权限或证据裁剪。
@@ -13,6 +14,10 @@ public:
     virtual int dimension() const = 0;
     virtual bool embed(const QString &text, QVector<float> *vector,
                        QString *error = nullptr) const = 0;
+    // 可选批量接口；默认逐条调用 embed，真实 Provider 可覆盖以降低请求数。
+    virtual bool embedBatch(const QStringList &texts,
+                            QVector<QVector<float>> *vectors,
+                            QString *error = nullptr) const;
 };
 
 // 确定性的本地测试/降级 Provider：只做字符 bigram 哈希，不是语义模型。

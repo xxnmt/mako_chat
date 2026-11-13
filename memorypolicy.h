@@ -68,10 +68,18 @@ struct MemoryRetrievalConfig {
     bool legacyFallback = true;
     int candidateLimit = 40;
     int rerankLimit = 10;
+    bool rerankEnabled = false;
     bool embeddingEnabled = false;
     QString embeddingProvider;
+    QString embeddingEndpoint;
+    QString embeddingApiKeyEnv = QStringLiteral("DASHSCOPE_API_KEY");
+    // 允许直接写入 setting.json 的 api.dashscope_api_key；环境变量仍可回退。
+    QString embeddingApiKey;
+    QString dashscopeBaseUrl;
     QString embeddingModel;
     int embeddingDimension = 0;
+    QString rerankEndpoint;
+    QString rerankModel = QStringLiteral("qwen3-rerank");
 };
 
 struct MemoryPolicyConfig {

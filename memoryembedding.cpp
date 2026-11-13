@@ -3,6 +3,23 @@
 #include <QHash>
 #include <QtMath>
 
+bool MemoryEmbeddingProvider::embedBatch(const QStringList &texts,
+                                         QVector<QVector<float>> *vectors,
+                                         QString *error) const
+{
+    if (!vectors)
+        return false;
+    vectors->clear();
+    vectors->reserve(texts.size());
+    for (const auto &text : texts) {
+        QVector<float> vector;
+        if (!embed(text, &vector, error))
+            return false;
+        vectors->append(vector);
+    }
+    return true;
+}
+
 LocalHashEmbeddingProvider::LocalHashEmbeddingProvider(int dimension)
     : m_dimension(qMax(8, dimension))
 {

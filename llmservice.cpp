@@ -12,6 +12,7 @@
 #include <QDir>
 #include <QFile>
 #include <QPointer>
+#include <QThread>
 #include <QTimer>
 #include <QElapsedTimer>
 #include <QPair>
@@ -114,6 +115,7 @@ LLMService::LLMService(const QString &apiKey,QObject *parent, QUrl endpoint)
             this, &LLMService::onMemoryAgentFailed);
 
     qRegisterMetaType<QList<SentenceText>>("QList<SentenceText>");
+    qRegisterMetaType<RetrievalResult>("RetrievalResult");
     m_apiKey=apiKey;
     m_memoryAgent->setApiKey(apiKey);
 
@@ -146,16 +148,17 @@ void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> 
         auto terms = RecentContextPlanner::extractTerms(userInput.left(100));
         if (!historyQA.isEmpty())
             terms.append(RecentContextPlanner::extractTerms(historyQA.last().userInput.left(80)));
-        QElapsedTimer retrievalTimer;
-        retrievalTimer.start();
         m_run.situation = MemorySituation::fromRequest(
             meta, config.getTTSMode() == QStringLiteral("api"));
-        QStringList candidates, privateRefs, reflectionRefs;
+        m_run.retrievalTerms = terms;
         RetrievalRequest request;
         request.query = userInput;
         request.purpose = QStringLiteral("automatic");
         request.subject = meta.subject;
         request.accounts = accounts;
+        request.viewerPersonId = !meta.personId.isEmpty() ? meta.personId
+            : (meta.subject == QStringLiteral("user") ? QStringLiteral("owner") : meta.subject);
+        request.viewerIsOwner = meta.subject == QStringLiteral("user");
         request.terms = terms;
         request.includeOthers = true;
         request.currentChannel = meta.channel;
@@ -168,57 +171,107 @@ void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> 
         request.candidateLimit = config.getMemoryPolicyConfig().retrieval.candidateLimit;
         request.rerankLimit = config.getMemoryPolicyConfig().retrieval.rerankLimit;
         request.situation = m_run.situation;
+
+        const auto retrievalConfig = config.getMemoryPolicyConfig().retrieval;
+        const QString asyncKey = !retrievalConfig.embeddingApiKey.isEmpty()
+            ? retrievalConfig.embeddingApiKey
+            : qEnvironmentVariable(retrievalConfig.embeddingApiKeyEnv.toUtf8().constData());
+        const bool asyncDashScope = retrievalConfig.embeddingEnabled
+            && retrievalConfig.embeddingProvider == QStringLiteral("dashscope")
+            && !retrievalConfig.embeddingEndpoint.isEmpty()
+            && !asyncKey.isEmpty();
+        if (asyncDashScope) {
+            const quint64 generation = m_agentGeneration;
+            auto *thread = new QThread(this);
+            const QString rerankEndpoint = retrievalConfig.rerankEnabled
+                ? retrievalConfig.rerankEndpoint : QString();
+            const QString rerankKey = retrievalConfig.rerankEnabled ? asyncKey : QString();
+            auto *worker = new MemoryRetrievalWorker(
+                config.getMemoryPath(), request,
+                retrievalConfig.embeddingEndpoint, asyncKey,
+                retrievalConfig.embeddingModel, retrievalConfig.embeddingDimension,
+                rerankEndpoint, rerankKey,
+                retrievalConfig.rerankModel);
+            worker->moveToThread(thread);
+            connect(thread, &QThread::started, worker, &MemoryRetrievalWorker::run);
+            connect(worker, &MemoryRetrievalWorker::finished, this,
+                    [this, thread, generation](const RetrievalResult &result) {
+                if (generation == m_agentGeneration)
+                    finishRetrieval(result);
+                thread->quit();
+            });
+            connect(thread, &QThread::finished, worker, &QObject::deleteLater);
+            connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+            thread->start();
+            return;
+        }
+
         RetrievalResult retrieval;
         if (m_retrievalService)
             retrieval = m_retrievalService->retrieve(request);
-        m_run.retrievalStatus = retrieval.status;
-        m_run.retrievalBackend = retrieval.backend;
-        m_run.retrievalCandidates = retrieval.candidateCount;
-        m_run.retrievalLatencyMs = retrieval.latencyMs;
-        m_run.retrievalTruncated = retrieval.truncated;
-        for (const auto &entry : retrieval.evidence) {
-            if (entry.text.trimmed().isEmpty())
-                continue;
-            // 当前消息已经作为 current_input 提供；避免同一句在召回里重复。
-            if (entry.channel == meta.channel && entry.session == meta.sessionId
-                && entry.text.trimmed() == userInput.trimmed())
-                continue;
-            auto obj = entry.toJson();
-            const QString ref = entry.handle;
-            if (ref.isEmpty())
-                continue;
-            candidates.append(ref);
-            if (config.isBlindZone(entry.channel, entry.session))
-                continue;
-            const auto scan = SensitiveContentFilter::sanitize(obj["text"].toString(), {},
-                                                               config.getMemoryPolicyConfig().privacyRules);
-            if (scan.blocked || scan.redacted)
-                continue;
-            if (meta.channel != Channel::kQQGroup && entry.own) {
-                privateRefs.append(ref);
-                privateContext.append(obj);
-            } else {
-                reflectionRefs.append(ref);
-                evidence.append(obj);
-            }
-        }
-        const auto at = meta.receivedAtUtc.isValid() ? meta.receivedAtUtc : QDateTime::currentDateTimeUtc();
-        const auto reports = observationHistory(meta.subject, meta.channel, meta.sessionId,
-                                                at.toUTC().toString(Qt::ISODateWithMs), terms, false);
-        for (const auto &report : reports) {
-            privateContext.append(report);
-            privateRefs.append(QString("chat/%1").arg(report.toObject()["turn"].toInteger()));
-        }
-        qInfo() << "[Cognition] retrieval run=" << meta.runId << "term_count=" << terms.size()
-                << "candidates=" << candidates << "private_context=" << privateRefs
-                << "reflection=" << reflectionRefs << "status=" << retrieval.status
-                << "elapsed_ms=" << retrievalTimer.elapsed();
+        finishRetrieval(retrieval);
+        return;
     }
+    finishRetrieval(RetrievalResult{});
+}
+
+void LLMService::finishRetrieval(const RetrievalResult &retrieval)
+{
+    auto &config = ConfigManager::instance();
+    const auto meta = m_run.meta;
+    QJsonArray evidence;
+    QJsonArray privateContext;
+    QStringList candidates, privateRefs, reflectionRefs;
+    m_run.retrievalStatus = retrieval.status;
+    m_run.retrievalBackend = retrieval.backend;
+    m_run.retrievalCandidates = retrieval.candidateCount;
+    m_run.retrievalAuxiliary = retrieval.auxiliaryCount;
+    m_run.retrievalLatencyMs = retrieval.latencyMs;
+    m_run.retrievalTruncated = retrieval.truncated;
+    for (const auto &entry : retrieval.evidence) {
+        if (entry.text.trimmed().isEmpty())
+            continue;
+        // 当前消息已经作为 current_input 提供；避免同一句在召回里重复。
+        if (entry.channel == meta.channel && entry.session == meta.sessionId
+            && entry.text.trimmed() == m_run.input.trimmed())
+            continue;
+        auto obj = entry.toJson();
+        const QString ref = entry.handle;
+        if (ref.isEmpty())
+            continue;
+        candidates.append(ref);
+        if (config.isBlindZone(entry.channel, entry.session))
+            continue;
+        const auto scan = SensitiveContentFilter::sanitize(
+            obj["text"].toString(), {}, config.getMemoryPolicyConfig().privacyRules);
+        if (scan.blocked || scan.redacted)
+            continue;
+        if (meta.channel != Channel::kQQGroup && entry.own) {
+            privateRefs.append(ref);
+            privateContext.append(obj);
+        } else {
+            reflectionRefs.append(ref);
+            evidence.append(obj);
+        }
+    }
+    const auto at = meta.receivedAtUtc.isValid() ? meta.receivedAtUtc : QDateTime::currentDateTimeUtc();
+    const auto reports = observationHistory(meta.subject, meta.channel, meta.sessionId,
+                                            at.toUTC().toString(Qt::ISODateWithMs),
+                                            m_run.retrievalTerms, false);
+    for (const auto &report : reports) {
+        privateContext.append(report);
+        privateRefs.append(QString("chat/%1").arg(report.toObject()["turn"].toInteger()));
+    }
+    qInfo() << "[Cognition] retrieval run=" << meta.runId
+            << "term_count=" << m_run.retrievalTerms.size()
+            << "candidates=" << candidates << "private_context=" << privateRefs
+            << "reflection=" << reflectionRefs << "status=" << retrieval.status
+            << "backend=" << retrieval.backend << "latency_ms=" << retrieval.latencyMs;
     const auto matters = meta.channel == Channel::kQQGroup && m_memoryManager
-        ? m_memoryManager->internalMatters(meta,RecentContextPlanner::extractTerms(userInput))
+        ? m_memoryManager->internalMatters(meta, m_run.retrievalTerms)
         : QJsonArray{};
     if (evidence.isEmpty() && matters.isEmpty()) {
-        prepareReply(userInput, historyQA, meta, privateContext, {});
+        prepareReply(m_run.input, m_run.history, meta, privateContext, {});
         return;
     }
     considerEvidence(evidence, privateContext, matters);
@@ -2523,6 +2576,7 @@ void LLMService::onReplyFinished(QNetworkReply *reply)
                 audit["retrieval_status"] = m_run.retrievalStatus;
                 audit["retrieval_backend"] = m_run.retrievalBackend;
                 audit["retrieval_candidates"] = m_run.retrievalCandidates;
+                audit["retrieval_auxiliary"] = m_run.retrievalAuxiliary;
                 audit["retrieval_latency_ms"] = m_run.retrievalLatencyMs;
                 audit["retrieval_truncated"] = m_run.retrievalTruncated;
                 audit["provided_evidence"] = m_run.evidence;

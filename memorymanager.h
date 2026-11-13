@@ -96,7 +96,8 @@ public:
     QJsonArray personalEvidence(const QString &subject, const QStringList &accounts,
                                 const QStringList &terms, bool includeOthers = false,
                                 const QString &currentChannel = {}, const QString &currentSession = {},
-                                bool excludeCurrent = true) const;
+                                bool excludeCurrent = true, bool includeUnmatched = false,
+                                bool includeAllEpisodic = false, bool requireTermMatch = false) const;
 
     // 可重建的检索块。原文仍留在原表；这些表只保存检索视图与向量。
     bool rebuildSearchIndex(QString *error = nullptr);
@@ -107,6 +108,7 @@ public:
     QJsonArray searchMemoryChunks(const QStringList &terms, int limit = 40,
                                   const QString &exactQuery = {}) const;
     QJsonArray memoryChunksForEmbedding(int limit = 2000) const;
+    QJsonArray memoryChunksMissingEmbedding(int limit, const QString &model) const;
     bool storeChunkEmbedding(qlonglong chunkId, const QString &model, int dimension,
                              const QByteArray &blob, const QString &contentHash);
     QByteArray chunkEmbedding(qlonglong chunkId, const QString &model) const;

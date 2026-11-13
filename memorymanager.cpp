@@ -354,7 +354,8 @@ bool MemoryManager::canShareThought(qlonglong id, int expectedVersion) const
 QJsonArray MemoryManager::personalEvidence(const QString &subject, const QStringList &accounts,
                                            const QStringList &terms, bool includeOthers,
                                            const QString &currentChannel, const QString &currentSession,
-                                           bool excludeCurrent) const
+                                           bool excludeCurrent, bool includeUnmatched,
+                                           bool includeAllEpisodic, bool requireTermMatch) const
 {
     // raw_events already reflects the inbound retention decision. Historical short-only
     // chat rows lack this provenance and must not be promoted during migration.
@@ -369,7 +370,7 @@ QJsonArray MemoryManager::personalEvidence(const QString &subject, const QString
               AND (:all_people OR sender_id IN (SELECT value FROM json_each(:accounts)))
             UNION ALL
             SELECT content,event_time,origin,session_id,subject=:subject,subject,'episode/'||rowid FROM episodic_memory
-            WHERE (subject=:subject OR :all_people) AND origin='pet' AND status='active'
+            WHERE (subject=:subject OR :all_people) AND (origin='pet' OR :all_episodic) AND status='active'
             UNION ALL
             SELECT safe_summary,ended_at,channel,session_id,0,'summary','interaction/'||rowid FROM interactions
             WHERE :all_people AND summary_status='ready' AND safe_summary IS NOT NULL
@@ -400,7 +401,8 @@ QJsonArray MemoryManager::personalEvidence(const QString &subject, const QString
             SELECT *,
                 row_number() OVER (ORDER BY matches DESC,own DESC,datetime(time) DESC,channel,session,speaker,text) AS topic_rank,
                 row_number() OVER (PARTITION BY own ORDER BY datetime(time) DESC,channel,session,speaker,text) AS timeline_rank
-            FROM candidates WHERE own OR matches>0
+            FROM candidates WHERE (own OR matches>0 OR :include_unmatched)
+              AND (:require_match=0 OR matches>0)
         )
         SELECT substr(text,1,360),time,channel,session,own,speaker,ref FROM ranked
         ORDER BY CASE WHEN own THEN min(topic_rank,timeline_rank) ELSE topic_rank END,
@@ -415,6 +417,9 @@ QJsonArray MemoryManager::personalEvidence(const QString &subject, const QString
     query.bindValue(":current_channel", currentChannel.isNull() ? QStringLiteral("") : currentChannel);
     query.bindValue(":current_session", currentSession.isNull() ? QStringLiteral("") : currentSession);
     query.bindValue(":exclude_current", int(excludeCurrent));
+    query.bindValue(":include_unmatched", int(includeUnmatched));
+    query.bindValue(":all_episodic", int(includeAllEpisodic));
+    query.bindValue(":require_match", int(requireTermMatch));
     query.bindValue(":terms", json(terms));
     QJsonArray evidence;
     if (query.exec()) {
@@ -750,15 +755,58 @@ QJsonArray MemoryManager::memoryChunksForEmbedding(int limit) const
 {
     QJsonArray result;
     QSqlQuery q(m_db);
-    q.prepare("SELECT id,content_hash,text FROM memory_chunks WHERE status='active' "
-              "AND index_generation=1 ORDER BY id LIMIT ?");
+    q.prepare("SELECT id,source_type,source_ref,chunk_kind,derived,text,content_hash,"
+              "channel,session_id,speaker_id,speaker_name,speaker_role,"
+              "speech_at,event_time,recorded_at,privacy,status "
+              "FROM memory_chunks WHERE status='active' AND index_generation=1 "
+              "ORDER BY id LIMIT ?");
     q.addBindValue(qMax(1, limit));
     if (!q.exec())
         return result;
-    while (q.next())
-        result.append(QJsonObject{{"id",q.value(0).toLongLong()},
-                                  {"content_hash",q.value(1).toString()},
-                                  {"text",q.value(2).toString()}});
+    while (q.next()) {
+        result.append(QJsonObject{
+            {"id",q.value(0).toLongLong()},{"source_type",q.value(1).toString()},
+            {"source_ref",q.value(2).toString()},{"chunk_kind",q.value(3).toString()},
+            {"derived",q.value(4).toString()},{"text",q.value(5).toString()},
+            {"content_hash",q.value(6).toString()},{"channel",q.value(7).toString()},
+            {"session",q.value(8).toString()},{"speaker_id",q.value(9).toString()},
+            {"speaker",q.value(10).toString()},{"speaker_role",q.value(11).toString()},
+            {"speech_at",q.value(12).toString()},{"event_time",q.value(13).toString()},
+            {"recorded_at",q.value(14).toString()},{"privacy",q.value(15).toString()},
+            {"status",q.value(16).toString()}});
+    }
+    return result;
+}
+
+QJsonArray MemoryManager::memoryChunksMissingEmbedding(int limit, const QString &model) const
+{
+    QJsonArray result;
+    if (model.isEmpty())
+        return result;
+    QSqlQuery q(m_db);
+    q.prepare("SELECT c.id,c.source_type,c.source_ref,c.chunk_kind,c.derived,c.text,c.content_hash,"
+              "c.channel,c.session_id,c.speaker_id,c.speaker_name,c.speaker_role,"
+              "c.speech_at,c.event_time,c.recorded_at,c.privacy,c.status "
+              "FROM memory_chunks c WHERE c.status='active' AND c.index_generation=1 "
+              "AND NOT EXISTS (SELECT 1 FROM memory_embeddings e WHERE e.chunk_id=c.id "
+              "AND e.model_config=? AND e.content_hash=c.content_hash) "
+              "ORDER BY c.id LIMIT ?");
+    q.addBindValue(model);
+    q.addBindValue(qMax(1, limit));
+    if (!q.exec())
+        return result;
+    while (q.next()) {
+        result.append(QJsonObject{
+            {"id",q.value(0).toLongLong()},{"source_type",q.value(1).toString()},
+            {"source_ref",q.value(2).toString()},{"chunk_kind",q.value(3).toString()},
+            {"derived",q.value(4).toString()},{"text",q.value(5).toString()},
+            {"content_hash",q.value(6).toString()},{"channel",q.value(7).toString()},
+            {"session",q.value(8).toString()},{"speaker_id",q.value(9).toString()},
+            {"speaker",q.value(10).toString()},{"speaker_role",q.value(11).toString()},
+            {"speech_at",q.value(12).toString()},{"event_time",q.value(13).toString()},
+            {"recorded_at",q.value(14).toString()},{"privacy",q.value(15).toString()},
+            {"status",q.value(16).toString()}});
+    }
     return result;
 }
 
@@ -799,26 +847,61 @@ bool MemoryManager::embedSearchChunks(MemoryEmbeddingProvider *provider, int lim
         if (error) *error = QStringLiteral("embedding provider is null");
         return false;
     }
-    const auto chunks = memoryChunksForEmbedding(limit);
+    const int chunkBatch = qMax(1, limit);
     int embedded = 0;
-    for (const auto &value : chunks) {
-        const auto chunk = value.toObject();
-        QVector<float> vector;
-        QString embedError;
-        if (!provider->embed(chunk.value(QStringLiteral("text")).toString(),
-                             &vector, &embedError)) {
-            if (error) *error = embedError;
-            return false;
+    QHash<QByteArray, QVector<float>> textVectors;
+    while (true) {
+        const auto chunks = memoryChunksMissingEmbedding(chunkBatch, provider->modelId());
+        if (chunks.isEmpty())
+            break;
+
+        QStringList pendingTexts;
+        QList<QByteArray> pendingKeys;
+        QHash<QByteArray, int> pendingIndex;
+        for (const auto &value : chunks) {
+            const auto chunk = value.toObject();
+            const QByteArray key = chunk.value(QStringLiteral("text")).toString().toUtf8();
+            if (textVectors.contains(key) || pendingIndex.contains(key))
+                continue;
+            pendingIndex.insert(key, pendingTexts.size());
+            pendingKeys.append(key);
+            pendingTexts.append(QString::fromUtf8(key));
         }
-        const QByteArray blob(reinterpret_cast<const char *>(vector.constData()),
-                              vector.size() * int(sizeof(float)));
-        if (!storeChunkEmbedding(chunk.value(QStringLiteral("id")).toInteger(),
-                                 provider->modelId(), vector.size(), blob,
-                                 chunk.value(QStringLiteral("content_hash")).toString())) {
-            if (error) *error = QStringLiteral("store embedding failed");
-            return false;
+        const int providerBatch = 10;
+        for (int offset = 0; offset < pendingTexts.size(); offset += providerBatch) {
+            QVector<QVector<float>> batchVectors;
+            QString embedError;
+            if (!provider->embedBatch(pendingTexts.mid(offset, providerBatch),
+                                      &batchVectors, &embedError)) {
+                if (error) *error = embedError;
+                return false;
+            }
+            for (int i = 0; i < batchVectors.size()
+                            && offset + i < pendingKeys.size(); ++i) {
+                textVectors.insert(pendingKeys.at(offset + i), batchVectors.at(i));
+            }
         }
-        ++embedded;
+
+        for (const auto &value : chunks) {
+            const auto chunk = value.toObject();
+            const QByteArray key = chunk.value(QStringLiteral("text")).toString().toUtf8();
+            if (!textVectors.contains(key)) {
+                if (error) *error = QStringLiteral("embedding batch missing a chunk");
+                return false;
+            }
+            const auto &vector = textVectors.value(key);
+            const QByteArray blob(reinterpret_cast<const char *>(vector.constData()),
+                                  vector.size() * int(sizeof(float)));
+            if (!storeChunkEmbedding(chunk.value(QStringLiteral("id")).toInteger(),
+                                     provider->modelId(), vector.size(), blob,
+                                     chunk.value(QStringLiteral("content_hash")).toString())) {
+                if (error) *error = QStringLiteral("store embedding failed");
+                return false;
+            }
+            ++embedded;
+        }
+        if (chunks.size() < chunkBatch)
+            break;
     }
     QSqlQuery state(m_db);
     state.prepare("INSERT OR REPLACE INTO memory_index_state(key,value) VALUES(?,?)");
@@ -969,7 +1052,9 @@ bool MemoryManager::indexChatTurn(qlonglong id)
     user.text = userText;
     user.channel = channel;
     user.session = session;
-    user.speakerId = subject.isEmpty() ? QStringLiteral("user") : subject;
+    user.speakerId = subject.isEmpty()
+        ? QStringLiteral("user")
+        : (subject == QStringLiteral("user") ? QStringLiteral("owner") : subject);
     user.speakerName = speaker.isEmpty()
         ? (subject == QStringLiteral("user") ? QStringLiteral("主人") : QStringLiteral("群友"))
         : speaker;

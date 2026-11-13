@@ -55,12 +55,16 @@ bool ConfigManager::loadSetting()
     if (rootObj.contains("api") && rootObj["api"].isObject()) {
         QJsonObject apiObj = rootObj["api"].toObject();
         m_apiKey = apiObj.value("deepseek_api_key").toString("sk-placeholder-key");
+        m_dashscopeApiKey = apiObj.value("dashscope_api_key").toString();
+        m_dashscopeBaseUrl = apiObj.value("dashscope_base_url").toString();
         m_ttsUrl = apiObj.value("gpt_sovits_url").toString("http://127.0.0.1:9880");
     }
     else
     {
         qDebug()<<"[ConfigManger]:api配置缺失，使用默认值";
         m_apiKey = "sk-placeholder-key";
+        m_dashscopeApiKey.clear();
+        m_dashscopeBaseUrl.clear();
         m_ttsUrl = "http://127.0.0.1:9880";
     }
 
@@ -153,14 +157,37 @@ bool ConfigManager::loadSetting()
             qBound(10, retrievalObj.value("candidate_limit").toInt(40), 200);
         m_memoryPolicy.retrieval.rerankLimit =
             qBound(1, retrievalObj.value("rerank_limit").toInt(10), 40);
+        m_memoryPolicy.retrieval.rerankEnabled =
+            retrievalObj.value("rerank_enabled").toBool(false);
         m_memoryPolicy.retrieval.embeddingEnabled =
             retrievalObj.value("embedding_enabled").toBool(false);
         m_memoryPolicy.retrieval.embeddingProvider =
             retrievalObj.value("embedding_provider").toString();
+        m_memoryPolicy.retrieval.embeddingEndpoint =
+            retrievalObj.value("embedding_endpoint").toString();
+        m_memoryPolicy.retrieval.embeddingApiKeyEnv =
+            retrievalObj.value("embedding_api_key_env").toString(QStringLiteral("DASHSCOPE_API_KEY"));
         m_memoryPolicy.retrieval.embeddingModel =
             retrievalObj.value("embedding_model").toString();
         m_memoryPolicy.retrieval.embeddingDimension =
             qBound(0, retrievalObj.value("embedding_dimension").toInt(0), 8192);
+        m_memoryPolicy.retrieval.rerankEndpoint =
+            retrievalObj.value("rerank_endpoint").toString();
+        m_memoryPolicy.retrieval.rerankModel =
+            retrievalObj.value("rerank_model").toString(QStringLiteral("qwen3-rerank"));
+        m_memoryPolicy.retrieval.embeddingApiKey = m_dashscopeApiKey;
+        m_memoryPolicy.retrieval.dashscopeBaseUrl = m_dashscopeBaseUrl;
+        QString dashScopeBase = m_dashscopeBaseUrl.trimmed();
+        while (dashScopeBase.endsWith(QLatin1Char('/')))
+            dashScopeBase.chop(1);
+        if (!dashScopeBase.isEmpty()) {
+            if (m_memoryPolicy.retrieval.embeddingEndpoint.isEmpty())
+                m_memoryPolicy.retrieval.embeddingEndpoint =
+                    dashScopeBase + QStringLiteral("/compatible-mode/v1/embeddings");
+            if (m_memoryPolicy.retrieval.rerankEndpoint.isEmpty())
+                m_memoryPolicy.retrieval.rerankEndpoint =
+                    dashScopeBase + QStringLiteral("/api/v1/services/rerank/text-rerank/text-rerank");
+        }
 
         m_memoryPolicy.policyVersion =
             memoryObj.value("privacy_policy_version").toString(QStringLiteral("r3"));
@@ -312,6 +339,8 @@ bool ConfigManager::saveSetting()
 
     QJsonObject apiObj;
     apiObj.insert("deepseek_api_key", m_apiKey);
+    apiObj.insert("dashscope_api_key", m_dashscopeApiKey);
+    apiObj.insert("dashscope_base_url", m_dashscopeBaseUrl);
     apiObj.insert("gpt_sovits_url", m_ttsUrl);
 
     QJsonObject memoryObj;
@@ -344,6 +373,22 @@ bool ConfigManager::saveSetting()
     recentContextObj.insert("warm_line_max_chars",
                             m_memoryPolicy.recentContext.warmLineMaxChars);
     memoryObj.insert("recent_group_context", recentContextObj);
+    QJsonObject retrievalObj;
+    retrievalObj.insert("index_enabled", m_memoryPolicy.retrieval.indexEnabled);
+    retrievalObj.insert("auto_backfill", m_memoryPolicy.retrieval.autoBackfill);
+    retrievalObj.insert("legacy_fallback", m_memoryPolicy.retrieval.legacyFallback);
+    retrievalObj.insert("candidate_limit", m_memoryPolicy.retrieval.candidateLimit);
+    retrievalObj.insert("rerank_limit", m_memoryPolicy.retrieval.rerankLimit);
+    retrievalObj.insert("rerank_enabled", m_memoryPolicy.retrieval.rerankEnabled);
+    retrievalObj.insert("embedding_enabled", m_memoryPolicy.retrieval.embeddingEnabled);
+    retrievalObj.insert("embedding_provider", m_memoryPolicy.retrieval.embeddingProvider);
+    retrievalObj.insert("embedding_endpoint", m_memoryPolicy.retrieval.embeddingEndpoint);
+    retrievalObj.insert("embedding_api_key_env", m_memoryPolicy.retrieval.embeddingApiKeyEnv);
+    retrievalObj.insert("embedding_model", m_memoryPolicy.retrieval.embeddingModel);
+    retrievalObj.insert("embedding_dimension", m_memoryPolicy.retrieval.embeddingDimension);
+    retrievalObj.insert("rerank_endpoint", m_memoryPolicy.retrieval.rerankEndpoint);
+    retrievalObj.insert("rerank_model", m_memoryPolicy.retrieval.rerankModel);
+    memoryObj.insert("retrieval", retrievalObj);
     memoryObj.insert("agent_enabled", m_memoryPolicy.agent.enabled);
     memoryObj.insert("agent_mode", m_memoryPolicy.agent.mode);
     memoryObj.insert("agent_protocol", m_memoryPolicy.agent.protocol);
@@ -496,6 +541,26 @@ QString ConfigManager::getApiKey() const
 void ConfigManager::setApiKey(const QString &apiKey)
 {
     m_apiKey=apiKey;
+}
+
+QString ConfigManager::getDashScopeApiKey() const
+{
+    return m_dashscopeApiKey;
+}
+
+void ConfigManager::setDashScopeApiKey(const QString &apiKey)
+{
+    m_dashscopeApiKey = apiKey;
+}
+
+QString ConfigManager::getDashScopeBaseUrl() const
+{
+    return m_dashscopeBaseUrl;
+}
+
+void ConfigManager::setDashScopeBaseUrl(const QString &baseUrl)
+{
+    m_dashscopeBaseUrl = baseUrl;
 }
 
 QString ConfigManager::getTTSUrl() const

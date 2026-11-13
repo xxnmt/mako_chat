@@ -56,6 +56,8 @@ add_phase0_test(tst_memorymanager
     ${PROJECT_SOURCE_DIR}/memoryretrieval.cpp
     ${PROJECT_SOURCE_DIR}/memoryembedding.h
     ${PROJECT_SOURCE_DIR}/memoryembedding.cpp
+    ${PROJECT_SOURCE_DIR}/memorydashscope.h
+    ${PROJECT_SOURCE_DIR}/memorydashscope.cpp
     ${PROJECT_SOURCE_DIR}/memoryindexworker.h
     ${PROJECT_SOURCE_DIR}/memoryindexworker.cpp
     ${PROJECT_SOURCE_DIR}/matterstore.cpp
@@ -64,6 +66,7 @@ add_phase0_test(tst_memorymanager
     ${PROJECT_SOURCE_DIR}/qqmessageparser.h
     ${PROJECT_SOURCE_DIR}/qqmessageparser.cpp
 )
+target_link_libraries(tst_memorymanager PRIVATE Qt6::Network)
 
 add_phase0_test(tst_configmanager
     tst_configmanager.cpp
@@ -134,7 +137,9 @@ add_phase0_test(tst_memoryagent
     ${PROJECT_SOURCE_DIR}/promptassembler.cpp
     ${PROJECT_SOURCE_DIR}/memoryevidence.cpp
     ${PROJECT_SOURCE_DIR}/memoryretrieval.cpp
+    ${PROJECT_SOURCE_DIR}/memoryretrievalworker.cpp
     ${PROJECT_SOURCE_DIR}/memoryembedding.cpp
+    ${PROJECT_SOURCE_DIR}/memorydashscope.cpp
     ${CALENDAR_RESOURCES}
     ${PROJECT_SOURCE_DIR}/memoryagenttypes.h
     ${PROJECT_SOURCE_DIR}/memoryagent.h

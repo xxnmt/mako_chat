@@ -19,6 +19,8 @@
 #include "memorymanager.h"
 #include "memorysourcepolicy.h"
 #include "memoryretrieval.h"
+#include "memoryembedding.h"
+#include "configmanager.h"
 #include "memorytextutils.h"
 #include "memorytimerange.h"
 
@@ -438,6 +440,80 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
                                 ? qMin(limit, 2)
                                 : limit;
     if (wantsRecent && !m_scope.allowedGroupIds.isEmpty()) {
+        bool servedByUnified = false;
+        if (m_memoryManager->memoryChunkCount() > 0) {
+            RetrievalRequest request;
+            request.query = query;
+            request.purpose = QStringLiteral("tool.recent");
+            request.subject = m_scope.viewerIsOwner
+                ? QStringLiteral("user") : m_scope.viewerPersonId;
+            request.viewerPersonId = m_scope.viewerPersonId;
+            request.viewerIsOwner = m_scope.viewerIsOwner;
+            request.accounts = m_scope.recentQueryTemplate.viewerIds;
+            request.terms = terms;
+            request.includeOthers = true;
+            request.currentChannel = m_scope.channel;
+            request.currentSession = m_scope.sessionId;
+            request.excludeCurrent = false;
+            request.requireTermMatch = true;
+            request.limit = recentLimit;
+            request.sourceKinds = {QStringLiteral("raw")};
+            QStringList allowed;
+            for (const auto &groupId : m_scope.allowedGroupIds)
+                allowed.append(QStringLiteral("qq_group|") + groupId);
+            request.allowedSources = allowed;
+            const auto retrievalConfig =
+                ConfigManager::instance().getMemoryPolicyConfig().retrieval;
+            request.useIndex = retrievalConfig.indexEnabled;
+            request.allowLegacyFallback = retrievalConfig.legacyFallback;
+            request.candidateLimit = retrievalConfig.candidateLimit;
+            request.rerankLimit = retrievalConfig.rerankLimit;
+            MemoryRetrievalService service(m_memoryManager);
+            if (retrievalConfig.embeddingEnabled
+                && retrievalConfig.embeddingProvider == QStringLiteral("local_hash_test")) {
+                const int dimension = retrievalConfig.embeddingDimension > 0
+                    ? retrievalConfig.embeddingDimension : 64;
+                service.setEmbeddingProvider(
+                    std::make_shared<LocalHashEmbeddingProvider>(dimension));
+            }
+            const auto unified = service.retrieve(request);
+            for (const auto &evidence : unified.evidence) {
+                if (resultItems.size() >= recentLimit)
+                    break;
+                if (evidence.sourceType != QStringLiteral("raw")
+                    || !evidence.sourceRef.startsWith(QStringLiteral("raw/")))
+                    continue;
+                if (timeRange.valid && evidence.speechAt.isValid()
+                    && (evidence.speechAt < timeRange.from
+                        || evidence.speechAt >= timeRange.to))
+                    continue;
+                const QString text = MemoryTextUtils::sanitizePromptText(evidence.text);
+                if (text.isEmpty())
+                    continue;
+                MemoryAgentItem item;
+                item.id = QStringLiteral("recent:%1")
+                    .arg(evidence.sourceRef.mid(QStringLiteral("raw/").size()));
+                item.kind = QStringLiteral("recent");
+                item.text = text;
+                item.time = evidence.speechAt;
+                item.source = sourceLabelForSession(m_scope, evidence.session);
+                item.groupLabel = groupLabelFor(evidence.session);
+                item.personId = evidence.speakerId;
+                item.rawEventId = evidence.sourceRef.mid(
+                    QStringLiteral("raw/").size()).toLongLong();
+                item.sourceSessionId = evidence.session;
+                item.isViewer = evidence.own
+                    || (m_scope.viewerIsOwner && evidence.speakerName == QStringLiteral("owner"))
+                    || evidence.speakerName == m_scope.viewerPersonId;
+                const int before = m_ordered.size();
+                remember(item);
+                if (m_ordered.size() > before) {
+                    resultItems.append(itemToJson(item));
+                    servedByUnified = true;
+                }
+            }
+        }
+        if (!servedByUnified) {
         RecentContextQuery recentQuery = m_scope.recentQueryTemplate;
         recentQuery.allowedGroupIds = m_scope.allowedGroupIds;
         recentQuery.queryText = query;
@@ -480,10 +556,10 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
                 break;
             }
         }
+        }
     }
 
-    // 2) interaction summaries：只来自当前群，或 Owner 的允许群。
-    // 非 Owner 私聊只允许 viewer 自己的跨群表达，不注入群级 summary。
+    // 2) interaction summaries：统一服务取候选，群级摘要仍需授权范围。
     const bool summariesAllowed = m_scope.channel == Channel::kQQGroup
                                   || m_scope.viewerIsOwner;
     if (summariesAllowed
@@ -494,134 +570,211 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
         if (m_scope.channel == Channel::kQQGroup) {
             sessions = {m_scope.sessionId};
         }
-
-        struct RankedSummary {
-            InteractionSummary summary;
-            int score = 0;
-        };
-        QList<RankedSummary> ranked;
-        QSet<qlonglong> seenSummaries;
-        // 时间范围可能包含几十条摘要，不能只取最近 limit 条；先多取候选，
-        // 再按查询词命中数排序，避免 19:19 的晚饭被 23:xx 的摘要挤出 top-k。
-        const int scanLimit = timeRange.valid
-                                  ? qMin(200, qMax(100, limit * 10))
-                                  : limit;
-        for (const QString &sessionId : sessions) {
-            const QList<InteractionSummary> summaries = timeRange.valid
-                ? m_memoryManager->getInteractionSummariesInRange(
-                      Channel::kQQGroup, sessionId, timeRange.from,
-                      timeRange.to, scanLimit)
-                : m_memoryManager->getRecentInteractionSummaries(
-                      Channel::kQQGroup, sessionId, scanLimit);
-            for (const InteractionSummary &summary : summaries) {
-                if (seenSummaries.contains(summary.id)) {
-                    continue;
-                }
-                const int score = countMatchingTerms(summary.summaryText, terms);
-                if (!timeRange.valid && score == 0) {
-                    continue;
-                }
-                seenSummaries.insert(summary.id);
-                ranked.append({summary, score});
-            }
+        RetrievalRequest request;
+        request.query = query;
+        request.purpose = QStringLiteral("tool.interaction_summary");
+        request.subject = m_scope.viewerIsOwner
+            ? QStringLiteral("user") : m_scope.viewerPersonId;
+        request.viewerPersonId = m_scope.viewerPersonId;
+        request.viewerIsOwner = m_scope.viewerIsOwner;
+        request.accounts = m_scope.recentQueryTemplate.viewerIds;
+        request.terms = terms;
+        request.includeOthers = true;
+        request.currentChannel = m_scope.channel;
+        request.currentSession = m_scope.sessionId;
+        request.excludeCurrent = false;
+        request.includeUnmatched = timeRange.valid;
+        request.limit = limit;
+        request.sourceKinds = {QStringLiteral("interaction")};
+        QStringList allowed;
+        for (const auto &session : sessions)
+            allowed.append(QStringLiteral("qq_group|") + session);
+        request.allowedSources = allowed;
+        const auto retrievalConfig =
+            ConfigManager::instance().getMemoryPolicyConfig().retrieval;
+        request.useIndex = retrievalConfig.indexEnabled;
+        request.allowLegacyFallback = retrievalConfig.legacyFallback;
+        request.candidateLimit = retrievalConfig.candidateLimit;
+        request.rerankLimit = retrievalConfig.rerankLimit;
+        MemoryRetrievalService service(m_memoryManager);
+        if (retrievalConfig.embeddingEnabled
+            && retrievalConfig.embeddingProvider == QStringLiteral("local_hash_test")) {
+            const int dimension = retrievalConfig.embeddingDimension > 0
+                ? retrievalConfig.embeddingDimension : 64;
+            service.setEmbeddingProvider(
+                std::make_shared<LocalHashEmbeddingProvider>(dimension));
         }
-        std::sort(ranked.begin(), ranked.end(),
-                  [](const RankedSummary &a, const RankedSummary &b) {
-                      if (a.score != b.score) {
-                          return a.score > b.score;
-                      }
-                      return a.summary.endedAt > b.summary.endedAt;
-                  });
-
-        for (const RankedSummary &entry : ranked) {
-            const InteractionSummary &summary = entry.summary;
+        const auto unified = service.retrieve(request);
+        for (const auto &evidence : unified.evidence) {
+            if (resultItems.size() >= limit)
+                break;
+            if (evidence.sourceType != QStringLiteral("interaction")
+                || !evidence.sourceRef.startsWith(QStringLiteral("interaction/")))
+                continue;
+            if (timeRange.valid && evidence.speechAt.isValid()
+                && (evidence.speechAt < timeRange.from
+                    || evidence.speechAt >= timeRange.to))
+                continue;
+            const QString text = MemoryTextUtils::sanitizePromptText(evidence.text);
+            if (text.isEmpty())
+                continue;
             MemoryAgentItem item;
-            item.id = QStringLiteral("summary:%1").arg(summary.id);
+            item.id = QStringLiteral("summary:%1")
+                .arg(evidence.sourceRef.mid(QStringLiteral("interaction/").size()));
             item.kind = QStringLiteral("summary");
-            item.text = summary.summaryText.trimmed();
-            item.time = summary.endedAt;
-            item.source = sourceLabelForSession(m_scope, summary.sessionId);
-            item.groupLabel = groupLabelFor(summary.sessionId);
-            item.interactionId = summary.id;
-            item.sourceSessionId = summary.sessionId;
+            item.text = text;
+            item.time = evidence.speechAt;
+            item.source = sourceLabelForSession(m_scope, evidence.session);
+            item.groupLabel = groupLabelFor(evidence.session);
+            item.interactionId = evidence.sourceRef.mid(
+                QStringLiteral("interaction/").size()).toLongLong();
+            item.sourceSessionId = evidence.session;
             const int before = m_ordered.size();
             remember(item);
-            if (m_ordered.size() > before) {
+            if (m_ordered.size() > before)
                 resultItems.append(itemToJson(item));
-            }
-            if (resultItems.size() >= limit) {
-                break;
-            }
         }
     }
 
-    // 3) claims：必须通过 MemoryAccessPolicy，只返回 shareable。
+    // 3) claims：统一服务取候选，仍由 MemoryAccessPolicy 做逐条授权。
     if (kinds.contains(QStringLiteral("claim"))
-        && (m_scope.viewerIsOwner || m_scope.membershipVerified)) {
-        if (resultItems.size() < limit) {
-            const QList<MemoryClaim> claims = m_memoryManager->getActiveClaims(50);
-            for (const MemoryClaim &claim : claims) {
-                const MemoryAccessDecision decision =
-                    MemoryAccessPolicy::evaluate(claim, m_scope.access);
-                if (decision.state != MemoryAccessState::Shareable) {
-                    continue;
-                }
-                if (!matchesTerms(claim.statement, terms)) {
-                    continue;
-                }
-                if (timeRange.valid && claim.validTimeStart.isValid()
-                    && (claim.validTimeStart < timeRange.from
-                        || claim.validTimeStart >= timeRange.to)) {
-                    continue;
-                }
-                MemoryAgentItem item;
-                item.id = QStringLiteral("claim:%1").arg(claim.id);
-                item.kind = QStringLiteral("claim");
-                item.text = claim.statement.trimmed();
-                item.time = claim.validTimeStart;
-                item.source = sourceLabelForSession(m_scope, claim.sourceSessionId);
-                item.groupLabel = groupLabelFor(claim.sourceSessionId);
-                item.personId = claim.aboutPersonId;
-                item.interactionId = claim.interactionId;
-                item.claimId = claim.id;
-                item.sourceSessionId = claim.sourceSessionId;
-                const int before = m_ordered.size();
-                remember(item);
-                if (m_ordered.size() > before) {
-                    resultItems.append(itemToJson(item));
-                }
-                if (resultItems.size() >= limit) {
-                    break;
-                }
-            }
+        && (m_scope.viewerIsOwner || m_scope.membershipVerified)
+        && resultItems.size() < limit) {
+        RetrievalRequest request;
+        request.query = query;
+        request.purpose = QStringLiteral("tool.claim");
+        request.subject = m_scope.viewerIsOwner
+            ? QStringLiteral("user") : m_scope.viewerPersonId;
+        request.viewerPersonId = m_scope.viewerPersonId;
+        request.viewerIsOwner = m_scope.viewerIsOwner;
+        request.accounts = m_scope.recentQueryTemplate.viewerIds;
+        request.terms = terms;
+        request.includeOthers = true;
+        request.currentChannel = m_scope.channel;
+        request.currentSession = m_scope.sessionId;
+        request.excludeCurrent = false;
+        request.limit = limit;
+        request.sourceKinds = {QStringLiteral("claim")};
+        QStringList allowed;
+        for (const auto &groupId : m_scope.allowedGroupIds)
+            allowed.append(QStringLiteral("qq_group|") + groupId);
+        if (m_scope.channel == Channel::kQQGroup)
+            allowed.append(QStringLiteral("qq_group|") + m_scope.sessionId);
+        request.allowedSources = allowed;
+        const auto retrievalConfig =
+            ConfigManager::instance().getMemoryPolicyConfig().retrieval;
+        request.useIndex = retrievalConfig.indexEnabled;
+        request.allowLegacyFallback = retrievalConfig.legacyFallback;
+        request.candidateLimit = retrievalConfig.candidateLimit;
+        request.rerankLimit = retrievalConfig.rerankLimit;
+        MemoryRetrievalService service(m_memoryManager);
+        if (retrievalConfig.embeddingEnabled
+            && retrievalConfig.embeddingProvider == QStringLiteral("local_hash_test")) {
+            const int dimension = retrievalConfig.embeddingDimension > 0
+                ? retrievalConfig.embeddingDimension : 64;
+            service.setEmbeddingProvider(
+                std::make_shared<LocalHashEmbeddingProvider>(dimension));
+        }
+        QHash<qlonglong, MemoryClaim> claims;
+        for (const auto &claim : m_memoryManager->getActiveClaims(200))
+            claims.insert(claim.id, claim);
+        const auto unified = service.retrieve(request);
+        for (const auto &evidence : unified.evidence) {
+            if (resultItems.size() >= limit)
+                break;
+            if (evidence.sourceType != QStringLiteral("claim"))
+                continue;
+            const auto claimId = evidence.sourceRef.mid(QStringLiteral("claim/").size()).toLongLong();
+            if (!claims.contains(claimId))
+                continue;
+            const MemoryClaim &claim = claims.value(claimId);
+            const MemoryAccessDecision decision =
+                MemoryAccessPolicy::evaluate(claim, m_scope.access);
+            if (decision.state != MemoryAccessState::Shareable)
+                continue;
+            if (timeRange.valid && claim.validTimeStart.isValid()
+                && (claim.validTimeStart < timeRange.from
+                    || claim.validTimeStart >= timeRange.to))
+                continue;
+            MemoryAgentItem item;
+            item.id = QStringLiteral("claim:%1").arg(claim.id);
+            item.kind = QStringLiteral("claim");
+            item.text = MemoryTextUtils::sanitizePromptText(claim.statement);
+            item.time = claim.validTimeStart;
+            item.source = sourceLabelForSession(m_scope, claim.sourceSessionId);
+            item.groupLabel = groupLabelFor(claim.sourceSessionId);
+            item.personId = claim.aboutPersonId;
+            item.interactionId = claim.interactionId;
+            item.claimId = claim.id;
+            item.sourceSessionId = claim.sourceSessionId;
+            if (item.text.isEmpty())
+                continue;
+            const int before = m_ordered.size();
+            remember(item);
+            if (m_ordered.size() > before)
+                resultItems.append(itemToJson(item));
         }
     }
 
-    // 4) episodic：事件/承诺/里程碑。message_time 不能拿 event_time 冒充；
-    // 没有 source 时间时只做 content 检索，由上层标记 partial。
+    // 4) episodic：统一服务取候选，MemorySourcePolicy 仍逐条授权。
     if (kinds.contains(QStringLiteral("episodic"))
         && resultItems.size() < limit && m_memoryManager) {
-        const QList<EpisodicMemory> memories =
-            m_memoryManager->getActiveEpisodicMemories(0.0, 200);
-        for (const EpisodicMemory &memory : memories) {
-            if (resultItems.size() >= limit) {
+        QHash<qlonglong, EpisodicMemory> memories;
+        for (const auto &memory : m_memoryManager->getActiveEpisodicMemories(0.0, 500))
+            memories.insert(memory.id, memory);
+        RetrievalRequest request;
+        request.query = query;
+        request.purpose = QStringLiteral("tool.episodic");
+        request.subject = m_scope.viewerIsOwner
+            ? QStringLiteral("user") : m_scope.viewerPersonId;
+        request.viewerPersonId = m_scope.viewerPersonId;
+        request.viewerIsOwner = m_scope.viewerIsOwner;
+        request.accounts = m_scope.recentQueryTemplate.viewerIds;
+        request.terms = terms;
+        request.includeOthers = true;
+        request.currentChannel = m_scope.channel;
+        request.currentSession = m_scope.sessionId;
+        request.excludeCurrent = false;
+        request.includeUnmatched = timeRange.valid;
+        request.includeAllEpisodic = true;
+        request.limit = limit;
+        request.sourceKinds = {QStringLiteral("episode")};
+        const auto retrievalConfig =
+            ConfigManager::instance().getMemoryPolicyConfig().retrieval;
+        request.useIndex = retrievalConfig.indexEnabled;
+        request.allowLegacyFallback = retrievalConfig.legacyFallback;
+        request.candidateLimit = retrievalConfig.candidateLimit;
+        request.rerankLimit = retrievalConfig.rerankLimit;
+        MemoryRetrievalService service(m_memoryManager);
+        if (retrievalConfig.embeddingEnabled
+            && retrievalConfig.embeddingProvider == QStringLiteral("local_hash_test")) {
+            const int dimension = retrievalConfig.embeddingDimension > 0
+                ? retrievalConfig.embeddingDimension : 64;
+            service.setEmbeddingProvider(
+                std::make_shared<LocalHashEmbeddingProvider>(dimension));
+        }
+        const auto unified = service.retrieve(request);
+        for (const auto &evidence : unified.evidence) {
+            if (resultItems.size() >= limit)
                 break;
-            }
+            if (evidence.sourceType != QStringLiteral("episode")
+                || !evidence.sourceRef.startsWith(QStringLiteral("episode/")))
+                continue;
+            const auto memoryId = evidence.sourceRef.mid(
+                QStringLiteral("episode/").size()).toLongLong();
+            if (!memories.contains(memoryId))
+                continue;
+            const EpisodicMemory &memory = memories.value(memoryId);
             if (!MemorySourcePolicy::canReadEpisodic(
                     m_scope, memory.origin, memory.visibility,
-                    memory.subject, memory.sessionId)) {
+                    memory.subject, memory.sessionId))
                 continue;
-            }
-            if (!matchesTerms(memory.content, terms)) {
-                continue;
-            }
             if (timeRange.valid
                 && timeTarget == MemoryTimeTarget::EventTime
                 && memory.eventTime.isValid()
                 && (memory.eventTime < timeRange.from
-                    || memory.eventTime >= timeRange.to)) {
+                    || memory.eventTime >= timeRange.to))
                 continue;
-            }
             MemoryAgentItem item;
             item.id = QStringLiteral("episodic:%1").arg(memory.id);
             item.kind = QStringLiteral("episodic");
@@ -635,18 +788,16 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
             item.sourceSessionId = memory.sessionId;
             item.isViewer = memory.subject == QStringLiteral("user")
                             || memory.subject == m_scope.viewerPersonId;
-            if (item.text.isEmpty()) {
+            if (item.text.isEmpty())
                 continue;
-            }
             const int before = m_ordered.size();
             remember(item);
-            if (m_ordered.size() > before) {
+            if (m_ordered.size() > before)
                 resultItems.append(itemToJson(item));
-            }
         }
     }
 
-    // 5) long-term summary：没有可靠覆盖区间，不能把 createdAt 当 message_time。
+    // 5) long-term summary：统一服务；没有可靠覆盖区间，不把 createdAt 当 message_time。
     if (kinds.contains(QStringLiteral("long_term_summary"))
         && resultItems.size() < limit && m_memoryManager) {
         QList<QPair<QString, QString>> sources;
@@ -659,39 +810,64 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
             && !sources.contains({m_scope.channel, m_scope.sessionId})) {
             sources.append({m_scope.channel, m_scope.sessionId});
         }
-        for (const auto &source : sources) {
-            if (resultItems.size() >= limit) {
+        RetrievalRequest request;
+        request.query = query;
+        request.purpose = QStringLiteral("tool.long_term_summary");
+        request.subject = m_scope.viewerIsOwner
+            ? QStringLiteral("user") : m_scope.viewerPersonId;
+        request.viewerPersonId = m_scope.viewerPersonId;
+        request.viewerIsOwner = m_scope.viewerIsOwner;
+        request.accounts = m_scope.recentQueryTemplate.viewerIds;
+        request.terms = terms;
+        request.includeOthers = true;
+        request.currentChannel = m_scope.channel;
+        request.currentSession = m_scope.sessionId;
+        request.excludeCurrent = false;
+        request.limit = limit;
+        request.sourceKinds = {QStringLiteral("summary")};
+        QStringList allowed;
+        for (const auto &source : sources)
+            allowed.append(source.first + QLatin1Char('|') + source.second);
+        request.allowedSources = allowed;
+        const auto retrievalConfig =
+            ConfigManager::instance().getMemoryPolicyConfig().retrieval;
+        request.useIndex = retrievalConfig.indexEnabled;
+        request.allowLegacyFallback = retrievalConfig.legacyFallback;
+        request.candidateLimit = retrievalConfig.candidateLimit;
+        request.rerankLimit = retrievalConfig.rerankLimit;
+        MemoryRetrievalService service(m_memoryManager);
+        if (retrievalConfig.embeddingEnabled
+            && retrievalConfig.embeddingProvider == QStringLiteral("local_hash_test")) {
+            const int dimension = retrievalConfig.embeddingDimension > 0
+                ? retrievalConfig.embeddingDimension : 64;
+            service.setEmbeddingProvider(
+                std::make_shared<LocalHashEmbeddingProvider>(dimension));
+        }
+        const auto unified = service.retrieve(request);
+        for (const auto &evidence : unified.evidence) {
+            if (resultItems.size() >= limit)
                 break;
-            }
-            const QList<LongTermSummary> summaries =
-                m_memoryManager->getLatestSummaries(200, source.first,
-                                                    source.second);
-            for (const LongTermSummary &summary : summaries) {
-                if (resultItems.size() >= limit) {
-                    break;
-                }
-                if (!matchesTerms(summary.summaryText, terms)) {
-                    continue;
-                }
-                MemoryAgentItem item;
-                item.id = QStringLiteral("long_summary:%1").arg(summary.id);
-                item.kind = QStringLiteral("long_term_summary");
-                item.text = MemoryTextUtils::sanitizePromptText(
-                    summary.summaryText);
-                item.source = source.first == Channel::kPet
-                                  ? QStringLiteral("internal")
-                                  : sourceLabelForSession(m_scope, source.second);
-                item.longTermSummaryId = summary.id;
-                item.sourceSessionId = source.second;
-                if (item.text.isEmpty()) {
-                    continue;
-                }
-                const int before = m_ordered.size();
-                remember(item);
-                if (m_ordered.size() > before) {
-                    resultItems.append(itemToJson(item));
-                }
-            }
+            if (evidence.sourceType != QStringLiteral("summary")
+                || !evidence.sourceRef.startsWith(QStringLiteral("summary/")))
+                continue;
+            const QString text = MemoryTextUtils::sanitizePromptText(evidence.text);
+            if (text.isEmpty())
+                continue;
+            MemoryAgentItem item;
+            item.id = QStringLiteral("long_summary:%1")
+                .arg(evidence.sourceRef.mid(QStringLiteral("summary/").size()));
+            item.kind = QStringLiteral("long_term_summary");
+            item.text = text;
+            item.source = evidence.session == Channel::kDefaultSession
+                ? QStringLiteral("internal")
+                : sourceLabelForSession(m_scope, evidence.session);
+            item.longTermSummaryId = evidence.sourceRef.mid(
+                QStringLiteral("summary/").size()).toLongLong();
+            item.sourceSessionId = evidence.session;
+            const int before = m_ordered.size();
+            remember(item);
+            if (m_ordered.size() > before)
+                resultItems.append(itemToJson(item));
         }
     }
 
@@ -716,6 +892,8 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
             request.purpose = QStringLiteral("tool.chat_history");
             request.subject = m_scope.viewerIsOwner
                 ? QStringLiteral("user") : m_scope.viewerPersonId;
+            request.viewerPersonId = m_scope.viewerPersonId;
+            request.viewerIsOwner = m_scope.viewerIsOwner;
             request.accounts = m_scope.recentQueryTemplate.viewerIds;
             if (request.accounts.isEmpty() && !m_scope.viewerPersonId.isEmpty())
                 request.accounts.append(m_scope.viewerPersonId);
@@ -727,17 +905,34 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
             request.limit = limit;
             request.candidateLimit = qMax(20, limit * 4);
             request.rerankLimit = limit;
-            MemoryRetrievalService service(m_memoryManager);
-            const auto unified = service.retrieve(request);
-            QSet<QString> allowedSources;
+            const auto retrievalConfig =
+                ConfigManager::instance().getMemoryPolicyConfig().retrieval;
+            request.useIndex = retrievalConfig.indexEnabled;
+            request.allowLegacyFallback = retrievalConfig.legacyFallback;
+            request.candidateLimit = retrievalConfig.candidateLimit;
+            request.rerankLimit = retrievalConfig.rerankLimit;
+            QStringList allowed;
             for (const auto &source : sources)
-                allowedSources.insert(source.first + QLatin1Char('|') + source.second);
+                allowed.append(source.first + QLatin1Char('|') + source.second);
+            if (m_scope.viewerIsOwner && m_scope.channel == Channel::kQQGroup
+                && m_scope.ownerCrossChannelPrivate) {
+                allowed.append(QStringLiteral("pet|default"));
+                allowed.append(QStringLiteral("qq_private|*"));
+            }
+            request.allowedSources = allowed;
+            MemoryRetrievalService service(m_memoryManager);
+            if (retrievalConfig.embeddingEnabled
+                && retrievalConfig.embeddingProvider == QStringLiteral("local_hash_test")) {
+                const int dimension = retrievalConfig.embeddingDimension > 0
+                    ? retrievalConfig.embeddingDimension : 64;
+                service.setEmbeddingProvider(
+                    std::make_shared<LocalHashEmbeddingProvider>(dimension));
+            }
+            const auto unified = service.retrieve(request);
             for (const auto &evidence : unified.evidence) {
                 if (resultItems.size() >= limit)
                     break;
                 if (evidence.sourceType != QStringLiteral("chat"))
-                    continue;
-                if (!allowedSources.contains(evidence.channel + QLatin1Char('|') + evidence.session))
                     continue;
                 if (timeRange.valid && evidence.speechAt.isValid()
                     && (evidence.speechAt < timeRange.from
@@ -764,8 +959,7 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
                 item.derived = evidence.derived;
                 item.historyTurnId = turnId;
                 item.sourceSessionId = evidence.session;
-                item.isViewer = !assistant
-                    && (evidence.speakerRole == QStringLiteral("user"));
+                item.isViewer = evidence.own && !assistant;
                 const int before = m_ordered.size();
                 remember(item);
                 if (m_ordered.size() > before) {

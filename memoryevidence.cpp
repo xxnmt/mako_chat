@@ -148,7 +148,9 @@ MemoryEvidence MemoryEvidence::fromLegacy(const QJsonObject &row)
     return evidence;
 }
 
-MemoryEvidence MemoryEvidence::fromChunk(const QJsonObject &row)
+MemoryEvidence MemoryEvidence::fromChunk(const QJsonObject &row,
+                                         const QString &viewerPersonId,
+                                         bool viewerIsOwner)
 {
     MemoryEvidence evidence;
     evidence.sourceRef = row.value(QStringLiteral("source_ref")).toString();
@@ -161,7 +163,15 @@ MemoryEvidence MemoryEvidence::fromChunk(const QJsonObject &row)
     evidence.speakerName = row.value(QStringLiteral("speaker")).toString();
     evidence.speakerRole = row.value(QStringLiteral("speaker_role")).toString(
         QStringLiteral("unknown"));
-    evidence.own = evidence.speakerRole == QStringLiteral("user");
+    // speaker_role 只说明说话人类型；own 必须与“本轮当前对象”比较。
+    const QString normalizedSpeaker = evidence.speakerId == QStringLiteral("user")
+        ? QStringLiteral("owner") : evidence.speakerId;
+    const QString normalizedViewer = viewerPersonId == QStringLiteral("user")
+        ? QStringLiteral("owner") : viewerPersonId;
+    evidence.own = viewerIsOwner
+        ? (evidence.speakerRole == QStringLiteral("user")
+           && (normalizedSpeaker == QStringLiteral("owner")))
+        : (!normalizedViewer.isEmpty() && normalizedSpeaker == normalizedViewer);
     evidence.channel = row.value(QStringLiteral("channel")).toString();
     evidence.session = row.value(QStringLiteral("session")).toString();
     evidence.speechAt = parseTime(row.value(QStringLiteral("speech_at")));
@@ -210,6 +220,7 @@ QJsonObject RetrievalResult::toJson() const
                        {QStringLiteral("candidates"), candidateCount},
                        {QStringLiteral("lexical_candidates"), lexicalCount},
                        {QStringLiteral("vector_candidates"), vectorCount},
+                       {QStringLiteral("auxiliary_candidates"), auxiliaryCount},
                        {QStringLiteral("latency_ms"), latencyMs},
                        {QStringLiteral("truncated"), truncated},
                        {QStringLiteral("evidence"), items}};

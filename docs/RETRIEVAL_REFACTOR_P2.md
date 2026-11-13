@@ -45,14 +45,27 @@
    ```
 - 可选 `memory.retrieval.auto_backfill=true`：启动时若索引为空，在独立 `QThread` + 独立 SQL 连接中重建；不阻塞 UI。默认关闭。
 - `MemoryRetrievalService`：
-  - 有索引时先走向量/词面候选，再用兼容适配器补 summary / claim / episodic，避免索引存在后这些来源消失。
+  - 有索引时词面候选与向量候选各自独立召回，RRF 融合；兼容适配器只作显式辅助来源。
   - 词面：中文按查询词项做 BM25 评分。
-  - 向量：可选 `MemoryEmbeddingProvider`；查询向量与 `memory_embeddings` 做 cosine。
+  - 向量：可选 `MemoryEmbeddingProvider`；对活跃 chunk 的 `memory_embeddings` 做 cosine，不再以 `LIKE` 命中为前提。
   - RRF 融合；默认 `HeuristicMemoryReranker` 按 RRF 顺序 + 词面命中 + 时间近因重排，**不是语义重排**。
   - 索引失败或为空时回退 `LegacyMemorySourceAdapter`；Query embedding 失败时保留词面结果并返回 `degraded`（有自动测试）。
-- `RetrievalRequest` 支持 `sourceKinds` 过滤和 `allowLegacyFallback`；关闭 legacy fallback 后只走索引，便于 P5 切换默认路径。测试覆盖 raw-only 与无回退返回空。
+- `RetrievalRequest` 支持 `sourceKinds`、`allowedSources`、`allowLegacyFallback` 和 `includeAuxiliarySources`；旧摘要/claim/episodic 只有在辅助来源显式开启时才合并，结果与审计记录 `auxiliaryCount`。
 - `RetrievalResult` 记录 backend / 候选数 / 词面命中数 / 向量命中数 / 延迟；`answer_decision` 审计带这些字段。
+- 新增 `DashScopeEmbeddingProvider` / `DashScopeReranker` 客户端骨架（OpenAI 兼容 Embedding、DashScope Rerank），并用 mock HTTP 响应测试了请求与解析。凭证支持 `setting.json` 的 `api.dashscope_api_key` + `api.dashscope_base_url`，也保留 `DASHSCOPE_API_KEY` 环境变量后备；`saveSetting()` 现在会保留 `memory.retrieval`。`--rebuild-memory-index` 与后台 Worker 在 `embedding_provider=dashscope` 时可用真实 DashScope 生成/写入向量；查询侧通过 `MemoryRetrievalWorker` 独立线程执行。
+- Embedding 采用每批 10 条请求；`embedSearchChunks()` 只处理当前模型缺失的 chunk，并复用同文本向量，避免只处理前 2000 条。新增 `--embed-memory-index` 可从已建索引继续补向量，不清空 chunk。
+- `rerank_enabled` 独立开关默认关闭；关闭时不调用 Reranker，便于在同一候选集上做 A/B。
 - 新增 `LocalHashEmbeddingProvider`：只做字符 bigram 哈希，明确标为 `local_hash_test`，用于测试 RRF/降级路径，不能当成语义模型。`embedding_enabled=true` + `embedding_provider=local_hash_test` 时会写入/读取测试向量，仅用于验证路径。
+
+## 审查修复（bf57ebb 之后）
+
+- **身份归属**：`speaker_id` 与 `speaker_role` 分离；`MemoryEvidence::fromChunk(row, viewerPersonId, viewerIsOwner)` 比较本轮 viewer，不再用 `speaker_role=user` 推断 `own`；工具 `isViewer` 使用 `evidence.own`；新增非主人私聊、助手证据与工具回归用例。
+- **独立向量召回**：词面 `searchMemoryChunks()` 与向量 `memoryChunksForEmbedding()` 各自召回，RRF 融合；测试覆盖“无词面命中但向量命中”。
+- 工具侧 `recent`、`chat_history`、`interaction_summary`、`long_term_summary`、`claim`、`episodic` 均已走统一服务；`claim`、`episodic` 仍分别由 `MemoryAccessPolicy` / `MemorySourcePolicy` 逐条授权。`recent` 在索引未就绪/无命中时保留 `searchRecentGroupContext` 回退。
+- `personalEvidence(includeUnmatched, includeAllEpisodic, requireTermMatch)` 支持时间范围摘要、全部 episodic 与 recent 的严格词面命中。
+- **工具配置**：工具统一服务继承 `memory.retrieval` 的 index/fallback/candidate/rerank 配置和测试 Provider；`allowedSources` 前移到服务过滤；owner 群在 `owner_cross_channel_private=true` 时可纳入 pet/private，并有工具回归用例。
+- **回退/预算顺序**：关闭 `allowLegacyFallback` 时，即使索引非空也不读取旧适配器；`sourceKinds` 与 `limit` 统一执行；新增“索引非空 + 关闭回退”测试。
+- **保留**：群聊表达继续保留 `background + personal`。
 
 ### 未完成
 

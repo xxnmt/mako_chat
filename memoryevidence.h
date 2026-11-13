@@ -4,6 +4,7 @@
 #include <QDateTime>
 #include <QJsonObject>
 #include <QList>
+#include <QMetaType>
 #include <QString>
 #include <QStringList>
 
@@ -61,7 +62,9 @@ struct MemoryEvidence
     bool own = false;
 
     static MemoryEvidence fromLegacy(const QJsonObject &row);
-    static MemoryEvidence fromChunk(const QJsonObject &row);
+    static MemoryEvidence fromChunk(const QJsonObject &row,
+                                    const QString &viewerPersonId = {},
+                                    bool viewerIsOwner = false);
     QJsonObject toJson() const;
 };
 
@@ -73,11 +76,18 @@ struct RetrievalRequest
     QStringList accounts;
     QStringList terms;
     bool includeOthers = true;
+    QString viewerPersonId;
+    bool viewerIsOwner = false;
     QString currentChannel;
     QString currentSession;
     bool excludeCurrent = true;
+    bool includeUnmatched = false;
+    bool includeAllEpisodic = false;
+    bool requireTermMatch = false;
     bool allowLegacyFallback = true;
+    bool includeAuxiliarySources = true;
     QStringList sourceKinds;
+    QStringList allowedSources; // "channel|session" 或 "channel|*"
     int limit = 12;
     int candidateLimit = 40;
     int rerankLimit = 10;
@@ -93,9 +103,12 @@ struct RetrievalResult
     int candidateCount = 0;
     int lexicalCount = 0;
     int vectorCount = 0;
+    int auxiliaryCount = 0;
     qint64 latencyMs = 0;
     bool truncated = false;
     QJsonObject toJson() const;
 };
+
+Q_DECLARE_METATYPE(RetrievalResult)
 
 #endif // MEMORYEVIDENCE_H

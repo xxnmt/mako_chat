@@ -32,8 +32,8 @@
 - PR-4、PR-6/7/8/9：legacy MemoryAgent、Memory Recall Tool、Overview、TimeFrame。
 - v15：`cognitive_source` / `matter_revision` / `observation_history` / `cognitive_audit` 证据链，以及可重建的 `memory_chunks` / `memory_chunk_sources` / `memory_embeddings` / `memory_index_state`。
 - 统一检索：`MemoryEvidence` / `MemoryRetrievalService`；Pet/QQ 自动证据同入口；同渠道历史进入候选；工具补助手表达、说话人字段并开放 Pet。
-- 混合召回：v15 检索块、词面 BM25、可选向量、RRF、启发式重排与旧适配器回退；`--rebuild-memory-index` / `--memory-index-status` / `--clear-memory-index` / `--backup-memory-db`；新消息增量写 chunk；`auto_backfill` 使用独立线程与独立 SQL 连接；审计记录 backend/候选数/延迟。
-- 工具对话检索不再固定只取最近 200 轮；`chat_history` 优先走统一服务，索引未就绪时回退逐轮查询；助手表达作为独立证据返回。
+- 混合召回：v15 检索块、词面 BM25、可选向量、RRF、启发式重排与旧适配器回退；`--rebuild-memory-index` / `--memory-index-status` / `--clear-memory-index` / `--backup-memory-db`；新消息增量写 chunk；`auto_backfill` 使用独立线程与独立 SQL 连接；审计记录 backend/候选数/辅助来源/延迟；DashScope Embedding 已接入后台索引，查询侧通过独立 `MemoryRetrievalWorker`；凭证可存 `setting.json` 的 `api.dashscope_api_key`。
+- 工具对话检索不再固定只取最近 200 轮；`recent`、`chat_history`、`interaction_summary`、`long_term_summary`、`claim`、`episodic` 优先走统一服务，索引未就绪时按配置回退；助手表达作为独立证据返回；`speaker_id` 与本轮 viewer 比较，owner 群可按配置看到跨渠道私聊。
 - 连续感知：`considerEvidence` 把 background + personal 交给表达模型；`currentUnderstanding` 支持 audience-private；群聊不再只靠失忆式投影。
 - 群聊跨渠道表达：`context/N` 最小片段投影、`excerpts` 校验、空决定拦截（`6a6a73d`）。
 - 承诺归属：`CURRENT_UNDERSTANDING` 增加 `self_report` 原话；证据带 `speaker_role/source_kind`；`attribution_check` 分编号、说话人、语义三层审计。

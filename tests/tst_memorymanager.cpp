@@ -5,7 +5,11 @@
 #include <QSqlError>
 #include <QVariant>
 #include <QFile>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QDir>
 
+#include "configmanager.h"
 #include "memorymanager.h"
 #include "memoryevidence.h"
 #include "memoryretrieval.h"
@@ -143,6 +147,19 @@ public:
     {
         if (error) *error = QStringLiteral("provider unavailable");
         return false;
+    }
+};
+
+class VectorOnlyEmbeddingProvider : public MemoryEmbeddingProvider
+{
+public:
+    QString modelId() const override { return QStringLiteral("vector_only_test"); }
+    int dimension() const override { return 2; }
+    bool embed(const QString &, QVector<float> *vector, QString *) const override
+    {
+        if (!vector) return false;
+        *vector = {1.0f, 0.0f};
+        return true;
     }
 };
 
@@ -626,6 +643,35 @@ private slots:
                  QStringLiteral("脚踝已经好了"));
     }
 
+    void evidenceOwnershipComparesViewerIdentity()
+    {
+        const QJsonObject row{{"id", 7},
+                              {"source_ref", "chat/7:user"},
+                              {"source_type", "chat"},
+                              {"derived", "original"},
+                              {"text", "这是别人的私聊"},
+                              {"speaker_id", "qq:2014366825"},
+                              {"speaker", "朋友"},
+                              {"speaker_role", "user"},
+                              {"channel", "qq_private"},
+                              {"session", "2014366825"},
+                              {"speech_at", "2026-11-13T10:00:00.000Z"}};
+        const auto ownerView = MemoryEvidence::fromChunk(row, "owner", true);
+        QVERIFY(!ownerView.own);
+        const auto selfView = MemoryEvidence::fromChunk(row, "qq:2014366825", false);
+        QVERIFY(selfView.own);
+        const auto assistantRow = QJsonObject{{"id", 8},
+                                               {"source_ref", "chat/8:assistant"},
+                                               {"source_type", "chat"},
+                                               {"derived", "assistant_expression"},
+                                               {"text", "好呀"},
+                                               {"speaker_id", "mako"},
+                                               {"speaker_role", "assistant"},
+                                               {"channel", "qq_private"},
+                                               {"session", "2014366825"}};
+        QVERIFY(!MemoryEvidence::fromChunk(assistantRow, "owner", true).own);
+    }
+
     void retrievalServiceIncludesCurrentChannelAndKeepsSpeaker()
     {
         QTemporaryDir dir;
@@ -762,6 +808,23 @@ private slots:
         for (const auto &item : rawOnlyResult.evidence)
             QCOMPARE(item.sourceType, QStringLiteral("raw"));
 
+        // 索引非空时，关闭回退也不能偷偷读取 old adapter。
+        QVERIFY(db.addLongTermSummary(QStringLiteral("legacy-only"), 1, QStringLiteral("[]")));
+        auto legacyRequest = request;
+        legacyRequest.query = QStringLiteral("legacy-only");
+        legacyRequest.terms = {QStringLiteral("legacy-only")};
+        legacyRequest.limit = 1;
+        const auto withFallback = defaultRerank.retrieve(legacyRequest);
+        QVERIFY(withFallback.evidence.size() <= 1);
+        auto noAux = legacyRequest;
+        noAux.includeAuxiliarySources = false;
+        noAux.sourceKinds = {QStringLiteral("summary")};
+        QVERIFY(defaultRerank.retrieve(noAux).evidence.isEmpty());
+        auto noFallback = legacyRequest;
+        noFallback.allowLegacyFallback = false;
+        noFallback.sourceKinds = {QStringLiteral("summary")};
+        QVERIFY(defaultRerank.retrieve(noFallback).evidence.isEmpty());
+
         MemoryRetrievalService degraded(&db, std::make_shared<FailingEmbeddingProvider>());
         const auto degradedResult = degraded.retrieve(request);
         QCOMPARE(degradedResult.status, QStringLiteral("degraded"));
@@ -866,6 +929,64 @@ private slots:
         QCOMPARE(copy.scalar("SELECT count(*) FROM chat_history").toInt(), 1);
         QCOMPARE(copy.scalar("PRAGMA user_version").toInt(), 15);
         QVERIFY(copy.scalar("SELECT count(*) FROM memory_chunks").toInt() > 0);
+    }
+
+    void vectorRecallWorksWithoutLexicalHit()
+    {
+        QTemporaryDir dir;
+        MemoryManager db(dir.filePath("vector-only.db"));
+        RequestMeta meta;
+        meta.channel = Channel::kQQPrivate;
+        meta.sessionId = meta.actorId = QStringLiteral("10101");
+        meta.eventId = QStringLiteral("vector-only");
+        QVERIFY(db.saveQATurn(QStringLiteral("完全无关的旧内容"),
+                              QStringLiteral("{}"), {}, meta));
+        QString error;
+        QVERIFY2(db.rebuildSearchIndex(&error), qPrintable(error));
+        auto provider = std::make_shared<VectorOnlyEmbeddingProvider>();
+        QVERIFY2(db.embedSearchChunks(provider.get(), 2000, &error), qPrintable(error));
+
+        RetrievalRequest request;
+        request.query = QStringLiteral("查询专用");
+        request.terms = {QStringLiteral("查询专用")};
+        request.subject = QStringLiteral("user");
+        request.viewerPersonId = QStringLiteral("owner");
+        request.viewerIsOwner = true;
+        request.currentChannel = Channel::kQQPrivate;
+        request.currentSession = QStringLiteral("10101");
+        request.excludeCurrent = false;
+        MemoryRetrievalService service(&db, provider);
+        const auto result = service.retrieve(request);
+        QVERIFY(!result.evidence.isEmpty());
+        QVERIFY(result.vectorCount > 0);
+        QCOMPARE(result.backend, QStringLiteral("index"));
+        bool found = false;
+        for (const auto &item : result.evidence)
+            if (item.text.contains(QStringLiteral("完全无关的旧内容")))
+                found = true;
+        QVERIFY(found);
+    }
+
+    void embeddingWalksAllChunksInBatches()
+    {
+        QTemporaryDir dir;
+        MemoryManager db(dir.filePath("embedding-batches.db"));
+        RequestMeta meta;
+        meta.channel = Channel::kQQPrivate;
+        meta.sessionId = meta.actorId = QStringLiteral("10101");
+        for (int i = 0; i < 3; ++i) {
+            meta.eventId = QStringLiteral("batch-%1").arg(i);
+            QVERIFY(db.saveQATurn(QStringLiteral("批量向量测试 %1").arg(i),
+                                  QStringLiteral("{}"), {}, meta));
+        }
+        QString error;
+        QVERIFY2(db.rebuildSearchIndex(&error), qPrintable(error));
+        LocalHashEmbeddingProvider provider(8);
+        QVERIFY2(db.embedSearchChunks(&provider, 2, &error), qPrintable(error));
+        const auto status = db.searchIndexStatus();
+        QCOMPARE(status.value(QStringLiteral("embeddings")).toInt(), 3);
+        QVERIFY2(db.embedSearchChunks(&provider, 2, &error), qPrintable(error));
+        QCOMPARE(db.searchIndexStatus().value(QStringLiteral("embeddings")).toInt(), 3);
     }
 
     void legacyMigrationPreservesData()
@@ -1868,4 +1989,70 @@ private slots:
 };
 
 QTEST_GUILESS_MAIN(TestMemoryManager)
+    void dashScopeCredentialsLoadAndSaveFromSetting()
+    {
+        auto &config = ConfigManager::instance();
+        const QString path = QDir(config.getConfigDirPath()).filePath("setting.json");
+        QFile original(path);
+        const bool existed = original.exists();
+        QByteArray previous;
+        if (existed) {
+            QVERIFY(original.open(QIODevice::ReadOnly));
+            previous = original.readAll();
+            original.close();
+        }
+
+        QJsonObject api;
+        api.insert("deepseek_api_key", QStringLiteral("sk-deepseek-test"));
+        api.insert("dashscope_api_key", QStringLiteral("sk-dashscope-test"));
+        api.insert("dashscope_base_url",
+                   QStringLiteral("https://ws-example.cn-beijing.maas.aliyuncs.com"));
+        QJsonObject retrieval;
+        retrieval.insert("embedding_enabled", true);
+        retrieval.insert("embedding_provider", QStringLiteral("dashscope"));
+        retrieval.insert("embedding_model", QStringLiteral("text-embedding-v4"));
+        retrieval.insert("embedding_dimension", 1024);
+        retrieval.insert("rerank_enabled", false);
+        QJsonObject memory;
+        memory.insert("retrieval", retrieval);
+        QJsonObject root;
+        root.insert("api", api);
+        root.insert("memory", memory);
+
+        QFile written(path);
+        QVERIFY(written.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        written.write(QJsonDocument(root).toJson(QJsonDocument::Compact));
+        written.close();
+
+        QVERIFY(config.loadSetting());
+        QCOMPARE(config.getDashScopeApiKey(), QStringLiteral("sk-dashscope-test"));
+        QCOMPARE(config.getDashScopeBaseUrl(),
+                 QStringLiteral("https://ws-example.cn-beijing.maas.aliyuncs.com"));
+        const auto loaded = config.getMemoryPolicyConfig().retrieval;
+        QVERIFY(!loaded.rerankEnabled);
+        QCOMPARE(loaded.embeddingEndpoint,
+                 QStringLiteral("https://ws-example.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings"));
+        QCOMPARE(loaded.rerankEndpoint,
+                 QStringLiteral("https://ws-example.cn-beijing.maas.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank"));
+
+        QVERIFY(config.saveSetting());
+        QFile savedFile(path);
+        QVERIFY(savedFile.open(QIODevice::ReadOnly));
+        const auto saved = QJsonDocument::fromJson(savedFile.readAll()).object();
+        savedFile.close();
+        QCOMPARE(saved.value("api").toObject().value("dashscope_api_key").toString(),
+                 QStringLiteral("sk-dashscope-test"));
+        QVERIFY(saved.value("memory").toObject().value("retrieval").isObject());
+
+        if (existed) {
+            QFile restore(path);
+            QVERIFY(restore.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            restore.write(previous);
+            restore.close();
+        } else {
+            QFile::remove(path);
+        }
+        config.loadSetting();
+    }
+
 #include "tst_memorymanager.moc"

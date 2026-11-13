@@ -17,6 +17,7 @@
 #include "memoryagenttypes.h"
 #include "memoryrecalltool.h"
 #include "memoryretrieval.h"
+#include "memoryretrievalworker.h"
 
 class MemoryManager;
 class MemoryAgent;
@@ -100,6 +101,7 @@ private:
     void sendEmptyReplyRetry();
     void sendPendingReply(const QJsonObject &agentMessage = QJsonObject(),
                           bool partial = false);
+    void finishRetrieval(const RetrievalResult &result);
 
     // 主 Conversation Agent 的记忆工具路径。
     void startMemoryToolPath(const QJsonArray &messages,
@@ -143,8 +145,10 @@ private:
         QString retrievalStatus;
         QString retrievalBackend;
         int retrievalCandidates = 0;
+        int retrievalAuxiliary = 0;
         qint64 retrievalLatencyMs = 0;
         bool retrievalTruncated = false;
+        QStringList retrievalTerms;
         QJsonObject evidence;
         QJsonObject beforeConsultation;
         QStringList catalogKeys;

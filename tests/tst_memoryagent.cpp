@@ -9,6 +9,7 @@
 #include <QTcpSocket>
 #include "llmservice.h"
 #include "cognitivecoordinator.h"
+#include "memorydashscope.h"
 
 #include "memoryagent.h"
 #include "memoryexecutor.h"
@@ -1279,6 +1280,119 @@ private slots:
                 found = true;
         }
         QVERIFY(found);
+    }
+
+    void ownerGroupToolCanSeeCrossChannelPrivateChat()
+    {
+        QTemporaryDir dir;
+        MemoryManager mm(dir.filePath("tool-cross.db"));
+        RequestMeta privateMeta;
+        privateMeta.channel = Channel::kQQPrivate;
+        privateMeta.sessionId = privateMeta.actorId = QStringLiteral("10101");
+        privateMeta.eventId = QStringLiteral("private-secret");
+        QVERIFY(mm.saveQATurn(QStringLiteral("私聊秘密"), QStringLiteral("{}"), {}, privateMeta));
+        RequestMeta groupMeta;
+        groupMeta.channel = Channel::kQQGroup;
+        groupMeta.sessionId = QStringLiteral("30001");
+        groupMeta.actorId = QStringLiteral("10101");
+        groupMeta.eventId = QStringLiteral("group-secret");
+        QVERIFY(mm.saveQATurn(QStringLiteral("公开内容"), QStringLiteral("{}"), {}, groupMeta));
+
+        MemoryAgentScope scope = ownerGroupScope(QStringLiteral("30001"), QDateTime::currentDateTime());
+        scope.ownerCrossChannelPrivate = true;
+        MemoryAgentTools tools(&mm, scope);
+        QString error;
+        const auto result = tools.execute(QStringLiteral("memory_search"),
+            QJsonObject{{"query",QStringLiteral("私聊秘密")},
+                        {"kinds",QJsonArray{QStringLiteral("chat_history")}}},
+            &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        bool found = false;
+        for (const auto &value : result.value(QStringLiteral("items")).toArray())
+            if (value.toObject().value(QStringLiteral("text")).toString()
+                == QStringLiteral("私聊秘密"))
+                found = true;
+        QVERIFY(found);
+    }
+
+    void dashScopeProvidersParseMockResponses()
+    {
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QObject::connect(&server, &QTcpServer::newConnection, &server, [&server] {
+            auto *socket = server.nextPendingConnection();
+            QObject::connect(socket, &QTcpSocket::readyRead, socket, [socket] {
+                const auto bytes = socket->readAll();
+                const auto header = bytes.indexOf("\r\n\r\n");
+                if (header < 0)
+                    return;
+                const bool rerankRequest = bytes.contains("\"documents\"");
+                const QJsonObject response = rerankRequest
+                    ? QJsonObject{{"output", QJsonObject{{"results",
+                        QJsonArray{QJsonObject{{"index", 1}, {"relevance_score", 0.9}},
+                                  QJsonObject{{"index", 0}, {"relevance_score", 0.2}}}}}}}
+                    : QJsonObject{{"data", QJsonArray{QJsonObject{{"embedding",
+                        QJsonArray{0.1, 0.2}}, {"index", 0}}}},
+                        {"model", "text-embedding-v4"}};
+                const auto body = QJsonDocument(response).toJson(QJsonDocument::Compact);
+                socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                              "Connection: close\r\nContent-Length: "
+                              + QByteArray::number(body.size()) + "\r\n\r\n" + body);
+                socket->disconnectFromHost();
+            });
+        });
+        const QString base = QStringLiteral("http://127.0.0.1:%1").arg(server.serverPort());
+        DashScopeEmbeddingProvider embedding(QUrl(base + QStringLiteral("/embeddings")),
+                                             QStringLiteral("test-key"),
+                                             QStringLiteral("text-embedding-v4"), 2);
+        QVector<float> vector;
+        QString error;
+        QVERIFY2(embedding.embed(QStringLiteral("你好"), &vector, &error), qPrintable(error));
+        QCOMPARE(vector.size(), 2);
+        QCOMPARE(vector.at(0), 0.1f);
+        QCOMPARE(vector.at(1), 0.2f);
+
+        QList<MemoryEvidence> candidates;
+        MemoryEvidence first;
+        first.text = QStringLiteral("第一");
+        MemoryEvidence second;
+        second.text = QStringLiteral("第二");
+        candidates << first << second;
+        DashScopeReranker reranker(QUrl(base + QStringLiteral("/rerank")),
+                                   QStringLiteral("test-key"));
+        const auto ranked = reranker.rerank(QStringLiteral("查询"), candidates, 2, &error);
+        QCOMPARE(ranked.size(), 2);
+        QCOMPARE(ranked.first().text, QStringLiteral("第二"));
+    }
+
+    void retrievalWorkerUsesOwnConnection()
+    {
+        QTemporaryDir dir;
+        const QString path = dir.filePath("retrieval-worker.db");
+        {
+            MemoryManager db(path);
+            RequestMeta meta;
+            meta.channel = Channel::kQQPrivate;
+            meta.sessionId = meta.actorId = QStringLiteral("10101");
+            meta.eventId = QStringLiteral("worker-turn");
+            QVERIFY(db.saveQATurn(QStringLiteral("worker 测试内容"),
+                                  QStringLiteral("{}"), {}, meta));
+        }
+        RetrievalRequest request;
+        request.query = QStringLiteral("worker");
+        request.terms = {QStringLiteral("worker")};
+        request.subject = QStringLiteral("user");
+        request.viewerPersonId = QStringLiteral("owner");
+        request.viewerIsOwner = true;
+        request.currentChannel = Channel::kQQPrivate;
+        request.currentSession = QStringLiteral("10101");
+        request.excludeCurrent = false;
+        MemoryRetrievalWorker worker(path, request, {}, {}, {}, 0, {}, {}, {});
+        QSignalSpy finished(&worker, &MemoryRetrievalWorker::finished);
+        worker.run();
+        QCOMPARE(finished.size(), 1);
+        const auto result = finished.first().first().value<RetrievalResult>();
+        QVERIFY(!result.evidence.isEmpty());
     }
 
     void toolGateDoesNotReadUserText()

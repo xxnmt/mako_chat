@@ -308,9 +308,17 @@ app_data/config/identity.json
 | `memory.retrieval.candidate_limit` | `40` | 每路候选上限 |
 | `memory.retrieval.rerank_limit` | `10` | 重排后上限；当前默认顺序截断，不是语义重排 |
 | `memory.retrieval.embedding_enabled` | `false` | 启用可选向量路径；当前只支持显式 `local_hash_test`，不是语义模型 |
-| `memory.retrieval.embedding_provider` | 空 | 设为 `local_hash_test` 时使用本地测试/降级 Provider |
-| `memory.retrieval.embedding_model` | 空 | 预留真实模型标识 |
-| `memory.retrieval.embedding_dimension` | `0` | 预留维度；0 表示使用 Provider 默认值 |
+| `api.deepseek_api_key` | 空 | DeepSeek API Key，明文保存在 `setting.json` |
+| `api.dashscope_api_key` | 空 | Qwen/百炼 API Key，直接保存在 `setting.json`；无需环境变量 |
+| `api.dashscope_base_url` | 空 | 百炼业务空间 Host，如 `https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com` |
+| `memory.retrieval.embedding_provider` | 空 | `local_hash_test` 测试；`dashscope` 用于真实百炼 Embedding |
+| `memory.retrieval.embedding_endpoint` | 空 | 百炼 OpenAI 兼容 Embedding 完整 URL；留空时由 `api.dashscope_base_url` 自动拼 |
+| `memory.retrieval.embedding_api_key_env` | `DASHSCOPE_API_KEY` | 环境变量名；`api.dashscope_api_key` 为空时的后备 |
+| `memory.retrieval.embedding_model` | 空 | 如 `text-embedding-v4` |
+| `memory.retrieval.embedding_dimension` | `0` | 如 `1024`；必须与库内向量一致 |
+| `memory.retrieval.rerank_endpoint` | 空 | `qwen3-rerank` 接口 URL；留空时由 base URL 自动拼 |
+| `memory.retrieval.rerank_enabled` | `false` | 独立开关；关闭时不发 Rerank 请求，只保留同一批候选 |
+| `memory.retrieval.rerank_model` | `qwen3-rerank` | 重排模型 |
 | `appearance.follow_external_mood` | `true` | D1：QQ 等外部渠道情绪是否驱动桌宠立绘 |
 | `proactive.enabled` | `false` | 启用主动联系与草稿分享，默认关闭 |
 | `proactive.private_writing` | `false` | 允许后台私下写作/回顾；与主动联系分开授权。关闭后仍保留已有草稿 |
