@@ -1,6 +1,6 @@
 # 配置参考：setting.json / identity.json
 
-> 源码基准：2026-11-12 工作树（基于 `6a6a73d`；记忆库 v14）
+> 源码基准：2026-11-13 工作树（基于 `1a82a2f`；记忆库 v15）
 > 更新日期：2026-11-12
 > 关联：[README](../README.md)、[ARCHITECTURE](ARCHITECTURE.md)、[STATUS](STATUS.md)
 
@@ -302,6 +302,15 @@ app_data/config/identity.json
 | `identity.self.qq` | `[]` | 机器人自己的 QQ；用于丢弃自触发/回声消息 |
 | `identity.master.qq` | `[]` | 主人 QQ 列表；全部归一为 `subject='user'` / `person_id='owner'` |
 | `memory.blind_zones` | `[]` | 不入长期记忆的渠道/会话；元素为 `{channel, session_id}` |
+| `memory.retrieval.index_enabled` | `true` | 有检索块时优先走统一索引；为空时回退旧适配器 |
+| `memory.retrieval.auto_backfill` | `false` | 启动时若索引为空，在独立线程重建；默认关闭，推荐用命令行重建 |
+| `memory.retrieval.legacy_fallback` | `true` | 索引未命中/索引为空时是否回退旧适配器；关闭后只走索引 |
+| `memory.retrieval.candidate_limit` | `40` | 每路候选上限 |
+| `memory.retrieval.rerank_limit` | `10` | 重排后上限；当前默认顺序截断，不是语义重排 |
+| `memory.retrieval.embedding_enabled` | `false` | 启用可选向量路径；当前只支持显式 `local_hash_test`，不是语义模型 |
+| `memory.retrieval.embedding_provider` | 空 | 设为 `local_hash_test` 时使用本地测试/降级 Provider |
+| `memory.retrieval.embedding_model` | 空 | 预留真实模型标识 |
+| `memory.retrieval.embedding_dimension` | `0` | 预留维度；0 表示使用 Provider 默认值 |
 | `appearance.follow_external_mood` | `true` | D1：QQ 等外部渠道情绪是否驱动桌宠立绘 |
 | `proactive.enabled` | `false` | 启用主动联系与草稿分享，默认关闭 |
 | `proactive.private_writing` | `false` | 允许后台私下写作/回顾；与主动联系分开授权。关闭后仍保留已有草稿 |

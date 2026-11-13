@@ -1,4 +1,5 @@
 #include "promptassembler.h"
+#include "memoryevidence.h"
 
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -422,29 +423,7 @@ QString PromptAssembler::buildViewerIdentityBlock(
 
 QString PromptAssembler::buildSituationBlock(const RequestMeta &meta, bool voiceAvailable)
 {
-    const bool group = isGroupChannel(meta);
-    const bool owner = isMasterMeta(meta);
-    const QString surface = meta.channel;
-    const QString speaker = owner ? QStringLiteral("owner") : meta.subject;
-    const QString audience = group ? QStringLiteral("group")
-        : (owner ? QStringLiteral("owner") : meta.subject);
-    // subject 是记忆归属/当前对话对象，不是本轮事情涉及的人。
-    // 服务端没有单独确认 about 时，明确保持 unknown，避免把 speaker 当成事情主体。
-    const QString about = QStringLiteral("unknown");
-    const QString modality = (meta.channel == Channel::kPet && voiceAvailable)
-        ? QStringLiteral("voice+text") : QStringLiteral("text");
-    const QString privacy = group ? QStringLiteral("public") : QStringLiteral("private");
-    return QStringLiteral(
-        "# 当前场景（服务端事实）\n"
-        "- surface: %1\n"
-        "- speaker: %2\n"
-        "- audience: %3\n"
-        "- about: %4\n"
-        "- modality: %5\n"
-        "- privacy: %6\n"
-        "- about=unknown 表示服务端没有确认本轮事情涉及谁；不要把 speaker 当成事情主体。\n"
-        "- 场景只说明在哪里、对谁、能用什么形式；不要求不同渠道换一种说法。\n")
-        .arg(surface, speaker, audience, about, modality, privacy);
+    return MemorySituation::fromRequest(meta, voiceAvailable).toPromptBlock();
 }
 
 QJsonArray PromptAssembler::buildHistoryMessages(const QList<HistoryTurn> &history,

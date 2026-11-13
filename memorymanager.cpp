@@ -3,6 +3,8 @@
 
 #include <QStandardPaths>
 #include <QDir>
+#include <QCryptographicHash>
+#include <QElapsedTimer>
 #include <QSqlQuery>
 #include <QSqlError>
 #include <QDebug>
@@ -13,6 +15,7 @@
 #include <QDebug>
 #include "qqmessageparser.h"
 #include "memorytextutils.h"
+#include "memoryembedding.h"
 
 #include "historyturn.h"
 
@@ -50,10 +53,11 @@ QString rawEventColumns()
 
 } // namespace
 
-MemoryManager::MemoryManager(const QString &dbFilePath,QObject *parent)
+MemoryManager::MemoryManager(const QString &dbFilePath,QObject *parent,
+                             const QString &connectionName)
     : QObject{parent}
 {
-    initDatabase(dbFilePath);
+    initDatabase(dbFilePath, connectionName);
 }
 
 MemoryManager::~MemoryManager()
@@ -149,6 +153,9 @@ bool MemoryManager::saveQATurn(const QString &userInput, const QString &rawReply
     }
 
     if (query.numRowsAffected() != 1) return false;
+    const qlonglong indexedTurn = receivedTurn > 0 ? receivedTurn : query.lastInsertId().toLongLong();
+    if (indexedTurn > 0 && !indexChatTurn(indexedTurn))
+        qWarning() << "[MemoryIndex] incremental chat index failed:" << indexedTurn;
     const auto activityAction = response["activity_action"].toObject();
     if (!activityAction.isEmpty()) {
         const QString ref = activityAction["activity_ref"].toString();
@@ -346,7 +353,8 @@ bool MemoryManager::canShareThought(qlonglong id, int expectedVersion) const
 
 QJsonArray MemoryManager::personalEvidence(const QString &subject, const QStringList &accounts,
                                            const QStringList &terms, bool includeOthers,
-                                           const QString &currentChannel, const QString &currentSession) const
+                                           const QString &currentChannel, const QString &currentSession,
+                                           bool excludeCurrent) const
 {
     // raw_events already reflects the inbound retention decision. Historical short-only
     // chat rows lack this provenance and must not be promoted during migration.
@@ -386,7 +394,7 @@ QJsonArray MemoryManager::personalEvidence(const QString &subject, const QString
             SELECT text,time,channel,session,own,speaker,min(ref) AS ref,
                 (SELECT count(*) FROM json_each(:terms) WHERE instr(text,value)>0) AS matches
             FROM evidence WHERE text <> ''
-              AND NOT (channel=:current_channel AND session=:current_session)
+              AND (:exclude_current=0 OR NOT (channel=:current_channel AND session=:current_session))
             GROUP BY text,time,channel,session,own,speaker
         ), ranked AS (
             SELECT *,
@@ -406,6 +414,7 @@ QJsonArray MemoryManager::personalEvidence(const QString &subject, const QString
     query.bindValue(":all_people", int(includeOthers));
     query.bindValue(":current_channel", currentChannel.isNull() ? QStringLiteral("") : currentChannel);
     query.bindValue(":current_session", currentSession.isNull() ? QStringLiteral("") : currentSession);
+    query.bindValue(":exclude_current", int(excludeCurrent));
     query.bindValue(":terms", json(terms));
     QJsonArray evidence;
     if (query.exec()) {
@@ -420,8 +429,585 @@ QJsonArray MemoryManager::personalEvidence(const QString &subject, const QString
     return evidence;
 }
 
-QJsonArray MemoryManager::matterEvidence(const RequestMeta &audience, const QString &matter) const
+bool MemoryManager::rebuildSearchIndex(QString *error)
 {
+    QElapsedTimer rebuildTimer;
+    rebuildTimer.start();
+    auto fail = [&](const QString &message) {
+        m_db.rollback();
+        if (error) *error = message;
+        qWarning() << "[MemoryIndex] rebuild failed:" << message;
+        return false;
+    };
+    if (!m_db.transaction())
+        return fail(m_db.lastError().text());
+    QSqlQuery clear(m_db);
+    for (const auto &table : {QStringLiteral("memory_embeddings"),
+                              QStringLiteral("memory_chunk_sources"),
+                              QStringLiteral("memory_chunks"),
+                              QStringLiteral("memory_index_state")}) {
+        if (!clear.exec(QStringLiteral("DELETE FROM ") + table))
+            return fail(clear.lastError().text());
+    }
+
+    const QString now = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
+    QSqlQuery insert(m_db);
+    insert.prepare(QStringLiteral(
+        "INSERT OR IGNORE INTO memory_chunks("
+        "source_type,source_ref,chunk_kind,derived,text,content_hash,search_text,"
+        "channel,session_id,speaker_id,speaker_name,speaker_role,"
+        "speech_at,event_time,recorded_at,privacy,status,index_generation,created_at,updated_at)"
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'active',1,?,?)"));
+    QSqlQuery idQuery(m_db);
+    idQuery.prepare(QStringLiteral(
+        "SELECT id FROM memory_chunks WHERE source_type=? AND source_ref=? "
+        "AND chunk_kind=? AND content_hash=? AND index_generation=1"));
+    QSqlQuery sourceInsert(m_db);
+    sourceInsert.prepare(QStringLiteral(
+        "INSERT OR IGNORE INTO memory_chunk_sources(chunk_id,source_table,source_id) VALUES(?,?,?)"));
+
+    auto addChunk = [&](const QString &sourceType, const QString &sourceRef,
+                        const QString &chunkKind, const QString &rawText,
+                        const QString &channel, const QString &session,
+                        const QString &speakerId, const QString &speakerName,
+                        const QString &speakerRole, const QString &speechAt,
+                        const QString &derived, const QString &privacy,
+                        const QString &sourceTable, const QString &sourceId) -> bool {
+        const QString text = rawText.trimmed();
+        if (text.isEmpty())
+            return true;
+        const QString hash = QString::fromLatin1(QCryptographicHash::hash(
+            (sourceRef + QLatin1Char('\n') + text).toUtf8(),
+            QCryptographicHash::Sha256).toHex());
+        insert.addBindValue(sourceType);
+        insert.addBindValue(sourceRef);
+        insert.addBindValue(chunkKind);
+        insert.addBindValue(derived);
+        insert.addBindValue(text);
+        insert.addBindValue(hash);
+        insert.addBindValue(text);
+        insert.addBindValue(channel);
+        insert.addBindValue(session);
+        insert.addBindValue(speakerId);
+        insert.addBindValue(speakerName);
+        insert.addBindValue(speakerRole);
+        insert.addBindValue(speechAt);
+        insert.addBindValue(QVariant(QMetaType(QMetaType::QString)));
+        insert.addBindValue(now);
+        insert.addBindValue(privacy);
+        insert.addBindValue(now);
+        insert.addBindValue(now);
+        if (!insert.exec()) {
+            if (error) *error = insert.lastError().text();
+            return false;
+        }
+        qlonglong chunkId = insert.lastInsertId().toLongLong();
+        if (chunkId <= 0) {
+            idQuery.addBindValue(sourceType);
+            idQuery.addBindValue(sourceRef);
+            idQuery.addBindValue(chunkKind);
+            idQuery.addBindValue(hash);
+            if (!idQuery.exec() || !idQuery.next()) {
+                if (error) *error = idQuery.lastError().text();
+                return false;
+            }
+            chunkId = idQuery.value(0).toLongLong();
+            idQuery.finish();
+        }
+        sourceInsert.addBindValue(chunkId);
+        sourceInsert.addBindValue(sourceTable);
+        sourceInsert.addBindValue(sourceId);
+        if (!sourceInsert.exec()) {
+            if (error) *error = sourceInsert.lastError().text();
+            return false;
+        }
+        return true;
+    };
+
+    QSqlQuery raw(m_db);
+    if (!raw.exec(QStringLiteral(
+            "SELECT rowid,channel,session_id,sender_id,sender_name,person_id,content,occurred_at "
+            "FROM raw_events WHERE direction='in' AND event_type='message' AND sensitive=0 "
+            "AND redaction_status='none' AND content IS NOT NULL AND content<>''"))) {
+        return fail(raw.lastError().text());
+    }
+    while (raw.next()) {
+        const auto rowid = raw.value(0).toLongLong();
+        const auto channel = raw.value(1).toString();
+        const auto session = raw.value(2).toString();
+        const auto senderId = raw.value(3).toString();
+        const auto senderName = raw.value(4).toString();
+        const auto personId = raw.value(5).toString();
+        const bool owner = personId == QStringLiteral("owner");
+        if (!addChunk(QStringLiteral("raw"), QStringLiteral("raw/%1").arg(rowid),
+                      QStringLiteral("message"), raw.value(6).toString(),
+                      channel, session,
+                      personId.isEmpty() ? senderId : personId,
+                      senderName.isEmpty() ? (owner ? QStringLiteral("主人") : QStringLiteral("群友"))
+                                           : senderName,
+                      owner ? QStringLiteral("user") : QStringLiteral("other"),
+                      raw.value(7).toString(), QStringLiteral("original"),
+                      channel == Channel::kQQGroup ? QStringLiteral("public") : QStringLiteral("private"),
+                      QStringLiteral("raw_events"), QString::number(rowid)))
+            return fail(error ? *error : QStringLiteral("raw chunk")) ;
+    }
+
+    QSqlQuery chat(m_db);
+    if (!chat.exec(QStringLiteral(
+            "SELECT id,channel,session_id,subject,speaker,user_input,raw_reply,timestamp "
+            "FROM chat_history WHERE sensitive=0 AND (user_input IS NOT NULL OR raw_reply IS NOT NULL)"))) {
+        return fail(chat.lastError().text());
+    }
+    while (chat.next()) {
+        const auto id = chat.value(0).toLongLong();
+        const auto channel = chat.value(1).toString();
+        const auto session = chat.value(2).toString();
+        const auto subject = chat.value(3).toString();
+        const auto speaker = chat.value(4).toString();
+        const auto userText = chat.value(5).toString();
+        const auto rawReply = chat.value(6).toString();
+        const auto timestamp = chat.value(7).toString();
+        const auto privacy = channel == Channel::kQQGroup
+            ? QStringLiteral("public") : QStringLiteral("private");
+        if (!addChunk(QStringLiteral("chat"), QStringLiteral("chat/%1:user").arg(id),
+                      QStringLiteral("turn_user"), userText, channel, session,
+                      subject.isEmpty() ? QStringLiteral("user") : subject,
+                      speaker.isEmpty() ? (subject == QStringLiteral("user")
+                                              ? QStringLiteral("主人") : QStringLiteral("群友"))
+                                        : speaker,
+                      QStringLiteral("user"), timestamp, QStringLiteral("original"),
+                      privacy, QStringLiteral("chat_history"), QString::number(id)))
+            return fail(error ? *error : QStringLiteral("chat user chunk"));
+        const auto root = QJsonDocument::fromJson(rawReply.toUtf8()).object();
+        QStringList replyParts;
+        for (const auto &value : root.value(QStringLiteral("sentences")).toArray()) {
+            const auto zh = value.toObject().value(QStringLiteral("zh_text")).toString().trimmed();
+            if (!zh.isEmpty()) replyParts.append(zh);
+        }
+        if (replyParts.isEmpty() && !rawReply.trimmed().startsWith(QLatin1Char('{')))
+            replyParts.append(rawReply.trimmed());
+        if (!addChunk(QStringLiteral("chat"), QStringLiteral("chat/%1:assistant").arg(id),
+                      QStringLiteral("turn_assistant"), replyParts.join(QLatin1Char('\n')),
+                      channel, session, QStringLiteral("mako"), QStringLiteral("茉子"),
+                      QStringLiteral("assistant"), timestamp, QStringLiteral("assistant_expression"),
+                      privacy, QStringLiteral("chat_history"), QString::number(id)))
+            return fail(error ? *error : QStringLiteral("chat assistant chunk"));
+    }
+    QSqlQuery count(m_db);
+    int chunkCount = 0;
+    if (count.exec("SELECT count(*) FROM memory_chunks WHERE status='active'") && count.next())
+        chunkCount = count.value(0).toInt();
+    QSqlQuery state(m_db);
+    state.prepare("INSERT OR REPLACE INTO memory_index_state(key,value) VALUES(?,?)");
+    const QList<QPair<QString, QString>> stateValues{
+        {QStringLiteral("status"), QStringLiteral("complete")},
+        {QStringLiteral("last_rebuild"), now},
+        {QStringLiteral("chunks"), QString::number(chunkCount)},
+        {QStringLiteral("generation"), QStringLiteral("1")},
+        {QStringLiteral("duration_ms"), QString::number(rebuildTimer.elapsed())}};
+    for (const auto &entry : stateValues) {
+        state.bindValue(0, entry.first);
+        state.bindValue(1, entry.second);
+        if (!state.exec())
+            return fail(state.lastError().text());
+    }
+    if (!m_db.commit())
+        return fail(m_db.lastError().text());
+    return true;
+}
+
+int MemoryManager::memoryChunkCount() const
+{
+    QSqlQuery q(m_db);
+    if (!q.exec("SELECT count(*) FROM memory_chunks WHERE status='active'") || !q.next())
+        return 0;
+    return q.value(0).toInt();
+}
+
+bool MemoryManager::clearSearchIndex(QString *error)
+{
+    if (!m_db.transaction()) {
+        if (error) *error = m_db.lastError().text();
+        return false;
+    }
+    for (const auto &table : {QStringLiteral("memory_embeddings"),
+                              QStringLiteral("memory_chunk_sources"),
+                              QStringLiteral("memory_chunks"),
+                              QStringLiteral("memory_index_state")}) {
+        QSqlQuery clear(m_db);
+        if (!clear.exec(QStringLiteral("DELETE FROM ") + table)) {
+            m_db.rollback();
+            if (error) *error = clear.lastError().text();
+            return false;
+        }
+    }
+    if (!m_db.commit()) {
+        if (error) *error = m_db.lastError().text();
+        return false;
+    }
+    return true;
+}
+
+bool MemoryManager::backupDatabase(const QString &destination, QString *error) const
+{
+    if (destination.trimmed().isEmpty()) {
+        if (error) *error = QStringLiteral("empty backup destination");
+        return false;
+    }
+    QSqlQuery query(m_db);
+    // VACUUM INTO 生成一致性副本；不依赖 -wal/-shm 文件同时复制。
+    query.prepare("VACUUM INTO ?");
+    query.addBindValue(destination);
+    if (!query.exec()) {
+        if (error) *error = query.lastError().text();
+        return false;
+    }
+    return true;
+}
+
+QJsonObject MemoryManager::searchIndexStatus() const
+{
+    QJsonObject status;
+    status.insert(QStringLiteral("chunks"), memoryChunkCount());
+    QSqlQuery bySource(m_db);
+    if (bySource.exec("SELECT source_type,count(*) FROM memory_chunks "
+                      "WHERE status='active' GROUP BY source_type ORDER BY source_type")) {
+        QJsonObject counts;
+        while (bySource.next())
+            counts.insert(bySource.value(0).toString(), bySource.value(1).toInt());
+        status.insert(QStringLiteral("chunks_by_source"), counts);
+    }
+    QSqlQuery embeddings(m_db);
+    if (embeddings.exec("SELECT count(*) FROM memory_embeddings") && embeddings.next())
+        status.insert(QStringLiteral("embeddings"), embeddings.value(0).toInt());
+    else
+        status.insert(QStringLiteral("embeddings"), 0);
+    QSqlQuery state(m_db);
+    if (state.exec("SELECT key,value FROM memory_index_state")) {
+        QJsonObject stateObject;
+        while (state.next())
+            stateObject.insert(state.value(0).toString(), state.value(1).toString());
+        status.insert(QStringLiteral("state"), stateObject);
+    }
+    return status;
+}
+
+QJsonArray MemoryManager::searchMemoryChunks(const QStringList &terms, int limit,
+                                             const QString &exactQuery) const
+{
+    QJsonArray result;
+    QString sql = QStringLiteral(
+        "SELECT id,source_type,source_ref,chunk_kind,derived,text,content_hash,channel,session_id,"
+        "speaker_id,speaker_name,speaker_role,speech_at,event_time,recorded_at,privacy,status "
+        "FROM memory_chunks WHERE status='active' AND index_generation=1");
+    QStringList safe;
+    for (const auto &term : terms) {
+        const auto trimmed = term.trimmed();
+        if (trimmed.isEmpty() || safe.contains(trimmed))
+            continue;
+        safe.append(trimmed);
+        if (safe.size() >= 8)
+            break;
+    }
+    const QString exact = exactQuery.trimmed();
+    if (!exact.isEmpty() && !safe.contains(exact))
+        safe.prepend(exact);
+    if (!safe.isEmpty()) {
+        QStringList clauses;
+        for (int i = 0; i < safe.size(); ++i)
+            clauses.append(QStringLiteral("text LIKE ?"));
+        sql += QStringLiteral(" AND (") + clauses.join(QStringLiteral(" OR ")) + QStringLiteral(")");
+    }
+    if (!exact.isEmpty())
+        sql += QStringLiteral(" ORDER BY CASE WHEN text LIKE ? THEN 0 ELSE 1 END,datetime(speech_at) DESC,id DESC LIMIT ?");
+    else
+        sql += QStringLiteral(" ORDER BY datetime(speech_at) DESC,id DESC LIMIT ?");
+    QSqlQuery q(m_db);
+    q.prepare(sql);
+    for (const auto &term : safe)
+        q.addBindValue(QStringLiteral("%") + term + QStringLiteral("%"));
+    if (!exact.isEmpty())
+        q.addBindValue(QStringLiteral("%") + exact + QStringLiteral("%"));
+    q.addBindValue(qMax(1, limit * 4));
+    if (!q.exec())
+        return result;
+    while (q.next()) {
+        result.append(QJsonObject{
+            {"id",q.value(0).toLongLong()},{"source_type",q.value(1).toString()},
+            {"source_ref",q.value(2).toString()},{"chunk_kind",q.value(3).toString()},
+            {"derived",q.value(4).toString()},
+            {"text",q.value(5).toString()},{"content_hash",q.value(6).toString()},
+            {"channel",q.value(7).toString()},{"session",q.value(8).toString()},
+            {"speaker_id",q.value(9).toString()},{"speaker",q.value(10).toString()},
+            {"speaker_role",q.value(11).toString()},{"speech_at",q.value(12).toString()},
+            {"event_time",q.value(13).toString()},{"recorded_at",q.value(14).toString()},
+            {"privacy",q.value(15).toString()},{"status",q.value(16).toString()}});
+    }
+    return result;
+}
+
+QJsonArray MemoryManager::memoryChunksForEmbedding(int limit) const
+{
+    QJsonArray result;
+    QSqlQuery q(m_db);
+    q.prepare("SELECT id,content_hash,text FROM memory_chunks WHERE status='active' "
+              "AND index_generation=1 ORDER BY id LIMIT ?");
+    q.addBindValue(qMax(1, limit));
+    if (!q.exec())
+        return result;
+    while (q.next())
+        result.append(QJsonObject{{"id",q.value(0).toLongLong()},
+                                  {"content_hash",q.value(1).toString()},
+                                  {"text",q.value(2).toString()}});
+    return result;
+}
+
+bool MemoryManager::storeChunkEmbedding(qlonglong chunkId, const QString &model, int dimension,
+                                        const QByteArray &blob, const QString &contentHash)
+{
+    if (chunkId <= 0 || model.isEmpty() || dimension <= 0 || blob.isEmpty())
+        return false;
+    QSqlQuery q(m_db);
+    q.prepare("INSERT OR REPLACE INTO memory_embeddings("
+              "chunk_id,model_config,dimension,vector,content_hash,index_generation,created_at)"
+              " VALUES(?,?,?,?,?,1,?)");
+    q.addBindValue(chunkId);
+    q.addBindValue(model);
+    q.addBindValue(dimension);
+    q.addBindValue(blob);
+    q.addBindValue(contentHash);
+    q.addBindValue(QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
+    return q.exec();
+}
+
+QByteArray MemoryManager::chunkEmbedding(qlonglong chunkId, const QString &model) const
+{
+    QSqlQuery q(m_db);
+    q.prepare("SELECT vector FROM memory_embeddings WHERE chunk_id=? AND model_config=? "
+              "AND index_generation=1");
+    q.addBindValue(chunkId);
+    q.addBindValue(model);
+    if (!q.exec() || !q.next())
+        return {};
+    return q.value(0).toByteArray();
+}
+
+bool MemoryManager::embedSearchChunks(MemoryEmbeddingProvider *provider, int limit,
+                                      QString *error)
+{
+    if (!provider) {
+        if (error) *error = QStringLiteral("embedding provider is null");
+        return false;
+    }
+    const auto chunks = memoryChunksForEmbedding(limit);
+    int embedded = 0;
+    for (const auto &value : chunks) {
+        const auto chunk = value.toObject();
+        QVector<float> vector;
+        QString embedError;
+        if (!provider->embed(chunk.value(QStringLiteral("text")).toString(),
+                             &vector, &embedError)) {
+            if (error) *error = embedError;
+            return false;
+        }
+        const QByteArray blob(reinterpret_cast<const char *>(vector.constData()),
+                              vector.size() * int(sizeof(float)));
+        if (!storeChunkEmbedding(chunk.value(QStringLiteral("id")).toInteger(),
+                                 provider->modelId(), vector.size(), blob,
+                                 chunk.value(QStringLiteral("content_hash")).toString())) {
+            if (error) *error = QStringLiteral("store embedding failed");
+            return false;
+        }
+        ++embedded;
+    }
+    QSqlQuery state(m_db);
+    state.prepare("INSERT OR REPLACE INTO memory_index_state(key,value) VALUES(?,?)");
+    state.bindValue(0, QStringLiteral("embeddings"));
+    state.bindValue(1, QString::number(embedded));
+    state.exec();
+    return true;
+}
+
+bool MemoryManager::upsertMemoryChunk(const MemoryChunkWrite &chunk)
+{
+    if (chunk.text.trimmed().isEmpty())
+        return true;
+    // 兼容极旧库/半迁移库：没有 v15 表时不阻断主写入路径。
+    QSqlQuery table(m_db);
+    if (!table.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_chunks'")
+        || !table.next())
+        return true;
+    const QString text = chunk.text.trimmed();
+    const QString hash = QString::fromLatin1(QCryptographicHash::hash(
+        (chunk.sourceRef + QLatin1Char('\n') + text).toUtf8(),
+        QCryptographicHash::Sha256).toHex());
+    const QString now = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
+    QSqlQuery insert(m_db);
+    insert.prepare("INSERT OR IGNORE INTO memory_chunks("
+                   "source_type,source_ref,chunk_kind,derived,text,content_hash,search_text,"
+                   "channel,session_id,speaker_id,speaker_name,speaker_role,"
+                   "speech_at,event_time,recorded_at,privacy,status,index_generation,created_at,updated_at)"
+                   "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'active',1,?,?)");
+    insert.addBindValue(chunk.sourceType);
+    insert.addBindValue(chunk.sourceRef);
+    insert.addBindValue(chunk.chunkKind);
+    insert.addBindValue(chunk.derived);
+    insert.addBindValue(text);
+    insert.addBindValue(hash);
+    insert.addBindValue(text);
+    insert.addBindValue(chunk.channel);
+    insert.addBindValue(chunk.session);
+    insert.addBindValue(chunk.speakerId);
+    insert.addBindValue(chunk.speakerName);
+    insert.addBindValue(chunk.speakerRole);
+    insert.addBindValue(chunk.speechAt);
+    insert.addBindValue(chunk.eventTime);
+    insert.addBindValue(now);
+    insert.addBindValue(chunk.privacy);
+    insert.addBindValue(now);
+    insert.addBindValue(now);
+    if (!insert.exec())
+        return false;
+    qlonglong chunkId = insert.lastInsertId().toLongLong();
+    if (chunkId <= 0) {
+        QSqlQuery find(m_db);
+        find.prepare("SELECT id FROM memory_chunks WHERE source_type=? AND source_ref=? "
+                     "AND chunk_kind=? AND content_hash=? AND index_generation=1");
+        find.addBindValue(chunk.sourceType);
+        find.addBindValue(chunk.sourceRef);
+        find.addBindValue(chunk.chunkKind);
+        find.addBindValue(hash);
+        if (!find.exec() || !find.next())
+            return false;
+        chunkId = find.value(0).toLongLong();
+    }
+    QSqlQuery source(m_db);
+    source.prepare("INSERT OR IGNORE INTO memory_chunk_sources(chunk_id,source_table,source_id)"
+                   " VALUES(?,?,?)");
+    source.addBindValue(chunkId);
+    source.addBindValue(chunk.sourceTable);
+    source.addBindValue(chunk.sourceId);
+    return source.exec();
+}
+
+bool MemoryManager::indexRawEvent(qlonglong id)
+{
+    if (id <= 0)
+        return false;
+    QSqlQuery q(m_db);
+    q.prepare("SELECT channel,session_id,sender_id,sender_name,person_id,content,occurred_at,"
+              "direction,event_type,sensitive,redaction_status FROM raw_events WHERE rowid=?");
+    q.addBindValue(id);
+    if (!q.exec() || !q.next())
+        return false;
+    if (q.value(7).toString() != QStringLiteral("in")
+        || q.value(8).toString() != QStringLiteral("message")
+        || q.value(9).toInt() != 0
+        || q.value(10).toString() != QStringLiteral("none")
+        || q.value(5).toString().trimmed().isEmpty())
+        return true;
+    const QString channel = q.value(0).toString();
+    const QString session = q.value(1).toString();
+    const QString senderId = q.value(2).toString();
+    const QString senderName = q.value(3).toString();
+    const QString personId = q.value(4).toString();
+    const bool owner = personId == QStringLiteral("owner");
+    QSqlQuery remove(m_db);
+    remove.prepare("DELETE FROM memory_chunks WHERE source_type='raw' AND source_ref=?");
+    remove.addBindValue(QStringLiteral("raw/%1").arg(id));
+    if (!remove.exec())
+        return false;
+    MemoryChunkWrite chunk;
+    chunk.sourceType = QStringLiteral("raw");
+    chunk.sourceRef = QStringLiteral("raw/%1").arg(id);
+    chunk.chunkKind = QStringLiteral("message");
+    chunk.derived = QStringLiteral("original");
+    chunk.text = q.value(5).toString();
+    chunk.channel = channel;
+    chunk.session = session;
+    chunk.speakerId = personId.isEmpty() ? senderId : personId;
+    chunk.speakerName = senderName.isEmpty()
+        ? (owner ? QStringLiteral("主人") : QStringLiteral("群友")) : senderName;
+    chunk.speakerRole = owner ? QStringLiteral("user") : QStringLiteral("other");
+    chunk.speechAt = q.value(6).toString();
+    chunk.privacy = channel == Channel::kQQGroup
+        ? QStringLiteral("public") : QStringLiteral("private");
+    chunk.sourceTable = QStringLiteral("raw_events");
+    chunk.sourceId = QString::number(id);
+    return upsertMemoryChunk(chunk);
+}
+
+bool MemoryManager::indexChatTurn(qlonglong id)
+{
+    if (id <= 0)
+        return false;
+    QSqlQuery q(m_db);
+    q.prepare("SELECT channel,session_id,subject,speaker,user_input,raw_reply,timestamp,sensitive "
+              "FROM chat_history WHERE id=?");
+    q.addBindValue(id);
+    if (!q.exec() || !q.next() || q.value(7).toInt() != 0)
+        return false;
+    const QString channel = q.value(0).toString();
+    const QString session = q.value(1).toString();
+    const QString subject = q.value(2).toString();
+    const QString speaker = q.value(3).toString();
+    const QString userText = q.value(4).toString();
+    const QString rawReply = q.value(5).toString();
+    const QString timestamp = q.value(6).toString();
+    const QString privacy = channel == Channel::kQQGroup
+        ? QStringLiteral("public") : QStringLiteral("private");
+    QSqlQuery remove(m_db);
+    remove.prepare("DELETE FROM memory_chunks WHERE source_type='chat' AND source_ref LIKE ?");
+    remove.addBindValue(QStringLiteral("chat/%1:%").arg(id));
+    if (!remove.exec())
+        return false;
+    MemoryChunkWrite user;
+    user.sourceType = QStringLiteral("chat");
+    user.sourceRef = QStringLiteral("chat/%1:user").arg(id);
+    user.chunkKind = QStringLiteral("turn_user");
+    user.derived = QStringLiteral("original");
+    user.text = userText;
+    user.channel = channel;
+    user.session = session;
+    user.speakerId = subject.isEmpty() ? QStringLiteral("user") : subject;
+    user.speakerName = speaker.isEmpty()
+        ? (subject == QStringLiteral("user") ? QStringLiteral("主人") : QStringLiteral("群友"))
+        : speaker;
+    user.speakerRole = QStringLiteral("user");
+    user.speechAt = timestamp;
+    user.privacy = privacy;
+    user.sourceTable = QStringLiteral("chat_history");
+    user.sourceId = QString::number(id);
+    if (!upsertMemoryChunk(user))
+        return false;
+
+    const auto root = QJsonDocument::fromJson(rawReply.toUtf8()).object();
+    QStringList replyParts;
+    for (const auto &value : root.value(QStringLiteral("sentences")).toArray()) {
+        const auto zh = value.toObject().value(QStringLiteral("zh_text")).toString().trimmed();
+        if (!zh.isEmpty()) replyParts.append(zh);
+    }
+    if (replyParts.isEmpty() && !rawReply.trimmed().startsWith(QLatin1Char('{')))
+        replyParts.append(rawReply.trimmed());
+    MemoryChunkWrite assistant;
+    assistant.sourceType = QStringLiteral("chat");
+    assistant.sourceRef = QStringLiteral("chat/%1:assistant").arg(id);
+    assistant.chunkKind = QStringLiteral("turn_assistant");
+    assistant.derived = QStringLiteral("assistant_expression");
+    assistant.text = replyParts.join(QLatin1Char('\n'));
+    assistant.channel = channel;
+    assistant.session = session;
+    assistant.speakerId = QStringLiteral("mako");
+    assistant.speakerName = QStringLiteral("茉子");
+    assistant.speakerRole = QStringLiteral("assistant");
+    assistant.speechAt = timestamp;
+    assistant.privacy = privacy;
+    assistant.sourceTable = QStringLiteral("chat_history");
+    assistant.sourceId = QString::number(id);
+    return upsertMemoryChunk(assistant);
+}
+
+QJsonArray MemoryManager::matterEvidence(const RequestMeta &audience, const QString &matter) const{
     QJsonArray result;
     if (audience.sensitive || !audience.longTermMemoryEnabled) return result;
     QSqlQuery q(m_db);
@@ -460,7 +1046,8 @@ QString MemoryManager::conversationPhase(const RequestMeta &audience) const
 }
 
 QJsonArray MemoryManager::currentUnderstanding(const RequestMeta &audience, const QString &input,
-                                    QStringList *keys, const QStringList &only) const
+                                    QStringList *keys, const QStringList &only,
+                                    bool includeAudiencePrivate) const
 {
     QJsonArray result;
     if (keys) keys->clear();
@@ -520,7 +1107,8 @@ QJsonArray MemoryManager::currentUnderstanding(const RequestMeta &audience, cons
     while (query.next()) {
         const auto count = result.size();
         const auto topic = query.value(0).toString();
-        if (audience.channel == Channel::kQQGroup && !query.value(3).toBool()) {
+        if (audience.channel == Channel::kQQGroup && !query.value(3).toBool()
+            && !includeAudiencePrivate) {
 
             if (query.value(4).toBool() || input.contains(topic)) {
                 if (query.value(5).toInt() > 0)
@@ -530,7 +1118,7 @@ QJsonArray MemoryManager::currentUnderstanding(const RequestMeta &audience, cons
             }
         } else if (query.value(5).toInt() > 0) {
             QJsonObject record{{"quote", query.value(1).toString()}, {"reported_at", query.value(2).toString()}};
-            if (audience.channel != Channel::kQQGroup) {
+            if (audience.channel != Channel::kQQGroup || includeAudiencePrivate) {
                 record["topic"] = topic;
                 record["understanding"] = query.value(8).toString();
                 record["status"] = query.value(6).toString();
@@ -614,8 +1202,67 @@ QList<HistoryTurn> MemoryManager::getHistoryTurn(int N, const QString &channel, 
     return historyTurnList;
 }
 
-QList<HistoryTurn> MemoryManager::getHistoryTurn(int offset, int limit)
+QList<HistoryTurn> MemoryManager::searchHistoryTurns(const QString &channel, const QString &sessionId,
+                                                   const QStringList &terms, int limit,
+                                                   const QDateTime &from, const QDateTime &to)
 {
+    QList<HistoryTurn> result;
+    if (!m_db.open() || limit <= 0)
+        return result;
+    QString sql = QStringLiteral(
+        "SELECT id,user_input,raw_reply,timestamp,turn_kind,subject,speaker "
+        "FROM chat_history WHERE channel=? AND session_id=? AND sensitive=0");
+    QStringList safeTerms;
+    for (const auto &term : terms) {
+        const auto trimmed = term.trimmed();
+        if (trimmed.isEmpty() || safeTerms.contains(trimmed))
+            continue;
+        safeTerms.append(trimmed);
+        if (safeTerms.size() >= 8)
+            break;
+    }
+    if (!safeTerms.isEmpty()) {
+        QStringList clauses;
+        for (int i = 0; i < safeTerms.size(); ++i)
+            clauses.append(QStringLiteral("(user_input LIKE ? OR raw_reply LIKE ?)"));
+        sql += QStringLiteral(" AND (") + clauses.join(QStringLiteral(" OR ")) + QStringLiteral(")");
+    }
+    if (from.isValid())
+        sql += QStringLiteral(" AND timestamp>=?");
+    if (to.isValid())
+        sql += QStringLiteral(" AND timestamp<?");
+    sql += QStringLiteral(" ORDER BY id DESC LIMIT ?");
+    QSqlQuery q(m_db);
+    q.prepare(sql);
+    q.addBindValue(channel);
+    q.addBindValue(sessionId);
+    for (const auto &term : safeTerms) {
+        const auto pattern = QStringLiteral("%") + term + QStringLiteral("%");
+        q.addBindValue(pattern);
+        q.addBindValue(pattern);
+    }
+    if (from.isValid())
+        q.addBindValue(from);
+    if (to.isValid())
+        q.addBindValue(to);
+    q.addBindValue(qMax(1, limit));
+    if (!q.exec())
+        return result;
+    while (q.next()) {
+        HistoryTurn turn;
+        turn.id = q.value(0).toLongLong();
+        turn.userInput = q.value(1).toString();
+        turn.rawReply = q.value(2).toString();
+        turn.timestamp = q.value(3).toDateTime();
+        turn.turnKind = q.value(4).toString();
+        turn.subject = q.value(5).toString();
+        turn.speaker = q.value(6).toString();
+        result.prepend(turn);
+    }
+    return result;
+}
+
+QList<HistoryTurn> MemoryManager::getHistoryTurn(int offset, int limit){
     QList<HistoryTurn> historyList;
     if(!m_db.open()){
         qDebug()<<"[MemoryManager]数据库打开失败:"<<m_db.lastError();
@@ -1424,6 +2071,9 @@ bool MemoryManager::appendRawEvent(const RawEventWrite &event)
     qDebug() << "[MemoryManager]raw_events写入: platform=" << event.platform
              << "channel=" << event.channel << "session=" << event.sessionId
              << "type=" << event.eventType << "affected=" << query.numRowsAffected();
+    const qlonglong rawId = query.lastInsertId().toLongLong();
+    if (rawId > 0 && !indexRawEvent(rawId))
+        qWarning() << "[MemoryIndex] incremental raw index failed:" << rawId;
     if (debugFullLogsEnabled()) {
         qDebug().noquote() << "[MemoryManager][debug] raw content:" << event.content
                            << "payload:" << event.payloadJson;
@@ -2972,7 +3622,7 @@ qlonglong MemoryManager::getMemoryCursorEventId(const QString &channel, const QS
     return 0;
 }
 
-void MemoryManager::initDatabase(const QString &dbFilePath)
+void MemoryManager::initDatabase(const QString &dbFilePath, const QString &connectionName)
 {
     QDir dbDir = QFileInfo(dbFilePath).dir();
     if (!dbDir.exists()) {
@@ -2984,7 +3634,8 @@ void MemoryManager::initDatabase(const QString &dbFilePath)
 
 
 
-    const QString connName = "memory_db_connection";
+    const QString connName = connectionName.isEmpty()
+        ? QStringLiteral("memory_db_connection") : connectionName;
     if (QSqlDatabase::contains(connName)) {
         // 复用连接时不自动 open（旧文件可能已不存在），改由下方 setDatabaseName 后统一打开
         m_db = QSqlDatabase::database(connName, false);
@@ -3644,6 +4295,76 @@ void MemoryManager::initDatabase(const QString &dbFilePath)
             for (const auto &statement : statements)
                 if (!query.exec(statement)) throw query.lastError();
             currentVersion = 14;
+        }
+        if (currentVersion < 15) {
+            const QStringList statements = {
+                "CREATE TABLE IF NOT EXISTS memory_chunks("
+                "id INTEGER PRIMARY KEY,"
+                "source_type TEXT NOT NULL,"
+                "source_ref TEXT NOT NULL,"
+                "chunk_kind TEXT NOT NULL,"
+                "derived TEXT,"
+                "text TEXT NOT NULL,"
+                "content_hash TEXT NOT NULL,"
+                "search_text TEXT NOT NULL,"
+                "channel TEXT,"
+                "session_id TEXT,"
+                "speaker_id TEXT,"
+                "speaker_name TEXT,"
+                "speaker_role TEXT,"
+                "speech_at TEXT,"
+                "event_time TEXT,"
+                "recorded_at TEXT,"
+                "privacy TEXT,"
+                "status TEXT NOT NULL DEFAULT 'active',"
+                "index_generation INTEGER NOT NULL DEFAULT 1,"
+                "created_at TEXT NOT NULL,"
+                "updated_at TEXT NOT NULL,"
+                "UNIQUE(source_type,source_ref,chunk_kind,content_hash,index_generation))",
+                "CREATE INDEX IF NOT EXISTS memory_chunks_active ON memory_chunks(status,index_generation,id)",
+                "CREATE INDEX IF NOT EXISTS memory_chunks_source ON memory_chunks(source_type,source_ref)",
+                "CREATE TABLE IF NOT EXISTS memory_chunk_sources("
+                "chunk_id INTEGER NOT NULL,"
+                "source_table TEXT NOT NULL,"
+                "source_id TEXT NOT NULL,"
+                "range_start INTEGER,"
+                "range_end INTEGER,"
+                "PRIMARY KEY(chunk_id,source_table,source_id))",
+                "CREATE INDEX IF NOT EXISTS memory_chunk_sources_source ON memory_chunk_sources(source_table,source_id)",
+                "CREATE TABLE IF NOT EXISTS memory_embeddings("
+                "chunk_id INTEGER NOT NULL,"
+                "model_config TEXT NOT NULL,"
+                "dimension INTEGER NOT NULL,"
+                "vector BLOB NOT NULL,"
+                "content_hash TEXT NOT NULL,"
+                "index_generation INTEGER NOT NULL,"
+                "created_at TEXT NOT NULL,"
+                "PRIMARY KEY(chunk_id,model_config))",
+                "CREATE TABLE IF NOT EXISTS memory_index_state("
+                "key TEXT PRIMARY KEY,value TEXT)",
+                "CREATE TRIGGER IF NOT EXISTS forget_chunk_parts AFTER DELETE ON memory_chunks BEGIN "
+                "DELETE FROM memory_chunk_sources WHERE chunk_id=OLD.id; "
+                "DELETE FROM memory_embeddings WHERE chunk_id=OLD.id; END"
+            };
+            for (const auto &statement : statements)
+                if (!query.exec(statement)) throw query.lastError();
+            auto hasTable = [&](const QString &name) {
+                QSqlQuery check(m_db);
+                check.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?");
+                check.addBindValue(name);
+                return check.exec() && check.next();
+            };
+            if (hasTable(QStringLiteral("raw_events"))
+                && !query.exec("CREATE TRIGGER IF NOT EXISTS forget_raw_chunks AFTER DELETE ON raw_events BEGIN "
+                               "DELETE FROM memory_chunks WHERE source_type='raw' AND source_ref='raw/'||OLD.rowid; END"))
+                throw query.lastError();
+            if (hasTable(QStringLiteral("chat_history"))
+                && !query.exec("CREATE TRIGGER IF NOT EXISTS forget_chat_chunks AFTER DELETE ON chat_history BEGIN "
+                               "DELETE FROM memory_chunks WHERE source_type='chat' AND source_ref LIKE 'chat/'||OLD.id||':%'; END"))
+                throw query.lastError();
+            if (!query.exec("PRAGMA user_version=15"))
+                throw query.lastError();
+            currentVersion = 15;
         }
         if (!m_db.commit()) throw m_db.lastError();
         qDebug()<<"[MemoryManager]数据库初始化完成,结构版本为:"<<currentVersion;

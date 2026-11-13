@@ -17,6 +17,8 @@ Windows Debug 构建成功，15/15 个 CTest 套件通过。独立临时数据�
 
 2026-11-12 晚（第二段）：接入 `self_report` 原话与 `attribution_check` 三层审计、`care` 按事项绑定、`Situation` 场景事实、`thought_result` 活动进度/暂停/恢复与 ID+版本条件操作、`draftReadyToShare` 分享前 guard、`proactive.private_writing` 与主动联系拆分。未新增数据库表；15/15 CTest 套件通过。真实群聊、私聊归属/收尾和跨重启活动仍待实际使用验收。
 
+2026-11-13：统一检索重构 P1/P2/P3 第一轮。新增 `MemoryEvidence` / `Situation` / `MemoryRetrievalService`，自动证据 Pet/QQ 同入口；工具补助手表达与说话人字段，Pet 开放工具；v15 增加 `memory_chunks` / `memory_chunk_sources` / `memory_embeddings` / `memory_index_state`，支持 `--rebuild-memory-index` 重建、词面 BM25、可选向量、RRF 与顺序截断；表达模型获得相关私人背景，`currentUnderstanding` 增加 audience-private 开关。15/15 CTest 通过。真实 Embedding/Reranker、自动异步回填、长库性能和真实渠道尚未验收；`LocalHashEmbeddingProvider` 仅用于测试/降级，不能当成语义模型。
+
 ## 已有阶段
 
 | 阶段 | 形成的能力或决策 | 状态依据 |

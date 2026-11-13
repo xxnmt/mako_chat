@@ -9,12 +9,14 @@
 #include <QScopedPointer>
 #include <QPointer>
 #include <QSet>
+#include <memory>
 
 #include "sentencedata.h"
 #include "historyturn.h"
 #include "utterance.h"
 #include "memoryagenttypes.h"
 #include "memoryrecalltool.h"
+#include "memoryretrieval.h"
 
 class MemoryManager;
 class MemoryAgent;
@@ -133,9 +135,16 @@ private:
 
     MemoryManager *m_memoryManager = nullptr;
     MemoryAgent *m_memoryAgent = nullptr;
+    std::unique_ptr<MemoryRetrievalService> m_retrievalService;
     struct ForegroundRun {
         RequestMeta meta;
         QString input;
+        MemorySituation situation;
+        QString retrievalStatus;
+        QString retrievalBackend;
+        int retrievalCandidates = 0;
+        qint64 retrievalLatencyMs = 0;
+        bool retrievalTruncated = false;
         QJsonObject evidence;
         QJsonObject beforeConsultation;
         QStringList catalogKeys;

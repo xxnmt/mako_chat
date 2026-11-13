@@ -1,4 +1,6 @@
 #include "appcontroller.h"
+#include "memoryindexworker.h"
+#include <QThread>
 #include "cognitivecoordinator.h"
 #include "characterwidget.h"
 #include "bubblewidget.h"
@@ -81,6 +83,26 @@ AppController::AppController(QObject *parent)
     m_memoryManager = new MemoryManager(ConfigManager::instance().getMemoryPath());
     m_coordinator = new CognitiveCoordinator(*m_memoryManager, *m_llmService, this);
     m_memoryManager->seedIdentity(ConfigManager::instance().getMasterQQAccounts());
+    const auto retrievalConfig =
+        ConfigManager::instance().getMemoryPolicyConfig().retrieval;
+    if (retrievalConfig.indexEnabled && retrievalConfig.autoBackfill
+        && m_memoryManager->memoryChunkCount() == 0) {
+        auto *thread = new QThread(this);
+        auto *worker = new MemoryIndexWorker(ConfigManager::instance().getMemoryPath());
+        worker->moveToThread(thread);
+        connect(thread, &QThread::started, worker, &MemoryIndexWorker::run);
+        connect(worker, &MemoryIndexWorker::finished, this,
+                [thread](bool ok, const QString &error, int chunks) {
+            if (ok)
+                qInfo() << "[MemoryIndex] background backfill chunks:" << chunks;
+            else
+                qWarning() << "[MemoryIndex] background backfill failed:" << error;
+            thread->quit();
+        });
+        connect(thread, &QThread::finished, worker, &QObject::deleteLater);
+        connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+        thread->start();
+    }
     // m_settingsWidget = new SettingsWidget;
     // m_settingsWidget->setMemoryManager(m_memoryManager);
     // m_settingsWidget->setMemoryLength(ConfigManager::instance().getShortMemoryLength());

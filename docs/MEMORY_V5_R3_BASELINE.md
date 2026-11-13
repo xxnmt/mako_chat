@@ -2,7 +2,7 @@
 
 > **历史基线，不代表当前实现，也不代表当前路线图。**
 > 本文冻结 v9 阶段的留存与披露工具设计；PR 编号只用于追溯 2026-11 的 R3 施工，新工作不要再用。
-> 当前库为 v14；当前实现见 [架构](ARCHITECTURE.md)，当前状态见 [STATUS.md](STATUS.md)，下一步见 [路线图](ROADMAP.md)。
+> 当前库为 v15；当前实现见 [架构](ARCHITECTURE.md)，当前状态见 [STATUS.md](STATUS.md)，下一步见 [路线图](ROADMAP.md)。
 > 日期：2026-11-03
 > 冻结：`blocked` 默认不回复；`group_authorized` 下非白名单成员只记录、不回复、不写 `chat_history`。
 > 取代：[HISTORY.md](HISTORY.md) 的历史草案

@@ -308,12 +308,13 @@ private slots:
         QVERIFY(committed);
         QCOMPARE(bodies.size(), 2);
         QVERIFY(bodies.first().contains(QStringLiteral("预约延期").toUtf8()));
-        QVERIFY(!bodies.last().contains(QStringLiteral("预约延期").toUtf8()));
+        // P3：表达模型保留相关背景；是否说出由听众与保密语义决定。
+        QVERIFY(bodies.last().contains(QStringLiteral("预约延期").toUtf8()));
         QCOMPARE(bodies.last().contains("CURRENT_UNDERSTANDING\\n"), updateDuringReflection);
         QCOMPARE(spoken.size(), 1);
     }
 
-    void privateReflectionDoesNotEnterPublicReply_data()
+    void privateBackgroundIsAvailableButReplyStaysPublic_data()
     {
         QTest::addColumn<QString>("secret");
         QTest::addColumn<QString>("status");
@@ -329,7 +330,7 @@ private slots:
         }
     }
 
-    void privateReflectionDoesNotEnterPublicReply()
+    void privateBackgroundIsAvailableButReplyStaysPublic()
     {
         QTemporaryDir dir;
         MemoryManager db(dir.filePath("reflection.db"));
@@ -388,7 +389,7 @@ private slots:
         QCOMPARE(replies.at(0).at(3).value<RequestMeta>().runId, meta.runId);
         QCOMPARE(replies.at(0).at(3).value<RequestMeta>().sessionId, meta.sessionId);
         QVERIFY(bodies[bodies.size()-2].contains(secret.toUtf8()));
-        QVERIFY(!bodies.last().contains(secret.toUtf8()));
+        QVERIFY(bodies.last().contains(secret.toUtf8()));
         QVERIFY(bodies.last().contains(QString("别按以前的情况主动追问").toUtf8()));
         service.askDeepSeek("我刚才说了什么",{},RequestMeta{});
         QTRY_COMPARE_WITH_TIMEOUT(replies.size(),2,5000);
@@ -1212,6 +1213,74 @@ private slots:
         QVERIFY(plannerInput.contains(QStringLiteral("memory_capabilities")));
     }
 
+    void toolSearchKeepsAssistantExpression()
+    {
+        QTemporaryDir dir;
+        MemoryManager mm(dir.filePath("assistant-tool.db"));
+        RequestMeta meta;
+        meta.channel = Channel::kQQPrivate;
+        meta.sessionId = meta.actorId = QStringLiteral("10101");
+        meta.eventId = QStringLiteral("assistant-tool");
+        SentenceText answer;
+        answer.zhText = QStringLiteral("好呀");
+        answer.jaText = QStringLiteral("いいよ");
+        QVERIFY(mm.saveQATurn(QStringLiteral("我答应你"), QStringLiteral("{}"),
+                              {answer}, meta));
+        MemoryAgentScope scope = ownerPrivateScope(QDateTime::currentDateTime(), false);
+        scope.sessionId = QStringLiteral("10101");
+        scope.access.sessionId = QStringLiteral("10101");
+        MemoryAgentTools tools(&mm, scope);
+        QString error;
+        const auto result = tools.execute(QStringLiteral("memory_search"),
+            QJsonObject{{"query",QStringLiteral("好呀")},
+                        {"kinds",QJsonArray{QStringLiteral("chat_history")}}},
+            &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        bool foundAssistant = false;
+        for (const auto &value : result.value(QStringLiteral("items")).toArray()) {
+            const auto item = value.toObject();
+            if (item.value(QStringLiteral("speaker_role")).toString()
+                == QStringLiteral("assistant")) {
+                foundAssistant = true;
+                QCOMPARE(item.value(QStringLiteral("derived")).toString(),
+                         QStringLiteral("assistant_expression"));
+                QVERIFY(!item.value(QStringLiteral("person_id")).toString().isEmpty());
+            }
+        }
+        QVERIFY(foundAssistant);
+    }
+
+    void toolSearchDoesNotDropOldTurns()
+    {
+        QTemporaryDir dir;
+        MemoryManager mm(dir.filePath("old-turns.db"));
+        RequestMeta meta;
+        meta.channel = Channel::kQQPrivate;
+        meta.sessionId = meta.actorId = QStringLiteral("10101");
+        for (int i = 0; i < 220; ++i) {
+            meta.eventId = QStringLiteral("old-%1").arg(i);
+            QVERIFY(mm.saveQATurn(QStringLiteral("旧记录%1").arg(i),
+                                  QStringLiteral("{}"), {}, meta));
+        }
+        MemoryAgentScope scope = ownerPrivateScope(QDateTime::currentDateTime(), false);
+        scope.sessionId = QStringLiteral("10101");
+        scope.access.sessionId = QStringLiteral("10101");
+        MemoryAgentTools tools(&mm, scope);
+        QString error;
+        const auto result = tools.execute(QStringLiteral("memory_search"),
+            QJsonObject{{"query",QStringLiteral("旧记录0")},
+                        {"kinds",QJsonArray{QStringLiteral("chat_history")}}},
+            &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        bool found = false;
+        for (const auto &value : result.value(QStringLiteral("items")).toArray()) {
+            if (value.toObject().value(QStringLiteral("text")).toString()
+                == QStringLiteral("旧记录0"))
+                found = true;
+        }
+        QVERIFY(found);
+    }
+
     void toolGateDoesNotReadUserText()
     {
         MemoryAgentConfig config;
@@ -1227,7 +1296,7 @@ private slots:
         RequestMeta pet;
         pet.channel = Channel::kPet;
         pet.turnKind = QStringLiteral("reply");
-        QVERIFY(!MemoryAgentPlanner::canExposeTools(pet, config));
+        QVERIFY(MemoryAgentPlanner::canExposeTools(pet, config));
 
         RequestMeta proactive;
         proactive.channel = Channel::kQQPrivate;

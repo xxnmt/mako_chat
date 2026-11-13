@@ -1,0 +1,333 @@
+#include "memoryretrieval.h"
+
+#include "memorymanager.h"
+
+#include <QElapsedTimer>
+#include <QCryptographicHash>
+#include <QHash>
+#include <QJsonArray>
+#include <QSet>
+#include <QtMath>
+
+#include <algorithm>
+#include <cstring>
+
+namespace {
+
+QList<int> rankOrder(const QVector<double> &scores)
+{
+    QList<int> order;
+    for (int i = 0; i < scores.size(); ++i)
+        order.append(i);
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+        return scores.at(a) > scores.at(b);
+    });
+    return order;
+}
+
+QVector<double> lexicalScores(const QList<MemoryEvidence> &evidence,
+                              const QStringList &terms)
+{
+    QVector<double> scores(evidence.size(), 0.0);
+    if (evidence.isEmpty() || terms.isEmpty())
+        return scores;
+    const double avgLength = [&] {
+        double total = 0.0;
+        for (const auto &item : evidence)
+            total += qMax(1, item.text.size());
+        return total / evidence.size();
+    }();
+    QHash<QString, int> documentFrequency;
+    for (const auto &term : terms) {
+        int count = 0;
+        for (const auto &item : evidence)
+            if (item.text.contains(term, Qt::CaseInsensitive))
+                ++count;
+        documentFrequency.insert(term, count);
+    }
+    for (int i = 0; i < evidence.size(); ++i) {
+        const double length = qMax(1, evidence.at(i).text.size());
+        double score = 0.0;
+        for (const auto &term : terms) {
+            const int tf = evidence.at(i).text.count(term, Qt::CaseInsensitive);
+            if (tf <= 0)
+                continue;
+            const int df = documentFrequency.value(term);
+            const double idf = qLn(1.0 + (evidence.size() - df + 0.5) / (df + 0.5));
+            const double denominator = tf + 1.2 * (1.0 - 0.75 + 0.75 * length / avgLength);
+            score += idf * (tf * 2.2) / denominator;
+        }
+        scores[i] = score;
+    }
+    return scores;
+}
+
+QVector<float> blobToVector(const QByteArray &blob)
+{
+    if (blob.isEmpty() || blob.size() % int(sizeof(float)) != 0)
+        return {};
+    QVector<float> vector(blob.size() / int(sizeof(float)));
+    std::memcpy(vector.data(), blob.constData(), size_t(blob.size()));
+    return vector;
+}
+
+double cosine(const QVector<float> &a, const QVector<float> &b)
+{
+    if (a.isEmpty() || a.size() != b.size())
+        return -1.0;
+    double dot = 0.0, na = 0.0, nb = 0.0;
+    for (int i = 0; i < a.size(); ++i) {
+        dot += double(a.at(i)) * b.at(i);
+        na += double(a.at(i)) * a.at(i);
+        nb += double(b.at(i)) * b.at(i);
+    }
+    if (na <= 0.0 || nb <= 0.0)
+        return -1.0;
+    return dot / (qSqrt(na) * qSqrt(nb));
+}
+
+qlonglong chunkId(const QString &handle)
+{
+    if (!handle.startsWith(QStringLiteral("chunk/")))
+        return 0;
+    return handle.mid(QStringLiteral("chunk/").size()).toLongLong();
+}
+
+} // namespace
+
+LegacyMemorySourceAdapter::LegacyMemorySourceAdapter(MemoryManager *manager)
+    : m_manager(manager)
+{
+}
+
+QList<MemoryEvidence> LegacyMemorySourceAdapter::fetch(const RetrievalRequest &request) const
+{
+    QList<MemoryEvidence> result;
+    if (!m_manager)
+        return result;
+    const auto rows = m_manager->personalEvidence(
+        request.subject, request.accounts, request.terms, request.includeOthers,
+        request.currentChannel, request.currentSession, request.excludeCurrent);
+    for (const auto &row : rows)
+        result.append(MemoryEvidence::fromLegacy(row.toObject()));
+    return result;
+}
+
+QList<MemoryEvidence> IdentityMemoryReranker::rerank(const QString &,
+                                                     const QList<MemoryEvidence> &candidates,
+                                                     int limit, QString *) const
+{
+    return candidates.mid(0, qMax(0, limit));
+}
+
+QList<MemoryEvidence> HeuristicMemoryReranker::rerank(const QString &query,
+                                                      const QList<MemoryEvidence> &candidates,
+                                                      int limit, QString *) const
+{
+    if (candidates.isEmpty() || limit <= 0)
+        return {};
+    const QStringList terms = query.simplified().split(QLatin1Char(' '), Qt::SkipEmptyParts);
+    QList<QPair<double, int>> scored;
+    const QDateTime now = QDateTime::currentDateTime();
+    for (int i = 0; i < candidates.size(); ++i) {
+        double score = 1.0 / (60.0 + i + 1.0);
+        for (const auto &term : terms) {
+            if (term.size() >= 2 && candidates.at(i).text.contains(term, Qt::CaseInsensitive))
+                score += 0.08;
+        }
+        if (candidates.at(i).speechAt.isValid()) {
+            const double days = qMax(0.0, candidates.at(i).speechAt.secsTo(now) / 86400.0);
+            score += 0.02 * qExp(-days / 30.0);
+        }
+        scored.append({score, i});
+    }
+    std::stable_sort(scored.begin(), scored.end(), [](const auto &a, const auto &b) {
+        return a.first > b.first;
+    });
+    QList<MemoryEvidence> result;
+    for (const auto &entry : scored) {
+        if (result.size() >= limit)
+            break;
+        result.append(candidates.at(entry.second));
+    }
+    return result;
+}
+
+MemoryRetrievalService::MemoryRetrievalService(MemoryManager *manager,
+                                               std::shared_ptr<MemoryEmbeddingProvider> embedding,
+                                               std::shared_ptr<MemoryReranker> reranker)
+    : m_embedding(std::move(embedding)), m_reranker(std::move(reranker))
+{
+    if (!m_reranker)
+        m_reranker = std::make_shared<HeuristicMemoryReranker>();
+    setMemoryManager(manager);
+}
+
+void MemoryRetrievalService::setMemoryManager(MemoryManager *manager)
+{
+    m_manager = manager;
+    m_adapter = std::make_unique<LegacyMemorySourceAdapter>(manager);
+}
+
+void MemoryRetrievalService::setEmbeddingProvider(
+    std::shared_ptr<MemoryEmbeddingProvider> embedding)
+{
+    m_embedding = std::move(embedding);
+}
+
+void MemoryRetrievalService::setReranker(std::shared_ptr<MemoryReranker> reranker)
+{
+    m_reranker = std::move(reranker);
+}
+
+QList<MemoryEvidence> MemoryRetrievalService::retrieveIndexed(const RetrievalRequest &request,
+                                                             RetrievalResult *result) const
+{
+    QList<MemoryEvidence> candidates;
+    if (!m_manager)
+        return candidates;
+    const auto rows = m_manager->searchMemoryChunks(request.terms, request.candidateLimit,
+                                                    request.query);
+    result->backend = QStringLiteral("index");
+    result->candidateCount = rows.size();
+    result->truncated = rows.size() >= qMax(1, request.candidateLimit * 4);
+    for (const auto &row : rows) {
+        const auto evidence = MemoryEvidence::fromChunk(row.toObject());
+        if (evidence.handle.isEmpty() || evidence.text.trimmed().isEmpty())
+            continue;
+        if (request.excludeCurrent && evidence.channel == request.currentChannel
+            && evidence.session == request.currentSession)
+            continue;
+        candidates.append(evidence);
+    }
+    if (candidates.isEmpty())
+        return candidates;
+
+    const auto lexical = lexicalScores(candidates, request.terms);
+    result->lexicalCount = 0;
+    for (double score : lexical)
+        if (score > 0.0)
+            ++result->lexicalCount;
+    QVector<double> vectorScores(candidates.size(), -1.0);
+    bool vectorUsed = false;
+    if (m_embedding) {
+        QVector<float> query;
+        QString embedError;
+        if (!m_embedding->embed(request.query, &query, &embedError)) {
+            result->status = QStringLiteral("degraded");
+        } else {
+            vectorUsed = true;
+            for (int i = 0; i < candidates.size(); ++i) {
+                const auto id = chunkId(candidates.at(i).handle);
+                if (id <= 0)
+                    continue;
+                const auto blob = m_manager->chunkEmbedding(id, m_embedding->modelId());
+                const auto stored = blobToVector(blob);
+                if (stored.size() == query.size())
+                    vectorScores[i] = cosine(query, stored);
+            }
+            for (double score : vectorScores)
+                if (score >= 0.0)
+                    ++result->vectorCount;
+        }
+    }
+
+    const auto lexicalOrder = rankOrder(lexical);
+    const auto vectorOrder = rankOrder(vectorScores);
+    QHash<QString, double> rrf;
+    const double k = 60.0;
+    for (int rank = 0; rank < lexicalOrder.size(); ++rank) {
+        const int index = lexicalOrder.at(rank);
+        if (lexical.at(index) > 0.0)
+            rrf[candidates.at(index).handle] += 1.0 / (k + rank + 1.0);
+    }
+    if (vectorUsed) {
+        for (int rank = 0; rank < vectorOrder.size(); ++rank) {
+            const int index = vectorOrder.at(rank);
+            if (vectorScores.at(index) >= 0.0)
+                rrf[candidates.at(index).handle] += 1.0 / (k + rank + 1.0);
+        }
+    }
+    QList<int> finalOrder;
+    for (int i = 0; i < candidates.size(); ++i)
+        finalOrder.append(i);
+    std::stable_sort(finalOrder.begin(), finalOrder.end(), [&](int a, int b) {
+        const double sa = rrf.value(candidates.at(a).handle);
+        const double sb = rrf.value(candidates.at(b).handle);
+        if (sa != sb)
+            return sa > sb;
+        return lexical.at(a) > lexical.at(b);
+    });
+    QList<MemoryEvidence> ranked;
+    for (int index : finalOrder)
+        ranked.append(candidates.at(index));
+    if (m_reranker) {
+        QString rerankError;
+        const auto reranked = m_reranker->rerank(request.query, ranked,
+                                                 request.rerankLimit, &rerankError);
+        if (!rerankError.isEmpty())
+            result->status = QStringLiteral("degraded");
+        return reranked;
+    }
+    return ranked.mid(0, qMax(0, request.rerankLimit));
+}
+
+RetrievalResult MemoryRetrievalService::retrieve(const RetrievalRequest &request) const
+{
+    RetrievalResult result;
+    QElapsedTimer timer;
+    timer.start();
+    auto filterKinds = [&](QList<MemoryEvidence> evidence) {
+        if (request.sourceKinds.isEmpty())
+            return evidence;
+        QList<MemoryEvidence> filtered;
+        for (const auto &item : evidence) {
+            if (request.sourceKinds.contains(item.sourceType))
+                filtered.append(item);
+        }
+        return filtered;
+    };
+    if (!m_adapter) {
+        result.status = QStringLiteral("degraded");
+        result.latencyMs = timer.elapsed();
+        return result;
+    }
+    if (request.useIndex && m_manager && m_manager->memoryChunkCount() > 0) {
+        auto indexed = retrieveIndexed(request, &result);
+        // 索引目前只覆盖 raw/chat；摘要、claim、episodic 仍由兼容适配器补充，
+        // 不能因为索引存在而让这些来源突然消失。
+        const auto legacy = m_adapter->fetch(request);
+        QSet<QString> seen;
+        QList<MemoryEvidence> combined;
+        for (const auto &item : indexed) {
+            const QString key = item.sourceRef.isEmpty() ? item.text : item.sourceRef;
+            if (seen.contains(key))
+                continue;
+            seen.insert(key);
+            combined.append(item);
+        }
+        for (const auto &item : legacy) {
+            const QString key = item.sourceRef.isEmpty() ? item.text : item.sourceRef;
+            if (seen.contains(key))
+                continue;
+            seen.insert(key);
+            combined.append(item);
+        }
+        result.evidence = filterKinds(combined);
+        if (!result.evidence.isEmpty()) {
+            result.latencyMs = timer.elapsed();
+            return result;
+        }
+    }
+    if (!request.allowLegacyFallback) {
+        result.latencyMs = timer.elapsed();
+        return result;
+    }
+    result.backend = QStringLiteral("legacy");
+    result.evidence = filterKinds(m_adapter->fetch(request));
+    result.candidateCount = result.evidence.size();
+    result.truncated = result.evidence.size() >= request.limit;
+    result.status = result.truncated ? QStringLiteral("partial") : QStringLiteral("complete");
+    result.latencyMs = timer.elapsed();
+    return result;
+}

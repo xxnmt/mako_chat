@@ -1,14 +1,15 @@
 # 文档索引
 
-> 更新：2026-11-12。**先读 [当前状态](STATUS.md)**；本文只负责“去哪找”。
+> 更新：2026-11-13。**先读 [当前状态](STATUS.md)**；本文只负责“去哪找”。
 
 ## 阅读顺序
 
 1. [当前状态](STATUS.md) — 现在在哪、下一步做什么。
 2. [开发路线图](ROADMAP.md) — 能力清单、阶段 A/B、B1–B5、验收。
-3. [架构与当前实现](ARCHITECTURE.md) — 当前组件、数据流、v14、已知限制。
+3. [架构与当前实现](ARCHITECTURE.md) — 当前组件、数据流、v15、已知限制。
 4. [配置参考](CONFIG_REFERENCE.md) / [记忆检索接口](MEMORY_RECALL_TOOL.md) / [语音参考](GPT_SOVITS_REFERENCE.md) — 按需查。
-5. [开发历史](HISTORY.md) / [R3 历史基线](MEMORY_V5_R3_BASELINE.md) — 只用于追溯，不要当当前实现。
+5. [统一检索进度](RETRIEVAL_REFACTOR_STATUS.md) / [P0](RETRIEVAL_REFACTOR_P0.md) / [P1](RETRIEVAL_REFACTOR_P1.md) / [P2/P3](RETRIEVAL_REFACTOR_P2.md) — 检索重构的基线、缺口与进度。
+6. [开发历史](HISTORY.md) / [R3 历史基线](MEMORY_V5_R3_BASELINE.md) — 只用于追溯，不要当当前实现。
 
 ## 文档地图
 
@@ -16,7 +17,8 @@
 |---|---|
 | 现在在哪、里程碑 M1–M4、下一步 | [当前状态](STATUS.md) |
 | 能力清单、阶段 A/B/C、B1–B5、验收 | [开发路线图](ROADMAP.md) |
-| 组件职责、正常对话路径、记忆与持久化、v14 | [架构与当前实现](ARCHITECTURE.md) |
+| 组件职责、正常对话路径、记忆与持久化、v15 | [架构与当前实现](ARCHITECTURE.md) |
+| 统一检索重构的 P0/P1/P2 进度 | [总览](RETRIEVAL_REFACTOR_STATUS.md) / [P0](RETRIEVAL_REFACTOR_P0.md) / [P1](RETRIEVAL_REFACTOR_P1.md) / [P2/P3](RETRIEVAL_REFACTOR_P2.md) |
 | `setting.json`、`identity.json` 与默认值 | [配置参考](CONFIG_REFERENCE.md) |
 | `memory_recall` / `memory_read`、时间框架、概览 | [记忆检索接口](MEMORY_RECALL_TOOL.md) |
 | R3 旧基线、PR 编号来源 | [R3 历史基线](MEMORY_V5_R3_BASELINE.md) |
@@ -35,7 +37,7 @@
 | **阶段 A/B/C** | 交付批次：跨渠道表达 / 连续生活 / 未定义 | ROADMAP 的交付顺序 |
 | **A1–A5 / B1–B5** | 阶段子项 | ROADMAP 的勾选项 |
 | **PR-n** | 旧 R3 施工单 | 只作历史，不再新增 |
-| **v14** | 数据库结构版本 | ARCHITECTURE / 配置 |
+| **v15** | 数据库结构版本 | ARCHITECTURE / 配置 |
 
 当前状态：**M1 已完成，M2 收尾中，M3 第一切片已接入、待真实使用验收，M4 以后**。旧 PR 的尾巴（PR-3.2b/3.2c、PR-5）并进 A5 和 B2/B5，不单开任务。
 

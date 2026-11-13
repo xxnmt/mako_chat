@@ -142,6 +142,26 @@ bool ConfigManager::loadSetting()
         m_memoryPolicy.agent.maxResults =
             qBound(1, memoryObj.value("agent_max_results").toInt(8), 20);
 
+        const QJsonObject retrievalObj = memoryObj.value("retrieval").toObject();
+        m_memoryPolicy.retrieval.indexEnabled =
+            retrievalObj.value("index_enabled").toBool(true);
+        m_memoryPolicy.retrieval.autoBackfill =
+            retrievalObj.value("auto_backfill").toBool(false);
+        m_memoryPolicy.retrieval.legacyFallback =
+            retrievalObj.value("legacy_fallback").toBool(true);
+        m_memoryPolicy.retrieval.candidateLimit =
+            qBound(10, retrievalObj.value("candidate_limit").toInt(40), 200);
+        m_memoryPolicy.retrieval.rerankLimit =
+            qBound(1, retrievalObj.value("rerank_limit").toInt(10), 40);
+        m_memoryPolicy.retrieval.embeddingEnabled =
+            retrievalObj.value("embedding_enabled").toBool(false);
+        m_memoryPolicy.retrieval.embeddingProvider =
+            retrievalObj.value("embedding_provider").toString();
+        m_memoryPolicy.retrieval.embeddingModel =
+            retrievalObj.value("embedding_model").toString();
+        m_memoryPolicy.retrieval.embeddingDimension =
+            qBound(0, retrievalObj.value("embedding_dimension").toInt(0), 8192);
+
         m_memoryPolicy.policyVersion =
             memoryObj.value("privacy_policy_version").toString(QStringLiteral("r3"));
         if (m_memoryPolicy.policyVersion.isEmpty()) {

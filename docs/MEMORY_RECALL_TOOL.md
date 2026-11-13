@@ -5,6 +5,7 @@
 > 关联：[CONFIG_REFERENCE.md](CONFIG_REFERENCE.md)
 
 > 本文只负责既有 recall/read 工具契约。personalEvidence/currentUnderstanding 的内部证据准备路径见 [架构](ARCHITECTURE.md)，未来重构任务见 [路线图](ROADMAP.md)。
+> 2026-11-13：自动证据准备已走 `MemoryRetrievalService`；`chat_history` 工具结果同时提供用户原话与助手表达，工具条目增加 `person_id` / `speaker` / `speaker_role` / `derived`。v15 检索块仍由工具外的统一服务优先使用，`MemoryAgentTools::search` 的逐源实现尚未完全替换。
 
 ## 1. 目标
 
@@ -32,7 +33,7 @@
 | `claim` | `memory_claims`，经 `MemoryAccessPolicy` |
 | `episodic` | `episodic_memory` |
 | `long_term_summary` | `long_term_summary` |
-| `chat_history` | `chat_history` 原始对话 |
+| `chat_history` | `chat_history` 原始对话；用户与助手分角色 |
 
 为兼容旧调用，`recent` / `summary` 作为旧别名继续接受；新调用使用新名称。
 `profile` / `relationship` 继续 Inline，不进入检索。

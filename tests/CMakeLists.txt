@@ -50,6 +50,14 @@ add_phase0_test(tst_memorymanager
     ${PROJECT_SOURCE_DIR}/qqreplypolicy.cpp
     ${PROJECT_SOURCE_DIR}/memorymanager.h
     ${PROJECT_SOURCE_DIR}/memorymanager.cpp
+    ${PROJECT_SOURCE_DIR}/memoryevidence.h
+    ${PROJECT_SOURCE_DIR}/memoryevidence.cpp
+    ${PROJECT_SOURCE_DIR}/memoryretrieval.h
+    ${PROJECT_SOURCE_DIR}/memoryretrieval.cpp
+    ${PROJECT_SOURCE_DIR}/memoryembedding.h
+    ${PROJECT_SOURCE_DIR}/memoryembedding.cpp
+    ${PROJECT_SOURCE_DIR}/memoryindexworker.h
+    ${PROJECT_SOURCE_DIR}/memoryindexworker.cpp
     ${PROJECT_SOURCE_DIR}/matterstore.cpp
     ${PROJECT_SOURCE_DIR}/recentcontext.h
     ${PROJECT_SOURCE_DIR}/recentcontext.cpp
@@ -124,6 +132,9 @@ add_phase0_test(tst_memoryagent
     ${PROJECT_SOURCE_DIR}/memoryoutputguard.cpp
     ${PROJECT_SOURCE_DIR}/configmanager.cpp
     ${PROJECT_SOURCE_DIR}/promptassembler.cpp
+    ${PROJECT_SOURCE_DIR}/memoryevidence.cpp
+    ${PROJECT_SOURCE_DIR}/memoryretrieval.cpp
+    ${PROJECT_SOURCE_DIR}/memoryembedding.cpp
     ${CALENDAR_RESOURCES}
     ${PROJECT_SOURCE_DIR}/memoryagenttypes.h
     ${PROJECT_SOURCE_DIR}/memoryagent.h
@@ -197,6 +208,8 @@ add_phase0_test(tst_promptassembler
     tst_promptassembler.cpp
     ${PROJECT_SOURCE_DIR}/promptassembler.h
     ${PROJECT_SOURCE_DIR}/promptassembler.cpp
+    ${PROJECT_SOURCE_DIR}/memoryevidence.h
+    ${PROJECT_SOURCE_DIR}/memoryevidence.cpp
     ${PROJECT_SOURCE_DIR}/memoryrecalltypes.h
     ${PROJECT_SOURCE_DIR}/memoryrecalltypes.cpp
     ${PROJECT_SOURCE_DIR}/memorytimeframe.h

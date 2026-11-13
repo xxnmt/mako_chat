@@ -62,6 +62,18 @@ struct MemoryAgentConfig {
     int maxResults = 8;
 };
 
+struct MemoryRetrievalConfig {
+    bool indexEnabled = true;
+    bool autoBackfill = false;
+    bool legacyFallback = true;
+    int candidateLimit = 40;
+    int rerankLimit = 10;
+    bool embeddingEnabled = false;
+    QString embeddingProvider;
+    QString embeddingModel;
+    int embeddingDimension = 0;
+};
+
 struct MemoryPolicyConfig {
     bool shortContextEnabled = true;
     bool longTermMemoryEnabled = true;
@@ -70,6 +82,7 @@ struct MemoryPolicyConfig {
     InteractionConfig interaction;
     RecentContextConfig recentContext;
     MemoryAgentConfig agent;
+    MemoryRetrievalConfig retrieval;
 };
 
 struct QQGroupMemoryConfig {

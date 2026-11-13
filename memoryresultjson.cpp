@@ -52,6 +52,14 @@ QJsonObject memoryAgentResultToJson(const MemoryAgentResult &result,
                         : QString());
         json.insert(QStringLiteral("text"), text);
         json.insert(QStringLiteral("source"), item.source);
+        if (!item.personId.isEmpty())
+            json.insert(QStringLiteral("person_id"), item.personId);
+        if (!item.speaker.isEmpty())
+            json.insert(QStringLiteral("speaker"), item.speaker);
+        if (!item.speakerRole.isEmpty())
+            json.insert(QStringLiteral("speaker_role"), item.speakerRole);
+        if (!item.derived.isEmpty())
+            json.insert(QStringLiteral("derived"), item.derived);
         if (!item.groupLabel.isEmpty()) {
             json.insert(QStringLiteral("group"),
                         MemoryTextUtils::sanitizeIdentityText(

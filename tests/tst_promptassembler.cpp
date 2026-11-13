@@ -43,7 +43,7 @@ private slots:
         other.speaker = QStringLiteral("朋友");
         const QString otherBlock = PromptAssembler::buildSituationBlock(other, false);
         QVERIFY(otherBlock.contains(QStringLiteral("speaker: qq:2014366825")));
-        QVERIFY(otherBlock.contains(QStringLiteral("audience: qq:2014366825")));
+        QVERIFY(otherBlock.contains(QStringLiteral("audience: participant")));
         QVERIFY(otherBlock.contains(QStringLiteral("privacy: private")));
     }
 

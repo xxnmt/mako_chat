@@ -7,6 +7,10 @@
 #include <QFile>
 
 #include "memorymanager.h"
+#include "memoryevidence.h"
+#include "memoryretrieval.h"
+#include "memoryembedding.h"
+#include "memoryindexworker.h"
 #include "utterance.h"
 
 // 独立于 MemoryManager 的原始连接，用于建 v1 库/直接校验表结构。
@@ -130,6 +134,18 @@ static void makePetTurn(MemoryManager &mm, const QString &userText, const QStrin
     QVERIFY(mm.saveQATurn(userText, replyText, {}, meta));
 }
 
+class FailingEmbeddingProvider : public MemoryEmbeddingProvider
+{
+public:
+    QString modelId() const override { return QStringLiteral("failing_test"); }
+    int dimension() const override { return 8; }
+    bool embed(const QString &, QVector<float> *, QString *error = nullptr) const override
+    {
+        if (error) *error = QStringLiteral("provider unavailable");
+        return false;
+    }
+};
+
 class TestMemoryManager : public QObject
 {
     Q_OBJECT
@@ -154,7 +170,7 @@ private slots:
         QVERIFY(raw.exec("DROP TABLE matter_revision"));
         for (int reopen=0; reopen<2; ++reopen) {
             MemoryManager db(path);
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),14);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),15);
             QCOMPARE(raw.scalar("SELECT state_updates FROM chat_history").toString(),QString("[]"));
             QVERIFY(db.matterHeads("user").isEmpty());
         }
@@ -580,6 +596,278 @@ private slots:
         QCOMPARE(resumed["id"].toInteger(), id);
     }
 
+    void currentUnderstandingCanIncludeAudiencePrivate()
+    {
+        QTemporaryDir dir;
+        MemoryManager db(dir.filePath("audience-private.db"));
+        RequestMeta privateMeta;
+        privateMeta.channel = Channel::kQQPrivate;
+        privateMeta.sessionId = privateMeta.actorId = QStringLiteral("2014366825");
+        privateMeta.eventId = QStringLiteral("audience-private");
+        QVERIFY(db.enqueueObservation(privateMeta, QStringLiteral("脚踝已经好了")));
+        const auto source = db.pendingObservation()["source"].toInteger();
+        const QJsonObject change{{"matter",""},{"version",0},{"topic","脚踝"},
+            {"quote","脚踝已经好了"},{"status","confirmed"},
+            {"understanding","脚踝已恢复"},{"kind","self_report"}};
+        QVERIFY(db.commitObservation(source,
+            QJsonObject{{"outcome","updated"},{"changes",QJsonArray{change}}}));
+
+        RequestMeta group;
+        group.channel = Channel::kQQGroup;
+        group.sessionId = QStringLiteral("20202");
+        group.actorId = QStringLiteral("owner");
+        const auto hidden = db.currentUnderstanding(group, QStringLiteral("脚踝"));
+        const auto included = db.currentUnderstanding(group, QStringLiteral("脚踝"),
+                                                      nullptr, {}, true);
+        QVERIFY(!QJsonDocument(hidden).toJson().contains("脚踝已经好了"));
+        QVERIFY(QJsonDocument(included).toJson().contains("脚踝已经好了"));
+        QVERIFY(!included.isEmpty());
+        QCOMPARE(included.first().toObject()["self_report"].toObject()["quote"].toString(),
+                 QStringLiteral("脚踝已经好了"));
+    }
+
+    void retrievalServiceIncludesCurrentChannelAndKeepsSpeaker()
+    {
+        QTemporaryDir dir;
+        MemoryManager db(dir.filePath("retrieval.db"));
+        db.seedIdentity({QStringLiteral("2014366825")});
+        RawEventWrite event;
+        event.platform = QStringLiteral("qq");
+        event.channel = Channel::kQQPrivate;
+        event.sessionId = event.senderId = QStringLiteral("2014366825");
+        event.eventType = QStringLiteral("message");
+        event.content = QStringLiteral("脚踝已经好了");
+        event.messageId = QStringLiteral("m-retrieval");
+        event.occurredAt = QDateTime::currentDateTime();
+        QVERIFY(db.appendRawEvent(event));
+
+        RetrievalRequest request;
+        request.subject = QStringLiteral("user");
+        request.accounts = {QStringLiteral("2014366825")};
+        request.terms = {QStringLiteral("脚踝")};
+        request.currentChannel = Channel::kQQPrivate;
+        request.currentSession = QStringLiteral("2014366825");
+        request.excludeCurrent = false;
+        MemoryRetrievalService service(&db);
+        const auto result = service.retrieve(request);
+        QVERIFY(!result.evidence.isEmpty());
+        const auto &evidence = result.evidence.first();
+        QCOMPARE(evidence.channel, Channel::kQQPrivate);
+        QCOMPARE(evidence.speakerId, QStringLiteral("owner"));
+        QCOMPARE(evidence.speakerRole, QStringLiteral("user"));
+        QCOMPARE(evidence.sourceType, QStringLiteral("raw"));
+        QCOMPARE(evidence.derived, QStringLiteral("original"));
+        QVERIFY(evidence.speechAt.isValid());
+        QCOMPARE(evidence.text, QStringLiteral("脚踝已经好了"));
+
+        request.excludeCurrent = true;
+        QVERIFY(service.retrieve(request).evidence.isEmpty());
+
+        RequestMeta meta;
+        meta.channel = Channel::kQQGroup;
+        meta.subject = QStringLiteral("user");
+        meta.speaker = QStringLiteral("主人");
+        const auto situation = MemorySituation::fromRequest(meta, false);
+        QCOMPARE(situation.about, QStringLiteral("unknown"));
+        QCOMPARE(situation.audienceKind, QStringLiteral("group"));
+        QCOMPARE(situation.modality, QStringLiteral("text"));
+        QVERIFY(situation.toPromptBlock().contains(QStringLiteral("speaker: owner")));
+    }
+
+    void searchIndexRebuildsAndRetrieves()
+    {
+        QTemporaryDir dir;
+        MemoryManager db(dir.filePath("index.db"));
+        db.seedIdentity({QStringLiteral("2014366825")});
+        RawEventWrite event;
+        event.platform = QStringLiteral("qq");
+        event.channel = Channel::kQQPrivate;
+        event.sessionId = event.senderId = QStringLiteral("2014366825");
+        event.senderName = QStringLiteral("主人");
+        event.eventType = QStringLiteral("message");
+        event.messageId = QStringLiteral("index-1");
+        event.content = QStringLiteral("脚踝已经好了，周末去散步");
+        event.occurredAt = QDateTime::currentDateTime().addSecs(-60);
+        QVERIFY(db.appendRawEvent(event));
+        event.messageId = QStringLiteral("index-2");
+        event.content = QStringLiteral("今天想写一段雨声");
+        event.occurredAt = QDateTime::currentDateTime();
+        QVERIFY(db.appendRawEvent(event));
+        RequestMeta chatMeta;
+        chatMeta.channel = Channel::kQQPrivate;
+        chatMeta.sessionId = chatMeta.actorId = QStringLiteral("2014366825");
+        chatMeta.eventId = QStringLiteral("index-chat");
+        QVERIFY(db.saveQATurn(QStringLiteral("今晚早点睡"),
+                              QStringLiteral(R"({"sentences":[{"zh_text":"好呀","ja_text":"いいよ"}]})"),
+                              {}, chatMeta));
+
+        QString error;
+        QVERIFY2(db.rebuildSearchIndex(&error), qPrintable(error));
+        QVERIFY(db.memoryChunkCount() >= 2);
+        const auto indexStatus = db.searchIndexStatus();
+        QCOMPARE(indexStatus.value(QStringLiteral("chunks")).toInt(), db.memoryChunkCount());
+        QCOMPARE(indexStatus.value(QStringLiteral("state")).toObject()
+                     .value(QStringLiteral("status")).toString(),
+                 QStringLiteral("complete"));
+        QVERIFY(indexStatus.value(QStringLiteral("state")).toObject()
+                    .value(QStringLiteral("duration_ms")).toString().toInt() >= 0);
+        QVERIFY(indexStatus.value(QStringLiteral("chunks_by_source")).toObject()
+                    .value(QStringLiteral("raw")).toInt() >= 1);
+        const auto rows = db.searchMemoryChunks({QStringLiteral("脚踝")});
+        QVERIFY(!rows.isEmpty());
+        const auto hash = rows.first().toObject().value(QStringLiteral("content_hash")).toString();
+        QVERIFY(!hash.isEmpty());
+
+        auto provider = std::make_shared<LocalHashEmbeddingProvider>(64);
+        const auto chunks = db.memoryChunksForEmbedding();
+        for (const auto &value : chunks) {
+            const auto chunk = value.toObject();
+            QVector<float> vector;
+            QVERIFY(provider->embed(chunk[QStringLiteral("text")].toString(), &vector));
+            const QByteArray blob(reinterpret_cast<const char *>(vector.constData()),
+                                  vector.size() * int(sizeof(float)));
+            QVERIFY(db.storeChunkEmbedding(chunk[QStringLiteral("id")].toInteger(),
+                                           provider->modelId(), vector.size(), blob,
+                                           chunk[QStringLiteral("content_hash")].toString()));
+        }
+        QString embedError;
+        QVERIFY2(db.embedSearchChunks(provider.get(), 2000, &embedError),
+                 qPrintable(embedError));
+        QVERIFY(db.searchIndexStatus().value(QStringLiteral("embeddings")).toInt() > 0);
+        auto reranker = std::make_shared<IdentityMemoryReranker>();
+        MemoryRetrievalService service(&db, provider, reranker);
+        RetrievalRequest request;
+        request.query = QStringLiteral("脚踝");
+        request.subject = QStringLiteral("user");
+        request.accounts = {QStringLiteral("2014366825")};
+        request.terms = {QStringLiteral("脚踝")};
+        request.currentChannel = Channel::kQQPrivate;
+        request.currentSession = QStringLiteral("2014366825");
+        request.excludeCurrent = false;
+        request.useIndex = true;
+        const auto result = service.retrieve(request);
+        QVERIFY(!result.evidence.isEmpty());
+        QCOMPARE(result.backend, QStringLiteral("index"));
+        QVERIFY(result.latencyMs >= 0);
+        QCOMPARE(result.evidence.first().speakerId, QStringLiteral("owner"));
+        QCOMPARE(result.evidence.first().derived, QStringLiteral("original"));
+        QVERIFY(result.evidence.first().handle.startsWith(QStringLiteral("chunk/")));
+        MemoryRetrievalService defaultRerank(&db, provider);
+        const auto defaultResult = defaultRerank.retrieve(request);
+        QVERIFY(defaultResult.evidence.size() <= request.rerankLimit);
+
+        auto rawOnly = request;
+        rawOnly.sourceKinds = {QStringLiteral("raw")};
+        const auto rawOnlyResult = defaultRerank.retrieve(rawOnly);
+        for (const auto &item : rawOnlyResult.evidence)
+            QCOMPARE(item.sourceType, QStringLiteral("raw"));
+
+        MemoryRetrievalService degraded(&db, std::make_shared<FailingEmbeddingProvider>());
+        const auto degradedResult = degraded.retrieve(request);
+        QCOMPARE(degradedResult.status, QStringLiteral("degraded"));
+        QVERIFY(!degradedResult.evidence.isEmpty());
+
+        // Rebuild is idempotent at the chunk level.
+        const int count = db.memoryChunkCount();
+        QVERIFY(db.rebuildSearchIndex(&error));
+        QCOMPARE(db.memoryChunkCount(), count);
+
+        const auto turns = db.getHistoryTurn(10, chatMeta.channel, chatMeta.sessionId);
+        QVERIFY(!turns.isEmpty());
+        QVERIFY(db.deleteTurnByID(turns.first().id));
+        QVERIFY(db.memoryChunkCount() < count);
+
+        QVERIFY2(db.clearSearchIndex(&error), qPrintable(error));
+        QCOMPARE(db.memoryChunkCount(), 0);
+        MemoryRetrievalService fallback(&db);
+        const auto fallbackResult = fallback.retrieve(request);
+        QVERIFY(!fallbackResult.evidence.isEmpty());
+        QCOMPARE(fallbackResult.status, QStringLiteral("complete"));
+        QCOMPARE(fallbackResult.backend, QStringLiteral("legacy"));
+        auto noLegacy = request;
+        noLegacy.allowLegacyFallback = false;
+        QVERIFY(fallback.retrieve(noLegacy).evidence.isEmpty());
+    }
+
+    void indexWorkerRebuilds()
+    {
+        QTemporaryDir dir;
+        const QString path = dir.filePath("worker.db");
+        {
+            MemoryManager db(path);
+            RawEventWrite event;
+            event.platform = QStringLiteral("qq");
+            event.channel = Channel::kQQGroup;
+            event.sessionId = QStringLiteral("30001");
+            event.senderId = QStringLiteral("20001");
+            event.eventType = QStringLiteral("message");
+            event.content = QStringLiteral("worker indexing");
+            event.occurredAt = QDateTime::currentDateTime();
+            QVERIFY(db.appendRawEvent(event));
+        }
+        MemoryIndexWorker worker(path);
+        QSignalSpy finished(&worker, &MemoryIndexWorker::finished);
+        worker.run();
+        QCOMPARE(finished.size(), 1);
+        QCOMPARE(finished.first().at(0).toBool(), true);
+        QVERIFY(finished.first().at(2).toInt() > 0);
+    }
+
+    void reopensV14DatabaseWithoutMemoryLoss()
+    {
+        QTemporaryDir dir;
+        const QString path = dir.filePath("v14-reopen.db");
+        {
+            MemoryManager db(path);
+            RequestMeta meta;
+            meta.eventId = QStringLiteral("v14-history");
+            QVERIFY(db.saveQATurn(QStringLiteral("旧版本历史"),
+                                  QStringLiteral("{}"), {}, meta));
+            QVERIFY(db.memoryChunkCount() > 0);
+        }
+        {
+            RawDb raw(path, "v15-downgrade");
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec("DROP TABLE memory_embeddings"));
+            QVERIFY(raw.exec("DROP TABLE memory_chunk_sources"));
+            QVERIFY(raw.exec("DROP TABLE memory_chunks"));
+            QVERIFY(raw.exec("DROP TABLE memory_index_state"));
+            QVERIFY(raw.exec("PRAGMA user_version=14"));
+        }
+        {
+            MemoryManager db(path);
+            QCOMPARE(db.getTotalHistoryCount(), 1);
+            QCOMPARE(db.memoryChunkCount(), 0);
+            QString error;
+            QVERIFY2(db.rebuildSearchIndex(&error), qPrintable(error));
+            QVERIFY(db.memoryChunkCount() > 0);
+        }
+        RawDb raw(path, "v15-verify");
+        QVERIFY(raw.open());
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 15);
+    }
+
+    void databaseBackupIsConsistent()
+    {
+        QTemporaryDir dir;
+        const QString path = dir.filePath("backup-source.db");
+        const QString backup = dir.filePath("backup-copy.db");
+        {
+            MemoryManager db(path);
+            RequestMeta meta;
+            meta.eventId = QStringLiteral("backup-turn");
+            QVERIFY(db.saveQATurn(QStringLiteral("备份我"), QStringLiteral("{}"), {}, meta));
+            QVERIFY(db.memoryChunkCount() > 0);
+            QString error;
+            QVERIFY2(db.backupDatabase(backup, &error), qPrintable(error));
+        }
+        RawDb copy(backup, "backup-copy");
+        QVERIFY(copy.open());
+        QCOMPARE(copy.scalar("SELECT count(*) FROM chat_history").toInt(), 1);
+        QCOMPARE(copy.scalar("PRAGMA user_version").toInt(), 15);
+        QVERIFY(copy.scalar("SELECT count(*) FROM memory_chunks").toInt() > 0);
+    }
+
     void legacyMigrationPreservesData()
     {
         QTemporaryDir dir;
@@ -594,7 +882,7 @@ private slots:
             QVERIFY(raw.open());
 
             // 版本推进到 v3
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 14);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 15);
 
             // 列扩展（v2 渠道 + v3 轮次）
             const QStringList historyCols = raw.columns("chat_history");
@@ -698,7 +986,7 @@ private slots:
             MemoryManager second(dbPath);
             RawDb raw(dbPath, "verify2");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 14);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 15);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM chat_history").toInt(), 1);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM relationship_state").toInt(), 2);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM long_term_summary").toInt(), 1);
@@ -715,7 +1003,7 @@ private slots:
             MemoryManager mm(dbPath);
             RawDb raw(dbPath, "fresh");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 14);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 15);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('raw_events')").toInt() > 0);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('memory_cursor')").toInt() > 0);
 
@@ -922,7 +1210,7 @@ private slots:
         Q_UNUSED(mm);
         RawDb raw(dbPath, "v2verify");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 14);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 15);
         QCOMPARE(raw.scalar("SELECT user_input FROM chat_history").toString(), QStringLiteral("旧输入"));
         QCOMPARE(raw.scalar("SELECT turn_kind FROM chat_history").toString(), QStringLiteral("reply"));
         QCOMPARE(raw.scalar("SELECT subject FROM chat_history").toString(), QStringLiteral("user"));

@@ -51,6 +51,9 @@ struct MemoryAgentItem {
     QString source;             // current_group / allowed_group / internal
     QString groupLabel;         // 可展示的群名，不含原始群号
     QString personId;
+    QString speaker;            // 可读说话人
+    QString speakerRole;        // user / assistant / other / unknown
+    QString derived;            // original / assistant_expression / summary / inference
     qlonglong rawEventId = -1;
     qlonglong interactionId = -1;
     qlonglong claimId = -1;

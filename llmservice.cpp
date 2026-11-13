@@ -97,6 +97,17 @@ LLMService::LLMService(const QString &apiKey,QObject *parent, QUrl endpoint)
     m_extractManager=new QNetworkAccessManager(this);
     m_interactionManager=new QNetworkAccessManager(this);
     m_memoryAgent = new MemoryAgent(this);
+    m_retrievalService = std::make_unique<MemoryRetrievalService>();
+    {
+        const auto retrieval = ConfigManager::instance().getMemoryPolicyConfig().retrieval;
+        if (retrieval.embeddingEnabled
+            && retrieval.embeddingProvider == QStringLiteral("local_hash_test")) {
+            const int dimension = retrieval.embeddingDimension > 0
+                ? retrieval.embeddingDimension : 64;
+            m_retrievalService->setEmbeddingProvider(
+                std::make_shared<LocalHashEmbeddingProvider>(dimension));
+        }
+    }
     connect(m_memoryAgent, &MemoryAgent::finished,
             this, &LLMService::onMemoryAgentFinished);
     connect(m_memoryAgent, &MemoryAgent::failed,
@@ -137,25 +148,53 @@ void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> 
             terms.append(RecentContextPlanner::extractTerms(historyQA.last().userInput.left(80)));
         QElapsedTimer retrievalTimer;
         retrievalTimer.start();
+        m_run.situation = MemorySituation::fromRequest(
+            meta, config.getTTSMode() == QStringLiteral("api"));
         QStringList candidates, privateRefs, reflectionRefs;
-        const auto rows = m_memoryManager->personalEvidence(meta.subject, accounts, terms, true,
-                                                            meta.channel, meta.sessionId);
-        for (auto row : rows) {
-            auto obj = row.toObject();
-            const QString ref = obj.take("reference").toString();
-            obj["evidence_ref"] = ref;
+        RetrievalRequest request;
+        request.query = userInput;
+        request.purpose = QStringLiteral("automatic");
+        request.subject = meta.subject;
+        request.accounts = accounts;
+        request.terms = terms;
+        request.includeOthers = true;
+        request.currentChannel = meta.channel;
+        request.currentSession = meta.sessionId;
+        request.excludeCurrent = false;
+        request.limit = 12;
+        request.useIndex = config.getMemoryPolicyConfig().retrieval.indexEnabled;
+        request.allowLegacyFallback =
+            config.getMemoryPolicyConfig().retrieval.legacyFallback;
+        request.candidateLimit = config.getMemoryPolicyConfig().retrieval.candidateLimit;
+        request.rerankLimit = config.getMemoryPolicyConfig().retrieval.rerankLimit;
+        request.situation = m_run.situation;
+        RetrievalResult retrieval;
+        if (m_retrievalService)
+            retrieval = m_retrievalService->retrieve(request);
+        m_run.retrievalStatus = retrieval.status;
+        m_run.retrievalBackend = retrieval.backend;
+        m_run.retrievalCandidates = retrieval.candidateCount;
+        m_run.retrievalLatencyMs = retrieval.latencyMs;
+        m_run.retrievalTruncated = retrieval.truncated;
+        for (const auto &entry : retrieval.evidence) {
+            if (entry.text.trimmed().isEmpty())
+                continue;
+            // 当前消息已经作为 current_input 提供；避免同一句在召回里重复。
+            if (entry.channel == meta.channel && entry.session == meta.sessionId
+                && entry.text.trimmed() == userInput.trimmed())
+                continue;
+            auto obj = entry.toJson();
+            const QString ref = entry.handle;
+            if (ref.isEmpty())
+                continue;
             candidates.append(ref);
-            const QString channel = obj.take("channel").toString();
-            const QString session = obj.take("session").toString();
-            if ((channel == meta.channel && session == meta.sessionId)
-                || config.isBlindZone(channel, session))
+            if (config.isBlindZone(entry.channel, entry.session))
                 continue;
             const auto scan = SensitiveContentFilter::sanitize(obj["text"].toString(), {},
                                                                config.getMemoryPolicyConfig().privacyRules);
             if (scan.blocked || scan.redacted)
                 continue;
-            if (meta.channel != Channel::kQQGroup && obj.value("own").toBool()) {
-                obj.remove("speaker");
+            if (meta.channel != Channel::kQQGroup && entry.own) {
                 privateRefs.append(ref);
                 privateContext.append(obj);
             } else {
@@ -172,7 +211,8 @@ void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> 
         }
         qInfo() << "[Cognition] retrieval run=" << meta.runId << "term_count=" << terms.size()
                 << "candidates=" << candidates << "private_context=" << privateRefs
-                << "reflection=" << reflectionRefs << "elapsed_ms=" << retrievalTimer.elapsed();
+                << "reflection=" << reflectionRefs << "status=" << retrieval.status
+                << "elapsed_ms=" << retrievalTimer.elapsed();
     }
     const auto matters = meta.channel == Channel::kQQGroup && m_memoryManager
         ? m_memoryManager->internalMatters(meta,RecentContextPlanner::extractTerms(userInput))
@@ -231,7 +271,11 @@ void LLMService::considerEvidence(const QJsonArray &background, const QJsonArray
     }
     QJsonObject data{{"background",background},{"matters",catalog},{"history",chain},
                      {"input",m_run.input},{"speaker_is_owner",m_run.meta.subject=="user"},
-                     {"channel",m_run.meta.channel},{"now",QDateTime::currentDateTime().toString(Qt::ISODate)}};
+                     {"channel",m_run.meta.channel},
+                     {"situation",m_run.situation.toJson()},
+                     {"retrieval_status",m_run.retrievalStatus},
+                     {"retrieval_truncated",m_run.retrievalTruncated},
+                     {"now",QDateTime::currentDateTime().toString(Qt::ISODate)}};
     if (!m_run.projectionError.isEmpty()) data["correct_previous_error"] = m_run.projectionError;
     if (!m_run.history.isEmpty()) data["recent_exchange"] = m_run.history.last().userInput.left(400);
     const auto instruction = QStringLiteral(
@@ -420,7 +464,12 @@ void LLMService::considerEvidence(const QJsonArray &background, const QJsonArray
         }
         if (m_run.meta.channel==Channel::kQQGroup && !matters.isEmpty() && m_run.expression.isEmpty())
             guidance += QStringLiteral(" 不要把表达范围有限说成遗忘；不要请人在群里重新公布私人细节。");
-        prepareReply(m_run.input,m_run.history,m_run.meta,personal,guidance);
+        // P3：表达模型保留本轮相关背景，不再只接收被删减的投影。
+        // 听众与保密语义已在 Situation/guidance 中，模型自行决定说什么。
+        QJsonArray expressionEvidence = background;
+        for (const auto &item : personal)
+            expressionEvidence.append(item);
+        prepareReply(m_run.input,m_run.history,m_run.meta,expressionEvidence,guidance);
     });
 }
 
@@ -733,7 +782,8 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
     }
 
     if (canReadUnderstanding) {
-        const auto understanding = m_memoryManager->currentUnderstanding(meta, userInput, &m_run.catalogKeys);
+        const auto understanding = m_memoryManager->currentUnderstanding(
+            meta, userInput, &m_run.catalogKeys, {}, true);
         if (meta.subject == "user" && meta.channel != Channel::kQQGroup
             && ConfigManager::instance().getProactiveConfig().privateWriting) {
             auto thought = m_memoryManager->nextThought(false);
@@ -863,13 +913,22 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
         messagesArray.append(identityMessage);
     }
 
-    const QString situationBlock = PromptAssembler::buildSituationBlock(
-        m_run.meta, ConfigManager::instance().getTTSMode() == QStringLiteral("api"));
+    const QString situationBlock = m_run.situation.isEmpty()
+        ? PromptAssembler::buildSituationBlock(
+              m_run.meta, ConfigManager::instance().getTTSMode() == QStringLiteral("api"))
+        : m_run.situation.toPromptBlock();
     if (!situationBlock.isEmpty()) {
         QJsonObject situationMessage;
         situationMessage["role"] = "system";
         situationMessage["content"] = situationBlock;
         messagesArray.append(situationMessage);
+    }
+    if (!m_run.retrievalStatus.isEmpty()
+        && m_run.retrievalStatus != QStringLiteral("complete")) {
+        messagesArray.append(QJsonObject{{"role","system"},{"content",QStringLiteral(
+            "本轮检索状态为 %1%2。不要把部分覆盖说成完整搜索；不确定时保留未知。")
+            .arg(m_run.retrievalStatus,
+                 m_run.retrievalTruncated ? QStringLiteral("（已截断）") : QString{})}});
     }
 
     // 近期原始群消息是独立不可信资料，优先于长期摘要。
@@ -1318,6 +1377,9 @@ void LLMService::setMemoryManager(MemoryManager *manager)
     }, Qt::QueuedConnection);
     if (m_memoryAgent) {
         m_memoryAgent->setMemoryManager(manager);
+    }
+    if (m_retrievalService) {
+        m_retrievalService->setMemoryManager(manager);
     }
 }
 
@@ -2458,6 +2520,11 @@ void LLMService::onReplyFinished(QNetworkReply *reply)
                 if (!attributionIssues.isEmpty())
                     audit["evidence_status"] = QStringLiteral("unverified");
                 audit["lookup_count"] = m_run.lookups.size();
+                audit["retrieval_status"] = m_run.retrievalStatus;
+                audit["retrieval_backend"] = m_run.retrievalBackend;
+                audit["retrieval_candidates"] = m_run.retrievalCandidates;
+                audit["retrieval_latency_ms"] = m_run.retrievalLatencyMs;
+                audit["retrieval_truncated"] = m_run.retrievalTruncated;
                 audit["provided_evidence"] = m_run.evidence;
                 audit["cited_evidence"] = cited;
                 audit["unknown_evidence_refs"] = unknown;

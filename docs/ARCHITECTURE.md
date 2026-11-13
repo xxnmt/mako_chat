@@ -1,9 +1,9 @@
 # 架构与当前实现
 
-> 更新于 2026-11-12，覆盖 v14 的运行路径和前台证据登记。
+> 更新于 2026-11-13，覆盖 v15 检索块与统一证据入口。
 > 先读 [当前状态](STATUS.md)；后续任务见 [开发路线图](ROADMAP.md)；入口见 [文档索引](README.md)。
 > 本文只描述当前实现。文中 PR/R3 编号是历史工作包，不代表当前路线图。
-> 当前实现一句话：v14 证据契约 + 两阶段生成（私下判断/公开表达）+ `memory_recall` 工具 + 跨渠道 `personalEvidence` / `currentUnderstanding`。
+> 当前实现一句话：v15 检索块 + 统一证据服务 + 两阶段生成（私下判断/公开表达）+ `memory_recall` 工具 + 跨渠道 `personalEvidence` / `currentUnderstanding`。
 
 ## 组件与职责
 
@@ -41,7 +41,7 @@ Pet 走语音合成和音频 sink，QQ 走文本发送。QQ 情绪可按配置�
 
 ## 记忆与持久化
 
-当前 SQLite user_version 为 14。基础表包括 chat_history、character_profile、episodic_memory、long_term_summary、relationship_state；多渠道之后增加 raw_events、memory_cursor、interactions、人物身份、claims 和群成员关系。完整字段以 MemoryManager::initDatabase 为准，v10 在 chat_history 中增加 state_updates、thought、thought_version、thought_result、review_after，并增加 thought_review_log 与索引。
+当前 SQLite user_version 为 15。基础表包括 chat_history、character_profile、episodic_memory、long_term_summary、relationship_state；多渠道之后增加 raw_events、memory_cursor、interactions、人物身份、claims 和群成员关系。完整字段以 MemoryManager::initDatabase 为准，v10 在 chat_history 中增加 state_updates、thought、thought_version、thought_result、review_after，并增加 thought_review_log 与索引；v15 增加 memory_chunks、memory_chunk_sources、memory_embeddings、memory_index_state。
 
 会话短期历史按 channel/session_id 分桶。稳定档案和关系可内联；tool 模式下历史事实主要按需检索。跨渠道 personalEvidence 与 currentUnderstanding 另行接入最终请求前的上下文准备。原始事件、聊天轮次和派生证据有各自删除边界，删除聊天记录不会自动删除独立 raw_events。
 
@@ -54,6 +54,14 @@ Pet 走语音合成和音频 sink，QQ 走文本发送。QQ 情绪可按配置�
 - **场景事实**：`PromptAssembler::buildSituationBlock` 注入 surface / speaker / audience / about / modality / privacy。它只说明在哪里、对谁、能用什么形式，不要求不同渠道换一种说法；`about` 未确认时写 `unknown`，不把当前对话对象当成事情主体；pet 只有在 TTS 为 `api` 时才标 `voice+text`。
 - **文字活动**：复用 `chat_history.thought` + `thought_result`，不新增表。`finishThoughtReview` 支持 `paused` 与 `progress/next_step/paused_reason`；`applyThoughtAction(id, expectedVersion, action)` 条件更新并递增 `thought_version`，迟到写作回调因版本不匹配被丢弃。`draftReadyToShare(activityRef, version, draft)` 在发送前再次检查 `canShareThought`。
 - **开关拆分**：`proactive.private_writing` 控制后台写作/回顾，`proactive.enabled` 控制主动联系/分享；`quiet_hours` 只暂停后者。
+
+## 2026-11-13 统一检索 P1/P2 切片
+
+- `memoryevidence.h` 定义 `MemorySituation`、`MemoryEvidence`、`RetrievalRequest`、`RetrievalResult`；`memoryretrieval.h` 定义 `MemorySourceAdapter`、`MemoryRetrievalService`；`memoryembedding.h` 定义可选向量 Provider。
+- `LLMService::askDeepSeek` 的自动证据准备调用统一服务：Pet、QQ 私聊、群聊使用同一入口；`currentUnderstanding(..., includeAudiencePrivate=true)` 让表达模型保留相关私人背景。
+- v15 的 `memory_chunks` / `memory_chunk_sources` / `memory_embeddings` / `memory_index_state` 是可重建索引；新 raw/chat 写入同步增量索引，`--rebuild-memory-index` 用于旧库整库回填，`--memory-index-status` 查看状态，索引为空时回退旧适配器。
+- 索引路径当前为词面 BM25 + 可选向量 + RRF + 启发式重排；真实 Embedding/Reranker Provider 尚未接入，`LocalHashEmbeddingProvider` 只是测试/降级 Provider。
+- `MemoryAgentTools` 已补充助手表达、说话人和派生字段，并允许 Pet 使用工具；但其逐源查询尚未全部委托统一服务。
 
 ## 实际验证与当前限制
 
@@ -80,7 +88,7 @@ v11 的认识更新独立于对话回复。语义关联仍由模型负责，每�
 
 ## 启用和验收
 
-跨渠道认识跟随全局长期记忆开关。要辨认跨渠道的主人，请在身份配置中登记本人的 QQ 账号。首次打开旧库时，SQLite 以事务迁移到 v14。v10 主题继续作为历史证据，已有行不重新提交给提取模型。更早版本先执行已有迁移。升级前如需保留旧版运行环境，可在应用关闭时备份记忆库。
+跨渠道认识跟随全局长期记忆开关。要辨认跨渠道的主人，请在身份配置中登记本人的 QQ 账号。首次打开旧库时，SQLite 以事务迁移到 v15。v10 主题继续作为历史证据，已有行不重新提交给提取模型。更早版本先执行已有迁移。升级前如需保留旧版运行环境，可在应用关闭时备份记忆库。
 
 认识更新在前台回复之外异步运行，每条符合条件的消息通常增加一次模型请求。无工作时只查询本地队列。同一主体的输入顺序处理，网络错误从 30 秒开始退避，最长一小时。协议、证据或基版本连续被拒的事件累计三次后记录为 review_required，后续事件可以继续。needs_evidence 触发一次历史补查，有可用依据才再请求一次模型。第二次仍无法判断时保存未决结果。同会话较早事件的聊天记录晚到时可重新排队。升级到 v12 时，保有输入的旧 needs_evidence 和 review_required 各重新排队一次。新增 [Cognition] 日志使用 run、来源序号、候选事项及版本、退出原因和耗时关联提案与上下文，正文仍受原有聊天调试日志设置影响。
 

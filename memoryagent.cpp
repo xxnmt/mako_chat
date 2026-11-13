@@ -18,6 +18,7 @@
 
 #include "memorymanager.h"
 #include "memorysourcepolicy.h"
+#include "memoryretrieval.h"
 #include "memorytextutils.h"
 #include "memorytimerange.h"
 
@@ -266,6 +267,14 @@ QJsonObject MemoryAgentTools::itemToJson(const MemoryAgentItem &item) const
                       item.time.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")));
     }
     object.insert(QStringLiteral("source"), item.source);
+    if (!item.personId.isEmpty())
+        object.insert(QStringLiteral("person_id"), item.personId);
+    if (!item.speaker.isEmpty())
+        object.insert(QStringLiteral("speaker"), item.speaker);
+    if (!item.speakerRole.isEmpty())
+        object.insert(QStringLiteral("speaker_role"), item.speakerRole);
+    if (!item.derived.isEmpty())
+        object.insert(QStringLiteral("derived"), item.derived);
     if (!item.groupLabel.isEmpty()) {
         object.insert(QStringLiteral("group"), item.groupLabel);
     }
@@ -686,10 +695,11 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
         }
     }
 
-    // 6) chat_history：原始对话；只把 user_input 作为事实证据，raw_reply
-    // 只用于匹配，不作为用户本人表达。
+    // 6) chat_history：用户发言与助手表达分角色提供；两者都可以被检索，
+    // 但助手只证明“她曾经这样说过”，不证明用户答应或事实已发生。
     if (kinds.contains(QStringLiteral("chat_history"))
         && resultItems.size() < limit && m_memoryManager) {
+        bool servedByUnified = false;
         QList<QPair<QString, QString>> sources;
         if (MemorySourcePolicy::canReadChatHistory(
                 m_scope, Channel::kPet, Channel::kDefaultSession)) {
@@ -700,20 +710,98 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
             && !sources.contains({m_scope.channel, m_scope.sessionId})) {
             sources.append({m_scope.channel, m_scope.sessionId});
         }
+        if (m_memoryManager->memoryChunkCount() > 0) {
+            RetrievalRequest request;
+            request.query = query;
+            request.purpose = QStringLiteral("tool.chat_history");
+            request.subject = m_scope.viewerIsOwner
+                ? QStringLiteral("user") : m_scope.viewerPersonId;
+            request.accounts = m_scope.recentQueryTemplate.viewerIds;
+            if (request.accounts.isEmpty() && !m_scope.viewerPersonId.isEmpty())
+                request.accounts.append(m_scope.viewerPersonId);
+            request.terms = terms;
+            request.includeOthers = true;
+            request.currentChannel = m_scope.channel;
+            request.currentSession = m_scope.sessionId;
+            request.excludeCurrent = false;
+            request.limit = limit;
+            request.candidateLimit = qMax(20, limit * 4);
+            request.rerankLimit = limit;
+            MemoryRetrievalService service(m_memoryManager);
+            const auto unified = service.retrieve(request);
+            QSet<QString> allowedSources;
+            for (const auto &source : sources)
+                allowedSources.insert(source.first + QLatin1Char('|') + source.second);
+            for (const auto &evidence : unified.evidence) {
+                if (resultItems.size() >= limit)
+                    break;
+                if (evidence.sourceType != QStringLiteral("chat"))
+                    continue;
+                if (!allowedSources.contains(evidence.channel + QLatin1Char('|') + evidence.session))
+                    continue;
+                if (timeRange.valid && evidence.speechAt.isValid()
+                    && (evidence.speechAt < timeRange.from
+                        || evidence.speechAt >= timeRange.to))
+                    continue;
+                const QString text = MemoryTextUtils::sanitizePromptText(evidence.text);
+                if (text.isEmpty())
+                    continue;
+                const QString ref = evidence.sourceRef;
+                const bool assistant = evidence.speakerRole == QStringLiteral("assistant");
+                const QString idPart = ref.section(QLatin1Char(':'), 0, 0);
+                const qlonglong turnId = idPart.section(QLatin1Char('/'), 1, 1).toLongLong();
+                MemoryAgentItem item;
+                item.id = assistant
+                    ? QStringLiteral("reply:%1").arg(turnId)
+                    : QStringLiteral("chat:%1:user").arg(turnId);
+                item.kind = QStringLiteral("chat_history");
+                item.text = text;
+                item.time = evidence.speechAt;
+                item.source = sourceLabelForSession(m_scope, evidence.session);
+                item.personId = evidence.speakerId;
+                item.speaker = evidence.speakerName;
+                item.speakerRole = evidence.speakerRole;
+                item.derived = evidence.derived;
+                item.historyTurnId = turnId;
+                item.sourceSessionId = evidence.session;
+                item.isViewer = !assistant
+                    && (evidence.speakerRole == QStringLiteral("user"));
+                const int before = m_ordered.size();
+                remember(item);
+                if (m_ordered.size() > before) {
+                    resultItems.append(itemToJson(item));
+                    servedByUnified = true;
+                }
+            }
+        }
+        if (!servedByUnified) {
+        auto assistantText = [](const QString &rawReply) {
+            const auto root = QJsonDocument::fromJson(rawReply.toUtf8()).object();
+            QStringList parts;
+            for (const auto &value : root.value(QStringLiteral("sentences")).toArray()) {
+                const auto sentence = value.toObject();
+                const auto zh = sentence.value(QStringLiteral("zh_text")).toString().trimmed();
+                if (!zh.isEmpty())
+                    parts.append(zh);
+            }
+            if (parts.isEmpty() && !rawReply.trimmed().startsWith(QLatin1Char('{')))
+                parts.append(rawReply.trimmed());
+            return MemoryTextUtils::sanitizePromptText(parts.join(QLatin1Char('\n')));
+        };
         for (const auto &source : sources) {
             if (resultItems.size() >= limit) {
                 break;
             }
             const QList<HistoryTurn> turns =
-                m_memoryManager->getHistoryTurn(200, source.first,
-                                                source.second);
+                m_memoryManager->searchHistoryTurns(source.first, source.second,
+                                                    terms, 5000);
             for (const HistoryTurn &turn : turns) {
                 if (resultItems.size() >= limit) {
                     break;
                 }
-                if (turn.userInput.trimmed().isEmpty()) {
-                    continue;
-                }
+                const QString userText = MemoryTextUtils::sanitizePromptText(
+                    turn.userInput.trimmed());
+                const QString replyText = assistantText(turn.rawReply);
                 const QString haystack = turn.userInput + QLatin1Char('\n')
                                          + turn.rawReply;
                 if (!matchesTerms(haystack, terms)) {
@@ -724,28 +812,53 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
                         || turn.timestamp >= timeRange.to)) {
                     continue;
                 }
-                MemoryAgentItem item;
-                item.id = QStringLiteral("chat:%1").arg(turn.id);
-                item.kind = QStringLiteral("chat_history");
-                item.text = MemoryTextUtils::sanitizePromptText(
-                    turn.userInput.trimmed());
-                item.time = turn.timestamp;
-                item.source = source.first == Channel::kPet
-                                  ? QStringLiteral("internal")
-                                  : sourceLabelForSession(m_scope, source.second);
-                item.personId = turn.subject;
-                item.historyTurnId = turn.id;
-                item.sourceSessionId = source.second;
-                item.isViewer = turn.subject == QStringLiteral("user");
-                if (item.text.isEmpty()) {
-                    continue;
+                const QString sourceLabel = source.first == Channel::kPet
+                    ? QStringLiteral("internal")
+                    : sourceLabelForSession(m_scope, source.second);
+                const QString ownerSpeaker = turn.speaker.isEmpty()
+                    ? (turn.subject == QStringLiteral("user") ? QStringLiteral("主人")
+                                                              : QStringLiteral("群友"))
+                    : turn.speaker;
+                if (!userText.isEmpty() && resultItems.size() < limit) {
+                    MemoryAgentItem item;
+                    item.id = QStringLiteral("chat:%1:user").arg(turn.id);
+                    item.kind = QStringLiteral("chat_history");
+                    item.text = userText;
+                    item.time = turn.timestamp;
+                    item.source = sourceLabel;
+                    item.personId = turn.subject;
+                    item.speaker = ownerSpeaker;
+                    item.speakerRole = QStringLiteral("user");
+                    item.derived = QStringLiteral("original");
+                    item.historyTurnId = turn.id;
+                    item.sourceSessionId = source.second;
+                    item.isViewer = turn.subject == QStringLiteral("user");
+                    const int before = m_ordered.size();
+                    remember(item);
+                    if (m_ordered.size() > before)
+                        resultItems.append(itemToJson(item));
                 }
-                const int before = m_ordered.size();
-                remember(item);
-                if (m_ordered.size() > before) {
-                    resultItems.append(itemToJson(item));
+                if (!replyText.isEmpty() && resultItems.size() < limit) {
+                    MemoryAgentItem item;
+                    item.id = QStringLiteral("reply:%1").arg(turn.id);
+                    item.kind = QStringLiteral("chat_history");
+                    item.text = replyText;
+                    item.time = turn.timestamp;
+                    item.source = sourceLabel;
+                    item.personId = QStringLiteral("mako");
+                    item.speaker = QStringLiteral("茉子");
+                    item.speakerRole = QStringLiteral("assistant");
+                    item.derived = QStringLiteral("assistant_expression");
+                    item.historyTurnId = turn.id;
+                    item.sourceSessionId = source.second;
+                    item.isViewer = false;
+                    const int before = m_ordered.size();
+                    remember(item);
+                    if (m_ordered.size() > before)
+                        resultItems.append(itemToJson(item));
                 }
             }
+        }
         }
     }
 
@@ -1365,7 +1478,8 @@ bool MemoryAgentPlanner::canExposeTools(const RequestMeta &meta,
     if (!config.enabled || config.mode != QStringLiteral("tool")) {
         return false;
     }
-    if (meta.channel != Channel::kQQGroup
+    if (meta.channel != Channel::kPet
+        && meta.channel != Channel::kQQGroup
         && meta.channel != Channel::kQQPrivate) {
         return false;
     }

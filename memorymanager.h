@@ -16,6 +16,8 @@
 #include "utterance.h"
 #include "recentcontext.h"
 
+class MemoryEmbeddingProvider;
+
 struct RawEventWrite
 {
     QString platform;
@@ -40,12 +42,31 @@ struct RawEventWrite
     bool processed = false;
 };
 
+struct MemoryChunkWrite
+{
+    QString sourceType;
+    QString sourceRef;
+    QString chunkKind;
+    QString derived;
+    QString text;
+    QString channel;
+    QString session;
+    QString speakerId;
+    QString speakerName;
+    QString speakerRole;
+    QString speechAt;
+    QString eventTime;
+    QString privacy;
+    QString sourceTable;
+    QString sourceId;
+};
+
 class MemoryManager : public QObject
 {
     Q_OBJECT
 public:
-    explicit MemoryManager(const QString &dbFilePath,QObject *parent = nullptr);
-    ~MemoryManager();
+    explicit MemoryManager(const QString &dbFilePath,QObject *parent = nullptr,
+                           const QString &connectionName = QString());    ~MemoryManager();
     bool saveQATurn(const QString &userInput,
                           const QString &rawReply,
                           const QList<SentenceText> &sentences,
@@ -68,12 +89,29 @@ public:
     QJsonArray internalMatters(const RequestMeta &meta, const QStringList &terms,
                                const QStringList &historyOf = {}) const;
     QJsonArray currentUnderstanding(const RequestMeta &audience, const QString &input,
-                                    QStringList *keys = nullptr, const QStringList &only = {}) const;
+                                    QStringList *keys = nullptr, const QStringList &only = {},
+                                    bool includeAudiencePrivate = false) const;
     QJsonArray matterEvidence(const RequestMeta &audience, const QString &matter) const;
     QString conversationPhase(const RequestMeta &audience) const;
     QJsonArray personalEvidence(const QString &subject, const QStringList &accounts,
                                 const QStringList &terms, bool includeOthers = false,
-                                const QString &currentChannel = {}, const QString &currentSession = {}) const;
+                                const QString &currentChannel = {}, const QString &currentSession = {},
+                                bool excludeCurrent = true) const;
+
+    // 可重建的检索块。原文仍留在原表；这些表只保存检索视图与向量。
+    bool rebuildSearchIndex(QString *error = nullptr);
+    bool clearSearchIndex(QString *error = nullptr);
+    bool backupDatabase(const QString &destination, QString *error = nullptr) const;
+    QJsonObject searchIndexStatus() const;
+    int memoryChunkCount() const;
+    QJsonArray searchMemoryChunks(const QStringList &terms, int limit = 40,
+                                  const QString &exactQuery = {}) const;
+    QJsonArray memoryChunksForEmbedding(int limit = 2000) const;
+    bool storeChunkEmbedding(qlonglong chunkId, const QString &model, int dimension,
+                             const QByteArray &blob, const QString &contentHash);
+    QByteArray chunkEmbedding(qlonglong chunkId, const QString &model) const;
+    bool embedSearchChunks(MemoryEmbeddingProvider *provider, int limit = 2000,
+                           QString *error = nullptr);
 
     QJsonObject nextThought(bool dueOnly) const;
     bool claimThoughtReview(qlonglong id, int dailyLimit, int cooldownSeconds);
@@ -87,6 +125,9 @@ public:
 
 //历史对话crud
     QList<HistoryTurn> getHistoryTurn(int N, const QString &channel = Channel::kPet, const QString &sessionId = Channel::kDefaultSession, qint64 beforeTurn = 0);
+    QList<HistoryTurn> searchHistoryTurns(const QString &channel, const QString &sessionId,
+                                          const QStringList &terms, int limit,
+                                          const QDateTime &from = {}, const QDateTime &to = {});
     QList<HistoryTurn> getHistoryTurn(int offset,int limit); // 管理界面分页，跨渠道浏览
     qlonglong getTotalHistoryCount();
     bool deleteTurnByID(int id);
@@ -254,7 +295,10 @@ signals:
     void understandingChanged();
 
 private:
-    void initDatabase(const QString &dbFilePath);
+    void initDatabase(const QString &dbFilePath, const QString &connectionName = QString());
+    bool upsertMemoryChunk(const MemoryChunkWrite &chunk);
+    bool indexRawEvent(qlonglong id);
+    bool indexChatTurn(qlonglong id);
     bool ensurePerson(const QString &personId,
                       const QString &role,
                       const QString &canonicalName);
