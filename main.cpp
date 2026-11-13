@@ -12,6 +12,7 @@
 #include "memorymanager.h"
 #include "memoryembedding.h"
 #include "memorydashscope.h"
+#include "benchmarkrunner.h"
 
 int main(int argc, char *argv[]) {
     //不创建应用名会报错
@@ -19,6 +20,10 @@ int main(int argc, char *argv[]) {
     // QCoreApplication::setOrganizationName("MakoDesktop");
 
     QApplication a(argc, argv);
+    if (a.arguments().contains(QStringLiteral("--bench-import")))
+        return runBenchmarkImport(a.arguments());
+    if (a.arguments().contains(QStringLiteral("--bench-ask")))
+        return runBenchmarkAsk(a.arguments());
     if (a.arguments().contains(QStringLiteral("--memory-index-status"))) {
         MemoryManager memory(ConfigManager::instance().getMemoryPath());
         qInfo().noquote() << QJsonDocument(memory.searchIndexStatus())

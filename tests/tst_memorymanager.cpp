@@ -163,6 +163,40 @@ public:
     }
 };
 
+class TargetedEmbeddingProvider : public MemoryEmbeddingProvider
+{
+public:
+    QString modelId() const override { return QStringLiteral("targeted_test"); }
+    int dimension() const override { return 2; }
+    bool embed(const QString &text, QVector<float> *vector, QString *) const override
+    {
+        if (!vector) return false;
+        *vector = (text.contains(QStringLiteral("目标"))
+                   || text.contains(QStringLiteral("查询")))
+            ? QVector<float>{1.0f, 0.0f}
+            : QVector<float>{0.0f, 1.0f};
+        return true;
+    }
+};
+
+class RecordingReranker : public MemoryReranker
+{
+public:
+    QString id() const override { return QStringLiteral("recording"); }
+    QList<MemoryEvidence> rerank(const QString &, const QList<MemoryEvidence> &candidates,
+                                 int limit, QString *error = nullptr) const override
+    {
+        seen = candidates;
+        if (fail) {
+            if (error) *error = QStringLiteral("rerank timeout");
+            return {};
+        }
+        return candidates.mid(0, qMax(0, limit));
+    }
+    mutable QList<MemoryEvidence> seen;
+    bool fail = false;
+};
+
 class TestMemoryManager : public QObject
 {
     Q_OBJECT
@@ -987,6 +1021,107 @@ private slots:
         QCOMPARE(status.value(QStringLiteral("embeddings")).toInt(), 3);
         QVERIFY2(db.embedSearchChunks(&provider, 2, &error), qPrintable(error));
         QCOMPARE(db.searchIndexStatus().value(QStringLiteral("embeddings")).toInt(), 3);
+    }
+
+    void vectorRecallScansBeyondFirstTwoThousandChunks()
+    {
+        QTemporaryDir dir;
+        MemoryManager db(dir.filePath("vector-range.db"));
+        RequestMeta meta;
+        meta.channel = Channel::kQQPrivate;
+        meta.sessionId = meta.actorId = QStringLiteral("bulk");
+        for (int i = 0; i < 2001; ++i) {
+            meta.eventId = QStringLiteral("bulk-%1").arg(i);
+            const QString text = i == 2000
+                ? QStringLiteral("独特目标内容") : QStringLiteral("填充内容 %1").arg(i);
+            QVERIFY(db.saveQATurn(text, QStringLiteral("{}"), {}, meta));
+        }
+        QString error;
+        QVERIFY2(db.rebuildSearchIndex(&error), qPrintable(error));
+        auto provider = std::make_shared<TargetedEmbeddingProvider>();
+        QVERIFY2(db.embedSearchChunks(provider.get(), 4000, &error), qPrintable(error));
+
+        RetrievalRequest request;
+        request.query = QStringLiteral("查询");
+        request.terms = {QStringLiteral("查询")};
+        request.subject = QStringLiteral("user");
+        request.viewerPersonId = QStringLiteral("owner");
+        request.viewerIsOwner = true;
+        request.currentChannel = Channel::kQQPrivate;
+        request.currentSession = QStringLiteral("other");
+        request.excludeCurrent = false;
+        request.useIndex = true;
+        request.allowLegacyFallback = false;
+        request.candidateLimit = 40;
+        request.rerankLimit = 10;
+        MemoryRetrievalService service(&db);
+        service.setEmbeddingProvider(provider);
+        const auto result = service.retrieve(request);
+        bool found = false;
+        for (const auto &item : result.evidence)
+            if (item.text == QStringLiteral("独特目标内容"))
+                found = true;
+        QVERIFY(found);
+        QVERIFY(result.evidence.size() <= 10);
+    }
+
+    void rerankReceivesFilteredDedupedBoundedCandidatesAndFallsBack()
+    {
+        QTemporaryDir dir;
+        MemoryManager db(dir.filePath("rerank-scope.db"));
+        RequestMeta meta;
+        meta.channel = Channel::kQQPrivate;
+        meta.sessionId = meta.actorId = QStringLiteral("A");
+        for (int i = 0; i < 2; ++i) {
+            meta.eventId = QStringLiteral("a-%1").arg(i);
+            QVERIFY(db.saveQATurn(QStringLiteral("重复文本"), QStringLiteral("{}"), {}, meta));
+        }
+        meta.sessionId = meta.actorId = QStringLiteral("B");
+        meta.eventId = QStringLiteral("b-1");
+        QVERIFY(db.saveQATurn(QStringLiteral("另一会话"), QStringLiteral("{}"), {}, meta));
+        QString error;
+        QVERIFY2(db.rebuildSearchIndex(&error), qPrintable(error));
+        auto provider = std::make_shared<VectorOnlyEmbeddingProvider>();
+        QVERIFY2(db.embedSearchChunks(provider.get(), 100, &error), qPrintable(error));
+
+        RetrievalRequest request;
+        request.query = QStringLiteral("重复");
+        request.terms = {QStringLiteral("重复")};
+        request.subject = QStringLiteral("user");
+        request.viewerPersonId = QStringLiteral("owner");
+        request.viewerIsOwner = true;
+        request.currentChannel = Channel::kQQPrivate;
+        request.currentSession = QStringLiteral("other");
+        request.excludeCurrent = false;
+        request.useIndex = true;
+        request.allowLegacyFallback = false;
+        request.sourceKinds = {QStringLiteral("chat")};
+        request.allowedSources = {QStringLiteral("qq_private|A")};
+        request.candidateLimit = 2;
+        request.rerankLimit = 2;
+
+        auto recorder = std::make_shared<RecordingReranker>();
+        MemoryRetrievalService service(&db);
+        service.setEmbeddingProvider(provider);
+        service.setReranker(recorder);
+        const auto result = service.retrieve(request);
+        QVERIFY(!recorder->seen.isEmpty());
+        QVERIFY(recorder->seen.size() <= 2);
+        QSet<QString> sessions;
+        QSet<QString> texts;
+        for (const auto &item : recorder->seen) {
+            sessions.insert(item.session);
+            texts.insert(item.text);
+        }
+        QCOMPARE(sessions.size(), 1);
+        QCOMPARE(texts.size(), recorder->seen.size());
+        QVERIFY(!result.evidence.isEmpty());
+
+        recorder->fail = true;
+        const auto degraded = service.retrieve(request);
+        QVERIFY(!degraded.evidence.isEmpty());
+        QCOMPARE(degraded.status, QStringLiteral("degraded"));
+        QVERIFY(degraded.degradedReason.contains(QStringLiteral("timeout")));
     }
 
     void legacyMigrationPreservesData()

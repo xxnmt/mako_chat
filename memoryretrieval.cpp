@@ -14,6 +14,30 @@
 
 namespace {
 
+bool sourceAllowed(const RetrievalRequest &request, const MemoryEvidence &item)
+{
+    if (!request.sourceKinds.isEmpty()
+        && !request.sourceKinds.contains(item.sourceType))
+        return false;
+    if (request.allowedSources.isEmpty())
+        return true;
+    for (const auto &source : request.allowedSources) {
+        const QString channel = source.section(QLatin1Char('|'), 0, 0);
+        const QString session = source.section(QLatin1Char('|'), 1, 1);
+        if (channel == item.channel
+            && (session == QStringLiteral("*") || session == item.session))
+            return true;
+    }
+    return false;
+}
+
+QByteArray normalizedEvidenceText(const MemoryEvidence &item)
+{
+    QByteArray key = item.text.toUtf8();
+    key = key.simplified();
+    return key;
+}
+
 QList<int> rankOrder(const QVector<double> &scores)
 {
     QList<int> order;
@@ -191,6 +215,8 @@ QList<MemoryEvidence> MemoryRetrievalService::retrieveIndexed(const RetrievalReq
     auto addCandidate = [&](const MemoryEvidence &evidence) {
         if (evidence.handle.isEmpty() || evidence.text.trimmed().isEmpty())
             return false;
+        if (!sourceAllowed(request, evidence))
+            return false;
         if (request.excludeCurrent && evidence.channel == request.currentChannel
             && evidence.session == request.currentSession)
             return false;
@@ -221,10 +247,8 @@ QList<MemoryEvidence> MemoryRetrievalService::retrieveIndexed(const RetrievalReq
         } else {
             vectorUsed = true;
             // 独立的向量召回：不以 LIKE 命中为前提，扫描当前活跃 chunk 的向量。
-            const auto allRows = m_manager->memoryChunksForEmbedding(2000);
+            const auto allRows = m_manager->memoryChunksForEmbedding(0);
             result->candidateCount += allRows.size();
-            if (allRows.size() >= 2000)
-                result->truncated = true;
             for (const auto &row : allRows) {
                 const auto value = row.toObject();
                 const auto id = value.value(QStringLiteral("id")).toInteger();
@@ -293,13 +317,33 @@ QList<MemoryEvidence> MemoryRetrievalService::retrieveIndexed(const RetrievalReq
     QList<MemoryEvidence> ranked;
     for (int index : finalOrder)
         ranked.append(candidates.at(index));
+
+    const int rerankCap = qMax(1, request.candidateLimit);
+    QList<MemoryEvidence> rerankInput;
+    QSet<QByteArray> seenText;
+    for (const auto &item : ranked) {
+        const QByteArray key = normalizedEvidenceText(item);
+        if (key.isEmpty() || seenText.contains(key))
+            continue;
+        seenText.insert(key);
+        rerankInput.append(item);
+        if (rerankInput.size() >= rerankCap)
+            break;
+    }
+
     if (m_reranker) {
         QString rerankError;
-        const auto reranked = m_reranker->rerank(request.query, ranked,
+        const auto reranked = m_reranker->rerank(request.query, rerankInput,
                                                  request.rerankLimit, &rerankError);
-        if (!rerankError.isEmpty())
+        if (!rerankError.isEmpty() || reranked.isEmpty()) {
             result->status = QStringLiteral("degraded");
-        return reranked;
+            result->degradedReason = rerankError.isEmpty()
+                ? QStringLiteral("rerank returned no usable results")
+                : rerankError;
+            // 重排是增强项，失败时保留重排前可用的候选。
+            return ranked.mid(0, qMax(0, request.rerankLimit));
+        }
+        return reranked.mid(0, qMax(0, request.rerankLimit));
     }
     return ranked.mid(0, qMax(0, request.rerankLimit));
 }
@@ -312,24 +356,8 @@ RetrievalResult MemoryRetrievalService::retrieve(const RetrievalRequest &request
     auto filterKinds = [&](QList<MemoryEvidence> evidence) {
         QList<MemoryEvidence> filtered;
         for (const auto &item : evidence) {
-            if (!request.sourceKinds.isEmpty()
-                && !request.sourceKinds.contains(item.sourceType))
-                continue;
-            if (!request.allowedSources.isEmpty()) {
-                bool allowed = false;
-                for (const auto &source : request.allowedSources) {
-                    const QString channel = source.section(QLatin1Char('|'), 0, 0);
-                    const QString session = source.section(QLatin1Char('|'), 1, 1);
-                    if (channel == item.channel
-                        && (session == QStringLiteral("*") || session == item.session)) {
-                        allowed = true;
-                        break;
-                    }
-                }
-                if (!allowed)
-                    continue;
-            }
-            filtered.append(item);
+            if (sourceAllowed(request, item))
+                filtered.append(item);
         }
         return filtered;
     };

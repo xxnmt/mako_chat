@@ -99,6 +99,7 @@ struct RetrievalResult
 {
     QList<MemoryEvidence> evidence;
     QString status = QStringLiteral("complete"); // complete / partial / degraded
+    QString degradedReason;
     QString backend = QStringLiteral("unknown"); // legacy / index
     int candidateCount = 0;
     int lexicalCount = 0;

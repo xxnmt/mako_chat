@@ -216,6 +216,7 @@ QJsonObject RetrievalResult::toJson() const
     for (const auto &item : evidence)
         items.append(item.toJson());
     return QJsonObject{{QStringLiteral("status"), status},
+                       {QStringLiteral("degraded_reason"), degradedReason},
                        {QStringLiteral("backend"), backend},
                        {QStringLiteral("candidates"), candidateCount},
                        {QStringLiteral("lexical_candidates"), lexicalCount},

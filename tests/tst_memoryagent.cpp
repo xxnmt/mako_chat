@@ -1319,14 +1319,17 @@ private slots:
     {
         QTcpServer server;
         QVERIFY(server.listen(QHostAddress::LocalHost));
-        QObject::connect(&server, &QTcpServer::newConnection, &server, [&server] {
+        QByteArray capturedRerankRequest;
+        QObject::connect(&server, &QTcpServer::newConnection, &server, [&server, &capturedRerankRequest] {
             auto *socket = server.nextPendingConnection();
-            QObject::connect(socket, &QTcpSocket::readyRead, socket, [socket] {
+            QObject::connect(socket, &QTcpSocket::readyRead, socket, [socket, &capturedRerankRequest] {
                 const auto bytes = socket->readAll();
                 const auto header = bytes.indexOf("\r\n\r\n");
                 if (header < 0)
                     return;
                 const bool rerankRequest = bytes.contains("\"documents\"");
+                if (rerankRequest)
+                    capturedRerankRequest = bytes.mid(header + 4);
                 const QJsonObject response = rerankRequest
                     ? QJsonObject{{"output", QJsonObject{{"results",
                         QJsonArray{QJsonObject{{"index", 1}, {"relevance_score", 0.9}},
@@ -1363,6 +1366,12 @@ private slots:
         const auto ranked = reranker.rerank(QStringLiteral("查询"), candidates, 2, &error);
         QCOMPARE(ranked.size(), 2);
         QCOMPARE(ranked.first().text, QStringLiteral("第二"));
+        const auto sent = QJsonDocument::fromJson(capturedRerankRequest).object();
+        const auto documents = sent.value(QStringLiteral("input")).toObject()
+                                   .value(QStringLiteral("documents")).toArray();
+        QCOMPARE(documents.size(), 2);
+        QCOMPARE(documents.at(0).toString(), QStringLiteral("第一"));
+        QCOMPARE(documents.at(1).toString(), QStringLiteral("第二"));
     }
 
     void retrievalWorkerUsesOwnConnection()

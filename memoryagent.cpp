@@ -20,11 +20,46 @@
 #include "memorysourcepolicy.h"
 #include "memoryretrieval.h"
 #include "memoryembedding.h"
+#include "memorydashscope.h"
 #include "configmanager.h"
 #include "memorytextutils.h"
 #include "memorytimerange.h"
 
 namespace {
+
+void configureRetrievalService(MemoryRetrievalService &service,
+                               const MemoryRetrievalConfig &config)
+{
+    if (!config.embeddingEnabled)
+        return;
+    if (config.embeddingProvider == QStringLiteral("local_hash_test")) {
+        const int dimension = config.embeddingDimension > 0
+            ? config.embeddingDimension : 64;
+        service.setEmbeddingProvider(
+            std::make_shared<LocalHashEmbeddingProvider>(dimension));
+        return;
+    }
+    if (config.embeddingProvider != QStringLiteral("dashscope"))
+        return;
+    const QString apiKey = !config.embeddingApiKey.isEmpty()
+        ? config.embeddingApiKey
+        : qEnvironmentVariable(config.embeddingApiKeyEnv.toUtf8().constData());
+    if (apiKey.isEmpty() || config.embeddingEndpoint.isEmpty())
+        return;
+    const int dimension = config.embeddingDimension > 0
+        ? config.embeddingDimension : 1024;
+    service.setEmbeddingProvider(std::make_shared<DashScopeEmbeddingProvider>(
+        QUrl(config.embeddingEndpoint), apiKey,
+        config.embeddingModel.isEmpty() ? QStringLiteral("text-embedding-v4")
+                                        : config.embeddingModel,
+        dimension));
+    if (config.rerankEnabled && !config.rerankEndpoint.isEmpty()) {
+        service.setReranker(std::make_shared<DashScopeReranker>(
+            QUrl(config.rerankEndpoint), apiKey,
+            config.rerankModel.isEmpty() ? QStringLiteral("qwen3-rerank")
+                                         : config.rerankModel));
+    }
+}
 
 const int kMaxQueryLength = 200;
 const int kMaxToolIds = 8;
@@ -469,13 +504,7 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
             request.candidateLimit = retrievalConfig.candidateLimit;
             request.rerankLimit = retrievalConfig.rerankLimit;
             MemoryRetrievalService service(m_memoryManager);
-            if (retrievalConfig.embeddingEnabled
-                && retrievalConfig.embeddingProvider == QStringLiteral("local_hash_test")) {
-                const int dimension = retrievalConfig.embeddingDimension > 0
-                    ? retrievalConfig.embeddingDimension : 64;
-                service.setEmbeddingProvider(
-                    std::make_shared<LocalHashEmbeddingProvider>(dimension));
-            }
+            configureRetrievalService(service, retrievalConfig);
             const auto unified = service.retrieve(request);
             for (const auto &evidence : unified.evidence) {
                 if (resultItems.size() >= recentLimit)
@@ -921,13 +950,7 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
             }
             request.allowedSources = allowed;
             MemoryRetrievalService service(m_memoryManager);
-            if (retrievalConfig.embeddingEnabled
-                && retrievalConfig.embeddingProvider == QStringLiteral("local_hash_test")) {
-                const int dimension = retrievalConfig.embeddingDimension > 0
-                    ? retrievalConfig.embeddingDimension : 64;
-                service.setEmbeddingProvider(
-                    std::make_shared<LocalHashEmbeddingProvider>(dimension));
-            }
+            configureRetrievalService(service, retrievalConfig);
             const auto unified = service.retrieve(request);
             for (const auto &evidence : unified.evidence) {
                 if (resultItems.size() >= limit)

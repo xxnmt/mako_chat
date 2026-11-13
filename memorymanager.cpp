@@ -130,8 +130,8 @@ bool MemoryManager::saveQATurn(const QString &userInput, const QString &rawReply
         query.bindValue(":event", meta.eventId);
     } else {
         query.prepare("INSERT INTO chat_history "
-                      "(user_input, raw_reply, channel, session_id, speaker, sensitive, turn_kind, trigger_event_ids, subject, state_updates, thought, cognitive_event) "
-                      "VALUES (:user_input, :raw_reply, :channel, :session_id, :speaker, :sensitive, :turn_kind, :trigger_event_ids, :subject, :updates, :thought, :event)");
+                      "(user_input, raw_reply, channel, session_id, speaker, sensitive, turn_kind, trigger_event_ids, subject, state_updates, thought, cognitive_event, timestamp) "
+                      "VALUES (:user_input, :raw_reply, :channel, :session_id, :speaker, :sensitive, :turn_kind, :trigger_event_ids, :subject, :updates, :thought, :event, :timestamp)");
         query.bindValue(":event", meta.eventId);
         query.bindValue(":updates", updates.isEmpty() ? QVariant(QMetaType(QMetaType::QString))
             : QVariant(QString::fromUtf8(QJsonDocument(updates).toJson(QJsonDocument::Compact))));
@@ -144,6 +144,9 @@ bool MemoryManager::saveQATurn(const QString &userInput, const QString &rawReply
         query.bindValue(":turn_kind", meta.turnKind.isEmpty() ? QStringLiteral("reply") : meta.turnKind);
         query.bindValue(":trigger_event_ids", meta.triggerEventIds.isEmpty() ? QVariant(QMetaType(QMetaType::QString)) : QVariant(meta.triggerEventIds));
         query.bindValue(":subject", meta.subject.isEmpty() ? QStringLiteral("user") : meta.subject);
+        const QDateTime logicalTime = meta.receivedAtUtc.isValid()
+            ? meta.receivedAtUtc.toLocalTime() : QDateTime::currentDateTime();
+        query.bindValue(":timestamp", logicalTime.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")));
     }
     query.bindValue(":thought", thought);
     query.bindValue(":raw_reply", JsonStr);
@@ -755,12 +758,17 @@ QJsonArray MemoryManager::memoryChunksForEmbedding(int limit) const
 {
     QJsonArray result;
     QSqlQuery q(m_db);
-    q.prepare("SELECT id,source_type,source_ref,chunk_kind,derived,text,content_hash,"
-              "channel,session_id,speaker_id,speaker_name,speaker_role,"
-              "speech_at,event_time,recorded_at,privacy,status "
-              "FROM memory_chunks WHERE status='active' AND index_generation=1 "
-              "ORDER BY id LIMIT ?");
-    q.addBindValue(qMax(1, limit));
+    QString sql = QStringLiteral(
+        "SELECT id,source_type,source_ref,chunk_kind,derived,text,content_hash,"
+        "channel,session_id,speaker_id,speaker_name,speaker_role,"
+        "speech_at,event_time,recorded_at,privacy,status "
+        "FROM memory_chunks WHERE status='active' AND index_generation=1 "
+        "ORDER BY id");
+    if (limit > 0)
+        sql += QStringLiteral(" LIMIT ?");
+    q.prepare(sql);
+    if (limit > 0)
+        q.addBindValue(limit);
     if (!q.exec())
         return result;
     while (q.next()) {

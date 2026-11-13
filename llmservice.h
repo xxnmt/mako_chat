@@ -144,6 +144,7 @@ private:
         MemorySituation situation;
         QString retrievalStatus;
         QString retrievalBackend;
+        QString retrievalDegradedReason;
         int retrievalCandidates = 0;
         int retrievalAuxiliary = 0;
         qint64 retrievalLatencyMs = 0;

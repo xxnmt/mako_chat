@@ -224,6 +224,7 @@ void LLMService::finishRetrieval(const RetrievalResult &retrieval)
     QStringList candidates, privateRefs, reflectionRefs;
     m_run.retrievalStatus = retrieval.status;
     m_run.retrievalBackend = retrieval.backend;
+    m_run.retrievalDegradedReason = retrieval.degradedReason;
     m_run.retrievalCandidates = retrieval.candidateCount;
     m_run.retrievalAuxiliary = retrieval.auxiliaryCount;
     m_run.retrievalLatencyMs = retrieval.latencyMs;
@@ -2575,6 +2576,7 @@ void LLMService::onReplyFinished(QNetworkReply *reply)
                 audit["lookup_count"] = m_run.lookups.size();
                 audit["retrieval_status"] = m_run.retrievalStatus;
                 audit["retrieval_backend"] = m_run.retrievalBackend;
+                audit["retrieval_degraded_reason"] = m_run.retrievalDegradedReason;
                 audit["retrieval_candidates"] = m_run.retrievalCandidates;
                 audit["retrieval_auxiliary"] = m_run.retrievalAuxiliary;
                 audit["retrieval_latency_ms"] = m_run.retrievalLatencyMs;
