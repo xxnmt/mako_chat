@@ -36,6 +36,8 @@ public:
     void registerStateProvider(std::function<QString()> provider);
     void setMemoryManager(MemoryManager *manager);
     QString retrievalDatabasePath() const;
+    void setBenchmarkChatOnly(bool enabled) { m_benchmarkChatOnly = enabled; }
+    void setBenchmarkMaxTurn(int turn) { m_benchmarkMaxTurn = qMax(0, turn); }
     QJsonArray lastRequestMessages() const { return m_lastRequestMessages; }
     RetrievalResult lastRetrievalResult() const { return m_lastRetrievalResult; }
     QJsonObject lastResponseUsage() const { return m_lastResponseUsage; }
@@ -175,6 +177,8 @@ private:
     QJsonArray m_lastRequestMessages;
     RetrievalResult m_lastRetrievalResult;
     QJsonObject m_lastResponseUsage;
+    bool m_benchmarkChatOnly = false;
+    int m_benchmarkMaxTurn = 0;
     QJsonArray m_pendingMessages; // legacy：等待 MemoryAgent 的主请求
     quint64 m_agentGeneration = 0;
     bool m_agentPending = false;

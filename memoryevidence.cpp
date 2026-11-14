@@ -182,6 +182,15 @@ MemoryEvidence MemoryEvidence::fromChunk(const QJsonObject &row,
     return evidence;
 }
 
+QString MemoryEvidence::turnKey() const
+{
+    if (sourceRef.startsWith(QStringLiteral("chat/"))
+        && sourceRef.contains(QLatin1Char(':'))) {
+        return sourceRef.section(QLatin1Char(':'), 0, 0);
+    }
+    return handle;
+}
+
 QJsonObject MemoryEvidence::toJson() const
 {
     QJsonObject object;
@@ -189,6 +198,17 @@ QJsonObject MemoryEvidence::toJson() const
     object.insert(QStringLiteral("evidence_ref"), handle);
     object.insert(QStringLiteral("source_ref"), sourceRef);
     object.insert(QStringLiteral("source_type"), sourceType);
+    object.insert(QStringLiteral("turn_id"), turnKey());
+    QString authority = QStringLiteral("unknown");
+    if (derived == QStringLiteral("assistant_expression"))
+        authority = QStringLiteral("assistant_expression");
+    else if (speakerRole == QStringLiteral("user"))
+        authority = QStringLiteral("user_statement");
+    else if (speakerRole == QStringLiteral("assistant"))
+        authority = QStringLiteral("assistant_statement");
+    else if (derived == QStringLiteral("summary") || derived == QStringLiteral("inference"))
+        authority = QStringLiteral("derived_") + derived;
+    object.insert(QStringLiteral("authority"), authority);
     object.insert(QStringLiteral("text"), text);
     object.insert(QStringLiteral("speaker_id"), speakerId);
     object.insert(QStringLiteral("speaker"), speakerName);

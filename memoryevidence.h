@@ -65,6 +65,7 @@ struct MemoryEvidence
     static MemoryEvidence fromChunk(const QJsonObject &row,
                                     const QString &viewerPersonId = {},
                                     bool viewerIsOwner = false);
+    QString turnKey() const;
     QJsonObject toJson() const;
 };
 
@@ -91,6 +92,8 @@ struct RetrievalRequest
     int limit = 12;
     int candidateLimit = 40;
     int rerankLimit = 10;
+    int maxTurn = 0;
+    bool turnAggregation = false;
     bool useIndex = true;
     MemorySituation situation;
 };

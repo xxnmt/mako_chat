@@ -38,6 +38,23 @@ QByteArray normalizedEvidenceText(const MemoryEvidence &item)
     return key;
 }
 
+int evidenceTurnNumber(const MemoryEvidence &item)
+{
+    if (!item.sourceRef.startsWith(QStringLiteral("chat/")))
+        return -1;
+    const QString turn = item.sourceRef.section(QLatin1Char(':'), 0, 0)
+                             .section(QLatin1Char('/'), 1, 1);
+    bool ok = false;
+    const int value = turn.toInt(&ok);
+    return ok ? value : -1;
+}
+
+bool afterMaxTurn(const RetrievalRequest &request, const MemoryEvidence &item)
+{
+    return request.maxTurn > 0
+        && evidenceTurnNumber(item) > request.maxTurn;
+}
+
 QList<int> rankOrder(const QVector<double> &scores)
 {
     QList<int> order;
@@ -47,6 +64,54 @@ QList<int> rankOrder(const QVector<double> &scores)
         return scores.at(a) > scores.at(b);
     });
     return order;
+}
+
+int roleOrder(const MemoryEvidence &item)
+{
+    if (item.speakerRole == QStringLiteral("user"))
+        return 0;
+    if (item.speakerRole == QStringLiteral("assistant"))
+        return 1;
+    return 2;
+}
+
+// 检索按 turn 聚合，但返回的仍是带 speaker/role/source 的 message 列表。
+QList<MemoryEvidence> groupByTurn(const QList<MemoryEvidence> &input,
+                                  const QHash<QString, double> &turnScore)
+{
+    if (input.isEmpty())
+        return {};
+    QHash<QString, QList<MemoryEvidence>> groups;
+    QStringList firstSeen;
+    for (const auto &item : input) {
+        const QString key = item.turnKey();
+        if (!groups.contains(key))
+            firstSeen.append(key);
+        groups[key].append(item);
+    }
+    std::stable_sort(firstSeen.begin(), firstSeen.end(), [&](const QString &a, const QString &b) {
+        if (turnScore.contains(a) || turnScore.contains(b)) {
+            const double sa = turnScore.value(a);
+            const double sb = turnScore.value(b);
+            if (sa != sb)
+                return sa > sb;
+        }
+        return false;
+    });
+    QList<MemoryEvidence> result;
+    for (const auto &key : firstSeen) {
+        auto items = groups.value(key);
+        std::stable_sort(items.begin(), items.end(), [](const MemoryEvidence &a,
+                                                         const MemoryEvidence &b) {
+            const int oa = roleOrder(a);
+            const int ob = roleOrder(b);
+            if (oa != ob)
+                return oa < ob;
+            return false;
+        });
+        result.append(items);
+    }
+    return result;
 }
 
 QStringList bm25Tokens(const QString &text)
@@ -228,8 +293,14 @@ QList<MemoryEvidence> HeuristicMemoryReranker::rerank(const QString &query,
     }
     QList<QPair<double, int>> scored;
     const QDateTime now = QDateTime::currentDateTime();
+    const QString exactQuery = query.trimmed();
     for (int i = 0; i < candidates.size(); ++i) {
         double score = 1.0 / (60.0 + i + 1.0);
+        if (!exactQuery.isEmpty()
+            && candidates.at(i).text.contains(exactQuery, Qt::CaseInsensitive)) {
+            // 原样命中优先，避免旧消息被近因/词项噪声挤掉。
+            score += 1.0;
+        }
         for (const auto &term : terms) {
             if (term.size() >= 2) {
                 if (candidates.at(i).text.contains(term, Qt::CaseInsensitive))
@@ -296,6 +367,8 @@ QList<MemoryEvidence> MemoryRetrievalService::retrieveIndexed(const RetrievalReq
             return false;
         if (!sourceAllowed(request, evidence))
             return false;
+        if (afterMaxTurn(request, evidence))
+            return false;
         if (request.excludeCurrent && evidence.channel == request.currentChannel
             && evidence.session == request.currentSession)
             return false;
@@ -337,6 +410,8 @@ QList<MemoryEvidence> MemoryRetrievalService::retrieveIndexed(const RetrievalReq
         if (evidence.handle.isEmpty() || evidence.text.trimmed().isEmpty())
             continue;
         if (!sourceAllowed(request, evidence))
+            continue;
+        if (afterMaxTurn(request, evidence))
             continue;
         if (request.excludeCurrent && evidence.channel == request.currentChannel
             && evidence.session == request.currentSession)
@@ -413,6 +488,8 @@ QList<MemoryEvidence> MemoryRetrievalService::retrieveIndexed(const RetrievalReq
                     value, request.viewerPersonId, request.viewerIsOwner);
                 if (evidence.handle.isEmpty())
                     continue;
+                if (afterMaxTurn(request, evidence))
+                    continue;
                 const double score = cosine(query, stored);
                 if (score < 0.0)
                     continue;
@@ -463,17 +540,55 @@ QList<MemoryEvidence> MemoryRetrievalService::retrieveIndexed(const RetrievalReq
     for (int index : finalOrder)
         ranked.append(candidates.at(index));
 
+    QHash<QString, double> turnScore;
+    QHash<QString, QList<MemoryEvidence>> turnItems;
+    QStringList turnOrder;
+    if (request.turnAggregation) {
+        for (const auto &item : ranked) {
+            const QString key = item.turnKey();
+            turnScore[key] = qMax(turnScore.value(key), rrf.value(item.handle));
+        }
+        ranked = groupByTurn(ranked, turnScore);
+        for (const auto &item : ranked) {
+            const QString key = item.turnKey();
+            if (!turnItems.contains(key))
+                turnOrder.append(key);
+            turnItems[key].append(item);
+        }
+    }
     const int rerankCap = qMax(1, request.candidateLimit);
     QList<MemoryEvidence> rerankInput;
     QSet<QByteArray> seenText;
-    for (const auto &item : ranked) {
-        const QByteArray key = normalizedEvidenceText(item);
-        if (key.isEmpty() || seenText.contains(key))
-            continue;
-        seenText.insert(key);
-        rerankInput.append(item);
-        if (rerankInput.size() >= rerankCap)
-            break;
+    if (request.turnAggregation) {
+        for (const auto &key : turnOrder) {
+            const auto items = turnItems.value(key);
+            if (items.isEmpty())
+                continue;
+            MemoryEvidence representative = items.first();
+            for (const auto &item : items) {
+                if (item.speakerRole == QStringLiteral("user")) {
+                    representative = item;
+                    break;
+                }
+            }
+            const QByteArray textKey = normalizedEvidenceText(representative);
+            if (textKey.isEmpty() || seenText.contains(textKey))
+                continue;
+            seenText.insert(textKey);
+            rerankInput.append(representative);
+            if (rerankInput.size() >= rerankCap)
+                break;
+        }
+    } else {
+        for (const auto &item : ranked) {
+            const QByteArray textKey = normalizedEvidenceText(item);
+            if (textKey.isEmpty() || seenText.contains(textKey))
+                continue;
+            seenText.insert(textKey);
+            rerankInput.append(item);
+            if (rerankInput.size() >= rerankCap)
+                break;
+        }
     }
     result->candidatesBeforeRerank = rerankInput;
     result->rerankerId = m_reranker ? m_reranker->id() : QString();
@@ -491,7 +606,22 @@ QList<MemoryEvidence> MemoryRetrievalService::retrieveIndexed(const RetrievalReq
             result->candidatesAfterRerank = ranked.mid(0, qMax(0, request.rerankLimit));
             return result->candidatesAfterRerank;
         }
-        result->candidatesAfterRerank = reranked.mid(0, qMax(0, request.rerankLimit));
+        QList<MemoryEvidence> expanded;
+        QSet<QString> expandedHandles;
+        if (request.turnAggregation) {
+            for (const auto &item : reranked) {
+                const auto group = turnItems.value(item.turnKey(), {item});
+                for (const auto &message : group) {
+                    if (expandedHandles.contains(message.handle))
+                        continue;
+                    expandedHandles.insert(message.handle);
+                    expanded.append(message);
+                }
+            }
+        } else {
+            expanded = reranked;
+        }
+        result->candidatesAfterRerank = expanded.mid(0, qMax(0, request.rerankLimit));
         return result->candidatesAfterRerank;
     }
     result->candidatesAfterRerank = ranked.mid(0, qMax(0, request.rerankLimit));
@@ -506,7 +636,7 @@ RetrievalResult MemoryRetrievalService::retrieve(const RetrievalRequest &request
     auto filterKinds = [&](QList<MemoryEvidence> evidence) {
         QList<MemoryEvidence> filtered;
         for (const auto &item : evidence) {
-            if (sourceAllowed(request, item))
+            if (sourceAllowed(request, item) && !afterMaxTurn(request, item))
                 filtered.append(item);
         }
         return filtered;

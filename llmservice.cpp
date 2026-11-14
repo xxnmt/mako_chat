@@ -170,6 +170,12 @@ void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> 
             config.getMemoryPolicyConfig().retrieval.legacyFallback;
         request.candidateLimit = config.getMemoryPolicyConfig().retrieval.candidateLimit;
         request.rerankLimit = config.getMemoryPolicyConfig().retrieval.rerankLimit;
+        request.maxTurn = m_benchmarkMaxTurn;
+        if (m_benchmarkChatOnly) {
+            request.sourceKinds = {QStringLiteral("chat")};
+            request.allowLegacyFallback = false;
+            request.includeAuxiliarySources = false;
+        }
         request.situation = m_run.situation;
 
         const auto retrievalConfig = config.getMemoryPolicyConfig().retrieval;
@@ -553,7 +559,7 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
 
     // 角色档案 / 情景记忆 / 摘要 / 关系：PromptAssembler 统一按渠道与可见性组装（C3）
     PromptAssembler::MemoryContext context;
-    if (m_memoryManager) {
+    if (m_memoryManager && !m_benchmarkChatOnly) {
         const QString profileSubject = m_run.meta.subject.isEmpty()
             ? QStringLiteral("user")
             : m_run.meta.subject;

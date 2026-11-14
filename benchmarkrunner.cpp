@@ -108,6 +108,10 @@ QJsonArray auditEvidence(const QList<MemoryEvidence> &items)
             {"handle", item.handle},
             {"source_ref", item.sourceRef},
             {"source_type", item.sourceType},
+            {"speaker_role", item.speakerRole},
+            {"derived", item.derived},
+            {"turn_id", item.turnKey()},
+            {"authority", item.toJson().value("authority").toString()},
             {"channel", item.channel},
             {"session", item.session},
             {"content_hash", QString::fromLatin1(hash)},
@@ -267,14 +271,19 @@ int runBenchmarkImport(const QStringList &args)
 int runBenchmarkRetrieve(const QStringList &args)
 {
     if (args.size() < 5) {
-        qCritical() << "usage: --bench-retrieve <db> <question.json> <out.json> [--rerank] [--candidate-limit N]";
+        qCritical() << "usage: --bench-retrieve <db> <question.json> <out.json> [--rerank] [--candidate-limit N] [--rerank-limit N]";
         return 2;
     }
     int candidateLimit = 200;
     const int limitIndex = args.indexOf(QStringLiteral("--candidate-limit"));
     if (limitIndex >= 0 && limitIndex + 1 < args.size())
         candidateLimit = qMax(1, args.at(limitIndex + 1).toInt());
+    int rerankLimit = 10;
+    const int rerankLimitIndex = args.indexOf(QStringLiteral("--rerank-limit"));
+    if (rerankLimitIndex >= 0 && rerankLimitIndex + 1 < args.size())
+        rerankLimit = qMax(1, args.at(rerankLimitIndex + 1).toInt());
     const bool withRerank = args.contains(QStringLiteral("--rerank"));
+    const bool turnAggregation = args.contains(QStringLiteral("--turn-aggregation"));
     MemoryManager memory(args.at(2));
     QFile qfile(args.at(3));
     if (!qfile.open(QIODevice::ReadOnly)) {
@@ -303,7 +312,8 @@ int runBenchmarkRetrieve(const QStringList &args)
     request.useIndex = true;
     request.allowLegacyFallback = true;
     request.candidateLimit = candidateLimit;
-    request.rerankLimit = withRerank ? 10 : 200;
+    request.rerankLimit = rerankLimit;
+    request.turnAggregation = turnAggregation;
 
     MemoryRetrievalService service(&memory);
     const auto retrieval = ConfigManager::instance().getMemoryPolicyConfig().retrieval;
@@ -338,6 +348,9 @@ int runBenchmarkRetrieve(const QStringList &args)
     }
     QJsonObject output = result.toJson();
     output.insert(QStringLiteral("terms"), QJsonArray::fromStringList(request.terms));
+    output.insert(QStringLiteral("before_rerank"), auditEvidence(result.candidatesBeforeRerank));
+    output.insert(QStringLiteral("after_rerank"), auditEvidence(result.candidatesAfterRerank));
+    output.insert(QStringLiteral("reranker"), result.rerankerId);
     out.write(QJsonDocument(output).toJson(QJsonDocument::Indented));
     out.close();
     return 0;
@@ -370,6 +383,12 @@ int runBenchmarkAsk(const QStringList &args)
     MemoryManager memory(dbPath);
     LLMService llm(ConfigManager::instance().getApiKey());
     llm.setMemoryManager(&memory);
+    llm.setBenchmarkChatOnly(args.contains(QStringLiteral("--strict-memory")));
+    int maxTurn = question.value(QStringLiteral("cutoff_turn")).toInt();
+    const int maxTurnIndex = args.indexOf(QStringLiteral("--max-turn"));
+    if (maxTurnIndex >= 0 && maxTurnIndex + 1 < args.size())
+        maxTurn = args.at(maxTurnIndex + 1).toInt();
+    llm.setBenchmarkMaxTurn(maxTurn);
 
     RequestMeta meta;
     meta.eventId = QStringLiteral("bench-question-%1").arg(id);
