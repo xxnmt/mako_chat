@@ -217,14 +217,27 @@ QList<MemoryEvidence> HeuristicMemoryReranker::rerank(const QString &query,
 {
     if (candidates.isEmpty() || limit <= 0)
         return {};
-    const QStringList terms = query.simplified().split(QLatin1Char(' '), Qt::SkipEmptyParts);
+    const QStringList rawTerms = bm25Tokens(query);
+    QStringList terms;
+    QSet<QString> seenTerms;
+    for (const auto &term : rawTerms) {
+        if (term.isEmpty() || seenTerms.contains(term))
+            continue;
+        seenTerms.insert(term);
+        terms.append(term);
+    }
     QList<QPair<double, int>> scored;
     const QDateTime now = QDateTime::currentDateTime();
     for (int i = 0; i < candidates.size(); ++i) {
         double score = 1.0 / (60.0 + i + 1.0);
         for (const auto &term : terms) {
-            if (term.size() >= 2 && candidates.at(i).text.contains(term, Qt::CaseInsensitive))
-                score += 0.08;
+            if (term.size() >= 2) {
+                if (candidates.at(i).text.contains(term, Qt::CaseInsensitive))
+                    score += 0.08;
+            } else if (candidates.at(i).text.contains(term, Qt::CaseInsensitive)) {
+                // 单字兜底：比 bigram 弱，但比完全没有词面信号强。
+                score += 0.02;
+            }
         }
         if (candidates.at(i).speechAt.isValid()) {
             const double days = qMax(0.0, candidates.at(i).speechAt.secsTo(now) / 86400.0);
