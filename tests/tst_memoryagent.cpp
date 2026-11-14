@@ -1479,7 +1479,8 @@ private slots:
                  QJsonObject{{QStringLiteral("id"), QStringLiteral("need-1")},
                              {QStringLiteral("query"), QStringLiteral("火锅")}},
                  QJsonObject{{QStringLiteral("id"), QStringLiteral("need-2")},
-                             {QStringLiteral("query"), QStringLiteral("完全不存在的词")}}}}};
+                             {QStringLiteral("query"), QStringLiteral("ZQZ_NOT_A_MEMORY_9X")},
+                             {QStringLiteral("kinds"), QJsonArray{QStringLiteral("chat_history")}}}}}};
         QString error;
         const QJsonObject payload = tool.execute(args, &error);
         QVERIFY2(error.isEmpty(), qPrintable(error));

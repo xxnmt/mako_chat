@@ -49,6 +49,72 @@ QList<int> rankOrder(const QVector<double> &scores)
     return order;
 }
 
+QStringList bm25Tokens(const QString &text)
+{
+    static const QSet<QString> stopWords = {
+        QStringLiteral("的"), QStringLiteral("了"), QStringLiteral("是"), QStringLiteral("在"),
+        QStringLiteral("和"), QStringLiteral("就"), QStringLiteral("都"), QStringLiteral("而"),
+        QStringLiteral("及"), QStringLiteral("与"), QStringLiteral("着"), QStringLiteral("过"),
+        QStringLiteral("也"), QStringLiteral("不"), QStringLiteral("有"), QStringLiteral("这"),
+        QStringLiteral("那"), QStringLiteral("我"), QStringLiteral("你"), QStringLiteral("他"),
+        QStringLiteral("她"), QStringLiteral("它"), QStringLiteral("们"), QStringLiteral("上"),
+        QStringLiteral("下"), QStringLiteral("里"), QStringLiteral("会"), QStringLiteral("要"),
+        QStringLiteral("把"), QStringLiteral("被"), QStringLiteral("让"), QStringLiteral("给"),
+        QStringLiteral("对"), QStringLiteral("从"), QStringLiteral("到"), QStringLiteral("为"),
+        QStringLiteral("以"), QStringLiteral("之"), QStringLiteral("其"), QStringLiteral("或"),
+        QStringLiteral("很"), QStringLiteral("太"), QStringLiteral("更"), QStringLiteral("最"),
+        QStringLiteral("又"), QStringLiteral("还"), QStringLiteral("再"), QStringLiteral("只"),
+        QStringLiteral("才"), QStringLiteral("能"), QStringLiteral("可"), QStringLiteral("没"),
+        QStringLiteral("想"), QStringLiteral("说"), QStringLiteral("做"), QStringLiteral("一"),
+        QStringLiteral("个"), QStringLiteral("什么"), QStringLiteral("怎么"), QStringLiteral("为什么")
+    };
+    QStringList output;
+    QString hanRun;
+    QString asciiRun;
+    auto flushHan = [&] {
+        if (hanRun.isEmpty())
+            return;
+        if (hanRun.size() == 1) {
+            if (!stopWords.contains(hanRun))
+                output.append(hanRun);
+        } else {
+            for (int i = 0; i < hanRun.size(); ++i) {
+                const QString single(hanRun.at(i));
+                if (!stopWords.contains(single))
+                    output.append(single);
+                if (i + 1 < hanRun.size()) {
+                    const QString bigram = hanRun.mid(i, 2);
+                    if (!stopWords.contains(bigram))
+                        output.append(bigram);
+                }
+            }
+        }
+        hanRun.clear();
+    };
+    auto flushAscii = [&] {
+        if (asciiRun.size() >= 2)
+            output.append(asciiRun.toLower());
+        asciiRun.clear();
+    };
+    for (const QChar ch : text) {
+        const ushort code = ch.unicode();
+        if (code >= 0x4E00 && code <= 0x9FFF) {
+            flushAscii();
+            hanRun.append(ch);
+        } else if ((code >= 'a' && code <= 'z') || (code >= 'A' && code <= 'Z')
+                   || (code >= '0' && code <= '9') || code == '_') {
+            flushHan();
+            asciiRun.append(ch);
+        } else {
+            flushHan();
+            flushAscii();
+        }
+    }
+    flushHan();
+    flushAscii();
+    return output;
+}
+
 QVector<double> lexicalScores(const QList<MemoryEvidence> &evidence,
                               const QStringList &terms)
 {
@@ -227,14 +293,90 @@ QList<MemoryEvidence> MemoryRetrievalService::retrieveIndexed(const RetrievalReq
         return true;
     };
 
-    const auto rows = m_manager->searchMemoryChunks(request.terms, request.candidateLimit,
-                                                    request.query);
+    const auto allRows = m_manager->memoryChunksForEmbedding(0);
     result->backend = QStringLiteral("index");
-    result->candidateCount = rows.size();
-    result->truncated = rows.size() >= qMax(1, request.candidateLimit * 4);
-    for (const auto &row : rows) {
-        addCandidate(MemoryEvidence::fromChunk(
-            row.toObject(), request.viewerPersonId, request.viewerIsOwner));
+    result->candidateCount = allRows.size();
+    result->truncated = false;
+
+    QStringList queryTokens = bm25Tokens(request.query);
+    if (queryTokens.isEmpty())
+        queryTokens = request.terms;
+    QSet<QString> queryTokenSet;
+    QStringList uniqueQueryTokens;
+    for (const auto &token : queryTokens) {
+        if (!token.isEmpty() && !queryTokenSet.contains(token)) {
+            queryTokenSet.insert(token);
+            uniqueQueryTokens.append(token);
+        }
+    }
+
+    struct Bm25Doc {
+        MemoryEvidence evidence;
+        int length = 1;
+        QHash<QString, int> tf;
+        double score = 0.0;
+    };
+    QList<Bm25Doc> docs;
+    QHash<QString, int> documentFrequency;
+    for (const auto &row : allRows) {
+        const auto evidence = MemoryEvidence::fromChunk(
+            row.toObject(), request.viewerPersonId, request.viewerIsOwner);
+        if (evidence.handle.isEmpty() || evidence.text.trimmed().isEmpty())
+            continue;
+        if (!sourceAllowed(request, evidence))
+            continue;
+        if (request.excludeCurrent && evidence.channel == request.currentChannel
+            && evidence.session == request.currentSession)
+            continue;
+        Bm25Doc doc;
+        doc.evidence = evidence;
+        doc.length = qMax(1, evidence.text.size());
+        if (!uniqueQueryTokens.isEmpty()) {
+            const auto tokens = bm25Tokens(evidence.text);
+            for (const auto &token : tokens)
+                doc.tf[token] += 1;
+            for (const auto &token : uniqueQueryTokens) {
+                if (doc.tf.value(token) > 0)
+                    documentFrequency[token] += 1;
+            }
+        }
+        docs.append(doc);
+    }
+
+    double averageLength = 1.0;
+    if (!docs.isEmpty()) {
+        double totalLength = 0.0;
+        for (const auto &doc : docs)
+            totalLength += doc.length;
+        averageLength = totalLength / docs.size();
+    }
+    const double k1 = 1.2;
+    const double b = 0.75;
+    for (auto &doc : docs) {
+        const double lengthNorm = 1.0 - b + b * (doc.length / averageLength);
+        double score = 0.0;
+        for (const auto &token : uniqueQueryTokens) {
+            const int tf = doc.tf.value(token);
+            if (tf <= 0)
+                continue;
+            const int df = documentFrequency.value(token);
+            const double idf = qLn(1.0 + (docs.size() - df + 0.5) / (df + 0.5));
+            score += idf * (tf * (k1 + 1.0)) / (tf + k1 * lengthNorm);
+        }
+        doc.score = score;
+        if (score > 0.0)
+            ++result->lexicalCount;
+    }
+    std::stable_sort(docs.begin(), docs.end(), [](const Bm25Doc &a, const Bm25Doc &b) {
+        if (a.score != b.score)
+            return a.score > b.score;
+        return a.evidence.handle < b.evidence.handle;
+    });
+    QHash<QString, double> lexicalScore;
+    const int lexicalCap = qMax(1, request.candidateLimit);
+    for (int i = 0; i < docs.size() && i < lexicalCap; ++i) {
+        if (addCandidate(docs.at(i).evidence))
+            lexicalScore.insert(docs.at(i).evidence.handle, docs.at(i).score);
     }
 
     QHash<QString, double> vectorScore;
@@ -247,8 +389,6 @@ QList<MemoryEvidence> MemoryRetrievalService::retrieveIndexed(const RetrievalReq
         } else {
             vectorUsed = true;
             // 独立的向量召回：不以 LIKE 命中为前提，扫描当前活跃 chunk 的向量。
-            const auto allRows = m_manager->memoryChunksForEmbedding(0);
-            result->candidateCount += allRows.size();
             for (const auto &row : allRows) {
                 const auto value = row.toObject();
                 const auto id = value.value(QStringLiteral("id")).toInteger();
@@ -268,14 +408,6 @@ QList<MemoryEvidence> MemoryRetrievalService::retrieveIndexed(const RetrievalReq
                 addCandidate(evidence);
             }
         }
-    }
-
-    const auto lexical = lexicalScores(candidates, request.terms);
-    QHash<QString, double> lexicalScore;
-    for (int i = 0; i < candidates.size(); ++i) {
-        lexicalScore.insert(candidates.at(i).handle, lexical.at(i));
-        if (lexical.at(i) > 0.0)
-            ++result->lexicalCount;
     }
 
     QList<QString> lexicalHandles = lexicalScore.keys();
