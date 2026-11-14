@@ -55,7 +55,7 @@ QString rawEventColumns()
 
 MemoryManager::MemoryManager(const QString &dbFilePath,QObject *parent,
                              const QString &connectionName)
-    : QObject{parent}
+    : QObject{parent}, m_databasePath(dbFilePath)
 {
     initDatabase(dbFilePath, connectionName);
 }

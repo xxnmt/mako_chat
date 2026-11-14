@@ -8,6 +8,7 @@
 #include <QTcpServer>
 #include <QTcpSocket>
 #include "llmservice.h"
+#include "configmanager.h"
 #include "cognitivecoordinator.h"
 #include "memorydashscope.h"
 
@@ -1372,6 +1373,19 @@ private slots:
         QCOMPARE(documents.size(), 2);
         QCOMPARE(documents.at(0).toString(), QStringLiteral("第一"));
         QCOMPARE(documents.at(1).toString(), QStringLiteral("第二"));
+    }
+
+    void retrievalDatabasePathPrefersCurrentManager()
+    {
+        QTemporaryDir dir;
+        MemoryManager configured(dir.filePath("configured.db"));
+        MemoryManager current(dir.filePath("current.db"));
+        LLMService model(QStringLiteral("test"));
+        QCOMPARE(model.retrievalDatabasePath(),
+                 ConfigManager::instance().getMemoryPath());
+        model.setMemoryManager(&current);
+        QCOMPARE(model.retrievalDatabasePath(), current.databasePath());
+        QVERIFY(model.retrievalDatabasePath() != configured.databasePath());
     }
 
     void retrievalWorkerUsesOwnConnection()

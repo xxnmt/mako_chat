@@ -626,13 +626,7 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
         request.candidateLimit = retrievalConfig.candidateLimit;
         request.rerankLimit = retrievalConfig.rerankLimit;
         MemoryRetrievalService service(m_memoryManager);
-        if (retrievalConfig.embeddingEnabled
-            && retrievalConfig.embeddingProvider == QStringLiteral("local_hash_test")) {
-            const int dimension = retrievalConfig.embeddingDimension > 0
-                ? retrievalConfig.embeddingDimension : 64;
-            service.setEmbeddingProvider(
-                std::make_shared<LocalHashEmbeddingProvider>(dimension));
-        }
+        configureRetrievalService(service, retrievalConfig);
         const auto unified = service.retrieve(request);
         for (const auto &evidence : unified.evidence) {
             if (resultItems.size() >= limit)
@@ -697,13 +691,7 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
         request.candidateLimit = retrievalConfig.candidateLimit;
         request.rerankLimit = retrievalConfig.rerankLimit;
         MemoryRetrievalService service(m_memoryManager);
-        if (retrievalConfig.embeddingEnabled
-            && retrievalConfig.embeddingProvider == QStringLiteral("local_hash_test")) {
-            const int dimension = retrievalConfig.embeddingDimension > 0
-                ? retrievalConfig.embeddingDimension : 64;
-            service.setEmbeddingProvider(
-                std::make_shared<LocalHashEmbeddingProvider>(dimension));
-        }
+        configureRetrievalService(service, retrievalConfig);
         QHash<qlonglong, MemoryClaim> claims;
         for (const auto &claim : m_memoryManager->getActiveClaims(200))
             claims.insert(claim.id, claim);
@@ -775,13 +763,7 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
         request.candidateLimit = retrievalConfig.candidateLimit;
         request.rerankLimit = retrievalConfig.rerankLimit;
         MemoryRetrievalService service(m_memoryManager);
-        if (retrievalConfig.embeddingEnabled
-            && retrievalConfig.embeddingProvider == QStringLiteral("local_hash_test")) {
-            const int dimension = retrievalConfig.embeddingDimension > 0
-                ? retrievalConfig.embeddingDimension : 64;
-            service.setEmbeddingProvider(
-                std::make_shared<LocalHashEmbeddingProvider>(dimension));
-        }
+        configureRetrievalService(service, retrievalConfig);
         const auto unified = service.retrieve(request);
         for (const auto &evidence : unified.evidence) {
             if (resultItems.size() >= limit)
@@ -865,13 +847,7 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
         request.candidateLimit = retrievalConfig.candidateLimit;
         request.rerankLimit = retrievalConfig.rerankLimit;
         MemoryRetrievalService service(m_memoryManager);
-        if (retrievalConfig.embeddingEnabled
-            && retrievalConfig.embeddingProvider == QStringLiteral("local_hash_test")) {
-            const int dimension = retrievalConfig.embeddingDimension > 0
-                ? retrievalConfig.embeddingDimension : 64;
-            service.setEmbeddingProvider(
-                std::make_shared<LocalHashEmbeddingProvider>(dimension));
-        }
+        configureRetrievalService(service, retrievalConfig);
         const auto unified = service.retrieve(request);
         for (const auto &evidence : unified.evidence) {
             if (resultItems.size() >= limit)

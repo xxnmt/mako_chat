@@ -24,6 +24,8 @@ int main(int argc, char *argv[]) {
         return runBenchmarkImport(a.arguments());
     if (a.arguments().contains(QStringLiteral("--bench-ask")))
         return runBenchmarkAsk(a.arguments());
+    if (a.arguments().contains(QStringLiteral("--bench-retrieve")))
+        return runBenchmarkRetrieve(a.arguments());
     if (a.arguments().contains(QStringLiteral("--memory-index-status"))) {
         MemoryManager memory(ConfigManager::instance().getMemoryPath());
         qInfo().noquote() << QJsonDocument(memory.searchIndexStatus())

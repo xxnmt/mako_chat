@@ -35,6 +35,8 @@ public:
                      const RequestMeta &meta = RequestMeta());
     void registerStateProvider(std::function<QString()> provider);
     void setMemoryManager(MemoryManager *manager);
+    QString retrievalDatabasePath() const;
+    QJsonArray lastRequestMessages() const { return m_lastRequestMessages; }
     void reviewDueThought();
     void processObservation();
     //Extract

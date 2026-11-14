@@ -67,6 +67,7 @@ class MemoryManager : public QObject
 public:
     explicit MemoryManager(const QString &dbFilePath,QObject *parent = nullptr,
                            const QString &connectionName = QString());    ~MemoryManager();
+    QString databasePath() const { return m_databasePath; }
     bool saveQATurn(const QString &userInput,
                           const QString &rawReply,
                           const QList<SentenceText> &sentences,
@@ -305,6 +306,7 @@ private:
                       const QString &role,
                       const QString &canonicalName);
     QSqlDatabase m_db;
+    QString m_databasePath;
     QSet<QString> m_masterUserIds;
 };
 

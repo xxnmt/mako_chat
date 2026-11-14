@@ -187,7 +187,8 @@ void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> 
                 ? retrievalConfig.rerankEndpoint : QString();
             const QString rerankKey = retrievalConfig.rerankEnabled ? asyncKey : QString();
             auto *worker = new MemoryRetrievalWorker(
-                config.getMemoryPath(), request,
+                retrievalDatabasePath(),
+                request,
                 retrievalConfig.embeddingEndpoint, asyncKey,
                 retrievalConfig.embeddingModel, retrievalConfig.embeddingDimension,
                 rerankEndpoint, rerankKey,
@@ -350,8 +351,9 @@ void LLMService::considerEvidence(const QJsonArray &background, const QJsonArray
     request.setHeader(QNetworkRequest::ContentTypeHeader,"application/json");
     request.setRawHeader("Authorization",("Bearer "+m_apiKey).toUtf8());
     QJsonObject body{{"model","deepseek-v4-flash"},{"messages",messages},{"reasoning_effort","low"},
+                     {"thinking",QJsonObject{{"type","disabled"}}},
                      {"response_format",QJsonObject{{"type","json_object"}}},
-                     {"max_tokens",m_run.projectionError=="truncated" ? 3072 : 1536}};
+                     {"max_tokens",m_run.projectionError=="truncated" ? 3072 : 2048}};
     auto *reply = m_extractManager->post(request,QJsonDocument(body).toJson(QJsonDocument::Compact));
     connect(reply,&QNetworkReply::finished,this,[this,reply,background,personal,matters,chain,generation=m_agentGeneration] {
         reply->deleteLater();
@@ -441,7 +443,9 @@ void LLMService::considerEvidence(const QJsonArray &background, const QJsonArray
         }
         const auto binding = plan["reference_status"].toString();
         const QString action = binding=="matched" ? "answer" : "answer_and_confirm";
-        QString rejection = decision=="respond" ? QStringLiteral("invalid_projection_contract") : QString{};
+        QString rejection;
+        if (requestsProjection)
+            rejection = QStringLiteral("invalid_projection_contract");
         if (requestsProjection && valid && (binding=="matched" || binding=="plausible") &&
             (plan["certainty"]=="reported" || plan["certainty"]=="inferred")) {
             for (const auto &ref : refs) {
@@ -1422,9 +1426,15 @@ void LLMService::proposeObservation(const QJsonObject &job, const QJsonArray &hi
     });
 }
 
-void LLMService::setMemoryManager(MemoryManager *manager)
+QString LLMService::retrievalDatabasePath() const
 {
-    if (m_memoryManager) disconnect(m_memoryManager, &MemoryManager::understandingChanged, this, nullptr);
+    return m_memoryManager
+        ? m_memoryManager->databasePath()
+        : ConfigManager::instance().getMemoryPath();
+}
+
+void LLMService::setMemoryManager(MemoryManager *manager)
+{    if (m_memoryManager) disconnect(m_memoryManager, &MemoryManager::understandingChanged, this, nullptr);
     m_memoryManager=manager;
     if (manager) connect(manager, &MemoryManager::understandingChanged, this, [this] {
         if (m_consultationReply) refreshConsultation();

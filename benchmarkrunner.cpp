@@ -4,6 +4,8 @@
 #include "llmservice.h"
 #include "memorymanager.h"
 #include "memorydashscope.h"
+#include "memoryretrieval.h"
+#include "recentcontext.h"
 
 #include <QDateTime>
 #include <QEventLoop>
@@ -242,6 +244,85 @@ int runBenchmarkImport(const QStringList &args)
     return 0;
 }
 
+int runBenchmarkRetrieve(const QStringList &args)
+{
+    if (args.size() < 5) {
+        qCritical() << "usage: --bench-retrieve <db> <question.json> <out.json> [--rerank] [--candidate-limit N]";
+        return 2;
+    }
+    int candidateLimit = 200;
+    const int limitIndex = args.indexOf(QStringLiteral("--candidate-limit"));
+    if (limitIndex >= 0 && limitIndex + 1 < args.size())
+        candidateLimit = qMax(1, args.at(limitIndex + 1).toInt());
+    const bool withRerank = args.contains(QStringLiteral("--rerank"));
+    MemoryManager memory(args.at(2));
+    QFile qfile(args.at(3));
+    if (!qfile.open(QIODevice::ReadOnly)) {
+        qCritical() << "[Bench] cannot open question";
+        return 2;
+    }
+    const auto question = QJsonDocument::fromJson(qfile.readAll()).object();
+    qfile.close();
+    const QString text = question.value(QStringLiteral("question")).toString();
+    if (text.isEmpty())
+        return 2;
+
+    RetrievalRequest request;
+    request.query = text;
+    request.purpose = QStringLiteral("bench.retrieve");
+    request.subject = QStringLiteral("user");
+    request.accounts = ConfigManager::instance().getMasterQQAccounts();
+    request.viewerPersonId = QStringLiteral("owner");
+    request.viewerIsOwner = true;
+    request.terms = RecentContextPlanner::extractTerms(text.left(100));
+    request.includeOthers = true;
+    request.currentChannel = Channel::kQQPrivate;
+    request.currentSession = QStringLiteral("bench");
+    request.excludeCurrent = false;
+    request.limit = 100;
+    request.useIndex = true;
+    request.allowLegacyFallback = true;
+    request.candidateLimit = candidateLimit;
+    request.rerankLimit = withRerank ? 10 : 200;
+
+    MemoryRetrievalService service(&memory);
+    const auto retrieval = ConfigManager::instance().getMemoryPolicyConfig().retrieval;
+    if (retrieval.embeddingProvider == QStringLiteral("dashscope")) {
+        const QString key = !retrieval.embeddingApiKey.isEmpty()
+            ? retrieval.embeddingApiKey
+            : qEnvironmentVariable(retrieval.embeddingApiKeyEnv.toUtf8().constData());
+        if (!key.isEmpty() && !retrieval.embeddingEndpoint.isEmpty()) {
+            service.setEmbeddingProvider(std::make_shared<DashScopeEmbeddingProvider>(
+                QUrl(retrieval.embeddingEndpoint), key,
+                retrieval.embeddingModel.isEmpty()
+                    ? QStringLiteral("text-embedding-v4") : retrieval.embeddingModel,
+                retrieval.embeddingDimension > 0 ? retrieval.embeddingDimension : 1024));
+        }
+    }
+    if (withRerank) {
+        const QString key = !retrieval.embeddingApiKey.isEmpty()
+            ? retrieval.embeddingApiKey
+            : qEnvironmentVariable(retrieval.embeddingApiKeyEnv.toUtf8().constData());
+        if (!key.isEmpty() && !retrieval.rerankEndpoint.isEmpty()) {
+            service.setReranker(std::make_shared<DashScopeReranker>(
+                QUrl(retrieval.rerankEndpoint), key,
+                retrieval.rerankModel.isEmpty()
+                    ? QStringLiteral("qwen3-rerank") : retrieval.rerankModel));
+        }
+    }
+    const auto result = service.retrieve(request);
+    QFile out(args.at(4));
+    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        qCritical() << "[Bench] cannot write output";
+        return 2;
+    }
+    QJsonObject output = result.toJson();
+    output.insert(QStringLiteral("terms"), QJsonArray::fromStringList(request.terms));
+    out.write(QJsonDocument(output).toJson(QJsonDocument::Indented));
+    out.close();
+    return 0;
+}
+
 int runBenchmarkAsk(const QStringList &args)
 {
     if (args.size() < 5) {
@@ -325,6 +406,7 @@ int runBenchmarkAsk(const QStringList &args)
     output.insert(QStringLiteral("answer"), answer);
     output.insert(QStringLiteral("error"), error);
     output.insert(QStringLiteral("timed_out"), timedOut);
+    output.insert(QStringLiteral("last_request"), llm.lastRequestMessages());
     QFile out(outputPath);
     if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
         qCritical() << "[Bench] cannot write output";
@@ -334,3 +416,4 @@ int runBenchmarkAsk(const QStringList &args)
     out.close();
     return answer.isEmpty() ? 3 : 0;
 }
+
