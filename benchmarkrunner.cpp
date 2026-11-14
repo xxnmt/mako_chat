@@ -13,6 +13,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QCryptographicHash>
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QTimer>
@@ -95,11 +96,30 @@ RequestMeta turnMeta(const BenchTurn &turn, int index)
     return meta;
 }
 
+QJsonArray auditEvidence(const QList<MemoryEvidence> &items)
+{
+    QJsonArray result;
+    for (int i = 0; i < items.size(); ++i) {
+        const auto &item = items.at(i);
+        const auto hash = QCryptographicHash::hash(
+            item.text.toUtf8(), QCryptographicHash::Sha256).toHex();
+        result.append(QJsonObject{
+            {"rank", i + 1},
+            {"handle", item.handle},
+            {"source_ref", item.sourceRef},
+            {"source_type", item.sourceType},
+            {"channel", item.channel},
+            {"session", item.session},
+            {"content_hash", QString::fromLatin1(hash)},
+            {"text_length", item.text.size()}});
+    }
+    return result;
+}
+
 void saveExtraction(MemoryManager &memory, const QJsonObject &extraction,
                     qlonglong lastEndId, const QString &sourceIdsJson,
                     const RequestMeta &meta)
-{
-    const auto updates = extraction.value(QStringLiteral("character_updates")).toArray();
+{    const auto updates = extraction.value(QStringLiteral("character_updates")).toArray();
     for (const auto &value : updates) {
         const auto object = value.toObject();
         const QString subject = object.value(QStringLiteral("subject")).toString(meta.subject);
@@ -406,6 +426,12 @@ int runBenchmarkAsk(const QStringList &args)
     output.insert(QStringLiteral("answer"), answer);
     output.insert(QStringLiteral("error"), error);
     output.insert(QStringLiteral("timed_out"), timedOut);
+    const auto retrieval = llm.lastRetrievalResult();
+    output.insert(QStringLiteral("retrieval"), retrieval.toJson());
+    output.insert(QStringLiteral("before_rerank"), auditEvidence(retrieval.candidatesBeforeRerank));
+    output.insert(QStringLiteral("after_rerank"), auditEvidence(retrieval.candidatesAfterRerank));
+    output.insert(QStringLiteral("reranker"), retrieval.rerankerId);
+    output.insert(QStringLiteral("usage"), llm.lastResponseUsage());
     output.insert(QStringLiteral("last_request"), llm.lastRequestMessages());
     QFile out(outputPath);
     if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {

@@ -107,6 +107,9 @@ struct RetrievalResult
     int auxiliaryCount = 0;
     qint64 latencyMs = 0;
     bool truncated = false;
+    QString rerankerId;
+    QList<MemoryEvidence> candidatesBeforeRerank;
+    QList<MemoryEvidence> candidatesAfterRerank;
     QJsonObject toJson() const;
 };
 

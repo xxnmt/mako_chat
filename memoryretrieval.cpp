@@ -462,6 +462,8 @@ QList<MemoryEvidence> MemoryRetrievalService::retrieveIndexed(const RetrievalReq
         if (rerankInput.size() >= rerankCap)
             break;
     }
+    result->candidatesBeforeRerank = rerankInput;
+    result->rerankerId = m_reranker ? m_reranker->id() : QString();
 
     if (m_reranker) {
         QString rerankError;
@@ -473,11 +475,14 @@ QList<MemoryEvidence> MemoryRetrievalService::retrieveIndexed(const RetrievalReq
                 ? QStringLiteral("rerank returned no usable results")
                 : rerankError;
             // 重排是增强项，失败时保留重排前可用的候选。
-            return ranked.mid(0, qMax(0, request.rerankLimit));
+            result->candidatesAfterRerank = ranked.mid(0, qMax(0, request.rerankLimit));
+            return result->candidatesAfterRerank;
         }
-        return reranked.mid(0, qMax(0, request.rerankLimit));
+        result->candidatesAfterRerank = reranked.mid(0, qMax(0, request.rerankLimit));
+        return result->candidatesAfterRerank;
     }
-    return ranked.mid(0, qMax(0, request.rerankLimit));
+    result->candidatesAfterRerank = ranked.mid(0, qMax(0, request.rerankLimit));
+    return result->candidatesAfterRerank;
 }
 
 RetrievalResult MemoryRetrievalService::retrieve(const RetrievalRequest &request) const

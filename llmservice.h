@@ -37,6 +37,8 @@ public:
     void setMemoryManager(MemoryManager *manager);
     QString retrievalDatabasePath() const;
     QJsonArray lastRequestMessages() const { return m_lastRequestMessages; }
+    RetrievalResult lastRetrievalResult() const { return m_lastRetrievalResult; }
+    QJsonObject lastResponseUsage() const { return m_lastResponseUsage; }
     void reviewDueThought();
     void processObservation();
     //Extract
@@ -171,6 +173,8 @@ private:
         QString projectionError;
     } m_run;
     QJsonArray m_lastRequestMessages;
+    RetrievalResult m_lastRetrievalResult;
+    QJsonObject m_lastResponseUsage;
     QJsonArray m_pendingMessages; // legacy：等待 MemoryAgent 的主请求
     quint64 m_agentGeneration = 0;
     bool m_agentPending = false;
