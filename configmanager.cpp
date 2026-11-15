@@ -152,7 +152,7 @@ bool ConfigManager::loadSetting()
         m_memoryPolicy.retrieval.autoBackfill =
             retrievalObj.value("auto_backfill").toBool(false);
         m_memoryPolicy.retrieval.legacyFallback =
-            retrievalObj.value("legacy_fallback").toBool(false);
+            retrievalObj.value("legacy_fallback").toBool(true);
         m_memoryPolicy.retrieval.candidateLimit =
             qBound(10, retrievalObj.value("candidate_limit").toInt(40), 200);
         m_memoryPolicy.retrieval.rerankLimit =

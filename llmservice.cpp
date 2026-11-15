@@ -496,11 +496,14 @@ void LLMService::considerEvidence(const QJsonArray &background, const QJsonArray
                 considerEvidence(background,personal,matters,chain);
                 return;
             }
+            // 单条投影失败不应阻断整轮：清理该投影，保留已获准的背景，
+            // 让表达模型基于 background/personal 自然回答或澄清。
+            m_run.projectionError = rejection;
+            guidance = QStringLiteral("相关投影证据未通过校验；不要把它当作确定事实，"
+                                      "只依据已获准的背景自然回答；依据不足时直接澄清。");
             if (m_run.meta.persistTurn && !m_run.meta.sensitive && m_memoryManager)
                 m_memoryManager->recordCognitiveAudit("expression_failure",m_run.meta.runId,0,
-                    {{"reason",rejection},{"retry",false}});
-            emit replyAbnormal("expression_"+rejection);
-            return;
+                    {{"reason",rejection},{"retry",false},{"fallback","background"}});
         }
         if (decision=="private_only") guidance = QStringLiteral("交谈决定：把这个话题留到私下。自然、简短地提议私下聊；无需解释原因、复述事实或询问细节。");
         else if (decision=="clarify") guidance = QStringLiteral("当前情况不确定，如确有需要，只就眼前话题自然询问。");

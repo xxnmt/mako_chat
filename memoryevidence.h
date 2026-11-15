@@ -85,7 +85,7 @@ struct RetrievalRequest
     bool includeUnmatched = false;
     bool includeAllEpisodic = false;
     bool requireTermMatch = false;
-    bool allowLegacyFallback = false;
+    bool allowLegacyFallback = true;
     bool includeAuxiliarySources = true;
     QStringList sourceKinds;
     QStringList allowedSources; // "channel|session" 或 "channel|*"
