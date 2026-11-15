@@ -9,6 +9,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QDir>
+#include <QScopeGuard>
 
 #include "configmanager.h"
 #include "memorymanager.h"
@@ -1846,6 +1847,12 @@ private slots:
         redacted.sensitive = true;
         redacted.redactionStatus = QStringLiteral("redacted");
         QVERIFY(mm.appendRawEvent(redacted));
+        auto ordinary = redacted;
+        ordinary.messageId = "rc-ordinary";
+        ordinary.content = "@770951546 ordinary message";
+        ordinary.sensitive = false;
+        ordinary.redactionStatus = "none";
+        QVERIFY(mm.appendRawEvent(ordinary));
 
         QVERIFY(mm.appendPrivacyBlockedEvent(
             QStringLiteral("qq"), Channel::kQQGroup, QStringLiteral("30010"),
@@ -1873,7 +1880,7 @@ private slots:
 
         QCOMPARE(bundle.items.size(), 1);
         QVERIFY(bundle.items.first().isViewer);
-        QVERIFY(bundle.items.first().sanitizedText.contains(QStringLiteral("[REDACTED]")));
+        QVERIFY(bundle.items.first().sanitizedText.contains("ordinary message"));
         QVERIFY(!bundle.items.first().sanitizedText.contains(QStringLiteral("770951546")));
         QCOMPARE(mm.countUnprocessedGroupEvents(QStringLiteral("30010")),
                  beforeUnprocessed);
@@ -1881,6 +1888,84 @@ private slots:
                                            QStringLiteral("30010")),
                  beforeCursor);
         QCOMPARE(mm.getPendingInteractionIds(10), beforePending);
+    }
+
+    void recentContextSharesKnowledgeBoundaryBeforeBudget()
+    {
+        auto &config = ConfigManager::instance();
+        const auto directory = config.getConfigDirPath();
+        const auto settingPath = QDir(directory).filePath("setting.json");
+        const auto identityPath = QDir(directory).filePath("identity.json");
+        auto read = [](const QString &path) {
+            QFile file(path);
+            file.open(QIODevice::ReadOnly);
+            return file.readAll();
+        };
+        const bool hadSetting = QFile::exists(settingPath), hadIdentity = QFile::exists(identityPath);
+        const auto settings = read(settingPath), identity = read(identityPath);
+        auto write = [](const QString &path, const QByteArray &data) {
+            QFile file(path);
+            return file.open(QIODevice::WriteOnly | QIODevice::Truncate)
+                && file.write(data) == data.size();
+        };
+        const auto restore = qScopeGuard([&] {
+            if (hadSetting) write(settingPath, settings); else QFile::remove(settingPath);
+            if (hadIdentity) write(identityPath, identity); else QFile::remove(identityPath);
+            config.loadSetting();
+            config.reloadIdentity();
+        });
+        QVERIFY(write(settingPath, R"({"memory":{"privacy_rules":[{"id":"test","type":"keyword","value":"restricted","action":"block"}]}})"));
+        QVERIFY(write(identityPath, R"({"memory":{"blind_zones":[{"channel":"qq_group","session_id":"hidden"}]}})"));
+        QVERIFY(config.loadSetting());
+        config.reloadIdentity();
+        QTemporaryDir dir;
+        MemoryManager db(dir.filePath("boundary.db"));
+        const auto now = QDateTime::currentDateTime();
+        RawEventWrite event;
+        event.platform = "qq";
+        event.channel = Channel::kQQGroup;
+        event.sessionId = "visible";
+        event.senderId = "20002";
+        event.eventType = "message";
+        event.content = "eligible message";
+        event.occurredAt = now.addSecs(-120);
+        QVERIFY(db.appendRawEvent(event));
+        for (const auto &variant : {"sensitive", "redacted", "out", "restricted", "hidden", "future", "other"}) {
+            auto excluded = event;
+            excluded.occurredAt = now.addSecs(-60);
+            excluded.content = variant;
+            if (excluded.content == "sensitive") excluded.sensitive = true;
+            if (excluded.content == "redacted") excluded.redactionStatus = "redacted";
+            if (excluded.content == "out") excluded.direction = "out";
+            if (excluded.content == "hidden") excluded.sessionId = "hidden";
+            if (excluded.content == "future") excluded.occurredAt = now.addSecs(60);
+            if (excluded.content == "other") excluded.senderId = "30003";
+            QVERIFY(db.appendRawEvent(excluded));
+        }
+        RecentContextQuery query;
+        query.allowedGroupIds = {"visible", "hidden"};
+        query.viewerPersonId = "qq:20002";
+        query.onlyViewer = true;
+        query.since = now.addSecs(-3600);
+        query.until = now;
+        query.maxGroups = 1;
+        query.perGroupCandidateLimit = 1;
+        query.mode = RecentContextMode::RecentOverview;
+        const auto result = db.searchRecentGroupContext(query);
+        QCOMPARE(result.items.size(), 1);
+        QCOMPARE(result.items.first().sanitizedText, QString("eligible message"));
+        RetrievalRequest request;
+        request.query = "restricted";
+        request.sourceKinds = {"raw"};
+        request.excludeCurrent = false;
+        const auto indexed = MemoryRetrievalService(&db).retrieve(request);
+        for (const auto &item : indexed.evidence) {
+            QVERIFY(item.text != "restricted");
+            QVERIFY(item.session != "hidden");
+            QVERIFY(item.text != "out");
+            QVERIFY(item.text != "sensitive");
+            QVERIFY(item.text != "redacted");
+        }
     }
 
     void recentContextDoesNotCrossGroups()

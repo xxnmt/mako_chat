@@ -1,6 +1,7 @@
 #include "memorymanager.h"
 #include "debuglog.h"
 #include "configmanager.h"
+#include "memoryreadpolicy.h"
 
 #include <QStandardPaths>
 #include <QDir>
@@ -503,8 +504,7 @@ bool MemoryManager::rebuildSearchIndex(QString *error)
     QSqlQuery raw(m_db);
     if (!raw.exec(QStringLiteral(
             "SELECT rowid,channel,session_id,sender_id,sender_name,person_id,content,occurred_at "
-            "FROM raw_events WHERE direction='in' AND event_type='message' AND sensitive=0 "
-            "AND redaction_status='none' AND content IS NOT NULL AND content<>''"))) {
+            "FROM raw_events WHERE ") + MemoryReadPolicy::rawMessagePredicate())) {
         return fail(raw.lastError().text());
     }
     while (raw.next()) {
@@ -1263,66 +1263,6 @@ QList<HistoryTurn> MemoryManager::getHistoryTurn(int N, const QString &channel, 
     }
     qDebug()<<"[MemoryManager]获取历史记录成功";
     return historyTurnList;
-}
-
-QList<HistoryTurn> MemoryManager::searchHistoryTurns(const QString &channel, const QString &sessionId,
-                                                   const QStringList &terms, int limit,
-                                                   const QDateTime &from, const QDateTime &to)
-{
-    QList<HistoryTurn> result;
-    if (!m_db.open() || limit <= 0)
-        return result;
-    QString sql = QStringLiteral(
-        "SELECT id,user_input,raw_reply,timestamp,turn_kind,subject,speaker "
-        "FROM chat_history WHERE channel=? AND session_id=? AND sensitive=0");
-    QStringList safeTerms;
-    for (const auto &term : terms) {
-        const auto trimmed = term.trimmed();
-        if (trimmed.isEmpty() || safeTerms.contains(trimmed))
-            continue;
-        safeTerms.append(trimmed);
-        if (safeTerms.size() >= 8)
-            break;
-    }
-    if (!safeTerms.isEmpty()) {
-        QStringList clauses;
-        for (int i = 0; i < safeTerms.size(); ++i)
-            clauses.append(QStringLiteral("(user_input LIKE ? OR raw_reply LIKE ?)"));
-        sql += QStringLiteral(" AND (") + clauses.join(QStringLiteral(" OR ")) + QStringLiteral(")");
-    }
-    if (from.isValid())
-        sql += QStringLiteral(" AND timestamp>=?");
-    if (to.isValid())
-        sql += QStringLiteral(" AND timestamp<?");
-    sql += QStringLiteral(" ORDER BY id DESC LIMIT ?");
-    QSqlQuery q(m_db);
-    q.prepare(sql);
-    q.addBindValue(channel);
-    q.addBindValue(sessionId);
-    for (const auto &term : safeTerms) {
-        const auto pattern = QStringLiteral("%") + term + QStringLiteral("%");
-        q.addBindValue(pattern);
-        q.addBindValue(pattern);
-    }
-    if (from.isValid())
-        q.addBindValue(from);
-    if (to.isValid())
-        q.addBindValue(to);
-    q.addBindValue(qMax(1, limit));
-    if (!q.exec())
-        return result;
-    while (q.next()) {
-        HistoryTurn turn;
-        turn.id = q.value(0).toLongLong();
-        turn.userInput = q.value(1).toString();
-        turn.rawReply = q.value(2).toString();
-        turn.timestamp = q.value(3).toDateTime();
-        turn.turnKind = q.value(4).toString();
-        turn.subject = q.value(5).toString();
-        turn.speaker = q.value(6).toString();
-        result.prepend(turn);
-    }
-    return result;
 }
 
 QList<HistoryTurn> MemoryManager::getHistoryTurn(int offset, int limit){
@@ -2909,7 +2849,7 @@ bool MemoryManager::resetInteractionSummaryForRetry(qlonglong interactionId)
 
 QStringList MemoryManager::getRecentGroupIds(const QStringList &allowedGroupIds,
                                              int maxGroups,
-                                             const QDateTime &since)
+                                             const QDateTime &since, const QDateTime &until)
 {
     QStringList groups;
     if (allowedGroupIds.isEmpty() || (!m_db.isOpen() && !m_db.open())) {
@@ -2923,14 +2863,14 @@ QStringList MemoryManager::getRecentGroupIds(const QStringList &allowedGroupIds,
 
     QString sql = QStringLiteral(
         "SELECT session_id, MAX(occurred_at) AS latest FROM raw_events "
-        "WHERE channel='qq_group' AND event_type='message' "
-        "AND content IS NOT NULL "
-        "AND COALESCE(redaction_status, 'none') <> 'blocked' "
-        "AND session_id IN (%1)").arg(placeholders.join(','));
+        "WHERE channel='qq_group' AND ") + MemoryReadPolicy::rawMessagePredicate()
+        + QStringLiteral(" AND session_id IN (%1)").arg(placeholders.join(','));
     if (since.isValid()) {
         sql += QStringLiteral(" AND occurred_at >= ?");
     }
-    sql += QStringLiteral(" GROUP BY session_id ORDER BY latest DESC LIMIT ?");
+    if (until.isValid())
+        sql += QStringLiteral(" AND occurred_at < ?");
+    sql += QStringLiteral(" GROUP BY session_id ORDER BY latest DESC,session_id LIMIT ?");
 
     QSqlQuery query(m_db);
     query.prepare(sql);
@@ -2940,6 +2880,8 @@ QStringList MemoryManager::getRecentGroupIds(const QStringList &allowedGroupIds,
     if (since.isValid()) {
         query.addBindValue(since.toString("yyyy-MM-dd HH:mm:ss"));
     }
+    if (until.isValid())
+        query.addBindValue(until.toString("yyyy-MM-dd HH:mm:ss"));
     query.addBindValue(qMax(1, maxGroups));
     if (!query.exec()) {
         qDebug() << "[MemoryManager]查询近期群组失败:" << query.lastError();
@@ -2964,26 +2906,27 @@ RecentContextBundle MemoryManager::searchRecentGroupContext(
     }
 
     const QStringList groups = getRecentGroupIds(
-        query.allowedGroupIds, query.maxGroups, query.since);
+        query.allowedGroupIds, query.allowedGroupIds.size(), query.since, query.until);
+    const MemoryReadPolicy policy;
+    int includedGroups = 0;
     QList<RecentContextItem> candidates;
     for (const QString &groupId : groups) {
+        if (!policy.allowsSession(Channel::kQQGroup, groupId))
+            continue;
+        const auto before = candidates.size();
         QString sql = QStringLiteral(
             "SELECT id, session_id, message_id, sender_id, sender_name, "
             "person_id, content, payload, occurred_at "
             "FROM raw_events "
             "WHERE channel='qq_group' AND session_id=? "
-            "AND event_type='message' AND content IS NOT NULL "
-            "AND COALESCE(redaction_status, 'none') <> 'blocked'");
+            "AND ") + MemoryReadPolicy::rawMessagePredicate();
         if (query.since.isValid()) {
             sql += QStringLiteral(" AND occurred_at >= ?");
         }
         if (query.until.isValid()) {
             sql += QStringLiteral(" AND occurred_at < ?");
         }
-        if (query.onlyViewer && !query.viewerPersonId.isEmpty()) {
-            sql += QStringLiteral(" AND person_id=?");
-        }
-        sql += QStringLiteral(" ORDER BY occurred_at DESC, id DESC LIMIT ?");
+        sql += QStringLiteral(" ORDER BY occurred_at DESC, id DESC");
 
         QSqlQuery eventQuery(m_db);
         eventQuery.prepare(sql);
@@ -2994,15 +2937,13 @@ RecentContextBundle MemoryManager::searchRecentGroupContext(
         if (query.until.isValid()) {
             eventQuery.addBindValue(query.until.toString("yyyy-MM-dd HH:mm:ss"));
         }
-        if (query.onlyViewer && !query.viewerPersonId.isEmpty()) {
-            eventQuery.addBindValue(query.viewerPersonId);
-        }
-        eventQuery.addBindValue(qMax(1, query.perGroupCandidateLimit));
         if (!eventQuery.exec()) {
             qDebug() << "[MemoryManager]查询近期群消息失败:" << eventQuery.lastError();
             continue;
         }
         while (eventQuery.next()) {
+            if (!policy.allows(Channel::kQQGroup, groupId, eventQuery.value(6).toString()))
+                continue;
             RecentContextItem item;
             item.rawEventId = eventQuery.value(0).toLongLong();
             item.sourceGroupId = eventQuery.value(1).toString();
@@ -3017,12 +2958,10 @@ RecentContextBundle MemoryManager::searchRecentGroupContext(
             }
             item.isViewer = !query.viewerPersonId.isEmpty()
                                 && item.personId == query.viewerPersonId;
-            if (item.isViewer) {
-                // 旧数据兼容：没有 person_id 时仍按 viewer 平台 ID 识别。
-                item.isViewer = true;
-            } else if (query.viewerPersonId.isEmpty()) {
+            if (query.viewerPersonId.isEmpty())
                 item.isViewer = query.viewerIds.contains(item.senderId);
-            }
+            if (query.onlyViewer && !item.isViewer)
+                continue;
             if (item.senderDisplayName.isEmpty()
                 || QRegularExpression(QStringLiteral("^\\d{5,}$"))
                        .match(item.senderDisplayName).hasMatch()) {
@@ -3046,7 +2985,11 @@ RecentContextBundle MemoryManager::searchRecentGroupContext(
             }
             item.occurredAt = eventQuery.value(8).toDateTime();
             candidates.append(item);
+            if (candidates.size() - before >= qMax(1, query.perGroupCandidateLimit))
+                break;
         }
+        if (candidates.size() > before && ++includedGroups >= qMax(1, query.maxGroups))
+            break;
     }
 
     bundle = RecentContextPlanner::build(candidates, query);

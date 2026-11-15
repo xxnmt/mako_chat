@@ -17,7 +17,7 @@ qt_add_executable(Windows_AI
     ${RESOURCE_FILES}
     bubblewidget.h bubblewidget.cpp bubblewidget.ui
     configmanager.h configmanager.cpp
-    memorypolicy.h memorypolicy.cpp
+    memorypolicy.h memorypolicy.cpp memoryreadpolicy.h
     memoryoutputguard.h memoryoutputguard.cpp
     interactionsegmenter.h interactionsegmenter.cpp
     recentcontext.h recentcontext.cpp

@@ -1,7 +1,7 @@
 #include "memoryretrieval.h"
 
 #include "memorymanager.h"
-#include "configmanager.h"
+#include "memoryreadpolicy.h"
 
 #include <QElapsedTimer>
 #include <QCryptographicHash>
@@ -648,14 +648,10 @@ RetrievalResult MemoryRetrievalService::retrieve(const RetrievalRequest &request
         return result;
     }
     auto scoped = request;
-    const auto rules = ConfigManager::instance().getMemoryPolicyConfig().privacyRules;
-    const auto blindZones = ConfigManager::instance().blindZones();
+    const MemoryReadPolicy policy;
     scoped.accept = [&](const MemoryEvidence &entry) {
-        for (const auto &zone : blindZones)
-            if (zone.channel == entry.channel && zone.sessionId == entry.session)
-                return false;
-        const auto scan = SensitiveContentFilter::sanitize(entry.text, {}, rules);
-        return !scan.blocked && !scan.redacted && (!request.accept || request.accept(entry));
+        return policy.allows(entry.channel, entry.session, entry.text)
+            && (!request.accept || request.accept(entry));
     };
     auto ranked = retrieveIndexed(scoped, &result);
     result.truncated |= ranked.size() > request.limit;

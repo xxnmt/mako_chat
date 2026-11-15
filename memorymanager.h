@@ -125,9 +125,6 @@ public:
 
 //历史对话crud
     QList<HistoryTurn> getHistoryTurn(int N, const QString &channel = Channel::kPet, const QString &sessionId = Channel::kDefaultSession, qint64 beforeTurn = 0);
-    QList<HistoryTurn> searchHistoryTurns(const QString &channel, const QString &sessionId,
-                                          const QStringList &terms, int limit,
-                                          const QDateTime &from = {}, const QDateTime &to = {});
     QList<HistoryTurn> getHistoryTurn(int offset,int limit); // 管理界面分页，跨渠道浏览
     qlonglong getTotalHistoryCount();
     bool deleteTurnByID(int id);
@@ -205,7 +202,7 @@ public:
     // PR-2.1: 只读近期群聊上下文检索
     QStringList getRecentGroupIds(const QStringList &allowedGroupIds,
                                   int maxGroups,
-                                  const QDateTime &since);
+                                  const QDateTime &since, const QDateTime &until = {});
     RecentContextBundle searchRecentGroupContext(const RecentContextQuery &query);
     QStringList getKnownDisplayNamesForUserIds(const QStringList &userIds, int limit);
 
