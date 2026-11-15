@@ -396,12 +396,29 @@ int runBenchmarkAsk(const QStringList &args)
     meta.receivedAtUtc = QDateTime::fromString(
         question.value(QStringLiteral("now")).toString(), Qt::ISODate).toUTC();
     meta.occurredAtUtc = meta.receivedAtUtc;
-    meta.channel = Channel::kQQPrivate;
+    meta.channel = QStringLiteral("qq_private");
     meta.sessionId = QStringLiteral("bench");
     meta.speaker = QStringLiteral("\u4E3B\u4EBA");
     meta.subject = QStringLiteral("user");
     meta.actorId = QStringLiteral("owner");
     meta.personId = QStringLiteral("owner");
+    const int channelIndex = args.indexOf(QStringLiteral("--channel"));
+    if (channelIndex >= 0 && channelIndex + 1 < args.size())
+        meta.channel = args.at(channelIndex + 1);
+    const int sessionIndex = args.indexOf(QStringLiteral("--session"));
+    if (sessionIndex >= 0 && sessionIndex + 1 < args.size())
+        meta.sessionId = args.at(sessionIndex + 1);
+    const int subjectIndex = args.indexOf(QStringLiteral("--subject"));
+    if (subjectIndex >= 0 && subjectIndex + 1 < args.size())
+        meta.subject = args.at(subjectIndex + 1);
+    const int actorIndex = args.indexOf(QStringLiteral("--actor"));
+    if (actorIndex >= 0 && actorIndex + 1 < args.size()) {
+        meta.actorId = args.at(actorIndex + 1);
+        meta.personId = meta.actorId;
+    }
+    const int speakerIndex = args.indexOf(QStringLiteral("--speaker"));
+    if (speakerIndex >= 0 && speakerIndex + 1 < args.size())
+        meta.speaker = args.at(speakerIndex + 1);
     meta.persistTurn = false;
     meta.longTermMemoryEnabled = true;
     meta.turnKind = QStringLiteral("reply");

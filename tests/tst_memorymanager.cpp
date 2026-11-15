@@ -848,6 +848,7 @@ private slots:
         legacyRequest.query = QStringLiteral("legacy-only");
         legacyRequest.terms = {QStringLiteral("legacy-only")};
         legacyRequest.limit = 1;
+        legacyRequest.allowLegacyFallback = true;
         const auto withFallback = defaultRerank.retrieve(legacyRequest);
         QVERIFY(withFallback.evidence.size() <= 1);
         auto noAux = legacyRequest;
@@ -877,7 +878,9 @@ private slots:
         QVERIFY2(db.clearSearchIndex(&error), qPrintable(error));
         QCOMPARE(db.memoryChunkCount(), 0);
         MemoryRetrievalService fallback(&db);
-        const auto fallbackResult = fallback.retrieve(request);
+        auto explicitFallback = request;
+        explicitFallback.allowLegacyFallback = true;
+        const auto fallbackResult = fallback.retrieve(explicitFallback);
         QVERIFY(!fallbackResult.evidence.isEmpty());
         QCOMPARE(fallbackResult.status, QStringLiteral("complete"));
         QCOMPARE(fallbackResult.backend, QStringLiteral("legacy"));
