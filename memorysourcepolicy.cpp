@@ -2,7 +2,7 @@
 
 bool MemorySourcePolicy::isOwnerPrivate(const MemoryAgentScope &scope)
 {
-    return scope.viewerIsOwner && scope.channel == Channel::kQQPrivate;
+    return scope.viewerIsOwner && (scope.channel == Channel::kQQPrivate || scope.channel == Channel::kPet);
 }
 
 bool MemorySourcePolicy::isOwnerGroup(const MemoryAgentScope &scope)
@@ -63,7 +63,7 @@ bool MemorySourcePolicy::canReadEpisodic(const MemoryAgentScope &scope,
     }
     if (origin == QStringLiteral("pet")
         && sessionId == Channel::kDefaultSession) {
-        return scope.ownerCrossChannelPrivate;
+        return scope.channel == Channel::kPet || scope.ownerCrossChannelPrivate;
     }
     return origin == scope.channel && sessionId == scope.sessionId;
 }
@@ -75,7 +75,7 @@ bool MemorySourcePolicy::canReadLongTermSummary(const MemoryAgentScope &scope,
     if (isOwnerPrivate(scope)) {
         if (channel == Channel::kPet
             && sessionId == Channel::kDefaultSession) {
-            return scope.ownerCrossChannelPrivate;
+            return scope.channel == Channel::kPet || scope.ownerCrossChannelPrivate;
         }
         return channel == scope.channel && sessionId == scope.sessionId;
     }
@@ -93,7 +93,7 @@ bool MemorySourcePolicy::canReadChatHistory(const MemoryAgentScope &scope,
     if (isOwnerPrivate(scope)) {
         if (channel == Channel::kPet
             && sessionId == Channel::kDefaultSession) {
-            return scope.ownerCrossChannelPrivate;
+            return scope.channel == Channel::kPet || scope.ownerCrossChannelPrivate;
         }
         return channel == scope.channel && sessionId == scope.sessionId;
     }

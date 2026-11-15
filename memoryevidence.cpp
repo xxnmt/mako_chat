@@ -42,7 +42,8 @@ MemorySituation MemorySituation::fromRequest(const RequestMeta &meta, bool voice
     MemorySituation situation;
     situation.runId = meta.runId;
     situation.eventId = meta.eventId;
-    situation.currentTime = QDateTime::currentDateTime();
+    situation.currentTime = meta.receivedAtUtc.isValid() ? meta.receivedAtUtc.toLocalTime()
+                                                        : QDateTime::currentDateTime();
     situation.timezone = QString::fromUtf8(QDateTime::currentDateTime().timeZone().id());
     situation.inputOccurredAt = meta.occurredAtUtc.isValid() ? meta.occurredAtUtc
                                                             : meta.receivedAtUtc;
@@ -109,43 +110,15 @@ QString MemorySituation::toPromptBlock() const
         "- about: %4\n"
         "- modality: %5\n"
         "- privacy: %6\n"
+        "- current_local_time: %10 (%11)\n"
         "- input_occurred_at: %7\n"
         "- knowledge_profile: %8\n"
         "- expression_preferences: %9\n"
         "- about=unknown 表示服务端没有确认本轮事情涉及谁；不要把 speaker 当成事情主体。\n"
         "- 场景只说明在哪里、对谁、能用什么形式；不要求不同渠道换一种说法。\n")
         .arg(surface, speakerLine, audienceLabel, about, modality, privacy,
-             timeText(inputOccurredAt), knowledgeProfile, expressionPreferences);
-}
-
-MemoryEvidence MemoryEvidence::fromLegacy(const QJsonObject &row)
-{
-    MemoryEvidence evidence;
-    evidence.sourceRef = row.value(QStringLiteral("reference")).toString(
-        row.value(QStringLiteral("evidence_ref")).toString());
-    evidence.handle = evidence.sourceRef;
-    const int slash = evidence.sourceRef.indexOf(QLatin1Char('/'));
-    evidence.sourceType = slash > 0 ? evidence.sourceRef.left(slash)
-                                    : QStringLiteral("unknown");
-    evidence.text = row.value(QStringLiteral("text")).toString();
-    evidence.own = row.value(QStringLiteral("own")).toBool();
-    evidence.channel = row.value(QStringLiteral("channel")).toString();
-    evidence.session = row.value(QStringLiteral("session")).toString();
-    evidence.speakerName = row.value(QStringLiteral("speaker")).toString();
-    evidence.speakerId = evidence.own ? QStringLiteral("owner") : QString();
-    evidence.speakerRole = evidence.own ? QStringLiteral("user") : QStringLiteral("other");
-    if (evidence.speakerName.isEmpty())
-        evidence.speakerName = evidence.own ? QStringLiteral("主人") : QStringLiteral("未知");
-    evidence.derived = row.value(QStringLiteral("derived")).toString(derivedFor(evidence.sourceType));
-    evidence.speechAt = parseTime(row.value(QStringLiteral("time")));
-    evidence.eventTime = parseTime(row.value(QStringLiteral("event_time")));
-    evidence.recordedAt = parseTime(row.value(QStringLiteral("recorded_at")));
-    evidence.privacy = row.value(QStringLiteral("privacy")).toString(QStringLiteral("unknown"));
-    evidence.status = row.value(QStringLiteral("status")).toString(QStringLiteral("complete"));
-    evidence.expressionHint = row.value(QStringLiteral("expression_hint")).toString();
-    for (const auto &id : row.value(QStringLiteral("about_ids")).toArray())
-        evidence.aboutIds.append(id.toString());
-    return evidence;
+             timeText(inputOccurredAt.toLocalTime()), knowledgeProfile, expressionPreferences,
+             timeText(currentTime), timezone);
 }
 
 MemoryEvidence MemoryEvidence::fromChunk(const QJsonObject &row,
@@ -154,7 +127,7 @@ MemoryEvidence MemoryEvidence::fromChunk(const QJsonObject &row,
 {
     MemoryEvidence evidence;
     evidence.sourceRef = row.value(QStringLiteral("source_ref")).toString();
-    evidence.handle = QStringLiteral("chunk/%1").arg(row.value(QStringLiteral("id")).toInteger());
+    evidence.handle = !row.contains("id") ? evidence.sourceRef : QStringLiteral("chunk/%1").arg(row.value(QStringLiteral("id")).toInteger());
     evidence.sourceType = row.value(QStringLiteral("source_type")).toString();
     evidence.text = row.value(QStringLiteral("text")).toString();
     evidence.derived = row.value(QStringLiteral("derived")).toString(
@@ -202,12 +175,12 @@ QJsonObject MemoryEvidence::toJson() const
     QString authority = QStringLiteral("unknown");
     if (derived == QStringLiteral("assistant_expression"))
         authority = QStringLiteral("assistant_expression");
+    else if (derived != "original" && derived != "self_report")
+        authority = QStringLiteral("derived_") + derived;
     else if (speakerRole == QStringLiteral("user"))
         authority = QStringLiteral("user_statement");
     else if (speakerRole == QStringLiteral("assistant"))
         authority = QStringLiteral("assistant_statement");
-    else if (derived == QStringLiteral("summary") || derived == QStringLiteral("inference"))
-        authority = QStringLiteral("derived_") + derived;
     object.insert(QStringLiteral("authority"), authority);
     object.insert(QStringLiteral("text"), text);
     object.insert(QStringLiteral("speaker_id"), speakerId);

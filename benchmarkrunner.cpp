@@ -1,4 +1,5 @@
 #include "benchmarkrunner.h"
+#include "benchmarksnapshot.h"
 
 #include "configmanager.h"
 #include "llmservice.h"
@@ -274,7 +275,7 @@ int runBenchmarkRetrieve(const QStringList &args)
         qCritical() << "usage: --bench-retrieve <db> <question.json> <out.json> [--rerank] [--candidate-limit N] [--rerank-limit N]";
         return 2;
     }
-    int candidateLimit = 200;
+    int candidateLimit = ConfigManager::instance().getMemoryPolicyConfig().retrieval.candidateLimit;
     const int limitIndex = args.indexOf(QStringLiteral("--candidate-limit"));
     if (limitIndex >= 0 && limitIndex + 1 < args.size())
         candidateLimit = qMax(1, args.at(limitIndex + 1).toInt());
@@ -284,7 +285,6 @@ int runBenchmarkRetrieve(const QStringList &args)
         rerankLimit = qMax(1, args.at(rerankLimitIndex + 1).toInt());
     const bool withRerank = args.contains(QStringLiteral("--rerank"));
     const bool turnAggregation = args.contains(QStringLiteral("--turn-aggregation"));
-    MemoryManager memory(args.at(2));
     QFile qfile(args.at(3));
     if (!qfile.open(QIODevice::ReadOnly)) {
         qCritical() << "[Bench] cannot open question";
@@ -296,6 +296,9 @@ int runBenchmarkRetrieve(const QStringList &args)
     if (text.isEmpty())
         return 2;
 
+    BenchmarkSnapshot snapshot;
+    if (!snapshot.open(args.at(2), question, args)) return 2;
+    MemoryManager memory(snapshot.path());
     RetrievalRequest request;
     request.query = text;
     request.purpose = QStringLiteral("bench.retrieve");
@@ -310,7 +313,7 @@ int runBenchmarkRetrieve(const QStringList &args)
     request.excludeCurrent = false;
     request.limit = 100;
     request.useIndex = true;
-    request.allowLegacyFallback = true;
+
     request.candidateLimit = candidateLimit;
     request.rerankLimit = rerankLimit;
     request.turnAggregation = turnAggregation;
@@ -380,15 +383,12 @@ int runBenchmarkAsk(const QStringList &args)
         return 2;
     }
 
-    MemoryManager memory(dbPath);
+    BenchmarkSnapshot snapshot;
+    if (!snapshot.open(dbPath, question, args)) return 2;
+    MemoryManager memory(snapshot.path());
     LLMService llm(ConfigManager::instance().getApiKey());
     llm.setMemoryManager(&memory);
     llm.setBenchmarkChatOnly(args.contains(QStringLiteral("--strict-memory")));
-    int maxTurn = question.value(QStringLiteral("cutoff_turn")).toInt();
-    const int maxTurnIndex = args.indexOf(QStringLiteral("--max-turn"));
-    if (maxTurnIndex >= 0 && maxTurnIndex + 1 < args.size())
-        maxTurn = args.at(maxTurnIndex + 1).toInt();
-    llm.setBenchmarkMaxTurn(maxTurn);
 
     RequestMeta meta;
     meta.eventId = QStringLiteral("bench-question-%1").arg(id);
@@ -425,6 +425,7 @@ int runBenchmarkAsk(const QStringList &args)
 
     QString answer;
     QString error;
+    QString quietAction;
     bool timedOut = false;
     QEventLoop loop;
     QTimer timer;
@@ -441,6 +442,11 @@ int runBenchmarkAsk(const QStringList &args)
         for (const auto &sentence : sentences)
             parts.append(sentence.zhText);
         answer = parts.join(QString());
+        loop.quit();
+    });
+    QObject::connect(&llm, &LLMService::replyQuiet, &loop,
+                     [&](const QString &action, const QString &, const RequestMeta &) {
+        quietAction = action;
         loop.quit();
     });
     QObject::connect(&llm, &LLMService::replyAbnormal, &loop,
@@ -462,6 +468,7 @@ int runBenchmarkAsk(const QStringList &args)
     output.insert(QStringLiteral("answer"), answer);
     output.insert(QStringLiteral("error"), error);
     output.insert(QStringLiteral("timed_out"), timedOut);
+    output.insert(QStringLiteral("quiet_action"), quietAction);
     const auto retrieval = llm.lastRetrievalResult();
     output.insert(QStringLiteral("retrieval"), retrieval.toJson());
     output.insert(QStringLiteral("before_rerank"), auditEvidence(retrieval.candidatesBeforeRerank));
@@ -476,6 +483,6 @@ int runBenchmarkAsk(const QStringList &args)
     }
     out.write(QJsonDocument(output).toJson(QJsonDocument::Indented));
     out.close();
-    return answer.isEmpty() ? 3 : 0;
+    return answer.isEmpty() && quietAction.isEmpty() ? 3 : 0;
 }
 

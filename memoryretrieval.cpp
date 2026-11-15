@@ -1,6 +1,7 @@
 #include "memoryretrieval.h"
 
 #include "memorymanager.h"
+#include "configmanager.h"
 
 #include <QElapsedTimer>
 #include <QCryptographicHash>
@@ -19,6 +20,15 @@ bool sourceAllowed(const RetrievalRequest &request, const MemoryEvidence &item)
     if (!request.sourceKinds.isEmpty()
         && !request.sourceKinds.contains(item.sourceType))
         return false;
+    if (!request.includeOthers && !item.own && !request.accounts.contains(item.speakerId)
+        && !(item.speakerId.startsWith("qq:") && request.accounts.contains(item.speakerId.mid(3))))
+        return false;
+    const auto time = item.eventTime.isValid() ? item.eventTime : item.speechAt;
+    if ((request.from.isValid() && (!time.isValid() || time < request.from))
+        || (request.until.isValid() && (!time.isValid() || time >= request.until)))
+        return false;
+    if (request.accept && !request.accept(item))
+        return false;
     if (request.allowedSources.isEmpty())
         return true;
     for (const auto &source : request.allowedSources) {
@@ -36,23 +46,6 @@ QByteArray normalizedEvidenceText(const MemoryEvidence &item)
     QByteArray key = item.text.toUtf8();
     key = key.simplified();
     return key;
-}
-
-int evidenceTurnNumber(const MemoryEvidence &item)
-{
-    if (!item.sourceRef.startsWith(QStringLiteral("chat/")))
-        return -1;
-    const QString turn = item.sourceRef.section(QLatin1Char(':'), 0, 0)
-                             .section(QLatin1Char('/'), 1, 1);
-    bool ok = false;
-    const int value = turn.toInt(&ok);
-    return ok ? value : -1;
-}
-
-bool afterMaxTurn(const RetrievalRequest &request, const MemoryEvidence &item)
-{
-    return request.maxTurn > 0
-        && evidenceTurnNumber(item) > request.maxTurn;
 }
 
 QList<int> rankOrder(const QVector<double> &scores)
@@ -250,25 +243,6 @@ qlonglong chunkId(const QString &handle)
 
 } // namespace
 
-LegacyMemorySourceAdapter::LegacyMemorySourceAdapter(MemoryManager *manager)
-    : m_manager(manager)
-{
-}
-
-QList<MemoryEvidence> LegacyMemorySourceAdapter::fetch(const RetrievalRequest &request) const
-{
-    QList<MemoryEvidence> result;
-    if (!m_manager)
-        return result;
-    const auto rows = m_manager->personalEvidence(
-        request.subject, request.accounts, request.terms, request.includeOthers,
-        request.currentChannel, request.currentSession, request.excludeCurrent,
-        request.includeUnmatched, request.includeAllEpisodic, request.requireTermMatch);
-    for (const auto &row : rows)
-        result.append(MemoryEvidence::fromLegacy(row.toObject()));
-    return result;
-}
-
 QList<MemoryEvidence> IdentityMemoryReranker::rerank(const QString &,
                                                      const QList<MemoryEvidence> &candidates,
                                                      int limit, QString *) const
@@ -341,7 +315,6 @@ MemoryRetrievalService::MemoryRetrievalService(MemoryManager *manager,
 void MemoryRetrievalService::setMemoryManager(MemoryManager *manager)
 {
     m_manager = manager;
-    m_adapter = std::make_unique<LegacyMemorySourceAdapter>(manager);
 }
 
 void MemoryRetrievalService::setEmbeddingProvider(
@@ -367,8 +340,6 @@ QList<MemoryEvidence> MemoryRetrievalService::retrieveIndexed(const RetrievalReq
             return false;
         if (!sourceAllowed(request, evidence))
             return false;
-        if (afterMaxTurn(request, evidence))
-            return false;
         if (request.excludeCurrent && evidence.channel == request.currentChannel
             && evidence.session == request.currentSession)
             return false;
@@ -379,9 +350,17 @@ QList<MemoryEvidence> MemoryRetrievalService::retrieveIndexed(const RetrievalReq
         return true;
     };
 
-    const auto allRows = m_manager->memoryChunksForEmbedding(0);
+    const bool original = request.sourceKinds.isEmpty() || request.sourceKinds.contains("chat")
+        || request.sourceKinds.contains("raw");
+    const auto allRows = original && request.useIndex ? m_manager->memoryChunksForEmbedding(0) : QJsonArray{};
+    QJsonArray lexicalRows = allRows;
+    if (request.includeAuxiliarySources) {
+        const auto structured = m_manager->structuredMemoryRows(request.sourceKinds, request.subject,
+                                                               request.includeOthers, request.includeAllEpisodic);
+        for (const auto &row : structured)
+            lexicalRows.append(row);
+    }
     result->backend = QStringLiteral("index");
-    result->candidateCount = allRows.size();
     result->truncated = false;
 
     QStringList queryTokens = bm25Tokens(request.query);
@@ -404,14 +383,12 @@ QList<MemoryEvidence> MemoryRetrievalService::retrieveIndexed(const RetrievalReq
     };
     QList<Bm25Doc> docs;
     QHash<QString, int> documentFrequency;
-    for (const auto &row : allRows) {
+    for (const auto &row : lexicalRows) {
         const auto evidence = MemoryEvidence::fromChunk(
             row.toObject(), request.viewerPersonId, request.viewerIsOwner);
         if (evidence.handle.isEmpty() || evidence.text.trimmed().isEmpty())
             continue;
         if (!sourceAllowed(request, evidence))
-            continue;
-        if (afterMaxTurn(request, evidence))
             continue;
         if (request.excludeCurrent && evidence.channel == request.currentChannel
             && evidence.session == request.currentSession)
@@ -458,18 +435,22 @@ QList<MemoryEvidence> MemoryRetrievalService::retrieveIndexed(const RetrievalReq
     std::stable_sort(docs.begin(), docs.end(), [](const Bm25Doc &a, const Bm25Doc &b) {
         if (a.score != b.score)
             return a.score > b.score;
+        if (a.evidence.speechAt != b.evidence.speechAt)
+            return a.evidence.speechAt > b.evidence.speechAt;
         return a.evidence.handle < b.evidence.handle;
     });
     QHash<QString, double> lexicalScore;
     const int lexicalCap = qMax(1, request.candidateLimit);
     for (int i = 0; i < docs.size() && i < lexicalCap; ++i) {
+        if (request.requireTermMatch && docs.at(i).score <= 0 && !request.includeUnmatched)
+            continue;
         if (addCandidate(docs.at(i).evidence))
             lexicalScore.insert(docs.at(i).evidence.handle, docs.at(i).score);
     }
 
     QHash<QString, double> vectorScore;
     bool vectorUsed = false;
-    if (m_embedding) {
+    if (m_embedding && !allRows.isEmpty()) {
         QVector<float> query;
         QString embedError;
         if (!m_embedding->embed(request.query, &query, &embedError)) {
@@ -488,7 +469,7 @@ QList<MemoryEvidence> MemoryRetrievalService::retrieveIndexed(const RetrievalReq
                     value, request.viewerPersonId, request.viewerIsOwner);
                 if (evidence.handle.isEmpty())
                     continue;
-                if (afterMaxTurn(request, evidence))
+                if (!sourceAllowed(request, evidence))
                     continue;
                 const double score = cosine(query, stored);
                 if (score < 0.0)
@@ -503,6 +484,7 @@ QList<MemoryEvidence> MemoryRetrievalService::retrieveIndexed(const RetrievalReq
     QList<QString> lexicalHandles = lexicalScore.keys();
     std::stable_sort(lexicalHandles.begin(), lexicalHandles.end(),
                      [&](const QString &a, const QString &b) {
+                         if (lexicalScore.value(a) == lexicalScore.value(b)) return a < b;
                          return lexicalScore.value(a) > lexicalScore.value(b);
                      });
     lexicalHandles = lexicalHandles.mid(0, qMax(1, request.candidateLimit));
@@ -510,6 +492,7 @@ QList<MemoryEvidence> MemoryRetrievalService::retrieveIndexed(const RetrievalReq
     QList<QString> vectorHandles = vectorScore.keys();
     std::stable_sort(vectorHandles.begin(), vectorHandles.end(),
                      [&](const QString &a, const QString &b) {
+                         if (vectorScore.value(a) == vectorScore.value(b)) return a < b;
                          return vectorScore.value(a) > vectorScore.value(b);
                      });
     vectorHandles = vectorHandles.mid(0, qMax(1, request.candidateLimit));
@@ -590,10 +573,12 @@ QList<MemoryEvidence> MemoryRetrievalService::retrieveIndexed(const RetrievalReq
                 break;
         }
     }
+    result->candidateCount = ranked.size();
+    result->truncated = ranked.size() > qMin(request.limit, request.rerankLimit);
     result->candidatesBeforeRerank = rerankInput;
     result->rerankerId = m_reranker ? m_reranker->id() : QString();
 
-    if (m_reranker) {
+    if (m_reranker && !rerankInput.isEmpty()) {
         QString rerankError;
         const auto reranked = m_reranker->rerank(request.query, rerankInput,
                                                  request.rerankLimit, &rerankError);
@@ -603,7 +588,7 @@ QList<MemoryEvidence> MemoryRetrievalService::retrieveIndexed(const RetrievalReq
                 ? QStringLiteral("rerank returned no usable results")
                 : rerankError;
             // 重排是增强项，失败时保留重排前可用的候选。
-            result->candidatesAfterRerank = ranked.mid(0, qMax(0, request.rerankLimit));
+            result->candidatesAfterRerank = rerankInput.mid(0, qMax(0, request.rerankLimit));
             return result->candidatesAfterRerank;
         }
         QList<MemoryEvidence> expanded;
@@ -622,9 +607,33 @@ QList<MemoryEvidence> MemoryRetrievalService::retrieveIndexed(const RetrievalReq
             expanded = reranked;
         }
         result->candidatesAfterRerank = expanded.mid(0, qMax(0, request.rerankLimit));
-        return result->candidatesAfterRerank;
+    } else {
+        result->candidatesAfterRerank = rerankInput.mid(0, qMax(0, request.rerankLimit));
     }
-    result->candidatesAfterRerank = ranked.mid(0, qMax(0, request.rerankLimit));
+    if (request.includeUnmatched) {
+        MemoryEvidence newest, newestMatch;
+        const auto terms = request.terms.isEmpty() ? QStringList{request.query} : request.terms;
+        for (const auto &doc : docs) {
+            const auto &item = doc.evidence;
+            if (!item.speechAt.isValid()) continue;
+            if (!newest.speechAt.isValid() || newest.speechAt < item.speechAt) newest = item;
+            if ((!newestMatch.speechAt.isValid() || newestMatch.speechAt < item.speechAt)
+                && std::any_of(terms.begin(), terms.end(), [&](const QString &term) {
+                    return !term.isEmpty() && item.text.contains(term, Qt::CaseInsensitive);
+                })) newestMatch = item;
+        }
+        const int budget = qMin(request.rerankLimit, request.limit);
+        if (budget >= 2) {
+            auto &items = result->candidatesAfterRerank;
+            QList<MemoryEvidence> overview;
+            for (const auto &item : {newestMatch, newest})
+                if (!item.handle.isEmpty() && (overview.isEmpty() || overview.first().handle != item.handle))
+                    overview.append(item);
+            for (const auto &item : items)
+                if (item.handle != newest.handle && item.handle != newestMatch.handle) overview.append(item);
+            items = overview.mid(0, budget);
+        }
+    }
     return result->candidatesAfterRerank;
 }
 
@@ -633,55 +642,28 @@ RetrievalResult MemoryRetrievalService::retrieve(const RetrievalRequest &request
     RetrievalResult result;
     QElapsedTimer timer;
     timer.start();
-    auto filterKinds = [&](QList<MemoryEvidence> evidence) {
-        QList<MemoryEvidence> filtered;
-        for (const auto &item : evidence) {
-            if (sourceAllowed(request, item) && !afterMaxTurn(request, item))
-                filtered.append(item);
-        }
-        return filtered;
-    };
-    if (!m_adapter) {
+    if (!m_manager) {
         result.status = QStringLiteral("degraded");
-        result.latencyMs = timer.elapsed();
+        result.degradedReason = QStringLiteral("database unavailable");
         return result;
     }
-    if (request.useIndex && m_manager && m_manager->memoryChunkCount() > 0) {
-        auto indexed = filterKinds(retrieveIndexed(request, &result));
-        QList<MemoryEvidence> combined = indexed;
-        if (request.allowLegacyFallback && request.includeAuxiliarySources) {
-            // 旧适配器只作为显式辅助来源；关闭回退或关闭辅助来源时不读取。
-            const auto legacy = filterKinds(m_adapter->fetch(request));
-            QSet<QString> seen;
-            for (const auto &item : combined) {
-                const QString key = item.sourceRef.isEmpty() ? item.text : item.sourceRef;
-                seen.insert(key);
-            }
-            for (const auto &item : legacy) {
-                const QString key = item.sourceRef.isEmpty() ? item.text : item.sourceRef;
-                if (seen.contains(key))
-                    continue;
-                seen.insert(key);
-                combined.append(item);
-                ++result.auxiliaryCount;
-            }
-        }
-        result.truncated = combined.size() > request.limit;
-        result.evidence = combined.mid(0, qMax(0, request.limit));
-        result.candidateCount = combined.size();
-        result.latencyMs = timer.elapsed();
-        return result;
-    }
-    if (!request.allowLegacyFallback) {
-        result.latencyMs = timer.elapsed();
-        return result;
-    }
-    result.backend = QStringLiteral("legacy");
-    result.evidence = filterKinds(m_adapter->fetch(request));
-    result.candidateCount = result.evidence.size();
-    result.truncated = result.evidence.size() > request.limit;
-    result.evidence = result.evidence.mid(0, qMax(0, request.limit));
-    result.status = result.truncated ? QStringLiteral("partial") : QStringLiteral("complete");
+    auto scoped = request;
+    const auto rules = ConfigManager::instance().getMemoryPolicyConfig().privacyRules;
+    const auto blindZones = ConfigManager::instance().blindZones();
+    scoped.accept = [&](const MemoryEvidence &entry) {
+        for (const auto &zone : blindZones)
+            if (zone.channel == entry.channel && zone.sessionId == entry.session)
+                return false;
+        const auto scan = SensitiveContentFilter::sanitize(entry.text, {}, rules);
+        return !scan.blocked && !scan.redacted && (!request.accept || request.accept(entry));
+    };
+    auto ranked = retrieveIndexed(scoped, &result);
+    result.truncated |= ranked.size() > request.limit;
+    result.evidence = ranked.mid(0, qMax(0, request.limit));
+    if (result.truncated && result.status == "complete") result.status = "partial";
+    for (const auto &item : result.evidence)
+        if (!item.handle.startsWith("chunk/"))
+            ++result.auxiliaryCount;
     result.latencyMs = timer.elapsed();
     return result;
 }

@@ -159,19 +159,6 @@ bool readAgentTimeRange(const QJsonObject &args,
     return true;
 }
 
-bool matchesTerms(const QString &text, const QStringList &terms)
-{
-    if (terms.isEmpty()) {
-        return true;
-    }
-    for (const QString &term : terms) {
-        if (text.contains(term, Qt::CaseInsensitive)) {
-            return true;
-        }
-    }
-    return false;
-}
-
 int countMatchingTerms(const QString &text, const QStringList &terms)
 {
     int score = 0;
@@ -458,7 +445,7 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
     }
     const MemoryTimeRange parsedTimeRange = m_useQueryTimeFallback
                                                 ? MemoryTimeRangePlanner::parse(
-                                                      query, QDateTime::currentDateTime())
+                                                      query, m_scope.now())
                                                 : MemoryTimeRange();
     const MemoryTimeRange timeRange = agentTimeRange.valid
                                           ? agentTimeRange
@@ -469,122 +456,79 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
     QJsonArray resultItems;
     QStringList terms = RecentContextPlanner::extractTerms(query);
 
+    const auto config = ConfigManager::instance().getMemoryPolicyConfig().retrieval;
+    MemoryRetrievalService service(m_memoryManager);
+    configureRetrievalService(service, config);
+    RetrievalRequest base;
+    base.query = query;
+    base.subject = m_scope.viewerIsOwner ? QStringLiteral("user") : m_scope.viewerPersonId;
+    base.viewerPersonId = m_scope.viewerPersonId;
+    base.viewerIsOwner = m_scope.viewerIsOwner;
+    base.accounts = m_scope.recentQueryTemplate.viewerIds;
+    base.terms = terms;
+    base.currentChannel = m_scope.channel;
+    base.currentSession = m_scope.sessionId;
+    base.excludeCurrent = false;
+    base.useIndex = config.indexEnabled;
+    base.candidateLimit = config.candidateLimit;
+    base.rerankLimit = config.rerankLimit;
+
     // 1) recent raw messages：复用只读时间窗检索，服务端 scope 固定。
     const bool includeSummaries = wantsInteractionSummary || timeRange.valid;
     const int recentLimit = (timeRange.valid && includeSummaries)
                                 ? qMin(limit, 2)
                                 : limit;
     if (wantsRecent && !m_scope.allowedGroupIds.isEmpty()) {
-        bool servedByUnified = false;
-        if (m_memoryManager->memoryChunkCount() > 0) {
-            RetrievalRequest request;
-            request.query = query;
-            request.purpose = QStringLiteral("tool.recent");
-            request.subject = m_scope.viewerIsOwner
-                ? QStringLiteral("user") : m_scope.viewerPersonId;
-            request.viewerPersonId = m_scope.viewerPersonId;
-            request.viewerIsOwner = m_scope.viewerIsOwner;
-            request.accounts = m_scope.recentQueryTemplate.viewerIds;
-            request.terms = terms;
-            request.includeOthers = true;
-            request.currentChannel = m_scope.channel;
-            request.currentSession = m_scope.sessionId;
-            request.excludeCurrent = false;
-            request.requireTermMatch = true;
-            request.limit = recentLimit;
-            request.sourceKinds = {QStringLiteral("raw")};
-            QStringList allowed;
-            for (const auto &groupId : m_scope.allowedGroupIds)
-                allowed.append(QStringLiteral("qq_group|") + groupId);
-            request.allowedSources = allowed;
-            const auto retrievalConfig =
-                ConfigManager::instance().getMemoryPolicyConfig().retrieval;
-            request.useIndex = retrievalConfig.indexEnabled;
-            request.allowLegacyFallback = retrievalConfig.legacyFallback;
-            request.candidateLimit = retrievalConfig.candidateLimit;
-            request.rerankLimit = retrievalConfig.rerankLimit;
-            MemoryRetrievalService service(m_memoryManager);
-            configureRetrievalService(service, retrievalConfig);
-            const auto unified = service.retrieve(request);
-            for (const auto &evidence : unified.evidence) {
-                if (resultItems.size() >= recentLimit)
-                    break;
-                if (evidence.sourceType != QStringLiteral("raw")
-                    || !evidence.sourceRef.startsWith(QStringLiteral("raw/")))
-                    continue;
-                if (timeRange.valid && evidence.speechAt.isValid()
-                    && (evidence.speechAt < timeRange.from
-                        || evidence.speechAt >= timeRange.to))
-                    continue;
-                const QString text = MemoryTextUtils::sanitizePromptText(evidence.text);
-                if (text.isEmpty())
-                    continue;
-                MemoryAgentItem item;
-                item.id = QStringLiteral("recent:%1")
-                    .arg(evidence.sourceRef.mid(QStringLiteral("raw/").size()));
-                item.kind = QStringLiteral("recent");
-                item.text = text;
-                item.time = evidence.speechAt;
-                item.source = sourceLabelForSession(m_scope, evidence.session);
-                item.groupLabel = groupLabelFor(evidence.session);
-                item.personId = evidence.speakerId;
-                item.rawEventId = evidence.sourceRef.mid(
-                    QStringLiteral("raw/").size()).toLongLong();
-                item.sourceSessionId = evidence.session;
-                item.isViewer = evidence.own
-                    || (m_scope.viewerIsOwner && evidence.speakerName == QStringLiteral("owner"))
-                    || evidence.speakerName == m_scope.viewerPersonId;
-                const int before = m_ordered.size();
-                remember(item);
-                if (m_ordered.size() > before) {
-                    resultItems.append(itemToJson(item));
-                    servedByUnified = true;
-                }
-            }
-        }
-        if (!servedByUnified) {
-        RecentContextQuery recentQuery = m_scope.recentQueryTemplate;
-        recentQuery.allowedGroupIds = m_scope.allowedGroupIds;
-        recentQuery.queryText = query;
-        recentQuery.mode = RecentContextPlanner::detectMode(query);
-        recentQuery.itemLimit = recentLimit;
-        recentQuery.itemLimitOverview = qMax(recentLimit, recentQuery.itemLimitOverview);
-        recentQuery.charBudget = qMax(400, recentQuery.charBudget);
-        recentQuery.overviewCharBudget = qMax(400, recentQuery.overviewCharBudget);
+        auto request = base;
+
+        request.purpose = QStringLiteral("tool.recent");
         if (timeRange.valid) {
-            recentQuery.since = timeRange.from;
-            recentQuery.until = timeRange.to;
-        } else {
-            recentQuery.until = QDateTime();
+            request.from = timeRange.from;
+            request.until = timeRange.to;
         }
-        const RecentContextBundle bundle =
-            m_memoryManager->searchRecentGroupContext(recentQuery);
-        if (bundle.truncated) {
-            m_truncated = true;
-        }
-        for (const RecentContextItem &recent : bundle.items) {
-            MemoryAgentItem item;
-            item.id = QStringLiteral("recent:%1").arg(recent.rawEventId);
-            item.kind = QStringLiteral("recent");
-            item.text = recent.sanitizedText.trimmed();
-            item.time = recent.occurredAt;
-            item.source = sourceLabelForSession(m_scope, recent.sourceGroupId);
-            item.groupLabel = groupLabelFor(recent.sourceGroupId);
-            item.personId = recent.personId;
-            item.rawEventId = recent.rawEventId;
-            item.sourceSessionId = recent.sourceGroupId;
-            item.isViewer = recent.isViewer;
-            if (!item.text.isEmpty()) {
-                const int before = m_ordered.size();
-                remember(item);
-                if (m_ordered.size() > before) {
-                    resultItems.append(itemToJson(item));
-                }
-            }
-            if (resultItems.size() >= recentLimit) {
+
+        request.includeOthers = !m_scope.recentQueryTemplate.onlyViewer;
+        request.requireTermMatch = true;
+        request.includeUnmatched = timeRange.valid;
+        request.limit = recentLimit;
+        request.sourceKinds = {QStringLiteral("raw")};
+        QStringList allowed;
+        for (const auto &groupId : m_scope.allowedGroupIds)
+            allowed.append(QStringLiteral("qq_group|") + groupId);
+        request.allowedSources = allowed;
+
+        const auto unified = service.retrieve(request);
+        for (const auto &evidence : unified.evidence) {
+            if (resultItems.size() >= recentLimit)
                 break;
+            if (evidence.sourceType != QStringLiteral("raw")
+                || !evidence.sourceRef.startsWith(QStringLiteral("raw/")))
+                continue;
+            if (timeRange.valid && evidence.speechAt.isValid()
+                && (evidence.speechAt < timeRange.from
+                    || evidence.speechAt >= timeRange.to))
+                continue;
+            const QString text = MemoryTextUtils::sanitizePromptText(evidence.text);
+            if (text.isEmpty())
+                continue;
+            MemoryAgentItem item;
+            item.id = QStringLiteral("recent:%1")
+                .arg(evidence.sourceRef.mid(QStringLiteral("raw/").size()));
+            item.kind = QStringLiteral("recent");
+            item.text = text;
+            item.time = evidence.speechAt;
+            item.source = sourceLabelForSession(m_scope, evidence.session);
+            item.groupLabel = groupLabelFor(evidence.session);
+            item.personId = evidence.speakerId;
+            item.rawEventId = evidence.sourceRef.mid(
+                QStringLiteral("raw/").size()).toLongLong();
+            item.sourceSessionId = evidence.session;
+            item.isViewer = evidence.own;
+            const int before = m_ordered.size();
+            remember(item);
+            if (m_ordered.size() > before) {
+                resultItems.append(itemToJson(item));
             }
-        }
         }
     }
 
@@ -599,19 +543,14 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
         if (m_scope.channel == Channel::kQQGroup) {
             sessions = {m_scope.sessionId};
         }
-        RetrievalRequest request;
-        request.query = query;
+        auto request = base;
+
         request.purpose = QStringLiteral("tool.interaction_summary");
-        request.subject = m_scope.viewerIsOwner
-            ? QStringLiteral("user") : m_scope.viewerPersonId;
-        request.viewerPersonId = m_scope.viewerPersonId;
-        request.viewerIsOwner = m_scope.viewerIsOwner;
-        request.accounts = m_scope.recentQueryTemplate.viewerIds;
-        request.terms = terms;
-        request.includeOthers = true;
-        request.currentChannel = m_scope.channel;
-        request.currentSession = m_scope.sessionId;
-        request.excludeCurrent = false;
+        if (timeRange.valid) {
+            request.from = timeRange.from;
+            request.until = timeRange.to;
+        }
+
         request.includeUnmatched = timeRange.valid;
         request.limit = limit;
         request.sourceKinds = {QStringLiteral("interaction")};
@@ -619,14 +558,7 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
         for (const auto &session : sessions)
             allowed.append(QStringLiteral("qq_group|") + session);
         request.allowedSources = allowed;
-        const auto retrievalConfig =
-            ConfigManager::instance().getMemoryPolicyConfig().retrieval;
-        request.useIndex = retrievalConfig.indexEnabled;
-        request.allowLegacyFallback = retrievalConfig.legacyFallback;
-        request.candidateLimit = retrievalConfig.candidateLimit;
-        request.rerankLimit = retrievalConfig.rerankLimit;
-        MemoryRetrievalService service(m_memoryManager);
-        configureRetrievalService(service, retrievalConfig);
+
         const auto unified = service.retrieve(request);
         for (const auto &evidence : unified.evidence) {
             if (resultItems.size() >= limit)
@@ -663,19 +595,14 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
     if (kinds.contains(QStringLiteral("claim"))
         && (m_scope.viewerIsOwner || m_scope.membershipVerified)
         && resultItems.size() < limit) {
-        RetrievalRequest request;
-        request.query = query;
+        auto request = base;
+
         request.purpose = QStringLiteral("tool.claim");
-        request.subject = m_scope.viewerIsOwner
-            ? QStringLiteral("user") : m_scope.viewerPersonId;
-        request.viewerPersonId = m_scope.viewerPersonId;
-        request.viewerIsOwner = m_scope.viewerIsOwner;
-        request.accounts = m_scope.recentQueryTemplate.viewerIds;
-        request.terms = terms;
-        request.includeOthers = true;
-        request.currentChannel = m_scope.channel;
-        request.currentSession = m_scope.sessionId;
-        request.excludeCurrent = false;
+        if (timeRange.valid) {
+            request.from = timeRange.from;
+            request.until = timeRange.to;
+        }
+
         request.limit = limit;
         request.sourceKinds = {QStringLiteral("claim")};
         QStringList allowed;
@@ -684,17 +611,15 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
         if (m_scope.channel == Channel::kQQGroup)
             allowed.append(QStringLiteral("qq_group|") + m_scope.sessionId);
         request.allowedSources = allowed;
-        const auto retrievalConfig =
-            ConfigManager::instance().getMemoryPolicyConfig().retrieval;
-        request.useIndex = retrievalConfig.indexEnabled;
-        request.allowLegacyFallback = retrievalConfig.legacyFallback;
-        request.candidateLimit = retrievalConfig.candidateLimit;
-        request.rerankLimit = retrievalConfig.rerankLimit;
-        MemoryRetrievalService service(m_memoryManager);
-        configureRetrievalService(service, retrievalConfig);
+
         QHash<qlonglong, MemoryClaim> claims;
-        for (const auto &claim : m_memoryManager->getActiveClaims(200))
+        for (const auto &claim : m_memoryManager->getActiveClaims(-1))
             claims.insert(claim.id, claim);
+        request.accept = [&](const MemoryEvidence &entry) {
+            const auto it = claims.constFind(entry.sourceRef.section('/', 1).toLongLong());
+            return it != claims.cend() && MemoryAccessPolicy::evaluate(*it, m_scope.access).state
+                == MemoryAccessState::Shareable;
+        };
         const auto unified = service.retrieve(request);
         for (const auto &evidence : unified.evidence) {
             if (resultItems.size() >= limit)
@@ -737,33 +662,26 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
     if (kinds.contains(QStringLiteral("episodic"))
         && resultItems.size() < limit && m_memoryManager) {
         QHash<qlonglong, EpisodicMemory> memories;
-        for (const auto &memory : m_memoryManager->getActiveEpisodicMemories(0.0, 500))
+        for (const auto &memory : m_memoryManager->getActiveEpisodicMemories(0.0, -1, {}, {}, {}, false))
             memories.insert(memory.id, memory);
-        RetrievalRequest request;
-        request.query = query;
+        auto request = base;
+
         request.purpose = QStringLiteral("tool.episodic");
-        request.subject = m_scope.viewerIsOwner
-            ? QStringLiteral("user") : m_scope.viewerPersonId;
-        request.viewerPersonId = m_scope.viewerPersonId;
-        request.viewerIsOwner = m_scope.viewerIsOwner;
-        request.accounts = m_scope.recentQueryTemplate.viewerIds;
-        request.terms = terms;
-        request.includeOthers = true;
-        request.currentChannel = m_scope.channel;
-        request.currentSession = m_scope.sessionId;
-        request.excludeCurrent = false;
+        if (timeTarget == MemoryTimeTarget::EventTime && timeRange.valid) {
+            request.from = timeRange.from;
+            request.until = timeRange.to;
+        }
+
         request.includeUnmatched = timeRange.valid;
         request.includeAllEpisodic = true;
         request.limit = limit;
         request.sourceKinds = {QStringLiteral("episode")};
-        const auto retrievalConfig =
-            ConfigManager::instance().getMemoryPolicyConfig().retrieval;
-        request.useIndex = retrievalConfig.indexEnabled;
-        request.allowLegacyFallback = retrievalConfig.legacyFallback;
-        request.candidateLimit = retrievalConfig.candidateLimit;
-        request.rerankLimit = retrievalConfig.rerankLimit;
-        MemoryRetrievalService service(m_memoryManager);
-        configureRetrievalService(service, retrievalConfig);
+
+        request.accept = [&](const MemoryEvidence &entry) {
+            const auto it = memories.constFind(entry.sourceRef.section('/', 1).toLongLong());
+            return it != memories.cend() && MemorySourcePolicy::canReadEpisodic(
+                m_scope, it->origin, it->visibility, it->subject, it->sessionId);
+        };
         const auto unified = service.retrieve(request);
         for (const auto &evidence : unified.evidence) {
             if (resultItems.size() >= limit)
@@ -821,33 +739,20 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
             && !sources.contains({m_scope.channel, m_scope.sessionId})) {
             sources.append({m_scope.channel, m_scope.sessionId});
         }
-        RetrievalRequest request;
-        request.query = query;
+        auto request = base;
+
         request.purpose = QStringLiteral("tool.long_term_summary");
-        request.subject = m_scope.viewerIsOwner
-            ? QStringLiteral("user") : m_scope.viewerPersonId;
-        request.viewerPersonId = m_scope.viewerPersonId;
-        request.viewerIsOwner = m_scope.viewerIsOwner;
-        request.accounts = m_scope.recentQueryTemplate.viewerIds;
-        request.terms = terms;
-        request.includeOthers = true;
-        request.currentChannel = m_scope.channel;
-        request.currentSession = m_scope.sessionId;
-        request.excludeCurrent = false;
+
         request.limit = limit;
         request.sourceKinds = {QStringLiteral("summary")};
+        request.accept = [&](const MemoryEvidence &entry) {
+            return MemorySourcePolicy::canReadLongTermSummary(m_scope, entry.channel, entry.session);
+        };
         QStringList allowed;
         for (const auto &source : sources)
             allowed.append(source.first + QLatin1Char('|') + source.second);
         request.allowedSources = allowed;
-        const auto retrievalConfig =
-            ConfigManager::instance().getMemoryPolicyConfig().retrieval;
-        request.useIndex = retrievalConfig.indexEnabled;
-        request.allowLegacyFallback = retrievalConfig.legacyFallback;
-        request.candidateLimit = retrievalConfig.candidateLimit;
-        request.rerankLimit = retrievalConfig.rerankLimit;
-        MemoryRetrievalService service(m_memoryManager);
-        configureRetrievalService(service, retrievalConfig);
+
         const auto unified = service.retrieve(request);
         for (const auto &evidence : unified.evidence) {
             if (resultItems.size() >= limit)
@@ -880,7 +785,6 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
     // 但助手只证明“她曾经这样说过”，不证明用户答应或事实已发生。
     if (kinds.contains(QStringLiteral("chat_history"))
         && resultItems.size() < limit && m_memoryManager) {
-        bool servedByUnified = false;
         QList<QPair<QString, QString>> sources;
         if (MemorySourcePolicy::canReadChatHistory(
                 m_scope, Channel::kPet, Channel::kDefaultSession)) {
@@ -891,42 +795,28 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
             && !sources.contains({m_scope.channel, m_scope.sessionId})) {
             sources.append({m_scope.channel, m_scope.sessionId});
         }
-        if (m_memoryManager->memoryChunkCount() > 0) {
-            RetrievalRequest request;
-            request.query = query;
+        if (m_scope.viewerIsOwner && m_scope.ownerCrossChannelPrivate) {
+            sources.append({Channel::kPet, Channel::kDefaultSession});
+            for (const auto &account : m_scope.recentQueryTemplate.viewerIds)
+                sources.append({Channel::kQQPrivate, account});
+        }
+        if (!sources.isEmpty()) {
+            auto request = base;
+
+            request.sourceKinds = {"chat"};
             request.purpose = QStringLiteral("tool.chat_history");
-            request.subject = m_scope.viewerIsOwner
-                ? QStringLiteral("user") : m_scope.viewerPersonId;
-            request.viewerPersonId = m_scope.viewerPersonId;
-            request.viewerIsOwner = m_scope.viewerIsOwner;
-            request.accounts = m_scope.recentQueryTemplate.viewerIds;
-            if (request.accounts.isEmpty() && !m_scope.viewerPersonId.isEmpty())
-                request.accounts.append(m_scope.viewerPersonId);
-            request.terms = terms;
-            request.includeOthers = true;
-            request.currentChannel = m_scope.channel;
-            request.currentSession = m_scope.sessionId;
-            request.excludeCurrent = false;
+            if (timeRange.valid) {
+                request.from = timeRange.from;
+                request.until = timeRange.to;
+            }
+
             request.limit = limit;
-            request.candidateLimit = qMax(20, limit * 4);
-            request.rerankLimit = limit;
-            const auto retrievalConfig =
-                ConfigManager::instance().getMemoryPolicyConfig().retrieval;
-            request.useIndex = retrievalConfig.indexEnabled;
-            request.allowLegacyFallback = retrievalConfig.legacyFallback;
-            request.candidateLimit = retrievalConfig.candidateLimit;
-            request.rerankLimit = retrievalConfig.rerankLimit;
+
             QStringList allowed;
             for (const auto &source : sources)
                 allowed.append(source.first + QLatin1Char('|') + source.second);
-            if (m_scope.viewerIsOwner && m_scope.channel == Channel::kQQGroup
-                && m_scope.ownerCrossChannelPrivate) {
-                allowed.append(QStringLiteral("pet|default"));
-                allowed.append(QStringLiteral("qq_private|*"));
-            }
             request.allowedSources = allowed;
-            MemoryRetrievalService service(m_memoryManager);
-            configureRetrievalService(service, retrievalConfig);
+
             const auto unified = service.retrieve(request);
             for (const auto &evidence : unified.evidence) {
                 if (resultItems.size() >= limit)
@@ -963,96 +853,10 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
                 remember(item);
                 if (m_ordered.size() > before) {
                     resultItems.append(itemToJson(item));
-                    servedByUnified = true;
                 }
             }
         }
-        if (!servedByUnified) {
-        auto assistantText = [](const QString &rawReply) {
-            const auto root = QJsonDocument::fromJson(rawReply.toUtf8()).object();
-            QStringList parts;
-            for (const auto &value : root.value(QStringLiteral("sentences")).toArray()) {
-                const auto sentence = value.toObject();
-                const auto zh = sentence.value(QStringLiteral("zh_text")).toString().trimmed();
-                if (!zh.isEmpty())
-                    parts.append(zh);
-            }
-            if (parts.isEmpty() && !rawReply.trimmed().startsWith(QLatin1Char('{')))
-                parts.append(rawReply.trimmed());
-            return MemoryTextUtils::sanitizePromptText(parts.join(QLatin1Char('\n')));
-        };
-        for (const auto &source : sources) {
-            if (resultItems.size() >= limit) {
-                break;
-            }
-            const QList<HistoryTurn> turns =
-                m_memoryManager->searchHistoryTurns(source.first, source.second,
-                                                    terms, 5000);
-            for (const HistoryTurn &turn : turns) {
-                if (resultItems.size() >= limit) {
-                    break;
-                }
-                const QString userText = MemoryTextUtils::sanitizePromptText(
-                    turn.userInput.trimmed());
-                const QString replyText = assistantText(turn.rawReply);
-                const QString haystack = turn.userInput + QLatin1Char('\n')
-                                         + turn.rawReply;
-                if (!matchesTerms(haystack, terms)) {
-                    continue;
-                }
-                if (timeRange.valid && turn.timestamp.isValid()
-                    && (turn.timestamp < timeRange.from
-                        || turn.timestamp >= timeRange.to)) {
-                    continue;
-                }
-                const QString sourceLabel = source.first == Channel::kPet
-                    ? QStringLiteral("internal")
-                    : sourceLabelForSession(m_scope, source.second);
-                const QString ownerSpeaker = turn.speaker.isEmpty()
-                    ? (turn.subject == QStringLiteral("user") ? QStringLiteral("主人")
-                                                              : QStringLiteral("群友"))
-                    : turn.speaker;
-                if (!userText.isEmpty() && resultItems.size() < limit) {
-                    MemoryAgentItem item;
-                    item.id = QStringLiteral("chat:%1:user").arg(turn.id);
-                    item.kind = QStringLiteral("chat_history");
-                    item.text = userText;
-                    item.time = turn.timestamp;
-                    item.source = sourceLabel;
-                    item.personId = turn.subject;
-                    item.speaker = ownerSpeaker;
-                    item.speakerRole = QStringLiteral("user");
-                    item.derived = QStringLiteral("original");
-                    item.historyTurnId = turn.id;
-                    item.sourceSessionId = source.second;
-                    item.isViewer = turn.subject == QStringLiteral("user");
-                    const int before = m_ordered.size();
-                    remember(item);
-                    if (m_ordered.size() > before)
-                        resultItems.append(itemToJson(item));
-                }
-                if (!replyText.isEmpty() && resultItems.size() < limit) {
-                    MemoryAgentItem item;
-                    item.id = QStringLiteral("reply:%1").arg(turn.id);
-                    item.kind = QStringLiteral("chat_history");
-                    item.text = replyText;
-                    item.time = turn.timestamp;
-                    item.source = sourceLabel;
-                    item.personId = QStringLiteral("mako");
-                    item.speaker = QStringLiteral("茉子");
-                    item.speakerRole = QStringLiteral("assistant");
-                    item.derived = QStringLiteral("assistant_expression");
-                    item.historyTurnId = turn.id;
-                    item.sourceSessionId = source.second;
-                    item.isViewer = false;
-                    const int before = m_ordered.size();
-                    remember(item);
-                    if (m_ordered.size() > before)
-                        resultItems.append(itemToJson(item));
-                }
-            }
-        }
-        }
+
     }
 
     QJsonObject result;
@@ -1217,10 +1021,10 @@ QJsonArray MemoryAgent::initialPlannerMessages(const QString &query) const
     QJsonObject userData;
     userData.insert(QStringLiteral("query"), query);
     userData.insert(QStringLiteral("current_time"),
-                    QDateTime::currentDateTime().toString(Qt::ISODate));
+                    m_scope.now().toString(Qt::ISODate));
     userData.insert(QStringLiteral("timezone"),
                     m_scope.timezone.isEmpty()
-                        ? QString::fromUtf8(QDateTime::currentDateTime().timeZone().id())
+                        ? QString::fromUtf8(m_scope.now().timeZone().id())
                         : m_scope.timezone);
     QJsonArray recentTurns;
     for (const PlannerTurn &turn : m_scope.recentTurns) {

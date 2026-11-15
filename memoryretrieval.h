@@ -38,26 +38,6 @@ public:
                                   int limit, QString *error = nullptr) const override;
 };
 
-// 一个来源适配器只负责把原始记录映射成共同证据，不做第二套裁剪。
-class MemorySourceAdapter
-{
-public:
-    virtual ~MemorySourceAdapter() = default;
-    virtual QList<MemoryEvidence> fetch(const RetrievalRequest &request) const = 0;
-};
-
-class LegacyMemorySourceAdapter : public MemorySourceAdapter
-{
-public:
-    explicit LegacyMemorySourceAdapter(MemoryManager *manager);
-    QList<MemoryEvidence> fetch(const RetrievalRequest &request) const override;
-
-private:
-    MemoryManager *m_manager = nullptr;
-};
-
-// 第一版统一服务：复用 personalEvidence 作为来源，先统一证据与入口；
-// 词面/向量/RRF/重排属于后续阶段，不在这里伪装成已实现。
 class MemoryRetrievalService
 {
 public:
@@ -72,7 +52,6 @@ public:
 private:
     QList<MemoryEvidence> retrieveIndexed(const RetrievalRequest &request,
                                           RetrievalResult *result) const;
-    std::unique_ptr<MemorySourceAdapter> m_adapter;
     MemoryManager *m_manager = nullptr;
     std::shared_ptr<MemoryEmbeddingProvider> m_embedding;
     std::shared_ptr<MemoryReranker> m_reranker;

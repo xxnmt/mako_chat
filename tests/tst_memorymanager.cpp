@@ -1,5 +1,6 @@
 #include <QtTest>
 #include <QTemporaryDir>
+#include "benchmarksnapshot.h"
 #include <QSqlDatabase>
 #include <QSqlQuery>
 #include <QSqlError>
@@ -221,7 +222,7 @@ private slots:
         QVERIFY(raw.exec("DROP TABLE matter_revision"));
         for (int reopen=0; reopen<2; ++reopen) {
             MemoryManager db(path);
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),15);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),16);
             QCOMPARE(raw.scalar("SELECT state_updates FROM chat_history").toString(),QString("[]"));
             QVERIFY(db.matterHeads("user").isEmpty());
         }
@@ -482,9 +483,15 @@ private slots:
         legacy.eventType = "message";
         legacy.content = "脚踝已经恢复";
         QVERIFY(db.appendRawEvent(legacy));
-        const auto evidence = db.personalEvidence("user", {direct.actorId}, {"脚踝"});
-        QVERIFY(QJsonDocument(evidence).toJson().contains(legacy.content.toUtf8()));
-        QVERIFY(db.personalEvidence(group.subject, {group.subject.mid(3)}, {"脚踝"}).isEmpty());
+        RetrievalRequest request;
+        request.query = "脚踝";
+        request.sourceKinds = {"raw"};
+        request.accounts = {direct.actorId};
+        request.includeOthers = false;
+        MemoryRetrievalService retrieval(&db);
+        QVERIFY(!retrieval.retrieve(request).evidence.isEmpty());
+        request.accounts = {group.subject.mid(3)};
+        QVERIFY(retrieval.retrieve(request).evidence.isEmpty());
         QVERIFY(db.clearAllHistory());
         QVERIFY(db.currentUnderstanding(RequestMeta{}, "").isEmpty());
     }
@@ -511,11 +518,16 @@ private slots:
         event.sessionId = "20002";
         event.occurredAt = event.occurredAt.addSecs(60);
         QVERIFY(db.appendRawEvent(event));
-        const auto items = db.personalEvidence("user", {event.senderId},
-            {"排练"}, true, Channel::kPet, Channel::kDefaultSession);
+        RetrievalRequest request;
+        request.query = "排练";
+        request.sourceKinds = {"raw"};
+        request.accounts = {event.senderId};
+        request.includeOthers = false;
+        request.includeUnmatched = true;
+        const auto items = MemoryRetrievalService(&db).retrieve(request).evidence;
         QStringList texts;
         for (const auto &item : items)
-            texts.append(item.toObject()["text"].toString());
+            texts.append(item.text);
         QVERIFY(texts.contains(event.content));
         QVERIFY(texts.contains(QStringLiteral("排练记录 15")));
     }
@@ -751,6 +763,8 @@ private slots:
         QCOMPARE(situation.about, QStringLiteral("unknown"));
         QCOMPARE(situation.audienceKind, QStringLiteral("group"));
         QCOMPARE(situation.modality, QStringLiteral("text"));
+        QVERIFY(situation.toPromptBlock().contains("current_local_time: "
+            + situation.currentTime.toString(Qt::ISODateWithMs)));
         QVERIFY(situation.toPromptBlock().contains(QStringLiteral("speaker: owner")));
     }
 
@@ -842,23 +856,21 @@ private slots:
         for (const auto &item : rawOnlyResult.evidence)
             QCOMPARE(item.sourceType, QStringLiteral("raw"));
 
-        // 索引非空时，关闭回退也不能偷偷读取 old adapter。
+        // 结构化来源可独立查询；严格原文模式排除派生资料。
         QVERIFY(db.addLongTermSummary(QStringLiteral("legacy-only"), 1, QStringLiteral("[]")));
-        auto legacyRequest = request;
-        legacyRequest.query = QStringLiteral("legacy-only");
-        legacyRequest.terms = {QStringLiteral("legacy-only")};
-        legacyRequest.limit = 1;
-        legacyRequest.allowLegacyFallback = true;
-        const auto withFallback = defaultRerank.retrieve(legacyRequest);
-        QVERIFY(withFallback.evidence.size() <= 1);
-        auto noAux = legacyRequest;
+        auto structuredRequest = request;
+        structuredRequest.query = QStringLiteral("legacy-only");
+        structuredRequest.terms = {QStringLiteral("legacy-only")};
+        structuredRequest.limit = 1;
+        const auto withSummary = defaultRerank.retrieve(structuredRequest);
+        QVERIFY(withSummary.evidence.size() <= 1);
+        auto noAux = structuredRequest;
         noAux.includeAuxiliarySources = false;
         noAux.sourceKinds = {QStringLiteral("summary")};
         QVERIFY(defaultRerank.retrieve(noAux).evidence.isEmpty());
-        auto noFallback = legacyRequest;
-        noFallback.allowLegacyFallback = false;
-        noFallback.sourceKinds = {QStringLiteral("summary")};
-        QVERIFY(defaultRerank.retrieve(noFallback).evidence.isEmpty());
+        auto summaryOnly = structuredRequest;
+        summaryOnly.sourceKinds = {QStringLiteral("summary")};
+        QVERIFY(!defaultRerank.retrieve(summaryOnly).evidence.isEmpty());
 
         MemoryRetrievalService degraded(&db, std::make_shared<FailingEmbeddingProvider>());
         const auto degradedResult = degraded.retrieve(request);
@@ -878,15 +890,10 @@ private slots:
         QVERIFY2(db.clearSearchIndex(&error), qPrintable(error));
         QCOMPARE(db.memoryChunkCount(), 0);
         MemoryRetrievalService fallback(&db);
-        auto explicitFallback = request;
-        explicitFallback.allowLegacyFallback = true;
-        const auto fallbackResult = fallback.retrieve(explicitFallback);
-        QVERIFY(!fallbackResult.evidence.isEmpty());
-        QCOMPARE(fallbackResult.status, QStringLiteral("complete"));
-        QCOMPARE(fallbackResult.backend, QStringLiteral("legacy"));
-        auto noLegacy = request;
-        noLegacy.allowLegacyFallback = false;
-        QVERIFY(fallback.retrieve(noLegacy).evidence.isEmpty());
+        request.sourceKinds = {"raw"};
+        QVERIFY(fallback.retrieve(request).evidence.isEmpty());
+        request.sourceKinds = {"summary"};
+        QVERIFY(!fallback.retrieve(request).evidence.isEmpty());
     }
 
     void indexWorkerRebuilds()
@@ -944,7 +951,7 @@ private slots:
         }
         RawDb raw(path, "v15-verify");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 15);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 16);
     }
 
     void databaseBackupIsConsistent()
@@ -964,8 +971,49 @@ private slots:
         RawDb copy(backup, "backup-copy");
         QVERIFY(copy.open());
         QCOMPARE(copy.scalar("SELECT count(*) FROM chat_history").toInt(), 1);
-        QCOMPARE(copy.scalar("PRAGMA user_version").toInt(), 15);
+        QCOMPARE(copy.scalar("PRAGMA user_version").toInt(), 16);
         QVERIFY(copy.scalar("SELECT count(*) FROM memory_chunks").toInt() > 0);
+    }
+
+    void historicalReplayIsolatesAllMemoryReaders()
+    {
+        QTemporaryDir directory;
+        const QString path = directory.filePath("archive.db");
+        { MemoryManager archive(path); }
+        RawDb archive(path, "replay-original");
+        QVERIFY(archive.open());
+        for (int day : {10, 12}) {
+            const QString date = QString("2026-11-%1 08:00:00").arg(day);
+            const QString stamp = QString("'%1'").arg(date);
+            const QString id = QString::number(day);
+            QVERIFY(archive.exec("INSERT INTO chat_history(id,timestamp,user_input,raw_reply) VALUES("+id+","+stamp+",'turn','')"));
+            QVERIFY(archive.exec("INSERT INTO raw_events(id,platform,channel,session_id,event_type,occurred_at,content) "
+                                 "VALUES("+id+",'qq','qq_group','g','message',"+stamp+",'raw')"));
+            QVERIFY(archive.exec("UPDATE raw_events SET content_recorded_at="+stamp+" WHERE id="+id));
+            QVERIFY(archive.exec("INSERT INTO interactions(id,channel,session_id,started_at,ended_at,source_event_ids,"
+                                 "segmentation_method,summary_status,safe_summary) VALUES("+id+",'qq_group','g',"+stamp+
+                                 ","+stamp+",'["+id+"]','test','ready','summary')"));
+            QVERIFY(archive.exec("UPDATE interactions SET content_recorded_at="+stamp+" WHERE id="+id));
+            QVERIFY(archive.exec("INSERT INTO memory_claims(interaction_id,statement,source_event_ids,source_channel,"
+                                 "source_session_id,updated_at,valid_time_start) VALUES(10,'claim','[10]','qq_group','g',"
+                                 +stamp+",'2026-11-01')"));
+            QVERIFY(archive.exec("INSERT INTO long_term_summary(summary_text,source_ids,covered_turn_end_id,updated_at)"
+                                 " VALUES('summary','[10]',10,"+stamp+")"));
+            QVERIFY(archive.exec("INSERT INTO cognitive_source(id,event,subject,channel,session,input,reported,outcome) "
+                                 "VALUES("+id+","+id+",'user','pet','default','fact','2026-11-01','updated')"));
+            QVERIFY(archive.exec("INSERT INTO matter_revision(matter,version,source,topic,status,quote,kind,understanding,"
+                                 "recorded) VALUES('matter',"+id+","+id+",'topic','active','fact','self_report','fact',"+stamp+")"));
+        }
+        BenchmarkSnapshot snapshot;
+        QVERIFY(snapshot.open(path, {{"now","2026-11-11T12:00:00Z"}}, {}));
+        RawDb replay(snapshot.path(), "replay-check");
+        QVERIFY(replay.open());
+        for (const QString table : {"chat_history","raw_events","memory_claims","long_term_summary","matter_revision"}) {
+            QVERIFY2(replay.scalar("SELECT count(*) FROM "+table).toInt() == 1, qPrintable(table));
+            QCOMPARE(archive.scalar("SELECT count(*) FROM "+table).toInt(), 2);
+        }
+        QCOMPARE(replay.scalar("SELECT count(*) FROM interactions WHERE summary_status='ready'").toInt(), 1);
+        QCOMPARE(replay.scalar("SELECT version FROM matter_revision").toInt(), 10);
     }
 
     void vectorRecallWorksWithoutLexicalHit()
@@ -1054,7 +1102,6 @@ private slots:
         request.currentSession = QStringLiteral("other");
         request.excludeCurrent = false;
         request.useIndex = true;
-        request.allowLegacyFallback = false;
         request.candidateLimit = 40;
         request.rerankLimit = 10;
         MemoryRetrievalService service(&db);
@@ -1097,7 +1144,6 @@ private slots:
         request.currentSession = QStringLiteral("other");
         request.excludeCurrent = false;
         request.useIndex = true;
-        request.allowLegacyFallback = false;
         request.sourceKinds = {QStringLiteral("chat")};
         request.allowedSources = {QStringLiteral("qq_private|A")};
         request.candidateLimit = 2;
@@ -1141,7 +1187,7 @@ private slots:
             QVERIFY(raw.open());
 
             // 版本推进到 v3
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 15);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 16);
 
             // 列扩展（v2 渠道 + v3 轮次）
             const QStringList historyCols = raw.columns("chat_history");
@@ -1207,7 +1253,8 @@ private slots:
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
                                 "AND name='raw_messages'").toInt(), 0);
             const QStringList rawCols = raw.columns("raw_events");
-            QCOMPARE(rawCols.size(), 19);
+            QCOMPARE(rawCols.size(), 20);
+            QVERIFY(rawCols.contains("content_recorded_at"));
             QVERIFY(rawCols.contains("message_id"));
             QVERIFY(rawCols.contains("sender_id"));
             QVERIFY(rawCols.contains("event_type"));
@@ -1245,7 +1292,7 @@ private slots:
             MemoryManager second(dbPath);
             RawDb raw(dbPath, "verify2");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 15);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 16);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM chat_history").toInt(), 1);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM relationship_state").toInt(), 2);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM long_term_summary").toInt(), 1);
@@ -1262,7 +1309,7 @@ private slots:
             MemoryManager mm(dbPath);
             RawDb raw(dbPath, "fresh");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 15);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 16);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('raw_events')").toInt() > 0);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('memory_cursor')").toInt() > 0);
 
@@ -1469,7 +1516,7 @@ private slots:
         Q_UNUSED(mm);
         RawDb raw(dbPath, "v2verify");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 15);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 16);
         QCOMPARE(raw.scalar("SELECT user_input FROM chat_history").toString(), QStringLiteral("旧输入"));
         QCOMPARE(raw.scalar("SELECT turn_kind FROM chat_history").toString(), QStringLiteral("reply"));
         QCOMPARE(raw.scalar("SELECT subject FROM chat_history").toString(), QStringLiteral("user"));

@@ -36,6 +36,8 @@ struct MemoryAgentScope {
     // 仅用于审计/回复边界，不包含敏感 ID。
     QString accessScope;
     bool otherChannelsVisible = false;
+    QDateTime referenceTime;
+    QDateTime now() const { return referenceTime.isValid() ? referenceTime : QDateTime::currentDateTime(); }
     QString timezone;
     QList<PlannerTurn> recentTurns;
     MemoryAccessContext access;

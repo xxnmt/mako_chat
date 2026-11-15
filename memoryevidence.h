@@ -1,6 +1,7 @@
 #ifndef MEMORYEVIDENCE_H
 #define MEMORYEVIDENCE_H
 
+#include <functional>
 #include <QDateTime>
 #include <QJsonObject>
 #include <QList>
@@ -61,7 +62,6 @@ struct MemoryEvidence
     QString expressionHint;
     bool own = false;
 
-    static MemoryEvidence fromLegacy(const QJsonObject &row);
     static MemoryEvidence fromChunk(const QJsonObject &row,
                                     const QString &viewerPersonId = {},
                                     bool viewerIsOwner = false);
@@ -85,14 +85,15 @@ struct RetrievalRequest
     bool includeUnmatched = false;
     bool includeAllEpisodic = false;
     bool requireTermMatch = false;
-    bool allowLegacyFallback = true;
+    QDateTime from;
+    QDateTime until;
+    std::function<bool(const MemoryEvidence &)> accept;
     bool includeAuxiliarySources = true;
     QStringList sourceKinds;
     QStringList allowedSources; // "channel|session" 或 "channel|*"
     int limit = 12;
     int candidateLimit = 40;
     int rerankLimit = 10;
-    int maxTurn = 0;
     bool turnAggregation = false;
     bool useIndex = true;
     MemorySituation situation;

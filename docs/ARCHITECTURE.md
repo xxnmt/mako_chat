@@ -1,9 +1,9 @@
 # 架构与当前实现
 
-> 更新于 2026-11-13，覆盖 v15 检索块与统一证据入口。
+> 更新于 2026-11-15。检索运行与验证记录见 [P5 交接](RETRIEVAL_REFACTOR_STATUS.md)。
 > 先读 [当前状态](STATUS.md)；后续任务见 [开发路线图](ROADMAP.md)；入口见 [文档索引](README.md)。
 > 本文只描述当前实现。文中 PR/R3 编号是历史工作包，不代表当前路线图。
-> 当前实现一句话：v15 检索块 + 统一证据服务 + 两阶段生成（私下判断/公开表达）+ `memory_recall` 工具 + 跨渠道 `personalEvidence` / `currentUnderstanding`。
+> 当前表达请求直接接收统一检索返回的证据、场景与当前认识，可按需调用记忆工具。
 
 ## 组件与职责
 
@@ -33,7 +33,7 @@
 
 ## 正常对话路径
 
-渠道输入经 SessionRouter 生成 RequestMeta 后，AppController 将输入交给 CognitiveCoordinator，由它保存输入并排入前台队列。实际启动时重读当前会话历史，再调用 LLMService。LLMService 先准备跨渠道证据，必要时做私下判断，再组装最终上下文并进入聊天及记忆工具循环。前台结果携带对应输入和元数据，AppController 将正文交给原渠道，协调器在渠道交接时回填对应输入行，控制器按阈值触发后台记忆提取。
+渠道输入经 SessionRouter 生成 RequestMeta 后，AppController 将输入交给 CognitiveCoordinator，由它保存输入并排入前台队列。实际启动时重读当前会话历史，再调用 LLMService。LLMService 先准备跨渠道证据，再组装最终上下文并进入聊天及记忆工具循环。前台结果携带对应输入和元数据，AppController 将正文交给原渠道，协调器在渠道交接时回填对应输入行，控制器按阈值触发后台记忆提取。
 
 LLMService 仍保留单份活动请求状态，当前应用依靠前台串行队列保证其调用边界。成功结果携带上下文不等于服务已支持任意并发调用。MemoryAgent 的结果及失败带请求 ID；主网络回复校验运行代次。原生工具拒绝时可回退 JSON Envelope，输出异常与空回复执行有限重试。
 
@@ -41,27 +41,27 @@ Pet 走语音合成和音频 sink，QQ 走文本发送。QQ 情绪可按配置�
 
 ## 记忆与持久化
 
-当前 SQLite user_version 为 15。基础表包括 chat_history、character_profile、episodic_memory、long_term_summary、relationship_state；多渠道之后增加 raw_events、memory_cursor、interactions、人物身份、claims 和群成员关系。完整字段以 MemoryManager::initDatabase 为准，v10 在 chat_history 中增加 state_updates、thought、thought_version、thought_result、review_after，并增加 thought_review_log 与索引；v15 增加 memory_chunks、memory_chunk_sources、memory_embeddings、memory_index_state。
+当前 SQLite user_version 为 16。基础表包括 chat_history、character_profile、episodic_memory、long_term_summary、relationship_state；多渠道之后增加 raw_events、memory_cursor、interactions、人物身份、claims 和群成员关系。完整字段以 MemoryManager::initDatabase 为准，v10 在 chat_history 中增加 state_updates、thought、thought_version、thought_result、review_after，并增加 thought_review_log 与索引；v15 增加 memory_chunks、memory_chunk_sources、memory_embeddings、memory_index_state。
 
-会话短期历史按 channel/session_id 分桶。稳定档案和关系可内联；tool 模式下历史事实主要按需检索。跨渠道 personalEvidence 与 currentUnderstanding 另行接入最终请求前的上下文准备。原始事件、聊天轮次和派生证据有各自删除边界，删除聊天记录不会自动删除独立 raw_events。
+会话短期历史按 channel/session_id 分桶。稳定档案和关系可内联；tool 模式下历史事实主要按需检索。统一检索证据与 currentUnderstanding 另行接入最终请求前的上下文准备。原始事件、聊天轮次和派生证据有各自删除边界，删除聊天记录不会自动删除独立 raw_events。
 
 既有 R3 披露工具契约见 [R3 基线](MEMORY_V5_R3_BASELINE.md)，工具 JSON、状态和时间框架见 [检索接口](MEMORY_RECALL_TOOL.md)。R3 文档中的 v9 快照只描述当时路径，新增内部证据路径不能套用旧矩阵推断其全部行为。MemoryAccessState 定义四个枚举，当前 evaluate 实际返回 Shareable 或 Forbidden；KnownOnly/OwnerCandidate 不能据枚举定义视为完整实现。
 
 ## 2026-11-12 归属、场景与文字活动
 
 - **承诺归属**：`currentUnderstanding` 为每个事项保留 `self_report`（最近一次本人原话、版本、`source/N`、`speaker_role=user`）。`prepareReply` 把 `self_report` 放进 `CURRENT_UNDERSTANDING` 目录；证据元数据补 `speaker_role` / `source_kind`。`attribution_check` 分三层：编号有效、说话人正确、语义是否蕴含（`semantic_review_required`，由验收样本判断）。
-- **关心收尾**：`considerEvidence` 可返回 `care` 数组（topic / user_response / care_action），只绑定用户实际回应的那件事；不把“上床”扩展成“已入睡/已洗澡/作息已调整”。无 `considerEvidence` 的普通私聊由 turn instruction 的通用规则兜底。
+- **关心收尾**。表达请求要求分清用户回应的具体事项，保留拒绝和完成状态。
 - **场景事实**：`PromptAssembler::buildSituationBlock` 注入 surface / speaker / audience / about / modality / privacy。它只说明在哪里、对谁、能用什么形式，不要求不同渠道换一种说法；`about` 未确认时写 `unknown`，不把当前对话对象当成事情主体；pet 只有在 TTS 为 `api` 时才标 `voice+text`。
 - **文字活动**：复用 `chat_history.thought` + `thought_result`，不新增表。`finishThoughtReview` 支持 `paused` 与 `progress/next_step/paused_reason`；`applyThoughtAction(id, expectedVersion, action)` 条件更新并递增 `thought_version`，迟到写作回调因版本不匹配被丢弃。`draftReadyToShare(activityRef, version, draft)` 在发送前再次检查 `canShareThought`。
 - **开关拆分**：`proactive.private_writing` 控制后台写作/回顾，`proactive.enabled` 控制主动联系/分享；`quiet_hours` 只暂停后者。
 
-## 2026-11-13 统一检索 P1/P2 切片
+## 统一检索与记忆感知
 
-- `memoryevidence.h` 定义 `MemorySituation`、`MemoryEvidence`、`RetrievalRequest`、`RetrievalResult`；`memoryretrieval.h` 定义 `MemorySourceAdapter`、`MemoryRetrievalService`；`memoryembedding.h` 定义可选向量 Provider。
+- `memoryevidence.h` 定义 `MemorySituation`、`MemoryEvidence`、`RetrievalRequest`、`RetrievalResult`；`memoryretrieval.h` 定义 `MemoryRetrievalService`；`memoryembedding.h` 定义可选向量 Provider。
 - `LLMService::askDeepSeek` 的自动证据准备调用统一服务：Pet、QQ 私聊、群聊使用同一入口；`currentUnderstanding(..., includeAudiencePrivate=true)` 让表达模型保留相关私人背景。
-- v15 的 `memory_chunks` / `memory_chunk_sources` / `memory_embeddings` / `memory_index_state` 是可重建索引；新 raw/chat 写入同步增量索引，`--rebuild-memory-index` 用于旧库整库回填，`--memory-index-status` 查看状态，索引为空时回退旧适配器。
-- 索引路径当前为词面 BM25 + 可选向量 + RRF + 启发式重排；真实 Embedding/Reranker Provider 尚未接入，`LocalHashEmbeddingProvider` 只是测试/降级 Provider。
-- `MemoryAgentTools` 已补充助手表达、说话人和派生字段，并允许 Pet 使用工具；但其逐源查询尚未全部委托统一服务。
+- v15 的 `memory_chunks` / `memory_chunk_sources` / `memory_embeddings` / `memory_index_state` 是可重建索引；新 raw/chat 写入同步增量索引，`--rebuild-memory-index` 用于旧库整库回填，`--memory-index-status` 查看状态，结构化来源单独读取原表。
+- 索引路径当前为BM25 与可选向量召回，经 RRF 合并后，按配置使用本地或 DashScope 重排。LocalHashEmbeddingProvider 可用于测试。
+- `MemoryAgentTools` 已补充助手表达、说话人和派生字段，并允许 Pet 使用工具；六类搜索来源均通过统一服务取得候选，工具继续负责授权和结果句柄。
 
 ## 实际验证与当前限制
 
@@ -69,7 +69,7 @@ Pet 走语音合成和音频 sink，QQ 走文本发送。QQ 情绪可按配置�
 
 最近一次开发验证中，Windows Debug 构建曾成功，15 个自动测试套件通过。后续召回排序修改也通过全部套件；运行中的原名可执行文件会阻止覆盖链接。测试覆盖的是受控输入下的数据与请求行为，不能据此宣称真实模型已能稳定理解更正。下述已实现路径表示源码已接入。
 
-v11 的认识更新独立于对话回复。语义关联仍由模型负责，每次最多选取该主体 48 个事项，按输入词匹配及修订顺序排序。历史证据检索仍有数量上限，群聊表达仍使用有限的私下判断。连续两条消息之间可能尚未完成后台提交，当前状态按已提交版本读取，提取器也可能将更正误判为无变化。
+v11 的认识更新独立于对话回复。语义关联仍由模型负责，每次最多选取该主体 48 个事项，按输入词匹配及修订顺序排序。历史证据检索仍有数量上限，群聊表达按相关性与预算读取证据。连续两条消息之间可能尚未完成后台提交，当前状态按已提交版本读取，提取器也可能将更正误判为无变化。
 
 当前排序同时保留主题相关性与本人时间线的候选机会，未针对私聊设置固定的一天窗口。时间字段包含消息时间、事件时间和摘要整理时间，现有聚合候选尚未完整区分这些语义，这是后续重构需要处理的缺口。
 
@@ -88,7 +88,7 @@ v11 的认识更新独立于对话回复。语义关联仍由模型负责，每�
 
 ## 启用和验收
 
-跨渠道认识跟随全局长期记忆开关。要辨认跨渠道的主人，请在身份配置中登记本人的 QQ 账号。首次打开旧库时，SQLite 以事务迁移到 v15。v10 主题继续作为历史证据，已有行不重新提交给提取模型。更早版本先执行已有迁移。升级前如需保留旧版运行环境，可在应用关闭时备份记忆库。
+跨渠道认识跟随全局长期记忆开关。要辨认跨渠道的主人，请在身份配置中登记本人的 QQ 账号。首次打开旧库时，SQLite 以事务迁移到 v16。v10 主题继续作为历史证据，已有行不重新提交给提取模型。更早版本先执行已有迁移。升级前如需保留旧版运行环境，可在应用关闭时备份记忆库。
 
 认识更新在前台回复之外异步运行，每条符合条件的消息通常增加一次模型请求。无工作时只查询本地队列。同一主体的输入顺序处理，网络错误从 30 秒开始退避，最长一小时。协议、证据或基版本连续被拒的事件累计三次后记录为 review_required，后续事件可以继续。needs_evidence 触发一次历史补查，有可用依据才再请求一次模型。第二次仍无法判断时保存未决结果。同会话较早事件的聊天记录晚到时可重新排队。升级到 v12 时，保有输入的旧 needs_evidence 和 review_required 各重新排队一次。新增 [Cognition] 日志使用 run、来源序号、候选事项及版本、退出原因和耗时关联提案与上下文，正文仍受原有聊天调试日志设置影响。
 
@@ -101,7 +101,7 @@ v11 的认识更新独立于对话回复。语义关联仍由模型负责，每�
 - 在两个渠道快速连续输入，再制造一次网络失败，检查各自的回复目标和下一轮能否继续。
 - 在开启主动活动后私聊讨论一个创作点子。若产生了兴趣，经过空闲回顾后，可以询问草稿。她也可能选择暂时搁置。
 
-自动化覆盖数据库迁移、本人更正、逐字证据、重启、删除、回顾预算与版本控制。回环 HTTP 测试使用正常 LLM 消息组装与网络解析路径，检查群聊私下判断能看到证据、公开回复上下文没有私聊原句、Pet 可以使用该证据。真实模型能否稳定提取主题与自然表达，需要实际使用观察。
+自动化覆盖数据库迁移、本人更正、逐字证据、重启、删除、回顾预算与版本控制。回环 HTTP 测试使用正常 LLM 消息组装与网络解析路径，检查群聊表达与 Pet 请求均可获得相关的跨渠道证据。真实模型能否稳定提取主题与自然表达，需要实际使用观察。
 
 
 
@@ -122,7 +122,7 @@ observation_history 记录补查轮次实际提供的聊天行。删除其中任
 
 接受消息后，允许留存的输入立即写入 chat_history，获得一条 turn_state 为 received 的记录。允许后台观察时，同一事务先尝试登记认知来源。前台按接收顺序工作，读取本条输入之前的会话历史，单独传入当前消息。摘要也以本次完成的行号为上界。模型可直接接话、澄清或主动收尾。后台观察有独立的重试周期，前台可以使用当前消息里的更正。
 
-CURRENT_UNDERSTANDING 提供本轮可见事项目录。模型需要核对现状时，先返回带 refs 的 consult 动作。程序将本轮编号映射到内部事项，按同一听众重新读取相应记录，再请求表达。群聊私下判断可产生交谈指引，也可选择本人主动问及的普通自述。内部核对修订记录之后，公开请求使用 context/N、认识、状态、报告时间和确定性，不传递跨渠道原文。内部判断与公开生成分两次或多次调用。历史事件检索仍使用 memory_recall/read。直接回应无需额外进行事项核对。
+CURRENT_UNDERSTANDING 提供事项目录、本人陈述和相关完整认识。咨询按本轮引用读取修订链并核验版本。群聊表达直接接收相关内部背景与听众信息。原始事件可经 memory_recall/read 补查。
 
 数据库提交认识或删除依据后，程序比较已选择事项对当前听众的投影。可见依据有变化时取消旧生成，用新资料重新表达一次。网络回调也会复核，覆盖提交与回调次序互换的情况。再次变化会结束处理并记录 referenced_matter_changed。未整理的输入是否涉及某件事仍需语义判断。当前变更通知覆盖已提交的事项，短期历史、跨渠道原始资料和历史工具结果尚无同等粒度的动态订阅。
 

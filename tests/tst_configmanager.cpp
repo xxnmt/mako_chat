@@ -212,6 +212,9 @@ private slots:
         QVERIFY(policy.privacyRules.isEmpty());
         QVERIFY(!cfg.getDebugFullLogs());
         QVERIFY(!debugFullLogsEnabled());
+        QVERIFY(policy.retrieval.rerankEnabled);
+        QCOMPARE(policy.retrieval.rerankLimit, 10);
+        QCOMPARE(policy.retrieval.candidateLimit, 40);
         QCOMPARE(policy.interaction.groupIdleMinutes, 15);
         QCOMPARE(policy.interaction.groupBatchSize, 50);
         QCOMPARE(policy.interaction.gapSeconds, 90);

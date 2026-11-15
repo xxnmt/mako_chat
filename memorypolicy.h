@@ -65,10 +65,9 @@ struct MemoryAgentConfig {
 struct MemoryRetrievalConfig {
     bool indexEnabled = true;
     bool autoBackfill = false;
-    bool legacyFallback = true;
     int candidateLimit = 40;
     int rerankLimit = 10;
-    bool rerankEnabled = false;
+    bool rerankEnabled = true;
     bool embeddingEnabled = false;
     QString embeddingProvider;
     QString embeddingEndpoint;

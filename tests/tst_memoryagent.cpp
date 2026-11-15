@@ -265,16 +265,16 @@ private slots:
         }
     }
 
-    void understandingSnapshotAcrossReflection_data()
+    void understandingSnapshotAtDispatch_data()
     {
-        QTest::addColumn<bool>("updateDuringReflection");
-        QTest::newRow("visible update before final prompt") << true;
-        QTest::newRow("hidden update during final generation") << false;
+        QTest::addColumn<bool>("updateBeforeRequest");
+        QTest::newRow("committed before dispatch") << true;
+        QTest::newRow("committed after dispatch") << false;
     }
 
-    void understandingSnapshotAcrossReflection()
+    void understandingSnapshotAtDispatch()
     {
-        QFETCH(bool, updateDuringReflection);
+        QFETCH(bool, updateBeforeRequest);
         QTemporaryDir dir;
         MemoryManager db(dir.filePath("snapshot.db"));
         RequestMeta report;
@@ -291,28 +291,28 @@ private slots:
         QTcpServer server;
         QVERIFY(server.listen(QHostAddress::LocalHost));
         QList<QByteArray> bodies;
-        bool committed = false;
-        serveCompletions(server, bodies, [&](int count) -> QString {
-            if (count == (updateDuringReflection ? 1 : 2)) {
-                const QJsonObject change{{"matter",""},{"version",0},{"topic","预约"},{"quote","预约延期"},
-                    {"status","tentative"},{"understanding","预约日期待定"},{"kind","self_report"}};
-                committed = db.commitObservation(source, {{"outcome","updated"},{"changes",QJsonArray{change}}});
-            }
-            if (count == 1) return R"({"decision":"normal"})";
+        const auto commit = [&] {
+            const QJsonObject change{{"matter",""},{"version",0},{"topic","预约"},{"quote","预约延期"},
+                {"status","tentative"},{"understanding","预约日期待定"},{"kind","self_report"}};
+            return db.commitObservation(source, {{"outcome","updated"},{"changes",QJsonArray{change}}});
+        };
+        bool committed = updateBeforeRequest && commit();
+        serveCompletions(server, bodies, [&](int) -> QString {
+            if (!updateBeforeRequest) committed = commit();
             return R"({"sentences":[{"zh_text":"好呀","ja_text":"いいよ","tags":{"emotion":"happy"}}]})";
         });
         LLMService service("test", nullptr, QUrl(QString("http://127.0.0.1:%1/").arg(server.serverPort())));
         service.setMemoryManager(&db);
         QSignalSpy spoken(&service, &LLMService::sentencesReady);
         QSignalSpy quiet(&service, &LLMService::replyQuiet);
-        service.askDeepSeek(updateDuringReflection ? "预约" : "最近如何", {}, group);
+        service.askDeepSeek(updateBeforeRequest ? "预约" : "最近如何", {}, group);
         QTRY_COMPARE_WITH_TIMEOUT(spoken.size() + quiet.size(), 1, 5000);
         QVERIFY(committed);
-        QCOMPARE(bodies.size(), 2);
+        QCOMPARE(bodies.size(), 1);
         QVERIFY(bodies.first().contains(QStringLiteral("预约延期").toUtf8()));
         // P3：表达模型保留相关背景；是否说出由听众与保密语义决定。
         QVERIFY(bodies.last().contains(QStringLiteral("预约延期").toUtf8()));
-        QCOMPARE(bodies.last().contains("CURRENT_UNDERSTANDING\\n"), updateDuringReflection);
+        QCOMPARE(bodies.last().contains("CURRENT_UNDERSTANDING\\n"), updateBeforeRequest);
         QCOMPARE(spoken.size(), 1);
     }
 
@@ -368,7 +368,7 @@ private slots:
         serveCompletions(server,bodies,[&](int count) {
                 const int step = count-int(needsHistory);
                 return step==0 ? QStringLiteral(R"({"outcome":"needs_evidence","changes":[]})")
-                    : step==1 ? update : step==2 ? QStringLiteral(R"({"decision":"skip_old_concern"})")
+                    : step==1 ? update
                     : QStringLiteral(R"({"sentences":[{"zh_text":"好呀","ja_text":"いいよ","tags":{"emotion":"happy"}}]})");
         });
         LLMService service("test",nullptr,QUrl(QString("http://127.0.0.1:%1/").arg(server.serverPort())));
@@ -386,16 +386,15 @@ private slots:
         meta.runId = "group";
         service.askDeepSeek(followup,{},meta);
         QTRY_COMPARE_WITH_TIMEOUT(replies.size(),1,5000);
-        QCOMPARE(bodies.size(),3+int(needsHistory));
+        QCOMPARE(bodies.size(),2+int(needsHistory));
         QCOMPARE(replies.at(0).at(2).toString(), followup);
         QCOMPARE(replies.at(0).at(3).value<RequestMeta>().runId, meta.runId);
         QCOMPARE(replies.at(0).at(3).value<RequestMeta>().sessionId, meta.sessionId);
-        QVERIFY(bodies[bodies.size()-2].contains(secret.toUtf8()));
         QVERIFY(bodies.last().contains(secret.toUtf8()));
-        QVERIFY(bodies.last().contains(QString("别按以前的情况主动追问").toUtf8()));
+        QVERIFY(bodies.last().contains(QString("按听众决定如何表达").toUtf8()));
         service.askDeepSeek("我刚才说了什么",{},RequestMeta{});
         QTRY_COMPARE_WITH_TIMEOUT(replies.size(),2,5000);
-        QCOMPARE(bodies.size(),4+int(needsHistory));
+        QCOMPARE(bodies.size(),3+int(needsHistory));
         QVERIFY(bodies.last().contains(secret.toUtf8()));
         if (needsHistory) {
             QVERIFY(db.deleteTurnByID(1));
@@ -481,7 +480,7 @@ private slots:
             QJsonValue(QStringLiteral("assistant_suggestion_as_user_promise"))));
     }
 
-    void projectionUsesCheckedOwnReport()
+    void groupExpressionReceivesAttributedRevisions()
     {
         QTemporaryDir dir;
         MemoryManager db(dir.filePath("projection.db"));
@@ -508,8 +507,6 @@ private slots:
         QVERIFY(server.listen(QHostAddress::LocalHost));
         QList<QByteArray> bodies;
         serveCompletions(server,bodies,[](int count) -> QString {
-            if (count==1 || count>4) return QStringLiteral("{}");
-            if (count<4) return R"({"decision":"respond","intent":"self_recall","disclosure":"ordinary_self_report","certainty":"reported","refs":[1],"evidence_versions":{"1":1},"reference_status":"plausible","excerpts":{"1":"陶艺课取消了"}})";
             return R"({"sentences":[{"zh_text":"记得，你说课取消了。","ja_text":"そうだね","tags":{"emotion":"happy"}}]})";
         });
         LLMService model("test",nullptr,QUrl(QString("http://127.0.0.1:%1/").arg(server.serverPort())));
@@ -522,21 +519,11 @@ private slots:
         QSignalSpy spoken(&model,&LLMService::sentencesReady);
         model.askDeepSeek("还记得我那个安排后来怎么样了吗",{},group);
         QTRY_COMPARE_WITH_TIMEOUT(spoken.count(),1,5000);
-        QCOMPARE(bodies.size(),4);
-        QVERIFY(bodies.at(1).contains("missing_decision"));
-        QVERIFY(bodies.at(2).contains(original.toUtf8()));
-        QVERIFY(bodies.last().contains("context/1"));
-        QVERIFY(!bodies.last().contains(QStringLiteral("课程已经取消").toUtf8()));
-        QVERIFY(bodies.last().contains(QStringLiteral("陶艺课取消了").toUtf8()));
-        QVERIFY(bodies.last().contains("answer_and_confirm"));
-        QVERIFY(!bodies.last().contains(original.toUtf8()));
-        QSignalSpy interrupted(&model,&LLMService::replyAbnormal);
-        group.runId = group.eventId = "invalid-repeat";
-        model.askDeepSeek("再想想",{},group);
-        QTRY_COMPARE_WITH_TIMEOUT(interrupted.size(),1,5000);
-        QCOMPARE(interrupted.first().first().toString(),QString("expression_missing_decision"));
-        QCOMPARE(bodies.size(),6);
-        QCOMPARE(spoken.size(),1);
+        QCOMPARE(bodies.size(),1);
+        QVERIFY(bodies.last().contains("revision/"));
+        QVERIFY(bodies.last().contains("self_report"));
+        QVERIFY(bodies.last().contains("inference"));
+        QVERIFY(bodies.last().contains(original.toUtf8()));
         group.subject = "qq:other";
         QVERIFY(db.internalMatters(group,{}).isEmpty());
     }
@@ -1301,6 +1288,12 @@ private slots:
 
         MemoryAgentScope scope = ownerGroupScope(QStringLiteral("30001"), QDateTime::currentDateTime());
         scope.ownerCrossChannelPrivate = true;
+        scope.recentQueryTemplate.viewerIds = {privateMeta.actorId};
+        RequestMeta other = privateMeta;
+        other.sessionId = other.actorId = "404";
+        other.eventId = "unrelated-private";
+        other.subject = "qq:404";
+        QVERIFY(mm.saveQATurn("其他人的私聊秘密", "{}", {}, other));
         MemoryAgentTools tools(&mm, scope);
         QString error;
         const auto result = tools.execute(QStringLiteral("memory_search"),
@@ -1314,6 +1307,7 @@ private slots:
                 == QStringLiteral("私聊秘密"))
                 found = true;
         QVERIFY(found);
+        QVERIFY(!QJsonDocument(result).toJson().contains(QString("其他人的私聊秘密").toUtf8()));
     }
 
     void dashScopeProvidersParseMockResponses()

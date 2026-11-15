@@ -123,7 +123,7 @@ QJsonArray MemoryManager::internalMatters(const RequestMeta &meta, const QString
             WHERE s.subject=:subject
               AND (:heads OR matter IN (SELECT value FROM json_each(:matters)))
         )
-        SELECT matter,version,topic,quote,kind,status,understanding,event_time,reported,channel,session,input
+        SELECT matter,version,topic,quote,kind,status,understanding,event_time,reported,channel,session,input,source,recorded
         FROM revisions WHERE pos<=:depth
         ORDER BY (SELECT count(*) FROM json_each(:terms)
             WHERE instr(topic,value)>0 OR instr(quote,value)>0 OR instr(understanding,value)>0) DESC,
@@ -145,7 +145,9 @@ QJsonArray MemoryManager::internalMatters(const RequestMeta &meta, const QString
             {"topic",q.value(2).toString()},{"quote",q.value(3).toString()},
             {"kind",q.value(4).toString()},{"status",q.value(5).toString()},
             {"understanding",q.value(6).toString()},{"event_time_expression",q.value(7).toString()},
-            {"reported_at",q.value(8).toString()},{"original_report",q.value(11).toString()}};
+            {"reported_at",q.value(8).toString()},{"original_report",q.value(11).toString()},
+            {"evidence_ref",QString("source/%1").arg(q.value(12).toLongLong())},
+            {"interpretation_recorded_at",q.value(13).toString()}};
         bool allowed = true;
         for (const auto &key : {"topic","quote","understanding","original_report","event_time_expression"}) {
             const auto scan = SensitiveContentFilter::sanitize(row[key].toString(),{},policy.privacyRules);

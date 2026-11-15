@@ -35,7 +35,7 @@ QString identityGuard(const RequestMeta &meta)
     if (group && master) {
         guard += QStringLiteral("- 当前对话对象是主人（在群聊中）。\n");
         guard += QStringLiteral("- 可以称呼“欧尼酱”，但群聊里保持分寸。\n");
-        guard += QStringLiteral("- 本人问起普通近况时，可使用本轮 context/N 中获准公开的认识；不要披露私人原文、来源或额外个人资料。\n");
+        guard += QStringLiteral("- 本人问起普通近况时，可使用有依据且适合当前听众的认识；不要披露私人原文、来源或额外个人资料。\n");
     } else if (group) {
         guard += QStringLiteral("- 当前对话对象是群友「%1」，不是主人。\n").arg(name);
         guard += QStringLiteral("- 称呼对方为「%1」或“你”，禁止使用“欧尼酱”。\n").arg(name);

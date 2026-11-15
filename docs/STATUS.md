@@ -1,6 +1,6 @@
 # 当前状态与阅读入口
 
-> 更新：2026-11-12 · 基于 `6a6a73d` 的工作树
+> 更新于 2026-11-15。
 > 本文只回答“现在在哪”。能力清单看 [开发路线图](ROADMAP.md)，实现细节看 [架构与当前实现](ARCHITECTURE.md)，历史看 [开发历史](HISTORY.md)。
 
 ## 一句话
@@ -22,7 +22,7 @@
 2. **私聊归属/收尾实机**：确认“你答应过”只引用用户原话；用户说“已经躺下”后不再新增义务。
 3. **活动真实使用**：写一段草稿 → 重启读回 → 继续写 → 写作中暂停 → 迟到回调不复活。
 
-> 统一检索与记忆感知重构另开阶段：总进度见 [RETRIEVAL_REFACTOR_STATUS.md](RETRIEVAL_REFACTOR_STATUS.md)，P0/P1/P2 细节见同名文档。已接入统一自动证据、Pet/QQ 工具入口、助手证据、v15 检索块、词面/RRF 与可选向量；真实 Embedding/Reranker、自动异步回填和真实渠道仍未验收。
+> P5 已接入新版检索与群聊表达。验证记录和验收范围见 [统一检索交接](RETRIEVAL_REFACTOR_STATUS.md)。
 
 ## 已完成 / 进行中 / 未开始
 
@@ -32,12 +32,11 @@
 - PR-4、PR-6/7/8/9：legacy MemoryAgent、Memory Recall Tool、Overview、TimeFrame。
 - v15：`cognitive_source` / `matter_revision` / `observation_history` / `cognitive_audit` 证据链，以及可重建的 `memory_chunks` / `memory_chunk_sources` / `memory_embeddings` / `memory_index_state`。
 - 统一检索：`MemoryEvidence` / `MemoryRetrievalService`；Pet/QQ 自动证据同入口；同渠道历史进入候选；工具补助手表达、说话人字段并开放 Pet。
-- 混合召回：v15 检索块、词面 BM25、可选向量、RRF、启发式重排与旧适配器回退；`--rebuild-memory-index` / `--memory-index-status` / `--clear-memory-index` / `--backup-memory-db`；新消息增量写 chunk；`auto_backfill` 使用独立线程与独立 SQL 连接；审计记录 backend/候选数/辅助来源/延迟；DashScope Embedding 已接入后台索引，查询侧通过独立 `MemoryRetrievalWorker`；凭证可存 `setting.json` 的 `api.dashscope_api_key`。
-- 工具对话检索不再固定只取最近 200 轮；`recent`、`chat_history`、`interaction_summary`、`long_term_summary`、`claim`、`episodic` 优先走统一服务，索引未就绪时按配置回退；助手表达作为独立证据返回；`speaker_id` 与本轮 viewer 比较，owner 群可按配置看到跨渠道私聊。
-- 连续感知：`considerEvidence` 把 background + personal 交给表达模型；`currentUnderstanding` 支持 audience-private；群聊不再只靠失忆式投影。
-- 群聊跨渠道表达：`context/N` 最小片段投影、`excerpts` 校验、空决定拦截（`6a6a73d`）。
+- 混合召回：v15 检索块、词面 BM25、可选向量、RRF、本地或 DashScope 重排；`--rebuild-memory-index` / `--memory-index-status` / `--clear-memory-index` / `--backup-memory-db`；新消息增量写 chunk；`auto_backfill` 使用独立线程与独立 SQL 连接；审计记录 backend/候选数/辅助来源/延迟；DashScope Embedding 已接入后台索引，查询侧通过独立 `MemoryRetrievalWorker`；凭证可存 `setting.json` 的 `api.dashscope_api_key`。
+- 工具对话检索不再固定只取最近 200 轮；`recent`、`chat_history`、`interaction_summary`、`long_term_summary`、`claim`、`episodic` 通过统一服务按来源读取；助手表达作为独立证据返回；`speaker_id` 与本轮 viewer 比较，owner 群可按配置看到跨渠道私聊。
+- 连续感知：表达模型直接读取相关证据与修订；`currentUnderstanding` 支持 audience-private；群聊不再只靠失忆式投影。
 - 承诺归属：`CURRENT_UNDERSTANDING` 增加 `self_report` 原话；证据带 `speaker_role/source_kind`；`attribution_check` 分编号、说话人、语义三层审计。
-- 关心收尾：`care` 数组按具体事项绑定；不把“上床”扩展成“已入睡/已洗澡/作息已调整”。
+- 关心收尾：表达请求保留按具体事项回应的约束；不把“上床”扩展成“已入睡/已洗澡/作息已调整”。
 - `Situation`：surface / speaker / audience / about / modality / privacy 进入 prompt。
 - 文字活动：`thought_result` 增加 progress/next_step/paused；`applyThoughtAction` 带 ID/版本；迟到回调与分享有 guard。
 - 开关拆分：`proactive.private_writing` 控制写作/回顾，`proactive.enabled` 控制主动联系/分享。
@@ -71,7 +70,7 @@
 | **阶段 A/B/C** | 阶段 B | 交付批次 | 只在 ROADMAP |
 | **A1–A5 / B1–B5** | A5 | 阶段子项 | 只在 ROADMAP |
 | **PR-n** | PR-5 | 旧 R3 施工单 | 只作历史，不再新增 |
-| **v15** | v15 | 数据库结构版本 | 只在 ARCHITECTURE / 配置 |
+| **v16** | v16 | 数据库结构版本 | 只在 ARCHITECTURE / 配置 |
 
 ## 文档地图
 
@@ -79,7 +78,7 @@
 |---|---|
 | 现在在哪、下一步做什么 | 本文 |
 | 能力清单、阶段 A/B、B1–B5 | [开发路线图](ROADMAP.md) |
-| 当前组件、数据流、v15、限制 | [架构与当前实现](ARCHITECTURE.md) |
+| 当前组件、数据流、v16、限制 | [架构与当前实现](ARCHITECTURE.md) |
 | 配置字段与默认值 | [配置参考](CONFIG_REFERENCE.md) |
 | `memory_recall` / `memory_read` 契约 | [记忆检索接口](MEMORY_RECALL_TOOL.md) |
 | R3 旧基线、PR 编号来源 | [R3 历史基线](MEMORY_V5_R3_BASELINE.md) |

@@ -45,6 +45,7 @@ endfunction()
 
 add_phase0_test(tst_memorymanager
     tst_memorymanager.cpp
+    ${PROJECT_SOURCE_DIR}/benchmarksnapshot.cpp
     ${PROJECT_SOURCE_DIR}/configmanager.cpp
     ${PROJECT_SOURCE_DIR}/memorypolicy.cpp
     ${PROJECT_SOURCE_DIR}/qqreplypolicy.cpp

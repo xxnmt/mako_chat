@@ -1,5 +1,6 @@
 #include "memorymanager.h"
 #include "debuglog.h"
+#include "configmanager.h"
 
 #include <QStandardPaths>
 #include <QDir>
@@ -213,6 +214,8 @@ qint64 MemoryManager::recordInput(const QString &input, const RequestMeta &meta,
     q.addBindValue(meta.eventId);
     if (q.exec()) {
         const auto id = q.lastInsertId().toLongLong();
+        if (!meta.sensitive && !indexChatTurn(id))
+            qWarning() << "[MemoryIndex] received input indexing failed:" << id;
         if (m_db.commit()) return id;
     }
     qWarning() << "[Conversation] record input failed" << q.lastError() << m_db.lastError();
@@ -354,87 +357,52 @@ bool MemoryManager::canShareThought(qlonglong id, int expectedVersion) const
     return q.exec() && q.next();
 }
 
-QJsonArray MemoryManager::personalEvidence(const QString &subject, const QStringList &accounts,
-                                           const QStringList &terms, bool includeOthers,
-                                           const QString &currentChannel, const QString &currentSession,
-                                           bool excludeCurrent, bool includeUnmatched,
-                                           bool includeAllEpisodic, bool requireTermMatch) const
+QJsonArray MemoryManager::structuredMemoryRows(const QStringList &kinds, const QString &subject,
+                                              bool includeOthers, bool allEpisodic) const
 {
-    // raw_events already reflects the inbound retention decision. Historical short-only
-    // chat rows lack this provenance and must not be promoted during migration.
-    QSqlQuery query(m_db);
-    query.prepare(R"(
-        WITH evidence AS (
-            SELECT content AS text,occurred_at AS time,channel,session_id AS session,
-                   sender_id IN (SELECT value FROM json_each(:accounts)) AS own,
-                   sender_id AS speaker,'raw/'||rowid AS ref
-            FROM raw_events WHERE direction='in' AND event_type='message' AND sensitive=0
-              AND redaction_status='none' AND content IS NOT NULL
-              AND (:all_people OR sender_id IN (SELECT value FROM json_each(:accounts)))
-            UNION ALL
-            SELECT content,event_time,origin,session_id,subject=:subject,subject,'episode/'||rowid FROM episodic_memory
-            WHERE (subject=:subject OR :all_people) AND (origin='pet' OR :all_episodic) AND status='active'
-            UNION ALL
-            SELECT safe_summary,ended_at,channel,session_id,0,'summary','interaction/'||rowid FROM interactions
-            WHERE :all_people AND summary_status='ready' AND safe_summary IS NOT NULL
-            UNION ALL
-            SELECT summary_text,created_at,channel,session_id,0,'summary','summary/'||rowid FROM long_term_summary
-            WHERE :all_people AND is_dirty=0
-            UNION ALL
-            SELECT statement,valid_time_start,source_channel,source_session_id,0,'claim','claim/'||rowid
-            FROM memory_claims WHERE :all_people AND claim_status='active' AND privacy_level<3
-            UNION ALL
-            SELECT input,reported,channel,session,1,subject,'source/'||id FROM cognitive_source
-            WHERE subject=:subject AND outcome IS NULL
-            UNION ALL
-            SELECT r.quote,s.reported,s.channel,s.session,s.subject=:subject,s.subject,'revision/'||r.matter||'/'||r.version
-            FROM cognitive_source s JOIN matter_revision r ON r.source=s.id
-            WHERE (s.subject=:subject OR :all_people)
-            UNION ALL
-            SELECT json_extract(j.value,'$.quote'),h.timestamp,h.channel,h.session_id,h.subject=:subject,h.subject,'legacy/'||h.id||'/'||j.key
-            FROM chat_history h,json_each(h.state_updates) j
-            WHERE (h.subject=:subject OR :all_people) AND h.state_updates IS NOT NULL AND h.sensitive=0
-        ), candidates AS (
-            SELECT text,time,channel,session,own,speaker,min(ref) AS ref,
-                (SELECT count(*) FROM json_each(:terms) WHERE instr(text,value)>0) AS matches
-            FROM evidence WHERE text <> ''
-              AND (:exclude_current=0 OR NOT (channel=:current_channel AND session=:current_session))
-            GROUP BY text,time,channel,session,own,speaker
-        ), ranked AS (
-            SELECT *,
-                row_number() OVER (ORDER BY matches DESC,own DESC,datetime(time) DESC,channel,session,speaker,text) AS topic_rank,
-                row_number() OVER (PARTITION BY own ORDER BY datetime(time) DESC,channel,session,speaker,text) AS timeline_rank
-            FROM candidates WHERE (own OR matches>0 OR :include_unmatched)
-              AND (:require_match=0 OR matches>0)
-        )
-        SELECT substr(text,1,360),time,channel,session,own,speaker,ref FROM ranked
-        ORDER BY CASE WHEN own THEN min(topic_rank,timeline_rank) ELSE topic_rank END,
-                 topic_rank LIMIT 12
-    )");
-    auto json = [](const QStringList &strings) {
-        return QString::fromUtf8(QJsonDocument(QJsonArray::fromStringList(strings)).toJson(QJsonDocument::Compact));
+    // Structured evidence is read from its authoritative table. It has no embedding
+    // and retains its source reference when ranked alongside indexed messages.
+    QJsonArray rows;
+    auto collect = [&](const QString &kind, const QString &sql, const QVariantList &bindings = {}) {
+        if (!kinds.isEmpty() && !kinds.contains(kind))
+            return;
+        QSqlQuery query(m_db);
+        query.prepare(sql);
+        for (const auto &binding : bindings)
+            query.addBindValue(binding);
+        if (!query.exec()) {
+            qWarning() << "[MemoryRetrieval]" << kind << query.lastError();
+            return;
+        }
+        while (query.next()) {
+            rows.append(QJsonObject{{"source_type", kind}, {"source_ref", kind + "/" + query.value(0).toString()},
+                {"text", query.value(1).toString()}, {"channel", query.value(2).toString()},
+                {"session", query.value(3).toString()}, {"speaker_id", query.value(4).toString()},
+                {"speaker_role", query.value(4).isNull() ? "unknown" : "user"},
+                {"speech_at", query.value(5).toString()}, {"event_time", query.value(6).toString()},
+                {"recorded_at", query.value(7).toString()}, {"derived", query.value(8).toString()}});
+        }
     };
-    query.bindValue(":subject", subject);
-    query.bindValue(":accounts", json(accounts));
-    query.bindValue(":all_people", int(includeOthers));
-    query.bindValue(":current_channel", currentChannel.isNull() ? QStringLiteral("") : currentChannel);
-    query.bindValue(":current_session", currentSession.isNull() ? QStringLiteral("") : currentSession);
-    query.bindValue(":exclude_current", int(excludeCurrent));
-    query.bindValue(":include_unmatched", int(includeUnmatched));
-    query.bindValue(":all_episodic", int(includeAllEpisodic));
-    query.bindValue(":require_match", int(requireTermMatch));
-    query.bindValue(":terms", json(terms));
-    QJsonArray evidence;
-    if (query.exec()) {
-        while (query.next())
-            evidence.append(QJsonObject{{"text",query.value(0).toString()},
-                                        {"time",query.value(1).toString()},
-                                        {"reference",query.value(6).toString()},
-                                        {"channel",query.value(2).toString()},
-                                        {"session",query.value(3).toString()},
-                                        {"own",query.value(4).toBool()}, {"speaker",query.value(5).toString()}});
+    collect("episode", "SELECT id,content,origin,session_id,subject,NULL,event_time,content_recorded_at,'memory' "
+            "FROM episodic_memory WHERE status='active' AND (subject=? OR ?) AND (origin='pet' OR ?)",
+            {subject, includeOthers, allEpisodic});
+    if (includeOthers) {
+        collect("interaction", "SELECT id,safe_summary,channel,session_id,NULL,ended_at,NULL,content_recorded_at,'summary' "
+                "FROM interactions WHERE summary_status='ready' AND safe_summary IS NOT NULL");
+        collect("summary", "SELECT id,summary_text,channel,session_id,NULL,NULL,NULL,updated_at,'summary' "
+                "FROM long_term_summary WHERE is_dirty=0");
+        collect("claim", "SELECT id,statement,source_channel,source_session_id,asserted_by_person_id,NULL,"
+                "valid_time_start,updated_at,'claim' FROM memory_claims WHERE claim_status='active' AND privacy_level<3");
     }
-    return evidence;
+    collect("source", "SELECT id,input,channel,session,subject,reported,NULL,reported,'original' "
+            "FROM cognitive_source WHERE subject=? AND outcome IS NULL", {subject});
+    collect("revision", "SELECT r.matter||'/'||r.version,r.quote,s.channel,s.session,s.subject,"
+            "s.reported,r.event_time,r.recorded,r.kind FROM cognitive_source s "
+            "JOIN matter_revision r ON r.source=s.id WHERE s.subject=? OR ?", {subject, includeOthers});
+    collect("legacy", "SELECT h.id||'/'||j.key,json_extract(j.value,'$.quote'),h.channel,h.session_id,"
+            "h.subject,h.timestamp,NULL,h.timestamp,'inference' FROM chat_history h,json_each(h.state_updates) j "
+            "WHERE (h.subject=? OR ?) AND h.sensitive=0", {subject, includeOthers});
+    return rows;
 }
 
 bool MemoryManager::rebuildSearchIndex(QString *error)
@@ -1102,24 +1070,14 @@ bool MemoryManager::indexChatTurn(qlonglong id)
 
 QJsonArray MemoryManager::matterEvidence(const RequestMeta &audience, const QString &matter) const{
     QJsonArray result;
-    if (audience.sensitive || !audience.longTermMemoryEnabled) return result;
-    QSqlQuery q(m_db);
-    q.prepare("SELECT s.id,s.reported,r.quote,r.kind,r.event_time,r.recorded,r.status,r.understanding "
-              "FROM matter_revision r JOIN cognitive_source s ON s.id=r.source "
-              "WHERE r.matter=? AND s.subject=? AND (? OR (s.channel=? AND s.session=?)) "
-              "ORDER BY r.version DESC LIMIT 8");
-    q.addBindValue(matter);
-    q.addBindValue(audience.subject);
-    q.addBindValue(audience.channel != Channel::kQQGroup);
-    q.addBindValue(audience.channel);
-    q.addBindValue(audience.sessionId);
-    if (!q.exec()) return result;
-    while (q.next()) result.prepend(QJsonObject{
-        {"evidence_ref",QString("source/%1").arg(q.value(0).toLongLong())},
-        {"reported_at",q.value(1).toString()},{"quote",q.value(2).toString()},
-        {"source_kind",q.value(3).toString()},{"event_time_expression",q.value(4).toString()},
-        {"interpretation_recorded_at",q.value(5).toString()},{"effective_at",QJsonValue::Null},
-        {"status",q.value(6).toString()},{"understanding",q.value(7).toString()}});
+    if (matter.isEmpty()) return result;
+    const auto revisions = internalMatters(audience, {}, {matter});
+    for (const auto &value : revisions) {
+        auto row = value.toObject();
+        row["source_kind"] = row.take("kind");
+        row["effective_at"] = QJsonValue::Null;
+        result.prepend(row);
+    }
     return result;
 }
 
@@ -1155,25 +1113,26 @@ QJsonArray MemoryManager::currentUnderstanding(const RequestMeta &audience, cons
                    json_extract(j.value,'$.quote') AS quote,
                    (h.channel=? AND h.session_id=?) AS local,
                    'legacy:'||json_extract(j.value,'$.topic') AS matter,0 AS version,
-                   NULL AS status,NULL AS kind,NULL AS understanding,NULL AS event_time,NULL AS recorded
+                   NULL AS status,NULL AS kind,NULL AS understanding,NULL AS event_time,NULL AS recorded,h.channel,h.session_id,h.user_input AS original
             FROM chat_history h,json_each(h.state_updates) j
             WHERE h.subject=? AND h.state_updates IS NOT NULL AND h.sensitive=0
               AND NOT EXISTS (SELECT 1 FROM cognitive_source WHERE event=h.cognitive_event)
             UNION ALL
             SELECT s.id,s.reported,r.topic,r.quote,(s.channel=? AND s.session=?),
-                   r.matter,r.version,r.status,r.kind,r.understanding,r.event_time,r.recorded
+                   r.matter,r.version,r.status,r.kind,r.understanding,r.event_time,r.recorded,s.channel,s.session,s.input
             FROM matter_revision r JOIN cognitive_source s ON s.id=r.source WHERE s.subject=?
         ), ranked AS (
             SELECT *,row_number() OVER (PARTITION BY matter ORDER BY version DESC,id DESC) AS pos,
                    max(local) OVER (PARTITION BY matter) AS mentioned_here FROM evidence
         ), self_ranked AS (
-            SELECT matter,quote,version,status,id,timestamp,recorded,
+            SELECT matter,quote,version,status,id,timestamp,recorded,channel,session_id,original,
                    row_number() OVER (PARTITION BY matter ORDER BY version DESC,id DESC) AS spos
             FROM evidence WHERE kind='self_report'
         )
         SELECT r.topic,r.quote,r.timestamp,r.local,r.mentioned_here,r.version,r.status,r.kind,
                r.understanding,r.id,r.matter,r.event_time,r.recorded,
-               sr.quote,sr.version,sr.status,sr.id,sr.timestamp,sr.recorded
+               sr.quote,sr.version,sr.status,sr.id,sr.timestamp,sr.recorded,
+               r.channel,r.session_id,r.original,sr.channel,sr.session_id,sr.original
         FROM ranked r LEFT JOIN self_ranked sr ON sr.matter=r.matter AND sr.spos=1
         WHERE r.pos=1
           AND (? OR r.matter IN (SELECT value FROM json_each(?)))
@@ -1196,8 +1155,19 @@ QJsonArray MemoryManager::currentUnderstanding(const RequestMeta &audience, cons
         return result;
     }
 
+    auto &config = ConfigManager::instance();
+    const auto rules = config.getMemoryPolicyConfig().privacyRules;
     QStringList selected;
     while (query.next()) {
+        if (config.isBlindZone(query.value(19).toString(), query.value(20).toString())
+            || config.isBlindZone(query.value(22).toString(), query.value(23).toString()))
+            continue;
+        bool restricted = false;
+        for (int column : {0, 1, 8, 13, 21, 24}) {
+            const auto scan = SensitiveContentFilter::sanitize(query.value(column).toString(), {}, rules);
+            if (scan.blocked || scan.redacted) { restricted = true; break; }
+        }
+        if (restricted) continue;
         const auto count = result.size();
         const auto topic = query.value(0).toString();
         if (audience.channel == Channel::kQQGroup && !query.value(3).toBool()
@@ -1634,7 +1604,7 @@ bool MemoryManager::addEpisodicMemory(const QString &content, const QString &typ
 
 QList<EpisodicMemory> MemoryManager::getActiveEpisodicMemories(double minImportance, int limit,
                                                               const QString &origin, const QString &visibility,
-                                                              const QString &sessionId)
+                                                              const QString &sessionId, bool touch)
 {
     QList<EpisodicMemory> memories;
     if (!m_db.isOpen() && !m_db.open()) {
@@ -1688,7 +1658,7 @@ QList<EpisodicMemory> MemoryManager::getActiveEpisodicMemories(double minImporta
     }
 
     // 更新 last_accessed
-    if (!memories.isEmpty()) {
+    if (touch && !memories.isEmpty()) {
         QStringList ids;
         for (const auto &m : memories) ids << QString::number(m.id);
         QSqlQuery upd(m_db);
@@ -2670,7 +2640,7 @@ QList<MemoryClaim> MemoryManager::getActiveClaims(int limit)
                   "claim_status, valid_time_start, valid_time_end "
                   "FROM memory_claims WHERE claim_status='active' "
                   "ORDER BY id DESC LIMIT ?");
-    query.addBindValue(qMax(1, limit));
+    query.addBindValue(limit < 0 ? -1 : qMax(1, limit));
     if (!query.exec()) {
         qDebug() << "[MemoryManager]查询 active claims 失败:" << query.lastError();
         return claims;
@@ -4458,6 +4428,30 @@ void MemoryManager::initDatabase(const QString &dbFilePath, const QString &conne
             if (!query.exec("PRAGMA user_version=15"))
                 throw query.lastError();
             currentVersion = 15;
+        }
+        if (currentVersion < 16) {
+            // Older rows have unknown recording times. Leave them NULL.
+            for (const QString table : {"interactions", "episodic_memory", "raw_events"}) {
+                QSqlQuery columns(m_db);
+                if (!columns.exec("PRAGMA table_info(" + table + ")")) throw columns.lastError();
+                bool exists = false, stamped = false;
+                while (columns.next()) {
+                    exists = true;
+                    stamped |= columns.value(1).toString() == "content_recorded_at";
+                }
+                if (!exists) continue;
+                if (!stamped && !query.exec("ALTER TABLE " + table + " ADD COLUMN content_recorded_at TEXT"))
+                    throw query.lastError();
+                const QString fields = table == "interactions" ? "safe_summary,summary_segments"
+                    : table == "raw_events" ? "content" : "content,event_time";
+                const QString stamp = " ON " + table + " BEGIN UPDATE " + table
+                    + " SET content_recorded_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=NEW.id; END";
+                if (!query.exec("CREATE TRIGGER IF NOT EXISTS stamp_" + table + "_insert AFTER INSERT" + stamp)
+                    || !query.exec("CREATE TRIGGER IF NOT EXISTS stamp_" + table + "_update AFTER UPDATE OF "
+                                   + fields + stamp)) throw query.lastError();
+            }
+            if (!query.exec("PRAGMA user_version=16")) throw query.lastError();
+            currentVersion = 16;
         }
         if (!m_db.commit()) throw m_db.lastError();
         qDebug()<<"[MemoryManager]数据库初始化完成,结构版本为:"<<currentVersion;

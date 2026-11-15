@@ -116,6 +116,7 @@ public:
     QStringList getSelfQQAccounts();      // 她自己的 QQ（防自触发、群聊回声排除）
     QStringList getMasterQQAccounts();    // 主人的 QQ 列表（多账号均归 subject='user'）
     bool isMasterQQ(const QString &uin);
+    QList<BlindZone> blindZones() const { ensureIdentityLoaded(); return m_blindZones; }
     bool isBlindZone(const QString &channel, const QString &sessionId);
     bool getFollowExternalMood();         // D1：外部渠道情绪是否驱动桌设立绘（默认 true）
     ProactiveConfig getProactiveConfig();

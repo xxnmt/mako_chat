@@ -151,14 +151,13 @@ bool ConfigManager::loadSetting()
             retrievalObj.value("index_enabled").toBool(true);
         m_memoryPolicy.retrieval.autoBackfill =
             retrievalObj.value("auto_backfill").toBool(false);
-        m_memoryPolicy.retrieval.legacyFallback =
-            retrievalObj.value("legacy_fallback").toBool(true);
+
         m_memoryPolicy.retrieval.candidateLimit =
             qBound(10, retrievalObj.value("candidate_limit").toInt(40), 200);
         m_memoryPolicy.retrieval.rerankLimit =
             qBound(1, retrievalObj.value("rerank_limit").toInt(10), 40);
         m_memoryPolicy.retrieval.rerankEnabled =
-            retrievalObj.value("rerank_enabled").toBool(false);
+            retrievalObj.value("rerank_enabled").toBool(true);
         m_memoryPolicy.retrieval.embeddingEnabled =
             retrievalObj.value("embedding_enabled").toBool(false);
         m_memoryPolicy.retrieval.embeddingProvider =
@@ -376,7 +375,6 @@ bool ConfigManager::saveSetting()
     QJsonObject retrievalObj;
     retrievalObj.insert("index_enabled", m_memoryPolicy.retrieval.indexEnabled);
     retrievalObj.insert("auto_backfill", m_memoryPolicy.retrieval.autoBackfill);
-    retrievalObj.insert("legacy_fallback", m_memoryPolicy.retrieval.legacyFallback);
     retrievalObj.insert("candidate_limit", m_memoryPolicy.retrieval.candidateLimit);
     retrievalObj.insert("rerank_limit", m_memoryPolicy.retrieval.rerankLimit);
     retrievalObj.insert("rerank_enabled", m_memoryPolicy.retrieval.rerankEnabled);

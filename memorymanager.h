@@ -94,11 +94,8 @@ public:
                                     bool includeAudiencePrivate = false) const;
     QJsonArray matterEvidence(const RequestMeta &audience, const QString &matter) const;
     QString conversationPhase(const RequestMeta &audience) const;
-    QJsonArray personalEvidence(const QString &subject, const QStringList &accounts,
-                                const QStringList &terms, bool includeOthers = false,
-                                const QString &currentChannel = {}, const QString &currentSession = {},
-                                bool excludeCurrent = true, bool includeUnmatched = false,
-                                bool includeAllEpisodic = false, bool requireTermMatch = false) const;
+    QJsonArray structuredMemoryRows(const QStringList &kinds, const QString &subject,
+                                    bool includeOthers, bool allEpisodic) const;
 
     // 可重建的检索块。原文仍留在原表；这些表只保存检索视图与向量。
     bool rebuildSearchIndex(QString *error = nullptr);
@@ -271,7 +268,7 @@ public:
     QList<EpisodicMemory> getActiveEpisodicMemories(double minImportance = 0.2, int limit = 20,
                                                    const QString &origin = QString(),
                                                    const QString &visibility = QString(),
-                                                   const QString &sessionId = QString());
+                                                   const QString &sessionId = QString(), bool touch = true);
     bool deleteEpisodicMemory(qlonglong id);
     bool updateEpisodicMemoryStatus(qlonglong id, const QString &status);
     int decayEpisodicMemory();

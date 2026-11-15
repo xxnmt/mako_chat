@@ -157,10 +157,10 @@ MemoryAgentResult MemoryExecutor::execute(const MemoryRecallPlan &plan)
             MemoryResolvedTime resolved = need.hasTimeFrame
                 ? TimeFrameResolver::resolve(
                       need.timeExpression, need.timeTarget, need.timeFrame,
-                      QDateTime::currentDateTime(), m_scope.timezone)
+                      m_scope.now(), m_scope.timezone)
                 : MemoryTimeResolver::resolve(
                       need.timeExpression, need.timeTarget,
-                      QDateTime::currentDateTime(), m_scope.timezone);
+                      m_scope.now(), m_scope.timezone);
             needResult.resolvedFrom = resolved.from.toString(Qt::ISODate);
             needResult.resolvedTo = resolved.to.toString(Qt::ISODate);
             needResult.interpretation = resolved.interpretation;

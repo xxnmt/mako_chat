@@ -44,7 +44,7 @@ qt_add_executable(Windows_AI
     memoryexecutor.h memoryexecutor.cpp
     llmservice.h llmservice.cpp
     promptassembler.h promptassembler.cpp
-    benchmarkrunner.h benchmarkrunner.cpp
+    benchmarkrunner.h benchmarkrunner.cpp benchmarksnapshot.h benchmarksnapshot.cpp
     appcontroller.h appcontroller.cpp
     cognitivecoordinator.h cognitivecoordinator.cpp
     sentencedata.h

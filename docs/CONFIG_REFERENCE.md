@@ -1,7 +1,7 @@
 # 配置参考：setting.json / identity.json
 
-> 源码基准：2026-11-13 工作树（基于 `1a82a2f`；记忆库 v15）
-> 更新日期：2026-11-12
+> 源码基准为 P5 工程验收工作树，记忆库 v16。
+> 更新于 2026-11-15。
 > 关联：[README](../README.md)、[ARCHITECTURE](ARCHITECTURE.md)、[STATUS](STATUS.md)
 
 > 2026-11-08 补充：当前请求串行化、跨渠道候选和空闲回顾已接入，仍存在真实对话更正丢失。实现与限制见 [连续性现状](ARCHITECTURE.md)，下一阶段见 [开发任务](ROADMAP.md)。下文 R3 授权描述适用于既有披露工具路径，不能覆盖新增内部证据路径。
@@ -138,7 +138,7 @@ app_data/config/identity.json
 | `agent_enabled` | `true` | bool | 是否允许 QQ 记忆检索；pet 永不进入 |
 | `agent_mode` | `"tool"` | `tool` / `legacy` | `tool`：主 Conversation Agent 自主调用 `memory_recall`；`legacy`：旧关键词门控 + 独立 Planner |
 | `agent_protocol` | `"native"` | `native` / `json_envelope` | 原生 DeepSeek tools，或 JSON 动作协议兜底 |
-| `owner_cross_channel_private` | `false` | bool | 既有检索工具的 Owner QQ 私聊跨渠道开关；新增 personalEvidence/currentUnderstanding 不受此开关控制，受全局长期记忆、身份、敏感及盲区检查约束 |
+| `owner_cross_channel_private` | `false` | bool | 主人在 Pet、QQ 私聊或群聊中补查本人私聊历史的工具开关。自动检索与当前认识按全局长期记忆、身份、敏感及盲区规则读取 |
 | `agent_plan_v2` | `true` | bool | 仅 legacy 路径：多 need Planner；false 回退旧 `tool_calls` |
 | `agent_trigger` | `"memory_question"` | `memory_question` / `always` | 仅 legacy 路径使用 |
 | `agent_timeout_ms` | `6000` | 1000–15000 | 单次工具检索预算 |
@@ -302,12 +302,12 @@ app_data/config/identity.json
 | `identity.self.qq` | `[]` | 机器人自己的 QQ；用于丢弃自触发/回声消息 |
 | `identity.master.qq` | `[]` | 主人 QQ 列表；全部归一为 `subject='user'` / `person_id='owner'` |
 | `memory.blind_zones` | `[]` | 不入长期记忆的渠道/会话；元素为 `{channel, session_id}` |
-| `memory.retrieval.index_enabled` | `true` | 有检索块时优先走统一索引；为空时回退旧适配器 |
+| `memory.retrieval.index_enabled` | `true` | 启用 raw/chat 检索块。结构化来源直接读取原表 |
 | `memory.retrieval.auto_backfill` | `false` | 启动时若索引为空，在独立线程重建；默认关闭，推荐用命令行重建 |
-| `memory.retrieval.legacy_fallback` | `true` | 索引未命中/索引为空时是否回退旧适配器；关闭后只走索引 |
+| `memory.retrieval.legacy_fallback` | 已撤销 | 旧字段会被忽略，下次保存时移除 |
 | `memory.retrieval.candidate_limit` | `40` | 每路候选上限 |
-| `memory.retrieval.rerank_limit` | `10` | 重排后上限；当前默认顺序截断，不是语义重排 |
-| `memory.retrieval.embedding_enabled` | `false` | 启用可选向量路径；当前只支持显式 `local_hash_test`，不是语义模型 |
+| `memory.retrieval.rerank_limit` | `10` | 重排后上限，最终还受请求条数限制 |
+| `memory.retrieval.embedding_enabled` | `false` | 启用配置的向量提供方 |
 | `api.deepseek_api_key` | 空 | DeepSeek API Key，明文保存在 `setting.json` |
 | `api.dashscope_api_key` | 空 | Qwen/百炼 API Key，直接保存在 `setting.json`；无需环境变量 |
 | `api.dashscope_base_url` | 空 | 百炼业务空间 Host，如 `https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com` |
@@ -317,7 +317,7 @@ app_data/config/identity.json
 | `memory.retrieval.embedding_model` | 空 | 如 `text-embedding-v4` |
 | `memory.retrieval.embedding_dimension` | `0` | 如 `1024`；必须与库内向量一致 |
 | `memory.retrieval.rerank_endpoint` | 空 | `qwen3-rerank` 接口 URL；留空时由 base URL 自动拼 |
-| `memory.retrieval.rerank_enabled` | `false` | 独立开关；关闭时不发 Rerank 请求，只保留同一批候选 |
+| `memory.retrieval.rerank_enabled` | `true` | 配置 DashScope 后允许远程重排候选正文。显式 false 使用本地排序 |
 | `memory.retrieval.rerank_model` | `qwen3-rerank` | 重排模型 |
 | `appearance.follow_external_mood` | `true` | D1：QQ 等外部渠道情绪是否驱动桌宠立绘 |
 | `proactive.enabled` | `false` | 启用主动联系与草稿分享，默认关闭 |

@@ -62,10 +62,10 @@ MemoryOverviewResult buildMemoryOverview(MemoryManager *manager,
         time = need.hasTimeFrame
             ? TimeFrameResolver::resolve(
                   need.timeExpression, need.timeTarget, need.timeFrame,
-                  QDateTime::currentDateTime(), scope.timezone)
+                  scope.now(), scope.timezone)
             : MemoryTimeResolver::resolve(
                   need.timeExpression, need.timeTarget,
-                  QDateTime::currentDateTime(), scope.timezone);
+                  scope.now(), scope.timezone);
     }
     if (!need.hasTime || !time.valid) {
         if (error) {
