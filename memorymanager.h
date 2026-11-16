@@ -17,6 +17,7 @@
 #include "recentcontext.h"
 
 class MemoryEmbeddingProvider;
+class MemoryReadPolicy;
 
 struct RawEventWrite
 {
@@ -106,12 +107,13 @@ public:
     QJsonArray searchMemoryChunks(const QStringList &terms, int limit = 40,
                                   const QString &exactQuery = {}) const;
     QJsonArray memoryChunksForEmbedding(int limit = 2000) const;
-    QJsonArray memoryChunksMissingEmbedding(int limit, const QString &model) const;
+    QJsonArray memoryChunksMissingEmbedding(int limit, const QString &model,
+                                           qlonglong afterId = 0, QString *error = nullptr) const;
     bool storeChunkEmbedding(qlonglong chunkId, const QString &model, int dimension,
                              const QByteArray &blob, const QString &contentHash);
     QByteArray chunkEmbedding(qlonglong chunkId, const QString &model) const;
     bool embedSearchChunks(MemoryEmbeddingProvider *provider, int limit = 2000,
-                           QString *error = nullptr);
+                           QString *error = nullptr, const MemoryReadPolicy *policy = nullptr);
 
     QJsonObject nextThought(bool dueOnly) const;
     bool claimThoughtReview(qlonglong id, int dailyLimit, int cooldownSeconds);
@@ -290,6 +292,7 @@ public:
     bool recordCognitiveAudit(const QString &kind, const QString &run, qint64 source, const QJsonObject &data);
 signals:
     void understandingChanged();
+    void searchChunksChanged();
 
 private:
     void initDatabase(const QString &dbFilePath, const QString &connectionName = QString());

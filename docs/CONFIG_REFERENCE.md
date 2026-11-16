@@ -303,11 +303,11 @@ app_data/config/identity.json
 | `identity.master.qq` | `[]` | 主人 QQ 列表；全部归一为 `subject='user'` / `person_id='owner'` |
 | `memory.blind_zones` | `[]` | 不入长期记忆的渠道/会话；元素为 `{channel, session_id}` |
 | `memory.retrieval.index_enabled` | `true` | 启用 raw/chat 检索块。结构化来源直接读取原表 |
-| `memory.retrieval.auto_backfill` | `false` | 启动时若索引为空，在独立线程重建；默认关闭，推荐用命令行重建 |
+| `memory.retrieval.auto_backfill` | `false` | 控制启动时是否从原始记录重建空的片段索引。已有片段的自动向量化由 `index_enabled` 和 `embedding_enabled` 控制。 |
 | `memory.retrieval.legacy_fallback` | 已撤销 | 旧字段会被忽略，下次保存时移除 |
 | `memory.retrieval.candidate_limit` | `40` | 每路候选上限 |
 | `memory.retrieval.rerank_limit` | `10` | 重排后上限，最终还受请求条数限制 |
-| `memory.retrieval.embedding_enabled` | `false` | 启用配置的向量提供方 |
+| `memory.retrieval.embedding_enabled` | `false` | 与 `index_enabled` 同时开启时，应用启动会补当前模型缺失的向量，日常新增 raw/chat 正文也会触发后台补算。使用 DashScope 时，符合读取规则的正文会发给所配置的服务。 |
 | `api.deepseek_api_key` | 空 | DeepSeek API Key，明文保存在 `setting.json` |
 | `api.dashscope_api_key` | 空 | Qwen/百炼 API Key，直接保存在 `setting.json`；无需环境变量 |
 | `api.dashscope_base_url` | 空 | 百炼业务空间 Host，如 `https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com` |
@@ -328,6 +328,8 @@ app_data/config/identity.json
 | `proactive.quiet_hours` | `23:00`–`08:00` | 暂停主动联系与分享的时段；不阻止私下写作 |
 | `proactive.targets` | `[]` | 明确配置的草稿分享目标；仅 Pet/default 或主人 QQ 私聊，最多选择一个可用目标 |
 | `proactive.schedule` | `[]` | 定时项：`at` + `type=fixed/random`（预留） |
+
+后台合并约 250 毫秒内的新增片段，每批最多发送 10 条不同正文。可检索的片段先进入词面索引，向量写回后加入语义召回。失败时从 1 秒开始退避，最长间隔 60 秒。重启会继续检查当前模型的缺口。日志中的 `[MemoryIndex] embedding scan` 给出本次检查与准许向量化的片段数。盲区及命中屏蔽、脱敏规则的片段会跳过，因此活跃片段数可以大于向量数。
 
 > 私下写作与主动联系分开：`private_writing` 控制回顾/写作，`enabled` 控制主动联系/分享。`targets` 缺省为空时不会主动投递草稿；`schedule` 仍只解析。
 

@@ -1,6 +1,6 @@
 # 当前状态与阅读入口
 
-> 更新于 2026-11-15。
+> 更新于 2026-11-16。
 > P5 评审收尾已清理死代码并校准近期上下文过滤，小样逐项结论及最终工作树冻结清单见 [P5 交接](RETRIEVAL_REFACTOR_STATUS.md)。200 题评测暂缓，现场另验。
 > 本文只回答“现在在哪”。能力清单看 [开发路线图](ROADMAP.md)，实现细节看 [架构与当前实现](ARCHITECTURE.md)，历史看 [开发历史](HISTORY.md)。
 
@@ -33,6 +33,7 @@
 - PR-4、PR-6/7/8/9：legacy MemoryAgent、Memory Recall Tool、Overview、TimeFrame。
 - v15：`cognitive_source` / `matter_revision` / `observation_history` / `cognitive_audit` 证据链，以及可重建的 `memory_chunks` / `memory_chunk_sources` / `memory_embeddings` / `memory_index_state`。
 - 统一检索：`MemoryEvidence` / `MemoryRetrievalService`；Pet/QQ 自动证据同入口；同渠道历史进入候选；工具补助手表达、说话人字段并开放 Pet。
+- 在线向量化已接入消息写入。开启索引和 Embedding 后，启动时会补已有片段的缺口，运行中会合并处理新增片段。已用临时库、桌宠输入和真实百炼验证 QQ 私聊场景下的无词面命中召回。真实渠道的最终表达仍待现场验收。
 - 混合召回：v15 检索块、词面 BM25、可选向量、RRF、本地或 DashScope 重排；`--rebuild-memory-index` / `--memory-index-status` / `--clear-memory-index` / `--backup-memory-db`；新消息增量写 chunk；`auto_backfill` 使用独立线程与独立 SQL 连接；审计记录 backend/候选数/辅助来源/延迟；DashScope Embedding 已接入后台索引，查询侧通过独立 `MemoryRetrievalWorker`；凭证可存 `setting.json` 的 `api.dashscope_api_key`。
 - 工具对话检索不再固定只取最近 200 轮；`recent`、`chat_history`、`interaction_summary`、`long_term_summary`、`claim`、`episodic` 通过统一服务按来源读取；助手表达作为独立证据返回；`speaker_id` 与本轮 viewer 比较，owner 群可按配置看到跨渠道私聊。
 - 连续感知：表达模型直接读取相关证据与修订；`currentUnderstanding` 支持 audience-private；群聊不再只靠失忆式投影。

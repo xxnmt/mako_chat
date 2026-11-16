@@ -7,6 +7,7 @@
 #include <QDir>
 #include <QCryptographicHash>
 #include <QElapsedTimer>
+#include <QThread>
 #include <QSqlQuery>
 #include <QSqlError>
 #include <QDebug>
@@ -161,6 +162,8 @@ bool MemoryManager::saveQATurn(const QString &userInput, const QString &rawReply
     const qlonglong indexedTurn = receivedTurn > 0 ? receivedTurn : query.lastInsertId().toLongLong();
     if (indexedTurn > 0 && !indexChatTurn(indexedTurn))
         qWarning() << "[MemoryIndex] incremental chat index failed:" << indexedTurn;
+    else if (indexedTurn > 0 && !meta.sensitive)
+        emit searchChunksChanged();
     const auto activityAction = response["activity_action"].toObject();
     if (!activityAction.isEmpty()) {
         const QString ref = activityAction["activity_ref"].toString();
@@ -217,7 +220,10 @@ qint64 MemoryManager::recordInput(const QString &input, const RequestMeta &meta,
         const auto id = q.lastInsertId().toLongLong();
         if (!meta.sensitive && !indexChatTurn(id))
             qWarning() << "[MemoryIndex] received input indexing failed:" << id;
-        if (m_db.commit()) return id;
+        if (m_db.commit()) {
+            if (!meta.sensitive) emit searchChunksChanged();
+            return id;
+        }
     }
     qWarning() << "[Conversation] record input failed" << q.lastError() << m_db.lastError();
     m_db.rollback();
@@ -478,7 +484,7 @@ bool MemoryManager::rebuildSearchIndex(QString *error)
             if (error) *error = insert.lastError().text();
             return false;
         }
-        qlonglong chunkId = insert.lastInsertId().toLongLong();
+        qlonglong chunkId = insert.numRowsAffected() ? insert.lastInsertId().toLongLong() : 0;
         if (chunkId <= 0) {
             idQuery.addBindValue(sourceType);
             idQuery.addBindValue(sourceRef);
@@ -754,7 +760,8 @@ QJsonArray MemoryManager::memoryChunksForEmbedding(int limit) const
     return result;
 }
 
-QJsonArray MemoryManager::memoryChunksMissingEmbedding(int limit, const QString &model) const
+QJsonArray MemoryManager::memoryChunksMissingEmbedding(int limit, const QString &model,
+                                                      qlonglong afterId, QString *error) const
 {
     QJsonArray result;
     if (model.isEmpty())
@@ -764,13 +771,16 @@ QJsonArray MemoryManager::memoryChunksMissingEmbedding(int limit, const QString 
               "c.channel,c.session_id,c.speaker_id,c.speaker_name,c.speaker_role,"
               "c.speech_at,c.event_time,c.recorded_at,c.privacy,c.status "
               "FROM memory_chunks c WHERE c.status='active' AND c.index_generation=1 "
-              "AND NOT EXISTS (SELECT 1 FROM memory_embeddings e WHERE e.chunk_id=c.id "
+              "AND c.id>? AND NOT EXISTS (SELECT 1 FROM memory_embeddings e WHERE e.chunk_id=c.id "
               "AND e.model_config=? AND e.content_hash=c.content_hash) "
               "ORDER BY c.id LIMIT ?");
+    q.addBindValue(afterId);
     q.addBindValue(model);
     q.addBindValue(qMax(1, limit));
-    if (!q.exec())
+    if (!q.exec()) {
+        if (error) *error = q.lastError().text();
         return result;
+    }
     while (q.next()) {
         result.append(QJsonObject{
             {"id",q.value(0).toLongLong()},{"source_type",q.value(1).toString()},
@@ -794,13 +804,16 @@ bool MemoryManager::storeChunkEmbedding(qlonglong chunkId, const QString &model,
     QSqlQuery q(m_db);
     q.prepare("INSERT OR REPLACE INTO memory_embeddings("
               "chunk_id,model_config,dimension,vector,content_hash,index_generation,created_at)"
-              " VALUES(?,?,?,?,?,1,?)");
+              " SELECT ?,?,?,?,?,1,? FROM memory_chunks WHERE id=? AND status='active' "
+              "AND index_generation=1 AND content_hash=?");
     q.addBindValue(chunkId);
     q.addBindValue(model);
     q.addBindValue(dimension);
     q.addBindValue(blob);
     q.addBindValue(contentHash);
     q.addBindValue(QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
+    q.addBindValue(chunkId);
+    q.addBindValue(contentHash);
     return q.exec();
 }
 
@@ -817,32 +830,53 @@ QByteArray MemoryManager::chunkEmbedding(qlonglong chunkId, const QString &model
 }
 
 bool MemoryManager::embedSearchChunks(MemoryEmbeddingProvider *provider, int limit,
-                                      QString *error)
+                                      QString *error, const MemoryReadPolicy *policy)
 {
     if (!provider) {
         if (error) *error = QStringLiteral("embedding provider is null");
         return false;
     }
     const int chunkBatch = qMax(1, limit);
-    int embedded = 0;
+    const MemoryReadPolicy readPolicy = policy ? *policy : MemoryReadPolicy();
+    qlonglong afterId = 0;
+    int eligibleCount = 0;
+    int scanned = 0;
     QHash<QByteArray, QVector<float>> textVectors;
     while (true) {
-        const auto chunks = memoryChunksMissingEmbedding(chunkBatch, provider->modelId());
+        if (QThread::currentThread()->isInterruptionRequested()) {
+            if (error) *error = QStringLiteral("embedding interrupted");
+            return false;
+        }
+        QString readError;
+        const auto chunks = memoryChunksMissingEmbedding(chunkBatch, provider->modelId(),
+                                                        afterId, &readError);
+        if (!readError.isEmpty()) {
+            if (error) *error = readError;
+            return false;
+        }
         if (chunks.isEmpty())
             break;
 
+        scanned += chunks.size();
+        afterId = chunks.last().toObject().value("id").toInteger();
+        QJsonArray eligible;
         QStringList pendingTexts;
         QList<QByteArray> pendingKeys;
         QHash<QByteArray, int> pendingIndex;
         for (const auto &value : chunks) {
             const auto chunk = value.toObject();
             const QByteArray key = chunk.value(QStringLiteral("text")).toString().toUtf8();
+            if (!readPolicy.allows(chunk.value("channel").toString(), chunk.value("session").toString(),
+                                   chunk.value("text").toString()))
+                continue;
+            eligible.append(chunk);
             if (textVectors.contains(key) || pendingIndex.contains(key))
                 continue;
             pendingIndex.insert(key, pendingTexts.size());
             pendingKeys.append(key);
             pendingTexts.append(QString::fromUtf8(key));
         }
+        eligibleCount += eligible.size();
         const int providerBatch = 10;
         for (int offset = 0; offset < pendingTexts.size(); offset += providerBatch) {
             QVector<QVector<float>> batchVectors;
@@ -858,7 +892,7 @@ bool MemoryManager::embedSearchChunks(MemoryEmbeddingProvider *provider, int lim
             }
         }
 
-        for (const auto &value : chunks) {
+        for (const auto &value : eligible) {
             const auto chunk = value.toObject();
             const QByteArray key = chunk.value(QStringLiteral("text")).toString().toUtf8();
             if (!textVectors.contains(key)) {
@@ -874,17 +908,28 @@ bool MemoryManager::embedSearchChunks(MemoryEmbeddingProvider *provider, int lim
                 if (error) *error = QStringLiteral("store embedding failed");
                 return false;
             }
-            ++embedded;
         }
         if (chunks.size() < chunkBatch)
             break;
     }
     QSqlQuery state(m_db);
-    state.prepare("INSERT OR REPLACE INTO memory_index_state(key,value) VALUES(?,?)");
-    state.bindValue(0, QStringLiteral("embeddings"));
-    state.bindValue(1, QString::number(embedded));
-    state.exec();
-    return true;
+    // One statement gives both counters the same SQLite snapshot.
+    state.prepare("INSERT OR REPLACE INTO memory_index_state(key,value) "
+                  "SELECT 'chunks',count(*) FROM memory_chunks WHERE status='active' "
+                  "UNION ALL SELECT 'embeddings',count(*) FROM memory_embeddings e "
+                  "JOIN memory_chunks c ON c.id=e.chunk_id AND c.content_hash=e.content_hash "
+                  "WHERE c.status='active' AND e.model_config=? "
+                  "UNION ALL SELECT 'embedding_model',?");
+    state.addBindValue(provider->modelId());
+    state.addBindValue(provider->modelId());
+    if (state.exec()) {
+        if (scanned)
+            qInfo() << "[MemoryIndex] embedding scan" << provider->modelId()
+                    << "examined=" << scanned << "eligible=" << eligibleCount;
+        return true;
+    }
+    if (error) *error = state.lastError().text();
+    return false;
 }
 
 bool MemoryManager::upsertMemoryChunk(const MemoryChunkWrite &chunk)
@@ -896,6 +941,7 @@ bool MemoryManager::upsertMemoryChunk(const MemoryChunkWrite &chunk)
     if (!table.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_chunks'")
         || !table.next())
         return true;
+    table.finish();
     const QString text = chunk.text.trimmed();
     const QString hash = QString::fromLatin1(QCryptographicHash::hash(
         (chunk.sourceRef + QLatin1Char('\n') + text).toUtf8(),
@@ -927,7 +973,7 @@ bool MemoryManager::upsertMemoryChunk(const MemoryChunkWrite &chunk)
     insert.addBindValue(now);
     if (!insert.exec())
         return false;
-    qlonglong chunkId = insert.lastInsertId().toLongLong();
+    qlonglong chunkId = insert.numRowsAffected() ? insert.lastInsertId().toLongLong() : 0;
     if (chunkId <= 0) {
         QSqlQuery find(m_db);
         find.prepare("SELECT id FROM memory_chunks WHERE source_type=? AND source_ref=? "
@@ -971,11 +1017,6 @@ bool MemoryManager::indexRawEvent(qlonglong id)
     const QString senderName = q.value(3).toString();
     const QString personId = q.value(4).toString();
     const bool owner = personId == QStringLiteral("owner");
-    QSqlQuery remove(m_db);
-    remove.prepare("DELETE FROM memory_chunks WHERE source_type='raw' AND source_ref=?");
-    remove.addBindValue(QStringLiteral("raw/%1").arg(id));
-    if (!remove.exec())
-        return false;
     MemoryChunkWrite chunk;
     chunk.sourceType = QStringLiteral("raw");
     chunk.sourceRef = QStringLiteral("raw/%1").arg(id);
@@ -993,7 +1034,15 @@ bool MemoryManager::indexRawEvent(qlonglong id)
         ? QStringLiteral("public") : QStringLiteral("private");
     chunk.sourceTable = QStringLiteral("raw_events");
     chunk.sourceId = QString::number(id);
-    return upsertMemoryChunk(chunk);
+    q.finish();
+    QSqlQuery remove(m_db);
+    remove.prepare("DELETE FROM memory_chunks WHERE source_type='raw' AND source_ref=?");
+    remove.addBindValue(QStringLiteral("raw/%1").arg(id));
+    if (!remove.exec())
+        return false;
+    if (!upsertMemoryChunk(chunk)) return false;
+    emit searchChunksChanged();
+    return true;
 }
 
 bool MemoryManager::indexChatTurn(qlonglong id)
@@ -1015,9 +1064,14 @@ bool MemoryManager::indexChatTurn(qlonglong id)
     const QString timestamp = q.value(6).toString();
     const QString privacy = channel == Channel::kQQGroup
         ? QStringLiteral("public") : QStringLiteral("private");
+    q.finish();
+    // Completing a received turn adds an assistant chunk. Keep the original
+    // user chunk (and any vector already computed while the reply was pending).
     QSqlQuery remove(m_db);
-    remove.prepare("DELETE FROM memory_chunks WHERE source_type='chat' AND source_ref LIKE ?");
+    remove.prepare("DELETE FROM memory_chunks WHERE source_type='chat' AND source_ref LIKE ? "
+                   "AND NOT (chunk_kind='turn_user' AND text=coalesce(?,''))");
     remove.addBindValue(QStringLiteral("chat/%1:%").arg(id));
+    remove.addBindValue(userText.trimmed());
     if (!remove.exec())
         return false;
     MemoryChunkWrite user;
@@ -2075,7 +2129,7 @@ bool MemoryManager::appendRawEvent(const RawEventWrite &event)
              << "channel=" << event.channel << "session=" << event.sessionId
              << "type=" << event.eventType << "affected=" << query.numRowsAffected();
     const qlonglong rawId = query.lastInsertId().toLongLong();
-    if (rawId > 0 && !indexRawEvent(rawId))
+    if (rawId > 0 && query.numRowsAffected() > 0 && !indexRawEvent(rawId))
         qWarning() << "[MemoryIndex] incremental raw index failed:" << rawId;
     if (debugFullLogsEnabled()) {
         qDebug().noquote() << "[MemoryManager][debug] raw content:" << event.content

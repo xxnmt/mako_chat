@@ -913,12 +913,100 @@ private slots:
             event.occurredAt = QDateTime::currentDateTime();
             QVERIFY(db.appendRawEvent(event));
         }
-        MemoryIndexWorker worker(path);
-        QSignalSpy finished(&worker, &MemoryIndexWorker::finished);
-        worker.run();
-        QCOMPARE(finished.size(), 1);
-        QCOMPARE(finished.first().at(0).toBool(), true);
-        QVERIFY(finished.first().at(2).toInt() > 0);
+        MemoryManager db(path);
+        QVERIFY(db.clearSearchIndex());
+        MemoryRetrievalConfig config;
+        config.autoBackfill = true;
+        MemoryIndexWorker worker(db, config);
+        QSignalSpy drained(&worker, &MemoryIndexWorker::drained);
+        QTRY_COMPARE(drained.size(), 1);
+        QVERIFY(drained.first().at(0).toBool());
+        QCOMPARE(db.memoryChunkCount(), 1);
+    }
+
+    void onlineEmbeddingsFollowCommittedMessages()
+    {
+        QTemporaryDir dir;
+        MemoryManager db(dir.filePath("online.db"));
+        MemoryRetrievalConfig config;
+        config.embeddingEnabled = true;
+        config.embeddingProvider = "local_hash_test";
+        config.embeddingDimension = 32;
+        auto provider = std::make_shared<LocalHashEmbeddingProvider>(32);
+        RawEventWrite event;
+        event.platform = "qq";
+        event.channel = Channel::kQQGroup;
+        event.sessionId = "30001";
+        event.senderId = "20001";
+        event.eventType = "message";
+        event.content = "backlog";
+        event.occurredAt = QDateTime::currentDateTime();
+        QVERIFY(db.appendRawEvent(event));
+        MemoryIndexWorker worker(db, config);
+        QSignalSpy drained(&worker, &MemoryIndexWorker::drained);
+        QTRY_COMPARE(drained.size(), 1);
+        QCOMPARE(db.searchIndexStatus()["embeddings"].toInt(), 1);
+
+        RequestMeta meta;
+        meta.eventId = "pet-receipt";
+        meta.subject = "user";
+        const auto turn = db.recordInput("updated schedule", meta, false);
+        QVERIFY(turn > 0);
+        QTRY_COMPARE(db.searchIndexStatus()["embeddings"].toInt(), 2);
+        const auto userChunk = db.searchMemoryChunks({"schedule"}).first().toObject();
+        const auto id = userChunk["id"].toInteger();
+        QVERIFY(!db.chunkEmbedding(id, provider->modelId()).isEmpty());
+        RetrievalRequest request;
+        request.currentChannel = Channel::kQQPrivate;
+        request.currentSession = "owner";
+        request.viewerPersonId = "owner";
+        request.viewerIsOwner = true;
+        request.sourceKinds = {"chat"};
+        request.requireTermMatch = true;
+        request.query = "rescheduled";
+        const auto result = MemoryRetrievalService(&db, provider).retrieve(request);
+        QCOMPARE(result.lexicalCount, 0);
+        QCOMPARE(result.vectorCount, 1);
+        QVERIFY(!result.evidence.isEmpty());
+        QCOMPARE(result.evidence.first().text, QStringLiteral("updated schedule"));
+
+        SentenceText reply;
+        reply.zhText = "acknowledged";
+        QVERIFY(db.saveQATurn("updated schedule", "{}", {reply}, meta, turn));
+        event.content = "online group input";
+        QVERIFY(db.appendRawEvent(event));
+        QTRY_COMPARE(db.searchIndexStatus()["embeddings"].toInt(), 4);
+        QVERIFY(!db.chunkEmbedding(id, provider->modelId()).isEmpty());
+        QVERIFY(db.memoryChunksMissingEmbedding(1, provider->modelId()).isEmpty());
+    }
+
+    void onlineEmbeddingRetriesWithoutAnotherMessage()
+    {
+        QTemporaryDir dir;
+        const auto path = dir.filePath("retry.db");
+        MemoryManager db(path);
+        RawDb raw(path, "retry");
+        QVERIFY(raw.open());
+        QVERIFY(raw.exec("CREATE TRIGGER busy_embedding BEFORE INSERT ON memory_embeddings "
+                         "BEGIN SELECT RAISE(ABORT,'temporary failure'); END"));
+        makePetTurn(db, "retry after failure", "");
+        MemoryRetrievalConfig config;
+        config.embeddingEnabled = true;
+        config.embeddingProvider = "local_hash_test";
+        MemoryIndexWorker worker(db, config);
+        QSignalSpy drained(&worker, &MemoryIndexWorker::drained);
+        QTRY_COMPARE(drained.size(), 1);
+        QVERIFY(!drained.first().at(0).toBool());
+        QCOMPARE(db.searchIndexStatus()["embeddings"].toInt(), 0);
+        QVERIFY(raw.exec("DROP TRIGGER busy_embedding"));
+        QTRY_COMPARE(drained.size(), 2);
+        QVERIFY(drained.last().at(0).toBool());
+        QCOMPARE(db.searchIndexStatus()["embeddings"].toInt(), 1);
+        const auto chunk = db.memoryChunksForEmbedding().first().toObject();
+        QVERIFY(raw.exec("DELETE FROM chat_history"));
+        QVERIFY(db.storeChunkEmbedding(chunk["id"].toInteger(), "stale", 1,
+                                       QByteArray(4, 0), chunk["content_hash"].toString()));
+        QCOMPARE(db.searchIndexStatus()["embeddings"].toInt(), 0);
     }
 
     void reopensV14DatabaseWithoutMemoryLoss()
@@ -1942,6 +2030,14 @@ private slots:
             if (excluded.content == "other") excluded.senderId = "30003";
             QVERIFY(db.appendRawEvent(excluded));
         }
+        LocalHashEmbeddingProvider embedding;
+        QString embedError;
+        QVERIFY2(db.embedSearchChunks(&embedding, 1, &embedError), qPrintable(embedError));
+        const auto excludedChunks = db.memoryChunksMissingEmbedding(20, embedding.modelId());
+        QSet<QString> excludedTexts;
+        for (const auto &chunk : excludedChunks)
+            excludedTexts.insert(chunk.toObject()["text"].toString());
+        QCOMPARE(excludedTexts, (QSet<QString>{"hidden", "restricted"}));
         RecentContextQuery query;
         query.allowedGroupIds = {"visible", "hidden"};
         query.viewerPersonId = "qq:20002";

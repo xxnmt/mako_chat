@@ -1,25 +1,36 @@
-#ifndef MEMORYINDEXWORKER_H
-#define MEMORYINDEXWORKER_H
+#pragma once
 
-#include <QObject>
-#include <QString>
+#include "memoryreadpolicy.h"
+#include <QThread>
+#include <QTimer>
 
-// 独立线程重建索引。Worker 自己创建 MemoryManager 和独立 SQL 连接，
-// 不跨线程复用主线程的 QSqlDatabase。
-class MemoryIndexWorker : public QObject
+class MemoryManager;
+
+// The timer and notifications live on the owner's thread. Each drain opens
+// an independent SQL connection and performs its network requests in run().
+class MemoryIndexWorker final : public QThread
 {
     Q_OBJECT
 public:
-    explicit MemoryIndexWorker(const QString &memoryPath, QObject *parent = nullptr);
-
-public slots:
-    void run();
+    MemoryIndexWorker(MemoryManager &memory, const MemoryRetrievalConfig &config);
+    ~MemoryIndexWorker() override;
 
 signals:
-    void finished(bool ok, const QString &error, int chunks);
+    void drained(bool ok, const QString &error);
+
+protected:
+    void run() override;
 
 private:
-    QString m_memoryPath;
-};
+    void schedule();
 
-#endif // MEMORYINDEXWORKER_H
+    QString m_path;
+    MemoryRetrievalConfig m_config;
+    MemoryReadPolicy m_policy;
+    QTimer m_timer;
+    bool m_rebuild;
+    bool m_busy = false;
+    bool m_pending = false;
+    int m_retryMs = 1000;
+    QString m_error;
+};
