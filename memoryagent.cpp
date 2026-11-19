@@ -454,6 +454,7 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
         args.value(QStringLiteral("time_target")).toString());
 
     QJsonArray resultItems;
+    QJsonArray retrievals;
     QStringList terms = RecentContextPlanner::extractTerms(query);
 
     const auto config = ConfigManager::instance().getMemoryPolicyConfig().retrieval;
@@ -498,6 +499,10 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
         request.allowedSources = allowed;
 
         const auto unified = service.retrieve(request);
+        auto retrievalReport = unified.toJson();
+        retrievalReport.remove("evidence");
+        retrievalReport.insert("purpose", request.purpose);
+        retrievals.append(retrievalReport);
         for (const auto &evidence : unified.evidence) {
             if (resultItems.size() >= recentLimit)
                 break;
@@ -560,6 +565,10 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
         request.allowedSources = allowed;
 
         const auto unified = service.retrieve(request);
+        auto retrievalReport = unified.toJson();
+        retrievalReport.remove("evidence");
+        retrievalReport.insert("purpose", request.purpose);
+        retrievals.append(retrievalReport);
         for (const auto &evidence : unified.evidence) {
             if (resultItems.size() >= limit)
                 break;
@@ -621,6 +630,10 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
                 == MemoryAccessState::Shareable;
         };
         const auto unified = service.retrieve(request);
+        auto retrievalReport = unified.toJson();
+        retrievalReport.remove("evidence");
+        retrievalReport.insert("purpose", request.purpose);
+        retrievals.append(retrievalReport);
         for (const auto &evidence : unified.evidence) {
             if (resultItems.size() >= limit)
                 break;
@@ -683,6 +696,10 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
                 m_scope, it->origin, it->visibility, it->subject, it->sessionId);
         };
         const auto unified = service.retrieve(request);
+        auto retrievalReport = unified.toJson();
+        retrievalReport.remove("evidence");
+        retrievalReport.insert("purpose", request.purpose);
+        retrievals.append(retrievalReport);
         for (const auto &evidence : unified.evidence) {
             if (resultItems.size() >= limit)
                 break;
@@ -754,6 +771,10 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
         request.allowedSources = allowed;
 
         const auto unified = service.retrieve(request);
+        auto retrievalReport = unified.toJson();
+        retrievalReport.remove("evidence");
+        retrievalReport.insert("purpose", request.purpose);
+        retrievals.append(retrievalReport);
         for (const auto &evidence : unified.evidence) {
             if (resultItems.size() >= limit)
                 break;
@@ -818,6 +839,10 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
             request.allowedSources = allowed;
 
             const auto unified = service.retrieve(request);
+            auto retrievalReport = unified.toJson();
+            retrievalReport.remove("evidence");
+            retrievalReport.insert("purpose", request.purpose);
+            retrievals.append(retrievalReport);
             for (const auto &evidence : unified.evidence) {
                 if (resultItems.size() >= limit)
                     break;
@@ -860,9 +885,18 @@ QJsonObject MemoryAgentTools::search(const QJsonObject &args, QString *error)
     }
 
     QJsonObject result;
+    bool candidateTruncated = m_truncated || resultItems.size() >= limit;
+    bool degraded = false;
+    for (const auto &report : retrievals) {
+        candidateTruncated |= report.toObject()["truncated_by_limit"].toBool();
+        degraded |= report.toObject()["execution_status"] == "degraded";
+    }
     result.insert(QStringLiteral("items"), resultItems);
-    result.insert(QStringLiteral("truncated"),
-                  m_truncated || resultItems.size() >= limit);
+    result.insert(QStringLiteral("retrievals"), retrievals);
+    result.insert(QStringLiteral("execution_status"), degraded ? "degraded" : "complete");
+    result.insert(QStringLiteral("coverage_status"), "unknown");
+    result.insert(QStringLiteral("truncated_by_limit"), candidateTruncated);
+    result.insert(QStringLiteral("truncated"), candidateTruncated);
     return result;
 }
 

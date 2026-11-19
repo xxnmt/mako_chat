@@ -56,14 +56,37 @@ QJsonObject MemoryRecallTool::definition()
                             QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}});
     anchorProperties.insert(QStringLiteral("name"),
                             QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}});
-    anchorProperties.insert(QStringLiteral("minutes"),
-                            QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}});
+    anchorProperties[QStringLiteral("minutes")] = QJsonObject{
+        {"type", "integer"}, {"minimum", 1}, {"maximum", 44640}};
     QJsonObject anchorSchema;
     anchorSchema.insert(QStringLiteral("type"), QStringLiteral("object"));
     anchorSchema.insert(QStringLiteral("properties"), anchorProperties);
     anchorSchema.insert(QStringLiteral("required"),
                         QJsonArray{QStringLiteral("type")});
     anchorSchema.insert(QStringLiteral("additionalProperties"), false);
+    anchorSchema.insert(QStringLiteral("description"), QStringLiteral(
+        "relative_day/relative_month 必填 offset。relative_week 必填 offset；"
+        "整周配 span=week_containing，可省略 weekday；具体一天必填 weekday(1=周一至7=周日)。"
+        "absolute_date 必填 date；festival 必填 name；recent_window 必填 minutes(1..44640)，"
+        "表示截止当前时刻的滚动窗口，不再附 span/period/occurrence。"));
+
+    QJsonArray anchorVariants;
+    const QList<QPair<QString, QStringList>> anchorRequirements{
+        {"relative_day", {"offset"}}, {"relative_week", {"offset"}},
+        {"relative_month", {"offset"}}, {"absolute_date", {"date"}},
+        {"festival", {"name"}}, {"recent_window", {"minutes"}}};
+    for (const auto &entry : anchorRequirements) {
+        QJsonObject properties{{"type", QJsonObject{{"const", entry.first}}}};
+        QJsonArray required{"type"};
+        for (const auto &key : entry.second) {
+            properties.insert(key, anchorProperties[key]);
+            required.append(key);
+        }
+        if (entry.first == "relative_week") properties.insert("weekday", anchorProperties["weekday"]);
+        anchorVariants.append(QJsonObject{{"type","object"},{"properties",properties},
+                                         {"required",required},{"additionalProperties",false}});
+    }
+    anchorSchema.insert("anyOf", anchorVariants);
 
     QJsonObject occurrenceType;
     occurrenceType.insert(QStringLiteral("type"), QStringLiteral("string"));
@@ -103,6 +126,26 @@ QJsonObject MemoryRecallTool::definition()
     spanSchema.insert(QStringLiteral("required"),
                       QJsonArray{QStringLiteral("type")});
     spanSchema.insert(QStringLiteral("additionalProperties"), false);
+    spanSchema.insert(QStringLiteral("description"), QStringLiteral(
+        "day/week_containing/month_containing 只包含 type；"
+        "surrounding_days 必填 before_days 和 after_days(0..31)。"
+        "自然周从周一零点至下周一零点。上周用 relative_week offset=-1 + week_containing；"
+        "上月用 relative_month offset=-1 + month_containing；最近七天用 recent_window minutes=10080。"));
+
+    QJsonArray spanVariants;
+    for (const auto &type : {"day", "week_containing", "month_containing", "surrounding_days"}) {
+        QJsonObject properties{{"type", QJsonObject{{"const", type}}}};
+        QJsonArray required{"type"};
+        if (QString(type) == "surrounding_days") {
+            for (const auto &key : {"before_days", "after_days"}) {
+                properties.insert(key, QJsonObject{{"type","integer"},{"minimum",0},{"maximum",31}});
+                required.append(key);
+            }
+        }
+        spanVariants.append(QJsonObject{{"type","object"},{"properties",properties},
+                                       {"required",required},{"additionalProperties",false}});
+    }
+    spanSchema.insert("anyOf", spanVariants);
 
     QJsonObject periodSchema;
     periodSchema.insert(QStringLiteral("type"), QStringLiteral("string"));
@@ -123,6 +166,27 @@ QJsonObject MemoryRecallTool::definition()
     frameSchema.insert(QStringLiteral("required"),
                        QJsonArray{QStringLiteral("anchor")});
     frameSchema.insert(QStringLiteral("additionalProperties"), false);
+
+    const auto anchorIs = [](const QString &type) {
+        return QJsonObject{{"properties", QJsonObject{{"anchor", QJsonObject{
+            {"properties", QJsonObject{{"type", QJsonObject{{"const", type}}}}},
+            {"required", QJsonArray{"type"}}}}}}, {"required", QJsonArray{"anchor"}}};
+    };
+    const QJsonObject wholeWeek{{"properties", QJsonObject{{"span", QJsonObject{
+        {"properties", QJsonObject{{"type", QJsonObject{{"const", "week_containing"}}}}},
+        {"required", QJsonArray{"type"}}}}}}, {"required", QJsonArray{"span"}}};
+    const QJsonObject weekdayPresent{{"properties", QJsonObject{{"anchor", QJsonObject{
+        {"required", QJsonArray{"weekday"}}}}}}};
+    frameSchema.insert("allOf", QJsonArray{
+        QJsonObject{{"if", anchorIs("relative_week")},
+                    {"then", QJsonObject{{"anyOf", QJsonArray{weekdayPresent, wholeWeek}}}}},
+        QJsonObject{{"if", anchorIs("recent_window")},
+                    {"then", QJsonObject{{"not", QJsonObject{{"anyOf", QJsonArray{
+                        QJsonObject{{"required", QJsonArray{"span"}}},
+                        QJsonObject{{"required", QJsonArray{"period"}}},
+                        QJsonObject{{"required", QJsonArray{"occurrence"}}}
+                    }}}}}}}
+    });
 
     QJsonObject timeProperties;
     timeProperties.insert(QStringLiteral("expression"), expression);
@@ -277,6 +341,9 @@ QJsonObject MemoryRecallTool::execute(const QJsonObject &arguments, QString *err
         }
         return QJsonObject{
             {QStringLiteral("status"), QStringLiteral("failed")},
+            {QStringLiteral("execution_status"), QStringLiteral("failed")},
+            {QStringLiteral("coverage_status"), QStringLiteral("unknown")},
+            {QStringLiteral("truncated_by_limit"), false},
             {QStringLiteral("partial"), false},
             {QStringLiteral("truncated"), false},
             {QStringLiteral("untrusted"), true},
@@ -355,6 +422,9 @@ QJsonObject MemoryRecallTool::read(const QJsonObject &arguments, QString *error)
         }
         return QJsonObject{
             {QStringLiteral("status"), QStringLiteral("failed")},
+            {QStringLiteral("execution_status"), QStringLiteral("failed")},
+            {QStringLiteral("coverage_status"), QStringLiteral("unknown")},
+            {QStringLiteral("truncated_by_limit"), false},
             {QStringLiteral("error"), QStringLiteral("invalid_arguments")}};
     }
     const QJsonArray requested = arguments.value(QStringLiteral("handles")).toArray();
@@ -364,6 +434,9 @@ QJsonObject MemoryRecallTool::read(const QJsonObject &arguments, QString *error)
         }
         return QJsonObject{
             {QStringLiteral("status"), QStringLiteral("failed")},
+            {QStringLiteral("execution_status"), QStringLiteral("failed")},
+            {QStringLiteral("coverage_status"), QStringLiteral("unknown")},
+            {QStringLiteral("truncated_by_limit"), false},
             {QStringLiteral("error"), QStringLiteral("invalid_arguments")}};
     }
 

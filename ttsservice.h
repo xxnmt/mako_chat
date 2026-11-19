@@ -54,6 +54,7 @@ private:
     TTSProcessManager *m_processManager = nullptr;
     QQueue<SentenceText> m_pendingSentences;
     bool m_isApiReady = false;
+    bool m_apiFailed = false;
 
     // 合成队列
     QQueue<SentenceText> m_ttsQueue;
@@ -61,6 +62,9 @@ private:
     // 状态锁
     bool m_isSynthesizing = false;
     bool m_lastSynthWasStream = false;
+    SentenceText m_currentSentence;
+    quint64 m_providerGeneration = 0;
+    QStringList m_loadedConfig;
 
     ITTSProvider *m_provider = nullptr;   // 当前 TTS 抽象策略
     IAudioSink *m_audioSink = nullptr;    // 非所有权（由渠道持有）

@@ -210,6 +210,10 @@ QJsonObject RetrievalResult::toJson() const
         items.append(item.toJson());
     return QJsonObject{{QStringLiteral("status"), status},
                        {QStringLiteral("degraded_reason"), degradedReason},
+                       {QStringLiteral("execution_status"), status},
+                       {QStringLiteral("coverage_status"), QStringLiteral("unknown")},
+                       {QStringLiteral("truncated_by_limit"), truncated},
+                       {QStringLiteral("returned"), evidence.size()},
                        {QStringLiteral("backend"), backend},
                        {QStringLiteral("candidates"), candidateCount},
                        {QStringLiteral("lexical_candidates"), lexicalCount},

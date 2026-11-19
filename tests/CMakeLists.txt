@@ -241,3 +241,18 @@ add_phase0_test(tst_globalmoodstate
     ${PROJECT_SOURCE_DIR}/globalmoodstate.h
     ${PROJECT_SOURCE_DIR}/globalmoodstate.cpp
 )
+add_phase0_test(tst_ttslifecycle
+    tst_ttslifecycle.cpp
+    ${PROJECT_SOURCE_DIR}/ttsservice.cpp
+    ${PROJECT_SOURCE_DIR}/ttsprocessmanager.cpp
+    ${PROJECT_SOURCE_DIR}/mockttsprovider.cpp
+    ${PROJECT_SOURCE_DIR}/apittsprovider.cpp
+    ${PROJECT_SOURCE_DIR}/ttsreferencemanager.cpp
+    ${PROJECT_SOURCE_DIR}/ittsprovider.h
+    ${PROJECT_SOURCE_DIR}/iaudiosink.h
+    ${PROJECT_SOURCE_DIR}/configmanager.cpp
+    ${PROJECT_SOURCE_DIR}/memorypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/qqreplypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/qqmessageparser.cpp
+)
+target_link_libraries(tst_ttslifecycle PRIVATE Qt6::Network)

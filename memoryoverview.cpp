@@ -22,6 +22,9 @@ QJsonObject errorPayload(const QString &error, const QString &message)
 {
     return QJsonObject{
         {QStringLiteral("status"), QStringLiteral("failed")},
+            {QStringLiteral("execution_status"), QStringLiteral("failed")},
+            {QStringLiteral("coverage_status"), QStringLiteral("unknown")},
+            {QStringLiteral("truncated_by_limit"), false},
         {QStringLiteral("mode"), QStringLiteral("overview")},
         {QStringLiteral("error"), error},
         {QStringLiteral("message"), message}};
@@ -270,6 +273,11 @@ MemoryOverviewResult buildMemoryOverview(MemoryManager *manager,
                                    {QStringLiteral("other_channels_visible"),
                                     scope.otherChannelsVisible}});
     }
+    payload.insert(QStringLiteral("execution_status"), QStringLiteral("complete"));
+    payload.insert(QStringLiteral("coverage_status"),
+                   scanComplete && aggregationComplete ? "complete" : "partial");
+    coverage.insert(QStringLiteral("basis"), QStringLiteral("stored_interactions"));
+    coverage.insert(QStringLiteral("historical_completeness"), QStringLiteral("unknown"));
     payload.insert(QStringLiteral("coverage"), coverage);
     payload.insert(QStringLiteral("buckets"), bucketArray);
     result.payload = payload;

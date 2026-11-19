@@ -22,6 +22,7 @@
 #include "memorytimeframe.h"
 #include "timeframeresolver.h"
 #include "memoryoverview.h"
+#include "memoryresultjson.h"
 
 namespace {
 
@@ -1919,6 +1920,93 @@ private slots:
             QJsonObject{{QStringLiteral("handles"), handleArray}}, &error);
         QVERIFY2(error.isEmpty(), qPrintable(error));
         QVERIFY(readResult.value(QStringLiteral("items")).toArray().size() >= 6);
+    }
+
+    void executionAndCoverageAreIndependent()
+    {
+        MemoryAgentResult result;
+        result.status = "complete";
+        result.truncated = true;
+        auto json = memoryAgentResultToJson(result);
+        QCOMPARE(json["execution_status"].toString(), QString("complete"));
+        QCOMPARE(json["coverage_status"].toString(), QString("unknown"));
+        QVERIFY(json["truncated_by_limit"].toBool());
+        QVERIFY(!json["partial"].toBool());
+        result.status = "partial";
+        QCOMPARE(memoryAgentResultToJson(result)["execution_status"].toString(), QString("degraded"));
+        result.status = "failed";
+        QCOMPARE(memoryAgentResultToJson(result)["execution_status"].toString(), QString("failed"));
+    }
+
+    void calendarRangeContractThroughRecall()
+    {
+        QTemporaryDir dir;
+        MemoryManager db(dir.filePath("calendar.db"));
+        const QDateTime now = QDateTime::fromString("2026-11-16T02:00:00Z", Qt::ISODate);
+        auto scope = ownerGroupScope("30001", now);
+        scope.referenceTime = now;
+        scope.timezone = "Asia/Shanghai";
+        scope.requireTimeFrame = true;
+        for (const auto &group : {QString("30001"), QString("30002")}) {
+            for (const auto &date : {QString("2026-11-08T23:59:59+08:00"),
+                                    QString("2026-11-09T00:00:00+08:00"),
+                                    QString("2026-11-15T23:59:59+08:00"),
+                                    QString("2026-11-16T00:00:00+08:00")}) {
+                const auto id = makeInteractionAt(db, group, QDateTime::fromString(date, Qt::ISODate),
+                                                   "group discussion", group, "participant");
+                QVERIFY(id >= 0);
+                QVERIFY(db.saveInteractionSummary(id, group + date, "ready"));
+            }
+        }
+        QJsonObject frame{{"anchor", QJsonObject{{"type","relative_week"},{"offset",-1}}},
+                          {"span", QJsonObject{{"type","week_containing"}}}};
+        QJsonObject time{{"expression","last week"},{"frame",frame}};
+        QJsonObject need{{"id","one"},{"query","group discussion"},{"time",time}};
+        QJsonObject plan{{"mode","overview"},{"needs",QJsonArray{need}}};
+        MemoryRecallTool tool(&db, scope);
+        QString error;
+        const auto result = tool.execute(plan, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        const auto coverage = result["coverage"].toObject();
+        QCOMPARE(coverage["from"].toString(), QString("2026-11-09 00:00:00"));
+        QCOMPARE(coverage["to"].toString(), QString("2026-11-16 00:00:00"));
+        QCOMPARE(coverage["total_interactions"].toInt(), 2);
+        QCOMPARE(result["execution_status"].toString(), QString("complete"));
+        MemoryTimeFrame parsed;
+        for (const auto &at : {QString("2027-01-01T01:00:00+08:00"),
+                               QString("2026-03-01T12:00:00+08:00")}) {
+            QVERIFY(MemoryTimeFrame::fromJson(frame, &parsed, &error));
+            const auto anchor = QDateTime::fromString(at, Qt::ISODate);
+            const auto resolved = TimeFrameResolver::resolve("last week", MemoryTimeTarget::MessageTime,
+                                                             parsed, anchor, "Asia/Shanghai");
+            QVERIFY(resolved.valid);
+            QCOMPARE(resolved.from.date().dayOfWeek(), 1);
+            QCOMPARE(resolved.from.date().daysTo(resolved.to.date()), 7);
+            QVERIFY(resolved.to <= anchor);
+        }
+        frame["span"] = QJsonObject{{"type","day"}};
+        QVERIFY(!MemoryTimeFrame::fromJson(frame, &parsed, &error));
+        QCOMPARE(error, QString("weekday_required_for_day_span"));
+        frame["anchor"] = QJsonObject{{"type","relative_week"},{"offset",-1},{"weekday",3}};
+        QVERIFY(MemoryTimeFrame::fromJson(frame, &parsed, &error));
+        auto resolved = TimeFrameResolver::resolve("last Wednesday", MemoryTimeTarget::MessageTime,
+                                                   parsed, now, "Asia/Shanghai");
+        QCOMPARE(resolved.from.date(), QDate(2026,11,11));
+        frame = QJsonObject{{"anchor",QJsonObject{{"type","relative_month"},{"offset",-1}}},
+                            {"span",QJsonObject{{"type","month_containing"}}}};
+        QVERIFY(MemoryTimeFrame::fromJson(frame, &parsed, &error));
+        resolved = TimeFrameResolver::resolve("last month", MemoryTimeTarget::MessageTime, parsed,
+                                               QDateTime::fromString("2024-03-01T02:00:00Z",Qt::ISODate),
+                                               "Asia/Shanghai");
+        QCOMPARE(resolved.from.date(), QDate(2024,2,1));
+        QCOMPARE(resolved.to.date(), QDate(2024,3,1));
+        frame = QJsonObject{{"anchor",QJsonObject{{"type","recent_window"},{"minutes",10080}}}};
+        QVERIFY(MemoryTimeFrame::fromJson(frame, &parsed, &error));
+        resolved = TimeFrameResolver::resolve("past seven days", MemoryTimeTarget::MessageTime,
+                                               parsed, now, "Asia/Shanghai");
+        QCOMPARE(resolved.from, now.addDays(-7));
+        frame["span"] = QJsonObject{{"type","week_containing"},{"before_days",7}};
+        QVERIFY(!MemoryTimeFrame::fromJson(frame, &parsed, &error));
     }
 
     void planAcceptsFrameAndOverviewMode()

@@ -102,7 +102,7 @@ struct RetrievalRequest
 struct RetrievalResult
 {
     QList<MemoryEvidence> evidence;
-    QString status = QStringLiteral("complete"); // complete / partial / degraded
+    QString status = QStringLiteral("complete"); // execution status: complete / degraded
     QString degradedReason;
     QString backend = QStringLiteral("unknown"); // legacy / index
     int candidateCount = 0;

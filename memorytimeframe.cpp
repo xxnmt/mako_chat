@@ -2,6 +2,8 @@
 
 #include <QJsonValue>
 #include <QSet>
+#include <cmath>
+#include <limits>
 
 namespace {
 
@@ -23,7 +25,10 @@ QString stringValue(const QJsonObject &object, const QString &key)
 bool intValue(const QJsonObject &object, const QString &key, int *out)
 {
     const QJsonValue value = object.value(key);
-    if (!value.isDouble()) {
+    if (!value.isDouble() || !std::isfinite(value.toDouble())
+        || value.toDouble() != std::trunc(value.toDouble())
+        || value.toDouble() < std::numeric_limits<int>::min()
+        || value.toDouble() > std::numeric_limits<int>::max()) {
         return false;
     }
     *out = value.toInt();
@@ -76,7 +81,8 @@ bool MemoryTimeFrame::fromJson(const QJsonObject &object,
                                   QStringLiteral("offset"),
                                   QStringLiteral("weekday")})
             || !intValue(anchor, QStringLiteral("offset"), &parsed.offset)
-            || !intValue(anchor, QStringLiteral("weekday"), &parsed.weekday)
+            || (anchor.contains(QStringLiteral("weekday"))
+                && !intValue(anchor, QStringLiteral("weekday"), &parsed.weekday))
             || parsed.weekday < 1 || parsed.weekday > 7) {
             if (error) {
                 *error = QStringLiteral("invalid_relative_week");
@@ -120,7 +126,7 @@ bool MemoryTimeFrame::fromJson(const QJsonObject &object,
         if (!hasOnlyKeys(anchor, {QStringLiteral("type"),
                                   QStringLiteral("minutes")})
             || !intValue(anchor, QStringLiteral("minutes"), &parsed.offset)
-            || parsed.offset < 1 || parsed.offset > 1440) {
+            || parsed.offset < 1 || parsed.offset > 44640) {
             if (error) {
                 *error = QStringLiteral("invalid_recent_window");
             }
@@ -260,6 +266,17 @@ bool MemoryTimeFrame::fromJson(const QJsonObject &object,
         return false;
     }
 
+    if (parsed.anchor == Anchor::RelativeWeek && !anchor.contains(QStringLiteral("weekday"))
+        && parsed.span != Span::WeekContaining) {
+        if (error) *error = QStringLiteral("weekday_required_for_day_span");
+        return false;
+    }
+    if (parsed.anchor == Anchor::RecentWindow
+        && (object.contains(QStringLiteral("span")) || !parsed.period.isEmpty()
+            || object.contains(QStringLiteral("occurrence")))) {
+        if (error) *error = QStringLiteral("recent_window_requires_minutes_only");
+        return false;
+    }
     *frame = parsed;
     return true;
 }

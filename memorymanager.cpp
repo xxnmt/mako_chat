@@ -2772,7 +2772,7 @@ QList<InteractionSummary> MemoryManager::getInteractionSummariesOverlapping(
                   "summary_format, summary_segments "
                   "FROM interactions "
                   "WHERE summary_status='ready' AND channel=? AND session_id=? "
-                  "AND started_at < ? AND ended_at > ? "
+                  "AND started_at < ? AND ended_at >= ? "
                   "ORDER BY ended_at ASC LIMIT ?");
     query.addBindValue(channel);
     query.addBindValue(sessionId);
@@ -2810,7 +2810,7 @@ int MemoryManager::countInteractionsInRange(const QString &channel,
     QSqlQuery query(m_db);
     query.prepare("SELECT COUNT(*) FROM interactions "
                   "WHERE channel=? AND session_id=? "
-                  "AND started_at < ? AND ended_at > ?");
+                  "AND started_at < ? AND ended_at >= ?");
     query.addBindValue(channel);
     query.addBindValue(sessionId);
     query.addBindValue(to.toString("yyyy-MM-dd HH:mm:ss"));

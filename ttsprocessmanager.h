@@ -27,13 +27,15 @@ private slots:
 private:
     QProcess *m_process=nullptr;
     QTimer *m_timer=nullptr;
+    QTimer m_startDeadline;
+    quint64 m_generation = 0;
     bool m_isApiReady=false;
     QString m_apiPythonPath;
     QString m_scriptDir;
     QStringList m_args;
     int m_port;
     const QString READY_MARKER = "Uvicorn running on";
-    void killProcessOnPort(int port);
+    void fail(const QString &reason);
 
 };
 

@@ -136,7 +136,7 @@ MemoryResolvedTime TimeFrameResolver::resolve(
         break;
     case MemoryTimeFrame::Anchor::RelativeWeek:
         date = mondayOf(localAnchor.date())
-                   .addDays(frame.offset * 7 + (frame.weekday - 1));
+                   .addDays(qint64(frame.offset) * 7 + (frame.weekday - 1));
         break;
     case MemoryTimeFrame::Anchor::RelativeMonth:
         date = QDate(localAnchor.date().year(), localAnchor.date().month(), 1)
@@ -150,7 +150,7 @@ MemoryResolvedTime TimeFrameResolver::resolve(
         }
         break;
     case MemoryTimeFrame::Anchor::RecentWindow:
-        result.from = localAnchor.addSecs(-frame.offset * 60);
+        result.from = localAnchor.addSecs(-qint64(frame.offset) * 60);
         result.to = localAnchor.addSecs(1);
         result.valid = true;
         result.interpretation = QStringLiteral("recent_window");

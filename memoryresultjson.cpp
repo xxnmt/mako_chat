@@ -162,6 +162,12 @@ QJsonObject memoryAgentResultToJson(const MemoryAgentResult &result,
     payload.insert(QStringLiteral("evidence_state"), evidenceState);
     payload.insert(QStringLiteral("partial"), partial);
     payload.insert(QStringLiteral("truncated"), truncated);
+    payload.insert(QStringLiteral("truncated_by_limit"), truncated);
+    payload.insert(QStringLiteral("execution_status"),
+                   (status == QStringLiteral("failed") || status == QStringLiteral("timeout"))
+                       ? QStringLiteral("failed")
+                       : (partial ? QStringLiteral("degraded") : QStringLiteral("complete")));
+    payload.insert(QStringLiteral("coverage_status"), QStringLiteral("unknown"));
     payload.insert(QStringLiteral("has_empty"), hasEmptyNeed(result));
     payload.insert(QStringLiteral("untrusted"), true);
     if (!result.accessScope.isEmpty()) {

@@ -242,6 +242,11 @@ MemoryAgentResult MemoryExecutor::execute(const MemoryRecallPlan &plan)
             needResult.timeCertainty = QStringLiteral("approximate");
             anyFailure = true;
         }
+        if (toolResult["execution_status"] == "degraded") {
+            anyFailure = true;
+            needResult.error = QStringLiteral("retrieval_degraded");
+            needResult.status = QStringLiteral("degraded");
+        }
         if (toolResult.value(QStringLiteral("truncated")).toBool(false)) {
             result.truncated = true;
         }
@@ -270,10 +275,10 @@ MemoryAgentResult MemoryExecutor::execute(const MemoryRecallPlan &plan)
         result.needs.append(needResult);
     }
 
-    anyFailure = anyFailure || result.truncated;
+
     // complete：所有 need 都正常结束（包括明确 empty）；
     // empty：全部正常结束但没有任何证据；
-    // partial：至少一个 need 未完成（unresolved/timeout/error/denied/fallback/truncated）；
+    // partial：至少一个 need 未完成（unresolved/timeout/error/denied/fallback）；
     // failed：执行器不可用且没有任何可安全交付的结果。
     bool anyNeed = false;
     bool allFailed = true;

@@ -473,6 +473,7 @@ void AppController::initConnections()
     connect(m_character, &CharacterWidget::settingsRequested, m_settingsWidget, &SettingsWidget::show);
     connect(m_settingsWidget, &SettingsWidget::settingsSaved, this, [this](){
         m_llmService->setApiKey(ConfigManager::instance().getApiKey());
+        m_ttsService->reloadProvider();
         // TD-037：时间/退火配置热生效（start() 会立即重估昼夜状态）
         applyTimeSettings();
         m_timeManager->start();

@@ -1,5 +1,6 @@
 #include "ttsservice.h"
 #include "apittsprovider.h"
+#include "mockttsprovider.h"
 #include "configmanager.h"
 #include "iaudiosink.h"
 
@@ -10,16 +11,7 @@ TTSService::TTSService(QObject *parent)
     : QObject(parent)
 {
     reloadProvider();
-    m_processManager = new TTSProcessManager(
-        ConfigManager::instance().getPythonPath(),
-        ConfigManager::instance().getGPTSovitsRootPath(),
-        {"-a", "127.0.0.1", "-p", "9880"},
-        9880,
-        this);
-    connect(m_processManager, &TTSProcessManager::apiReady, this, &TTSService::onApiReady);
-    connect(m_processManager, &TTSProcessManager::apiFailed, this, &TTSService::onApiFailed);
-    m_processManager->apiStart();
-    qDebug() << "[TTS]:正在启动api";
+
 }
 
 void TTSService::setAudioSink(IAudioSink *sink)
@@ -51,29 +43,49 @@ void TTSService::enqueueSentences(const QList<SentenceText> &sentences)
 
 void TTSService::reloadProvider()
 {
+    const auto &config = ConfigManager::instance();
+    const QStringList loadedConfig{config.getTTSMode(), config.getPythonPath(), config.getGPTSovitsRootPath()};
+    if (m_provider && loadedConfig == m_loadedConfig && !m_apiFailed) return;
+    m_loadedConfig = loadedConfig;
+    const quint64 generation = ++m_providerGeneration;
+    if (m_isSynthesizing) m_ttsQueue.prepend(m_currentSentence);
+    if (m_audioSink) m_audioSink->abortPendingStream();
     if (m_provider) {
-        m_provider->deleteLater();
+        disconnect(m_provider, nullptr, this, nullptr);
+        delete m_provider;
         m_provider = nullptr;
     }
-    QString mode = ConfigManager::instance().getTTSMode();
-
+    if (m_processManager) {
+        disconnect(m_processManager, nullptr, this, nullptr);
+        delete m_processManager;
+        m_processManager = nullptr;
+    }
+    m_isSynthesizing = false;
+    m_lastSynthWasStream = false;
+    m_isApiReady = false;
+    m_apiFailed = false;
+    const QString mode = ConfigManager::instance().getTTSMode();
     if (mode == "api") {
-        m_provider = new ApiTTSProvider;
-        qDebug() << "[TTS]:已加载ApiProvider";
-        QTimer::singleShot(100, this, [this]() {
-            if (m_provider) {
-                qDebug() << "[TTS]:预热中";
-                m_provider->warmUp();
-            }
-        });
+        m_provider = new ApiTTSProvider(this);
+        m_processManager = new TTSProcessManager(
+            ConfigManager::instance().getPythonPath(),
+            ConfigManager::instance().getGPTSovitsRootPath(),
+            {"-a", "127.0.0.1", "-p", "9880"}, 9880, this);
+        connect(m_processManager, &TTSProcessManager::apiReady, this, &TTSService::onApiReady);
+        connect(m_processManager, &TTSProcessManager::apiFailed, this, &TTSService::onApiFailed);
+    } else {
+        m_provider = new MockTTSProvider(this);
     }
-    if (mode == "mock") {
-        qDebug() << "[TTS]:已加载MoceTTSProvider";
-    }
-    if (m_provider) {
-        connect(m_provider, &ITTSProvider::synthesisFinished, this, &TTSService::onTtsFinished);
-        connect(m_provider, &ITTSProvider::synthesisFailed, this, &TTSService::onTtsFailed);
-    }
+    connect(m_provider, &ITTSProvider::synthesisFinished, this,
+            [this, generation](const QString &path, const SentenceText &sentence) {
+        if (generation == m_providerGeneration) onTtsFinished(path, sentence);
+    });
+    connect(m_provider, &ITTSProvider::synthesisFailed, this,
+            [this, generation](const QString &error, const SentenceText &sentence) {
+        if (generation == m_providerGeneration) onTtsFailed(error, sentence);
+    });
+    if (m_processManager) m_processManager->apiStart();
+    processPendingSentences();
 }
 
 void TTSService::switchModel(const QString &gptPath, const QString &sovitsPath)
@@ -90,7 +102,7 @@ void TTSService::processTtsQueue()
     }
 
     // API 未就绪：全部转入 pending，保持顺序
-    if (!m_processManager->isApiReady()) {
+    if (m_processManager && !m_isApiReady && !m_apiFailed) {
         while (!m_ttsQueue.isEmpty()) {
             m_pendingSentences.enqueue(m_ttsQueue.dequeue());
         }
@@ -108,6 +120,7 @@ void TTSService::processTtsQueue()
 
     m_isSynthesizing = true;
     SentenceText currentSentence = m_ttsQueue.dequeue();
+    m_currentSentence = currentSentence;
     m_lastSynthWasStream = m_provider->isStreamingMode();
 
     if (m_lastSynthWasStream) {
@@ -116,9 +129,10 @@ void TTSService::processTtsQueue()
 
         if (m_audioSink) {
             m_audioSink->beginStream(currentSentence, apiSampleRate());
+            const quint64 generation = m_providerGeneration;
             connect(m_provider, &ITTSProvider::pcmDataReady, this,
-                    [this](const QByteArray &pcm) {
-                        if (!m_audioSink) {
+                    [this, generation](const QByteArray &pcm) {
+                        if (!m_audioSink || generation != m_providerGeneration) {
                             return;
                         }
                         // 首块到达时服务端 WAV 头已解析，用真实采样率校正播放器
@@ -130,7 +144,13 @@ void TTSService::processTtsQueue()
         qDebug() << "[TTS]开始合成语音(日文):" << currentSentence.jaText;
     }
 
-    m_provider->synthesize(currentSentence);
+    if (m_apiFailed) {
+        QTimer::singleShot(0, m_provider, [this, currentSentence] {
+            onTtsFailed(QStringLiteral("TTS service unavailable"), currentSentence);
+        });
+    } else {
+        m_provider->synthesize(currentSentence);
+    }
 }
 
 void TTSService::onTtsFinished(const QString &audioPath, const SentenceText &sentence)
@@ -169,6 +189,8 @@ void TTSService::onTtsFailed(const QString &errorMsg, const SentenceText &senten
 void TTSService::onApiReady()
 {
     m_isApiReady = true;
+    m_apiFailed = false;
+    m_provider->warmUp();
     qDebug() << "[TTS]:apiReady,正在推入缓存的未合成语音";
     QString gptPath = ConfigManager::instance().getGPTWeightsPath();
     QString sovitsPath = ConfigManager::instance().getSoVITSWeightsPath();
@@ -182,12 +204,9 @@ void TTSService::onApiReady()
 void TTSService::onApiFailed(const QString &error)
 {
     qDebug() << "[TTS]:api启动失败:" << error;
-    m_pendingSentences.clear();
-    if (m_audioSink) {
-        QMap<QString, QString> tags;
-        tags.insert("emotion", "sad");
-        emit playAudioAction("茉子的声音出问题了，待会儿再试吧...", tags);
-    }
+    m_isApiReady = false;
+    m_apiFailed = true;
+    processPendingSentences();
 }
 
 void TTSService::processPendingSentences()

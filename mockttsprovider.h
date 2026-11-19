@@ -12,6 +12,7 @@ public:
     explicit MockTTSProvider(QObject *parent = nullptr);
     void synthesize(const SentenceText &sentence) override;
     void warmUp()override;
+    bool isStreamingMode() const override { return false; }
 private slots:
     void onMockSynthesisFinished();
 

@@ -273,7 +273,9 @@ void LLMService::finishRetrieval(const RetrievalResult &retrieval)
             << "term_count=" << m_run.retrievalTerms.size()
             << "candidates=" << candidates << "private_context=" << privateRefs
             << "reflection=" << reflectionRefs << "status=" << retrieval.status
-            << "backend=" << retrieval.backend << "latency_ms=" << retrieval.latencyMs;
+            << "backend=" << retrieval.backend << "latency_ms=" << retrieval.latencyMs
+            << "budget_truncated=" << retrieval.truncated << "coverage=unknown"
+            << "degraded_reason=" << retrieval.degradedReason;
     for (const auto &item : privateContext)
         evidence.append(item);
     if (meta.channel == Channel::kQQGroup && m_memoryManager) {
@@ -565,7 +567,7 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
             "最终 JSON 附 evidence_decision 对象，包含 question、question_type（fact/latest/overview/absence）、"
             "used_evidence（实际使用的资料编号，如 ref:1、chat/339）、evidence_status（sufficient/insufficient/conflicting）、"
             "basis（简短证据依据，禁止记录内部思维过程）、unresolved_conflicts 数组、consult_required 布尔值。"
-            "partial 仅表示检索覆盖不足。明确且时间匹配的直接证据可支持具体事实，"
+            "结合 execution_status、truncated_by_limit 和 coverage 判断检索结果。明确且时间匹配的直接证据可支持具体事实，"
             "latest 需关注后续修订，overview 需时间范围覆盖，absence 不能从局部未命中推出不存在。"
             "先结合当前消息、听众和最新更正决定怎样行动。可以直接回应、询问不确定的地方、回想或安静收尾。"
             "需要确认某个已知事项的当前状态时，先返回 JSON {\"action\":\"consult\",\"refs\":[1]}，"
@@ -770,12 +772,13 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
         situationMessage["content"] = situationBlock;
         messagesArray.append(situationMessage);
     }
-    if (!m_run.retrievalStatus.isEmpty()
-        && m_run.retrievalStatus != QStringLiteral("complete")) {
+    if (m_run.retrievalBackend != QStringLiteral("unknown")) {
         messagesArray.append(QJsonObject{{"role","system"},{"content",QStringLiteral(
-            "本轮检索状态为 %1%2。不要把部分覆盖说成完整搜索；不确定时保留未知。")
-            .arg(m_run.retrievalStatus,
-                 m_run.retrievalTruncated ? QStringLiteral("（已截断）") : QString{})}});
+            "本轮记忆检索执行状态 %1，按结果预算裁剪 %2，历史覆盖程度未知。"
+            "正常的候选裁剪不决定已有证据是否足以回答。依据本轮问题判断证据，"
+            "单项事实可依据明确原话；最新状态需检查更正；概览参考工具的区间覆盖，"
+            "从未发生或从未说过需要更强覆盖。查询失败与没有记录分别处理。")
+            .arg(m_run.retrievalStatus, m_run.retrievalTruncated ? QStringLiteral("是") : QStringLiteral("否"))}});
     }
 
     // 近期原始群消息是独立不可信资料，优先于长期摘要。
@@ -1961,6 +1964,7 @@ void LLMService::handleNativeToolCalls(const QJsonObject &message,
 
         qDebug() << "[MemoryTool] call=" << name
                  << "status=" << payload.value("status").toString()
+                 << "detail=" << payload.value("message").toString()
                  << "items=" << payload.value("items").toArray().size()
                  << "error=" << toolError;
     }
@@ -2039,6 +2043,7 @@ void LLMService::handleEnvelopeRecall(const QJsonObject &content)
     qDebug() << "[MemoryTool] envelope recall mode="
              << plan.mode
              << "status=" << payload.value("status").toString()
+                 << "detail=" << payload.value("message").toString()
              << "items=" << payload.value("items").toArray().size()
              << "error=" << toolError;
     sendChatRequest(m_toolMessages, false, true);

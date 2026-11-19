@@ -1163,6 +1163,27 @@ private slots:
         QCOMPARE(db.searchIndexStatus().value(QStringLiteral("embeddings")).toInt(), 3);
     }
 
+    void candidateBudgetDoesNotClaimHistoricalCoverage()
+    {
+        QTemporaryDir dir;
+        MemoryManager db(dir.filePath("budget.db"));
+        for (int i=0; i<4; ++i) makePetTurn(db, QString("shared subject %1").arg(i), "");
+        RetrievalRequest request;
+        request.query = "shared";
+        request.excludeCurrent = false;
+        request.limit = request.rerankLimit = 1;
+        auto result = MemoryRetrievalService(&db).retrieve(request);
+        QVERIFY(result.truncated);
+        QCOMPARE(result.status, QString("complete"));
+        QCOMPARE(result.evidence.size(), 1);
+        QCOMPARE(result.toJson()["coverage_status"].toString(), QString("unknown"));
+        auto failing = std::make_shared<FailingEmbeddingProvider>();
+        result = MemoryRetrievalService(&db, failing).retrieve(request);
+        QCOMPARE(result.status, QString("degraded"));
+        QVERIFY(!result.evidence.isEmpty());
+        QVERIFY(!result.degradedReason.isEmpty());
+    }
+
     void vectorRecallScansBeyondFirstTwoThousandChunks()
     {
         QTemporaryDir dir;

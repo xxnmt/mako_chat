@@ -1,10 +1,7 @@
 #include "ttsprocessmanager.h"
 #include <QDebug>
 #include <QTcpSocket>
-#include <QRegularExpression>
-#ifdef Q_OS_WIN
-#include <QThread>
-#endif
+
 
 
 TTSProcessManager::TTSProcessManager(const QString &apiPythonPath, const QString &scriptDir,
@@ -15,6 +12,10 @@ TTSProcessManager::TTSProcessManager(const QString &apiPythonPath, const QString
     m_args(args),
     m_port(port)
 {
+    m_startDeadline.setSingleShot(true);
+    connect(&m_startDeadline, &QTimer::timeout, this, [this] {
+        fail(QStringLiteral("TTS startup timed out"));
+    });
     qDebug()<<"[TTSPM]:以构建,apiPath:"<<m_apiPythonPath;
 }
 
@@ -31,13 +32,12 @@ bool TTSProcessManager::isApiReady()
 
 void TTSProcessManager::apiStart()
 {
-        
+    if (m_isApiReady || m_startDeadline.isActive()) return;
     QTcpSocket probe;
     probe.connectToHost("127.0.0.1", m_port);
     if (probe.waitForConnected(500)) {
-        probe.disconnectFromHost();
-        qDebug() << "[TTSPM]:检测到端口" << m_port << "已被占用，清理可能的孤儿进程";
-        killProcessOnPort(m_port);
+        emit apiFailed(QStringLiteral("TTS port already occupied by an external service"));
+        return;
     }
 
     if(m_process){
@@ -57,6 +57,12 @@ void TTSProcessManager::apiStart()
 
     QStringList fullArgs=m_args;
     fullArgs.prepend(m_scriptDir+"/api_v2.py");
+    connect(m_process, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
+        if (error == QProcess::FailedToStart)
+            fail(QStringLiteral("TTS process failed to start"));
+    });
+    ++m_generation;
+    m_startDeadline.start(60000);
     m_process->start(m_apiPythonPath,fullArgs);
     if(!m_timer){
         m_timer=new QTimer(this);
@@ -65,29 +71,26 @@ void TTSProcessManager::apiStart()
     }
     m_timer->start();
 
-    QTimer::singleShot(60000,this,[this](){
-        if(!m_isApiReady){
-            if(m_timer) m_timer->stop();
-            qDebug()<<"[TTSPM]:启动超时（60秒）";
-            emit apiFailed("启动超时（60秒）");
-        }
-    });
     qDebug()<<"[TTSPM]:api启动中，请稍后";
 }
 
 void TTSProcessManager::apiStop()
 {
+    ++m_generation;
+    m_startDeadline.stop();
     if(m_timer){
         m_timer->stop();
         delete m_timer;
         m_timer=nullptr;
     }
     if(m_process){
+        disconnect(m_process, nullptr, this, nullptr);
         m_process->terminate();
         if(!m_process->waitForFinished(3000)){
             m_process->kill();
+            m_process->waitForFinished(3000);
         }
-        delete m_process;
+        m_process->deleteLater();
         m_process=nullptr;
     }
     m_isApiReady=false;
@@ -100,6 +103,7 @@ void TTSProcessManager::onReadyReadStandOutput()
     if(!m_isApiReady&&data.contains(READY_MARKER)){
         qDebug()<<"[TTSPM](stdOut):api启动成功";
         m_isApiReady=true;
+        m_startDeadline.stop();
         if(m_timer) m_timer->stop();
 
         emit apiReady();
@@ -108,11 +112,8 @@ void TTSProcessManager::onReadyReadStandOutput()
 
 void TTSProcessManager::onProcessStateChanged(QProcess::ProcessState state)
 {
-    if(state==QProcess::NotRunning&&!m_isApiReady){
-        if(m_timer) m_timer->stop();
-        qDebug()<<"[TTSPM]:api进程异常终止";
-        emit apiFailed("api进程异常终止");
-    }
+    if (state == QProcess::NotRunning && (m_isApiReady || m_startDeadline.isActive()))
+        fail(QStringLiteral("TTS process exited"));
 }
 
 void TTSProcessManager::onHealthCheck()
@@ -123,9 +124,11 @@ void TTSProcessManager::onHealthCheck()
     }
     // 异步探测：不阻塞主线程，避免拖动人物卡顿
     QTcpSocket *socket = new QTcpSocket(this);
-    connect(socket, &QTcpSocket::connected, this, [this, socket]() {
-        if (!m_isApiReady) {
+    const quint64 generation = m_generation;
+    connect(socket, &QTcpSocket::connected, this, [this, socket, generation]() {
+        if (generation == m_generation && !m_isApiReady && m_startDeadline.isActive()) {
             m_isApiReady = true;
+            m_startDeadline.stop();
             if (m_timer) m_timer->stop();
             qDebug()<<"[TTSPM]（tcp）:api启动成功";
             emit apiReady();
@@ -136,33 +139,8 @@ void TTSProcessManager::onHealthCheck()
     socket->connectToHost("127.0.0.1", m_port);
 }
 
-void TTSProcessManager::killProcessOnPort(int port)
+void TTSProcessManager::fail(const QString &reason)
 {
-#ifdef Q_OS_WIN
-    QProcess netstat;
-    netstat.start("cmd", {"/c", QString("netstat -ano | findstr :%1").arg(port)});
-    netstat.waitForFinished(3000);
-    QString output = QString::fromUtf8(netstat.readAllStandardOutput());
-
-    QStringList killedPids;
-    for (const QString &line : output.split('\n')) {
-        if (!line.contains("LISTENING", Qt::CaseInsensitive)) continue;
-        QStringList parts = line.split(QRegularExpression("\\s+"), Qt::SkipEmptyParts);
-        if (parts.size() < 5) continue;
-        QString pid = parts.last();
-        if (killedPids.contains(pid)) continue;
-
-        QProcess killer;
-        killer.start("taskkill", {"/F", "/PID", pid});
-        killer.waitForFinished(3000);
-        killedPids.append(pid);
-        qDebug() << "[TTSPM]:已杀掉占用端口" << port << "的进程 PID=" << pid;
-    }
-
-    if (!killedPids.isEmpty()) {
-        QThread::msleep(1000);  // 等待端口释放
-    }
-#else
-    Q_UNUSED(port)
-#endif
+    apiStop();
+    emit apiFailed(reason);
 }

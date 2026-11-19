@@ -455,6 +455,7 @@ QList<MemoryEvidence> MemoryRetrievalService::retrieveIndexed(const RetrievalReq
         QString embedError;
         if (!m_embedding->embed(request.query, &query, &embedError)) {
             result->status = QStringLiteral("degraded");
+            result->degradedReason = QStringLiteral("embedding: ") + embedError;
         } else {
             vectorUsed = true;
             // 独立的向量召回：不以 LIKE 命中为前提，扫描当前活跃 chunk 的向量。
@@ -656,7 +657,7 @@ RetrievalResult MemoryRetrievalService::retrieve(const RetrievalRequest &request
     auto ranked = retrieveIndexed(scoped, &result);
     result.truncated |= ranked.size() > request.limit;
     result.evidence = ranked.mid(0, qMax(0, request.limit));
-    if (result.truncated && result.status == "complete") result.status = "partial";
+
     for (const auto &item : result.evidence)
         if (!item.handle.startsWith("chunk/"))
             ++result.auxiliaryCount;

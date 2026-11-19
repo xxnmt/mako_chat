@@ -258,6 +258,8 @@ app_data/config/identity.json
 | `prompt_text` | 空 | 参考音频对应文本 |
 | `prompt_lang` | `"ja"` | 参考音频语言 |
 
+运行行为（2026-11-19）：mock 使用模拟提供者，不启动 GPT-SoVITS，也不请求语音接口。api 尝试启动配置的 Python/API；启动失败或合成失败仍交付文字。保存设置会检查模式、Python 路径和根目录是否变化，变化时切换提供者，作废旧合成回调；普通设置保存不会重启服务。程序只停止自己创建的进程，9880 端口被外部服务占用时报告启动失败并保留外部服务。本轮未增加“接管已有外部 API”模式。
+
 参考音频与情绪映射由 `TTSReferenceManager` 读取 `tts_map.json`；具体资源要求见 [README](GPT_SOVITS_REFERENCE.md)。
 
 ---
