@@ -7,6 +7,7 @@
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QHash>
+#include <QQueue>
 
 #include "configmanager.h"
 
@@ -24,7 +25,7 @@ public:
     void stop();
     bool isConnected() const;
 
-    // 发送 OneBot 动作（自动带 echo）
+    // 发送 OneBot 动作（唯一 echo）。send_* 按回执串行；true 表示接受提交/入队，非送达证明。
     bool sendAction(const QString &action, const QJsonObject &params = QJsonObject(),
                     const QString &echo = QString());
 
@@ -46,6 +47,8 @@ private:
     void openSocket();
     void scheduleReconnect();
     bool sendPayload(const QString &action, const QJsonObject &params, const QString &echo);
+    void sendNextAction();
+    void finishSendAction();
 
     QWebSocket m_socket;
     QTimer m_reconnectTimer;
@@ -58,8 +61,12 @@ private:
         QString action;
         QJsonObject params;
         int attempts = 0;
+        bool waitingRetry = false;
     };
     QHash<QString, PendingAction> m_pendingActions;
+    QQueue<QString> m_sendQueue;
+    QTimer m_sendTimeout;
+    QString m_activeSend;
 };
 
 #endif // QQPROTOCOLCLIENT_H

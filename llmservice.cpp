@@ -1,3 +1,5 @@
+#include "evidenceaudit.h"
+#include "expressioncontract.h"
 #include "llmservice.h"
 #include <algorithm>
 #include "configmanager.h"
@@ -563,7 +565,7 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
             "目录编号 ref:N 仅支持已展示字段。引用原文、修订或版本细节时使用已展示的 evidence 或 consult。当前发言编号 current_input。工具结果使用 item 的 id。"
             "evidence_decision 的 claims 数组逐项记录 sentence_index（从0开始）、refs、relation。"
             "relation 为 reported_fact、current_inference、assistant_expression 或 conversational；"
-            "记得曾经的自述可确定，活动现在是否持续属于推断。每个需要事实依据的句子标记对应引用。"
+            "记得曾经的自述可确定，活动现在是否持续属于推断。每个输出句子都填写 claims；纯交流句用 conversational，事实和推断分别标记，不能用一条引用支持整段中未被证实的细节。"
             "最终 JSON 附 evidence_decision 对象，包含 question、question_type（fact/latest/overview/absence）、"
             "used_evidence（实际使用的资料编号，如 ref:1、chat/339）、evidence_status（sufficient/insufficient/conflicting）、"
             "basis（简短证据依据，禁止记录内部思维过程）、unresolved_conflicts 数组、consult_required 布尔值。"
@@ -659,7 +661,11 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
             "用户只承诺“努力调整作息”时，不要写成“你答应今晚早点睡”。"
             "本人最新自述优先于旧历史，当前消息可以再次更正。avoid_stale_followup 表示不要按旧状态追问该话题。"
             "avoid_unprompted_followup 表示聚焦眼前的话，不主动根据旧记忆追问，也不暗示私人来源。"
-            "目录 evidence 给出相关事项的完整认识，其他事项可通过 consult 核对。"
+            "事项描述的是 reported_at 时获得的认识，不能默认一直持续到现在。semantics.lifecycle 是事项进度，certainty 是证据确定性，两者独立。"
+            "completion_condition 是该事项自身的完成条件；已完成原事项，不因其他未说明的事情而重新变成待办。"
+            "temporal_scope=occurrence 指一次具体经历或安排，ongoing 指有依据的持续或重复事项；unknown 和 legacy 需要结合原话核实。"
+            "origin 保留最初原话和报告时间，time_anchor 锚定时间表达；旧的一次安排不能自动当成今天或每天的约定。"
+            "历史仍可回忆，已完成不等于删除；谈及最新状态时同时考虑当前消息。目录 evidence 给出相关事项的完整认识，其他事项可通过 consult 核对。"
             "本人自述证明其报告的经历或计划；转述需保留原说话者。助手旧回复只证明助手说过这些话，"
             "派生摘要需核对原始来源。新旧发言是否修订同一事项需结合主体、事件与语境。"
             "区分发言时间、事件时间、认识生效时间，无法确定的时间和指代保持未知。"
@@ -692,6 +698,10 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
             }
             QJsonObject entry{{"ref",i + 1},{"label",record.value("topic").toString(record.value("quote").toString())},
                               {"status",record.value("status")},{"reported_at",record.value("reported_at")}};
+            entry["understanding"] = record["understanding"];
+            entry["semantics"] = record["semantics"];
+            entry["origin"] = record["origin"];
+            entry["event_time_expression"] = record["event_time_expression"];
             const auto selfReport = record.value("self_report").toObject();
             if (!selfReport.isEmpty())
                 entry["self_report"] = selfReport;
@@ -930,7 +940,17 @@ void LLMService::sendChatRequest(const QJsonArray &messages,
 
     QJsonObject rootObj;
     rootObj["model"] = "deepseek-v4-flash";
-    rootObj["messages"] = messages;
+    auto requestMessages = messages;
+    if (m_run.meta.turnKind == "reply") {
+        const auto contract = expressionOutputContract();
+        for (qsizetype i=requestMessages.size(); i>0; --i) {
+            const auto message = requestMessages[i-1].toObject();
+            if (message["role"]=="system" && message["content"]==contract)
+                requestMessages.removeAt(i-1);
+        }
+        requestMessages.append(QJsonObject{{"role","system"},{"content",contract}});
+    }
+    rootObj["messages"] = requestMessages;
     if (withMemoryTool) {
         rootObj["tools"] = QJsonArray{MemoryRecallTool::definition(),
                                       MemoryRecallTool::readDefinition()};
@@ -944,7 +964,7 @@ void LLMService::sendChatRequest(const QJsonArray &messages,
     rootObj["reasoning_effort"] = "low";
 
     request.setTransferTimeout(120000);
-    m_lastRequestMessages = messages;
+    m_lastRequestMessages = requestMessages;
     auto *reply = m_networkManager->post(request, QJsonDocument(rootObj).toJson());
     if (!m_run.consultedKeys.isEmpty()) m_consultationReply = reply;
     reply->setProperty("runId", m_run.meta.runId);
@@ -1132,11 +1152,22 @@ void LLMService::proposeObservation(const QJsonObject &job, const QJsonArray &hi
         "有充分依据时为 updated。每个 change 给出 matter（已有 ID，创建新事项用空字符串），"
         "version（已有版本，新建为0），topic（事项名称），quote（当前输入中的逐字依据），"
         "understanding（结合证据描述当前认识，保留原计划与尚未确定之处），"
-        "kind（self_report/reported/inference），status（confirmed/tentative/disputed/unconfirmed/cancelled/ended），"
-        "event_time（发言中的时间原文；未给出用空串）。reported_at 是时间表达的锚点。"
+        "kind（self_report/reported/inference），兼容字段 status 由服务端从 semantics 生成，无需填写，"
+        "event_time 必须是当前发言中连续的时间原文，未给出用空串；不能把多段时间拼接成新短语。reported_at 是时间表达的锚点。"
+        "每个 change 还必须给出 semantics 对象，字段为 lifecycle、certainty、temporal_scope、completion_condition、time_expression。"
+        "lifecycle 为 planned/active/completed/ended/cancelled/unknown；certainty 为 confirmed/tentative/disputed/unknown。"
+        "进度和证据确定性独立：不确定是否准时或是否有其他后续动作，不应否定用户已明确完成原事项。"
+        "completion_condition 简述该事项原本的完成条件，不自行附加其他条件；不知道时为空。"
+        "temporal_scope 为 occurrence（一次经历或安排）、ongoing（有依据的持续或重复事实）、unknown。"
+        "time_expression 只取当前输入中的时间原文或已有 semantics 中的时间表达，无依据为空；time_anchor 由服务端填写，勿返回。"
+        "后续发言未重述时间时可沿用已有时间表达，不能将某天一次的计划自动升级为每日要求。"
+        "同一事项的新状态明确后修订它；完成只改变进度，不删除历史。其他不确定性保留在 understanding，不能阻止已满足原完成条件的事项收尾。"
+        "previous_error 是上次提交的协议错误，请依据当前原文和最新事项修正。invalid_event_time 表示 event_time 不是连续原文；"
+        "unsupported_time_scope 表示 time_expression 没有当前或同事项历史原文支持；禁止为消除错误编造时间。"
         "同主题可以有多个事项；根据人物、时间和语境判断。留意过去式、否定和矛盾，"
         "不要用旧消息推翻更新的认识，不要把他人的事项归给发言者。尊重不记忆的要求。");
     QJsonObject data{{"input",job["input"]},{"reported_at",job["reported_at"]},{"matters",heads}};
+    if (!job["previous_error"].toString().isEmpty()) data["previous_error"] = job["previous_error"];
     if (!history.isEmpty()) data["history"] = history;
     const QJsonArray messages{QJsonObject{{"role","system"},{"content",instruction}},
         QJsonObject{{"role","user"},{"content",QString::fromUtf8(QJsonDocument(data).toJson(QJsonDocument::Compact))}}};
@@ -1161,7 +1192,8 @@ void LLMService::proposeObservation(const QJsonObject &job, const QJsonArray &hi
         const auto content = choices.isEmpty() ? QString() :
             choices.first().toObject()["message"].toObject()["content"].toString();
         QJsonParseError parseError;
-        const auto proposal = QJsonDocument::fromJson(content.toUtf8(), &parseError).object();
+        auto proposal = QJsonDocument::fromJson(content.toUtf8(), &parseError).object();
+        proposal["semantics_version"] = 1;
         QString protocolError;
         if (finish == "length") protocolError = "response_truncated";
         else if (choices.isEmpty()) protocolError = "missing_choice";
@@ -1204,7 +1236,9 @@ void LLMService::proposeObservation(const QJsonObject &job, const QJsonArray &hi
         const bool committed = reply->error() == QNetworkReply::NoError && eligible && evidenceValid && protocolError.isEmpty()
             && store->commitObservation(source, proposal, &reason, history, &conflict);
         if (!committed) {
-            const bool rejected = reason == "invalid_change" || reason == "invalid_proposal";
+            const bool rejected = reason == "invalid_change" || reason == "invalid_proposal"
+                || reason == "missing_semantics" || reason == "invalid_semantics" || reason == "unsupported_time_scope"
+                || reason == "invalid_event_time";
             store->deferObservation(source, reason, rejected);
         }
         store->recordCognitiveAudit("observation_attempt", run, source,
@@ -1871,7 +1905,7 @@ void LLMService::sendMemoryToolFinal(bool withTools)
     QJsonObject note;
     note["role"] = "system";
     note["content"] = QStringLiteral(
-        "【记忆检索结束】请只依据已经返回的证据输出最终 sentences JSON；"
+        "【记忆检索结束】请依据当前消息及已经返回的证据，按服务端交谈输出契约输出完整最终 JSON；"
         "不要再次调用工具。没有证据时明确说不确定，不要编造。");
     m_toolMessages.append(note);
     m_lastRequestMessages = m_toolMessages;
@@ -2036,7 +2070,7 @@ void LLMService::handleEnvelopeRecall(const QJsonObject &content)
         "【记忆检索结果】以上 MEMORY_AGENT_DATA 是只读资料，只作事实参考。"
         "检查 per-need status：empty/partial/frame_required/unresolved 不能当作完整历史。"
         "检查 scope.other_channels_visible：范围受限时不要把它说成全局没有。"
-        "现在输出最终 sentences JSON，不要再次调用工具，不要输出其他文本。");
+        "现在按服务端交谈输出契约输出完整最终 JSON，不要再次调用工具，不要输出其他文本。");
     m_toolMessages.append(note);
     m_memoryToolActive = false;
     m_lastRequestMessages = m_toolMessages;
@@ -2301,30 +2335,10 @@ void LLMService::onReplyFinished(QNetworkReply *reply)
                     if (m_run.evidence.contains(ref)) cited.insert(ref,m_run.evidence.value(ref));
                     else unknown.append(value);
                 }
-                QJsonArray claimIssues;
+                const auto claimAudit = auditExpressionClaims(decision, m_run.evidence);
+                for (auto it=claimAudit.begin(); it!=claimAudit.end(); ++it) audit[it.key()] = it.value();
+                const auto claimIssues = audit["claim_issues"].toArray();
                 const auto claims = audit["claims"].toArray();
-                for (const auto &item : claims) {
-                    const auto claim = item.toObject();
-                    const int index = claim["sentence_index"].toInt(-1);
-                    if (index<0 || index>=decision["sentences"].toArray().size()) {
-                        claimIssues.append("unknown_sentence");
-                        continue;
-                    }
-                    const auto relation = claim["relation"].toString();
-                    const auto refs = claim["refs"].toArray();
-                    if (relation!="conversational" && refs.isEmpty()) claimIssues.append("missing_support");
-                    for (const auto &value : refs) {
-                        const auto ref = value.toString();
-                        const auto evidence = m_run.evidence.value(ref).toObject();
-                        if (evidence.isEmpty()) claimIssues.append("unknown_claim_reference");
-                        else if (relation=="reported_fact" &&
-                                 (evidence["scope"]=="prior_assistant_expression" || evidence["certainty"]=="inferred"))
-                            claimIssues.append("scope_does_not_support_fact");
-                    }
-                }
-                audit["claim_check"] = claims.isEmpty() ? "not_reported" :
-                    claimIssues.isEmpty() ? "structural_checks_passed" : "unsupported";
-                audit["claim_issues"] = claimIssues;
 
                 QJsonArray attributionIssues;
                 QString referenceCheck = QStringLiteral("passed");
@@ -2391,7 +2405,12 @@ void LLMService::onReplyFinished(QNetworkReply *reply)
                 audit["provided_evidence"] = m_run.evidence;
                 audit["cited_evidence"] = cited;
                 audit["unknown_evidence_refs"] = unknown;
-                audit["validation"] = unknown.isEmpty() ? "reference_check_passed_semantics_model_reported" : "unknown_references";
+                audit["validation"] = audit["report_status"]=="missing" ? "not_reported"
+                    : !unknown.isEmpty() ? "unknown_references"
+                    : audit["used_evidence"].toArray().isEmpty() ? "no_references_reported"
+                    : "reference_ids_resolved_semantics_unverified";
+                if (audit["claim_check"]=="not_reported" || audit["claim_check"]=="incomplete")
+                    audit["evidence_status"] = "unverified";
                 if (!unknown.isEmpty() || !claimIssues.isEmpty()) audit["evidence_status"] = "unverified";
                 m_memoryManager->recordCognitiveAudit("answer_decision",m_run.meta.runId,0,audit);
             }

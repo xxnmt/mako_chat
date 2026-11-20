@@ -256,3 +256,14 @@ add_phase0_test(tst_ttslifecycle
     ${PROJECT_SOURCE_DIR}/qqmessageparser.cpp
 )
 target_link_libraries(tst_ttslifecycle PRIVATE Qt6::Network)
+
+add_phase0_test(tst_qqdelivery
+    tst_qqdelivery.cpp
+    ${PROJECT_SOURCE_DIR}/qqchanneladapter.cpp
+    ${PROJECT_SOURCE_DIR}/qqprotocolclient.cpp
+    ${PROJECT_SOURCE_DIR}/configmanager.cpp
+    ${PROJECT_SOURCE_DIR}/memorypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/qqreplypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/qqmessageparser.cpp
+)
+target_link_libraries(tst_qqdelivery PRIVATE Qt6::Network Qt6::WebSockets)

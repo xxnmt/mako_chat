@@ -6,6 +6,7 @@
 #include <QUrl>
 #include <QDebug>
 #include <QDateTime>
+#include <QUuid>
 
 QQProtocolClient::QQProtocolClient(QObject *parent)
     : QObject(parent)
@@ -22,6 +23,13 @@ QQProtocolClient::QQProtocolClient(QObject *parent)
 
     m_reconnectTimer.setSingleShot(true);
     connect(&m_reconnectTimer, &QTimer::timeout, this, &QQProtocolClient::openSocket);
+    m_sendTimeout.setSingleShot(true);
+    m_sendTimeout.setInterval(30000);
+    connect(&m_sendTimeout, &QTimer::timeout, this, [this] {
+        if (m_sendQueue.isEmpty()) return;
+        qWarning() << "[QQ] send acknowledgement timeout; delivery unknown, no replay" << m_sendQueue.head();
+        finishSendAction();
+    });
 }
 
 QQProtocolClient::~QQProtocolClient()
@@ -56,6 +64,10 @@ void QQProtocolClient::stop()
 {
     m_running = false;
     m_reconnectTimer.stop();
+    m_sendTimeout.stop();
+    m_pendingActions.clear();
+    m_sendQueue.clear();
+    m_activeSend.clear();
     if (m_socket.state() != QAbstractSocket::UnconnectedState) {
         m_socket.close();
     }
@@ -96,7 +108,11 @@ void QQProtocolClient::onDisconnected()
         m_wasConnected = false;
         emit disconnected();
     }
+    m_sendTimeout.stop();
+    if (!m_sendQueue.isEmpty()) qWarning() << "[QQ] disconnected; discard queued sends=" << m_sendQueue.size();
     m_pendingActions.clear();
+    m_sendQueue.clear();
+    m_activeSend.clear();
     scheduleReconnect();
 }
 
@@ -127,15 +143,46 @@ bool QQProtocolClient::sendAction(const QString &action, const QJsonObject &para
         return false;
     }
     const QString actualEcho = echo.isEmpty()
-        ? QString("%1-%2").arg(action).arg(QDateTime::currentMSecsSinceEpoch())
+        ? QString("%1-%2").arg(action, QUuid::createUuid().toString(QUuid::WithoutBraces))
         : echo;
     if (action.startsWith(QStringLiteral("send_"))) {
+        if (m_pendingActions.contains(actualEcho)) return false;
         m_pendingActions.insert(actualEcho, PendingAction{action, params, 0});
+        m_sendQueue.enqueue(actualEcho);
+        if (m_sendQueue.size() == 1) sendNextAction();
+        return m_pendingActions.contains(actualEcho);
     }
     qDebug() << "[QQ]发送动作:" << action << "echo=" << actualEcho;
     if (sendPayload(action, params, actualEcho)) return true;
     m_pendingActions.remove(actualEcho);
     return false;
+}
+
+void QQProtocolClient::sendNextAction()
+{
+    if (m_sendQueue.isEmpty()) return;
+    const auto echo = m_sendQueue.head();
+    m_activeSend = echo;
+    const auto pending = m_pendingActions.value(echo);
+    qDebug() << "[QQ] submitting queued action" << pending.action << "echo=" << echo;
+    if (!isConnected() || !sendPayload(pending.action,pending.params,echo)) {
+        qWarning() << "[QQ] queued action submission failed" << echo;
+        finishSendAction();
+        return;
+    }
+    m_sendTimeout.start();
+}
+
+void QQProtocolClient::finishSendAction()
+{
+    m_sendTimeout.stop();
+    if (m_sendQueue.isEmpty()) return;
+    m_pendingActions.remove(m_sendQueue.dequeue());
+    m_activeSend.clear();
+    // Do not recurse through a disconnected queue or allow replies to interleave.
+    QTimer::singleShot(0, this, [this] {
+        if (m_activeSend.isEmpty()) sendNextAction();
+    });
 }
 
 bool QQProtocolClient::sendPayload(const QString &action, const QJsonObject &params,
@@ -172,6 +219,9 @@ void QQProtocolClient::onTextMessageReceived(const QString &message)
         }
 
         auto it = m_pendingActions.find(echo);
+        if (it == m_pendingActions.end() || m_sendQueue.isEmpty() || m_sendQueue.head()!=echo)
+            return; // Late/duplicate/unrelated acknowledgements cannot advance the queue.
+        if (it->waitingRetry && !ok) return;
         if (!ok) {
             qDebug() << "[QQ]动作失败:" << echo
                      << QString::fromUtf8(QJsonDocument(obj).toJson(QJsonDocument::Compact));
@@ -179,19 +229,23 @@ void QQProtocolClient::onTextMessageReceived(const QString &message)
             if (it != m_pendingActions.end() && retcode == 100 && it->attempts < 1
                 && it->action.startsWith(QStringLiteral("send_"))) {
                 it->attempts++;
+                it->waitingRetry = true;
+                m_sendTimeout.stop();
                 const QString retryEcho = echo;
                 qDebug() << "[QQ]发送失败 retcode=100，4 秒后重试一次:" << retryEcho;
                 QTimer::singleShot(4000, this, [this, retryEcho]() {
                     auto retryIt = m_pendingActions.find(retryEcho);
-                    if (retryIt != m_pendingActions.end() && isConnected()) {
-                        sendPayload(retryIt->action, retryIt->params, retryEcho);
+                    if (retryIt != m_pendingActions.end() && isConnected()
+                        && !m_sendQueue.isEmpty() && m_sendQueue.head()==retryEcho) {
+                        retryIt->waitingRetry = false;
+                        sendNextAction();
                     }
                 });
             } else if (it != m_pendingActions.end()) {
-                m_pendingActions.erase(it);
+                finishSendAction();
             }
         } else if (it != m_pendingActions.end()) {
-            m_pendingActions.erase(it);
+            finishSendAction();
         }
         return;
     }

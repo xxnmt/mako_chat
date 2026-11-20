@@ -22,6 +22,8 @@
 #include "memorytimeframe.h"
 #include "timeframeresolver.h"
 #include "memoryoverview.h"
+#include "evidenceaudit.h"
+#include "expressioncontract.h"
 #include "memoryresultjson.h"
 
 namespace {
@@ -344,7 +346,10 @@ private slots:
         QFETCH(QString, status);
         QFETCH(QString, followup);
         const QJsonObject change{{"matter",""},{"version",0},{"topic","近况"},{"status",status},
-            {"kind","self_report"},{"quote",secret},{"understanding",secret}};
+            {"kind","self_report"},{"quote",secret},{"understanding",secret},
+            {"semantics",QJsonObject{{"lifecycle",status=="ended" ? "ended" : "unknown"},
+                {"certainty",status=="tentative" ? "tentative" : "confirmed"},
+                {"temporal_scope","unknown"},{"completion_condition",""},{"time_expression",""}}}};
         const QString update = QString::fromUtf8(QJsonDocument(QJsonObject{{"outcome","updated"},
             {"changes",QJsonArray{change}}}).toJson(QJsonDocument::Compact));
         meta.eventId = "replay-report";
@@ -392,6 +397,12 @@ private slots:
         QCOMPARE(replies.at(0).at(3).value<RequestMeta>().runId, meta.runId);
         QCOMPARE(replies.at(0).at(3).value<RequestMeta>().sessionId, meta.sessionId);
         QVERIFY(bodies.last().contains(secret.toUtf8()));
+        const auto requestMessages=QJsonDocument::fromJson(bodies.last()).object()["messages"].toArray();
+        QCOMPARE(requestMessages.last().toObject()["content"].toString(),expressionOutputContract());
+        int contracts=0;
+        for(const auto &message:requestMessages)
+            contracts+=message.toObject()["content"].toString()==expressionOutputContract();
+        QCOMPARE(contracts,1);
         QVERIFY(bodies.last().contains(QString("按听众决定如何表达").toUtf8()));
         service.askDeepSeek("我刚才说了什么",{},RequestMeta{});
         QTRY_COMPARE_WITH_TIMEOUT(replies.size(),2,5000);
@@ -1920,6 +1931,30 @@ private slots:
             QJsonObject{{QStringLiteral("handles"), handleArray}}, &error);
         QVERIFY2(error.isEmpty(), qPrintable(error));
         QVERIFY(readResult.value(QStringLiteral("items")).toArray().size() >= 6);
+    }
+
+    void evidenceAuditRequiresSentenceAccounting()
+    {
+        QJsonObject decision{{"sentences",QJsonArray{QJsonObject{{"zh_text","a"}},QJsonObject{{"zh_text","b"}}}}};
+        QJsonObject evidence{{"reply/1",QJsonObject{{"speaker_role","assistant"}}},
+                             {"source/1",QJsonObject{{"speaker_role","user"}}}};
+        auto audit = auditExpressionClaims(decision,evidence);
+        QCOMPARE(audit["claim_check"].toString(),QString("not_reported"));
+        QCOMPARE(audit["unaccounted_sentences"].toArray().size(),2);
+        QJsonObject claim{{"sentence_index",0},{"relation","reported_fact"},{"refs",QJsonArray{"reply/1"}}};
+        decision["evidence_decision"] = QJsonObject{{"claims",QJsonArray{claim}}};
+        QCOMPARE(auditExpressionClaims(decision,evidence)["claim_check"].toString(),QString("unsupported"));
+        claim["refs"] = QJsonArray{"source/1"};
+        decision["evidence_decision"] = QJsonObject{{"claims",QJsonArray{claim}}};
+        QCOMPARE(auditExpressionClaims(decision,evidence)["claim_check"].toString(),QString("incomplete"));
+        QJsonObject conversational{{"sentence_index",1},{"relation","conversational"},{"refs",QJsonArray{}}};
+        decision["evidence_decision"] = QJsonObject{{"claims",QJsonArray{claim,conversational}}};
+        audit = auditExpressionClaims(decision,evidence);
+        QCOMPARE(audit["claim_check"].toString(),QString("structural_checks_passed"));
+        QCOMPARE(audit["semantic_validation"].toString(),QString("not_performed"));
+        conversational["sentence_index"] = 0.5;
+        decision["evidence_decision"] = QJsonObject{{"claims",QJsonArray{claim,conversational}}};
+        QCOMPARE(auditExpressionClaims(decision,evidence)["claim_check"].toString(),QString("unsupported"));
     }
 
     void executionAndCoverageAreIndependent()

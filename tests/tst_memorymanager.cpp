@@ -223,7 +223,7 @@ private slots:
         QVERIFY(raw.exec("DROP TABLE matter_revision"));
         for (int reopen=0; reopen<2; ++reopen) {
             MemoryManager db(path);
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),16);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),17);
             QCOMPARE(raw.scalar("SELECT state_updates FROM chat_history").toString(),QString("[]"));
             QVERIFY(db.matterHeads("user").isEmpty());
         }
@@ -556,6 +556,109 @@ private slots:
         QCOMPARE(db.nextThought(false)["last_review"].toObject()["status"].toString(),QString("completed"));
         QVERIFY(db.deleteTurnByID(id));
         QVERIFY(db.nextThought(false).isEmpty());
+    }
+
+    void v16MigrationPreservesUnknownLifecycle()
+    {
+        QTemporaryDir dir;
+        const auto path = dir.filePath("v16.db");
+        { MemoryManager db(path); }
+        {
+            RawDb raw(path,"v16-semantics");
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec("INSERT INTO cognitive_source(id,event,run,subject,channel,session,input,reported,outcome) "
+                             "VALUES(1,'old','old','user','pet','default','tonight submit','2026-11-16T12:00:00Z','updated')"));
+            QVERIFY(raw.exec("INSERT INTO matter_revision(matter,version,source,topic,status,quote,kind,event_time,understanding) "
+                             "VALUES('old',1,1,'report','tentative','tonight submit','self_report','tonight','one report')"));
+            QVERIFY(raw.exec("ALTER TABLE matter_revision DROP COLUMN semantics"));
+            QVERIFY(raw.exec("PRAGMA user_version=16"));
+        }
+        {
+            MemoryManager db(path);
+            const auto head = db.matterHeads("user").first().toObject();
+            QCOMPARE(head["status"].toString(),QString("tentative"));
+            QCOMPARE(head["semantics"].toObject()["lifecycle"].toString(),QString("unknown"));
+            QVERIFY(head["semantics"].toObject()["legacy"].toBool());
+            const auto row = db.currentUnderstanding(RequestMeta{},"report").first().toObject();
+            QCOMPARE(row["origin"].toObject()["event_time_expression"].toString(),QString("tonight"));
+        }
+        RawDb raw(path,"v17-semantics");
+        QVERIFY(raw.open());
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),17);
+        QCOMPARE(raw.scalar("SELECT count(*) FROM matter_revision").toInt(),1);
+        QVERIFY(raw.scalar("SELECT semantics IS NULL FROM matter_revision").toBool());
+    }
+
+    void matterLifecycleAndTimeScopeSurviveRevision()
+    {
+        QTemporaryDir dir;
+        const auto path = dir.filePath("lifecycle.db");
+        RequestMeta meta;
+        meta.eventId = "plan";
+        meta.occurredAtUtc = QDateTime::fromString("2026-11-16T12:00:00Z",Qt::ISODate);
+        {
+            MemoryManager db(path);
+            QVERIFY(db.enqueueObservation(meta,"submit the report tonight"));
+            auto source = db.pendingObservation()["source"].toInteger();
+            QJsonObject semantics{{"lifecycle","planned"},{"certainty","confirmed"},
+                {"temporal_scope","occurrence"},{"completion_condition","report submitted"},{"time_expression","tonight"}};
+            QJsonObject change{{"matter",""},{"version",0},{"topic","report"},{"quote","submit the report tonight"},
+                {"kind","self_report"},{"status","tentative"},{"understanding","one report tonight"},
+                {"event_time","tonight"},{"semantics",semantics}};
+            auto proposal = [&]{return QJsonObject{{"semantics_version",1},{"outcome","updated"},{"changes",QJsonArray{change}}};};
+            QVERIFY(db.commitObservation(source,proposal()));
+            const auto head = db.matterHeads("user").first().toObject();
+            meta.eventId = "done";
+            meta.occurredAtUtc = meta.occurredAtUtc.addSecs(3600);
+            QVERIFY(db.enqueueObservation(meta,"submitted; I do not know if it was read"));
+            source = db.pendingObservation()["source"].toInteger();
+            change["matter"] = head["matter"]; change["version"] = head["version"];
+            change["quote"] = "submitted"; change["event_time"] = "";
+            change["understanding"] = "submitted; recipient reading remains unknown";
+            semantics["lifecycle"] = "completed";
+            semantics["certainty"] = "tentative";
+            semantics["time_expression"] = "next month";
+            change["semantics"] = semantics;
+            QString failure;
+            QVERIFY(!db.commitObservation(source,proposal(),&failure));
+            QCOMPARE(failure,QString("unsupported_time_scope"));
+            QCOMPARE(db.matterHeads("user").first().toObject()["version"],head["version"]);
+            semantics["time_expression"] = "tonight";
+            change["semantics"] = semantics;
+            change["event_time"] = "today, next week";
+            QVERIFY(!db.commitObservation(source,proposal(),&failure));
+            QCOMPARE(failure,QString("invalid_event_time"));
+            db.deferObservation(source,failure,true);
+            {
+                RawDb raw(path,"retry-feedback");
+                QVERIFY(raw.open());
+                QVERIFY(raw.exec("UPDATE cognitive_source SET due=0 WHERE outcome IS NULL"));
+            }
+            QCOMPARE(db.pendingObservation(source)["previous_error"].toString(),failure);
+            change["event_time"] = "";
+            QVERIFY(db.commitObservation(source,proposal()));
+            const auto row = db.currentUnderstanding(meta,"unrelated").first().toObject();
+            QCOMPARE(row["status"].toString(),QString("ended"));
+            QCOMPARE(row["semantics"].toObject()["certainty"].toString(),QString("tentative"));
+            QCOMPARE(row["semantics"].toObject()["lifecycle"].toString(),QString("completed"));
+            QCOMPARE(row["semantics"].toObject()["time_anchor"].toString(),QString("2026-11-16T12:00:00.000Z"));
+            QCOMPARE(row["origin"].toObject()["quote"].toString(),QString("submit the report tonight"));
+            QCOMPARE(row["self_report"].toObject()["quote"].toString(),QString("submitted"));
+            meta.eventId = "missing";
+            QVERIFY(db.enqueueObservation(meta,"another report"));
+            source = db.pendingObservation()["source"].toInteger();
+            change.remove("semantics");
+            change["quote"] = "another report";
+            change["version"] = db.matterHeads("user").first().toObject()["version"];
+            QVERIFY(!db.commitObservation(source,proposal(),&failure));
+            QCOMPARE(failure,QString("missing_semantics"));
+        }
+        MemoryManager reopened(path);
+        QCOMPARE(reopened.matterHeads("user").first().toObject()["semantics"].toObject()["lifecycle"].toString(),QString("completed"));
+        RawDb raw(path,"lifecycle");
+        QVERIFY(raw.open());
+        QCOMPARE(raw.scalar("SELECT count(*) FROM matter_revision").toInt(),2);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),17);
     }
 
     void currentUnderstandingRetainsLatestSelfReport()
@@ -1040,7 +1143,7 @@ private slots:
         }
         RawDb raw(path, "v15-verify");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 16);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 17);
     }
 
     void databaseBackupIsConsistent()
@@ -1060,7 +1163,7 @@ private slots:
         RawDb copy(backup, "backup-copy");
         QVERIFY(copy.open());
         QCOMPARE(copy.scalar("SELECT count(*) FROM chat_history").toInt(), 1);
-        QCOMPARE(copy.scalar("PRAGMA user_version").toInt(), 16);
+        QCOMPARE(copy.scalar("PRAGMA user_version").toInt(), 17);
         QVERIFY(copy.scalar("SELECT count(*) FROM memory_chunks").toInt() > 0);
     }
 
@@ -1297,7 +1400,7 @@ private slots:
             QVERIFY(raw.open());
 
             // 版本推进到 v3
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 16);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 17);
 
             // 列扩展（v2 渠道 + v3 轮次）
             const QStringList historyCols = raw.columns("chat_history");
@@ -1402,7 +1505,7 @@ private slots:
             MemoryManager second(dbPath);
             RawDb raw(dbPath, "verify2");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 16);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 17);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM chat_history").toInt(), 1);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM relationship_state").toInt(), 2);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM long_term_summary").toInt(), 1);
@@ -1419,7 +1522,7 @@ private slots:
             MemoryManager mm(dbPath);
             RawDb raw(dbPath, "fresh");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 16);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 17);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('raw_events')").toInt() > 0);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('memory_cursor')").toInt() > 0);
 
@@ -1626,7 +1729,7 @@ private slots:
         Q_UNUSED(mm);
         RawDb raw(dbPath, "v2verify");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 16);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 17);
         QCOMPARE(raw.scalar("SELECT user_input FROM chat_history").toString(), QStringLiteral("旧输入"));
         QCOMPARE(raw.scalar("SELECT turn_kind FROM chat_history").toString(), QStringLiteral("reply"));
         QCOMPARE(raw.scalar("SELECT subject FROM chat_history").toString(), QStringLiteral("user"));

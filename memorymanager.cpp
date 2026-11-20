@@ -1,3 +1,4 @@
+#include "mattersemantics.h"
 #include "memorymanager.h"
 #include "debuglog.h"
 #include "configmanager.h"
@@ -1167,17 +1168,23 @@ QJsonArray MemoryManager::currentUnderstanding(const RequestMeta &audience, cons
                    json_extract(j.value,'$.quote') AS quote,
                    (h.channel=? AND h.session_id=?) AS local,
                    'legacy:'||json_extract(j.value,'$.topic') AS matter,0 AS version,
-                   NULL AS status,NULL AS kind,NULL AS understanding,NULL AS event_time,NULL AS recorded,h.channel,h.session_id,h.user_input AS original
+                   NULL AS status,NULL AS kind,NULL AS understanding,NULL AS event_time,NULL AS recorded,h.channel,h.session_id,h.user_input AS original,NULL AS semantics
             FROM chat_history h,json_each(h.state_updates) j
             WHERE h.subject=? AND h.state_updates IS NOT NULL AND h.sensitive=0
               AND NOT EXISTS (SELECT 1 FROM cognitive_source WHERE event=h.cognitive_event)
             UNION ALL
             SELECT s.id,s.reported,r.topic,r.quote,(s.channel=? AND s.session=?),
-                   r.matter,r.version,r.status,r.kind,r.understanding,r.event_time,r.recorded,s.channel,s.session,s.input
+                   r.matter,r.version,r.status,r.kind,r.understanding,r.event_time,r.recorded,s.channel,s.session,s.input,r.semantics
             FROM matter_revision r JOIN cognitive_source s ON s.id=r.source WHERE s.subject=?
         ), ranked AS (
             SELECT *,row_number() OVER (PARTITION BY matter ORDER BY version DESC,id DESC) AS pos,
-                   max(local) OVER (PARTITION BY matter) AS mentioned_here FROM evidence
+                   max(local) OVER (PARTITION BY matter) AS mentioned_here,
+                   first_value(quote) OVER origin AS initial_quote,
+                   first_value(timestamp) OVER origin AS initial_reported,
+                   first_value(event_time) OVER origin AS initial_event_time,
+                   first_value(channel) OVER origin AS initial_channel,
+                   first_value(session_id) OVER origin AS initial_session
+            FROM evidence WINDOW origin AS (PARTITION BY matter ORDER BY version,id)
         ), self_ranked AS (
             SELECT matter,quote,version,status,id,timestamp,recorded,channel,session_id,original,
                    row_number() OVER (PARTITION BY matter ORDER BY version DESC,id DESC) AS spos
@@ -1186,7 +1193,8 @@ QJsonArray MemoryManager::currentUnderstanding(const RequestMeta &audience, cons
         SELECT r.topic,r.quote,r.timestamp,r.local,r.mentioned_here,r.version,r.status,r.kind,
                r.understanding,r.id,r.matter,r.event_time,r.recorded,
                sr.quote,sr.version,sr.status,sr.id,sr.timestamp,sr.recorded,
-               r.channel,r.session_id,r.original,sr.channel,sr.session_id,sr.original
+               r.channel,r.session_id,r.original,sr.channel,sr.session_id,sr.original,
+               r.semantics,r.initial_quote,r.initial_reported,r.initial_event_time,r.initial_channel,r.initial_session
         FROM ranked r LEFT JOIN self_ranked sr ON sr.matter=r.matter AND sr.spos=1
         WHERE r.pos=1
           AND (? OR r.matter IN (SELECT value FROM json_each(?)))
@@ -1217,7 +1225,7 @@ QJsonArray MemoryManager::currentUnderstanding(const RequestMeta &audience, cons
             || config.isBlindZone(query.value(22).toString(), query.value(23).toString()))
             continue;
         bool restricted = false;
-        for (int column : {0, 1, 8, 13, 21, 24}) {
+        for (int column : {0, 1, 8, 13, 21, 24, 25}) {
             const auto scan = SensitiveContentFilter::sanitize(query.value(column).toString(), {}, rules);
             if (scan.blocked || scan.redacted) { restricted = true; break; }
         }
@@ -1245,6 +1253,18 @@ QJsonArray MemoryManager::currentUnderstanding(const RequestMeta &audience, cons
                 record["event_time_expression"] = query.value(11).toString();
                 record["interpretation_recorded_at"] = query.value(12).toString();
                 record["effective_at"] = QJsonValue::Null;
+                auto semantics = QJsonDocument::fromJson(query.value(25).toByteArray()).object();
+                if (semantics.isEmpty()) semantics = MatterSemantics::legacy(query.value(6).toString());
+                record["semantics"] = semantics;
+                bool originAllowed = !config.isBlindZone(query.value(29).toString(),query.value(30).toString());
+                for (int column : {26,28}) {
+                    const auto scan = SensitiveContentFilter::sanitize(query.value(column).toString(),{},rules);
+                    if (scan.blocked || scan.redacted) originAllowed = false;
+                }
+                if (originAllowed)
+                    record["origin"] = QJsonObject{{"quote",query.value(26).toString()},
+                        {"reported_at",query.value(27).toString()},{"event_time_expression",query.value(28).toString()}};
+
                 const auto selfQuote = query.value(13).toString();
                 const auto selfVersion = query.value(14).toLongLong();
                 if (selfVersion > 0 && !selfQuote.isEmpty()) {
@@ -4449,6 +4469,16 @@ void MemoryManager::initDatabase(const QString &dbFilePath, const QString &conne
             }
             if (!query.exec("PRAGMA user_version=16")) throw query.lastError();
             currentVersion = 16;
+        }
+        if (currentVersion < 17) {
+            QSqlQuery columns(m_db);
+            if (!columns.exec("PRAGMA table_info(matter_revision)")) throw columns.lastError();
+            bool hasSemantics = false;
+            while (columns.next()) hasSemantics |= columns.value(1).toString() == "semantics";
+            if (!hasSemantics && !query.exec("ALTER TABLE matter_revision ADD COLUMN semantics TEXT"))
+                throw query.lastError();
+            if (!query.exec("PRAGMA user_version=17")) throw query.lastError();
+            currentVersion = 17;
         }
         if (!m_db.commit()) throw m_db.lastError();
         qDebug()<<"[MemoryManager]数据库初始化完成,结构版本为:"<<currentVersion;

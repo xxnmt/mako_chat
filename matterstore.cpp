@@ -1,3 +1,4 @@
+#include "mattersemantics.h"
 #include "memorymanager.h"
 #include "configmanager.h"
 #include <QSqlError>
@@ -67,7 +68,7 @@ bool MemoryManager::enqueueObservation(const RequestMeta &meta, const QString &i
 QJsonObject MemoryManager::pendingObservation(qint64 source) const
 {
     QSqlQuery q(m_db);
-    q.prepare("SELECT id,run,subject,input,reported,channel,session FROM cognitive_source s "
+    q.prepare("SELECT id,run,subject,input,reported,channel,session,last_error FROM cognitive_source s "
                 "WHERE (:source=0 OR id=:source) AND outcome IS NULL AND due<=unixepoch() AND NOT EXISTS "
                 "(SELECT 1 FROM cognitive_source p WHERE p.subject=s.subject AND p.outcome IS NULL AND p.id<s.id) "
                 "ORDER BY id LIMIT 1");
@@ -77,13 +78,13 @@ QJsonObject MemoryManager::pendingObservation(qint64 source) const
     return {{"source",q.value(0).toLongLong()},{"run",q.value(1).toString()},
             {"subject",q.value(2).toString()},{"input",q.value(3).toString()},
             {"reported_at",q.value(4).toString()},{"channel",q.value(5).toString()},
-            {"session",q.value(6).toString()}};
+            {"session",q.value(6).toString()},{"previous_error",q.value(7).toString()}};
 }
 
 QJsonArray MemoryManager::matterHeads(const QString &subject, const QStringList &terms) const
 {
     QSqlQuery q(m_db);
-    q.prepare("SELECT matter,version,topic,status,quote,kind,reported,event_time,understanding,initial_quote,initial_reported FROM "
+    q.prepare("SELECT matter,version,topic,status,quote,kind,reported,event_time,understanding,initial_quote,initial_reported,semantics FROM "
               "(SELECT r.*,s.reported,first_value(quote) OVER history AS initial_quote,"
               "first_value(reported) OVER history AS initial_reported,row_number() OVER(PARTITION BY matter ORDER BY version DESC) pos "
               "FROM matter_revision r JOIN cognitive_source s ON s.id=r.source WHERE s.subject=? "
@@ -99,7 +100,8 @@ QJsonArray MemoryManager::matterHeads(const QString &subject, const QStringList 
             heads.append(QJsonObject{{"matter",q.value(0).toString()},{"version",q.value(1).toLongLong()},
                 {"topic",q.value(2).toString()},{"status",q.value(3).toString()},{"quote",q.value(4).toString()},
                 {"kind",q.value(5).toString()},{"reported_at",q.value(6).toString()},{"event_time",q.value(7).toString()},{"understanding",q.value(8).toString()},
-                {"initial_quote",q.value(9).toString()},{"initial_reported_at",q.value(10).toString()}});
+                {"initial_quote",q.value(9).toString()},{"initial_reported_at",q.value(10).toString()},
+                {"semantics",q.value(11).isNull() ? MatterSemantics::legacy(q.value(3).toString()) : QJsonDocument::fromJson(q.value(11).toByteArray()).object()}});
     }
     return heads;
 }
@@ -123,7 +125,7 @@ QJsonArray MemoryManager::internalMatters(const RequestMeta &meta, const QString
             WHERE s.subject=:subject
               AND (:heads OR matter IN (SELECT value FROM json_each(:matters)))
         )
-        SELECT matter,version,topic,quote,kind,status,understanding,event_time,reported,channel,session,input,source,recorded
+        SELECT matter,version,topic,quote,kind,status,understanding,event_time,reported,channel,session,input,source,recorded,semantics
         FROM revisions WHERE pos<=:depth
         ORDER BY (SELECT count(*) FROM json_each(:terms)
             WHERE instr(topic,value)>0 OR instr(quote,value)>0 OR instr(understanding,value)>0) DESC,
@@ -147,12 +149,16 @@ QJsonArray MemoryManager::internalMatters(const RequestMeta &meta, const QString
             {"understanding",q.value(6).toString()},{"event_time_expression",q.value(7).toString()},
             {"reported_at",q.value(8).toString()},{"original_report",q.value(11).toString()},
             {"evidence_ref",QString("source/%1").arg(q.value(12).toLongLong())},
-            {"interpretation_recorded_at",q.value(13).toString()}};
+            {"interpretation_recorded_at",q.value(13).toString()},
+            {"semantics",q.value(14).isNull() ? MatterSemantics::legacy(q.value(5).toString()) : QJsonDocument::fromJson(q.value(14).toByteArray()).object()}};
         bool allowed = true;
         for (const auto &key : {"topic","quote","understanding","original_report","event_time_expression"}) {
             const auto scan = SensitiveContentFilter::sanitize(row[key].toString(),{},policy.privacyRules);
             if (scan.blocked || scan.redacted) { allowed = false; break; }
         }
+        const auto semanticsScan = SensitiveContentFilter::sanitize(
+            QString::fromUtf8(QJsonDocument(row["semantics"].toObject()).toJson()),{},policy.privacyRules);
+        if (semanticsScan.blocked || semanticsScan.redacted) allowed = false;
         if (allowed) result.append(row);
         else restricted.insert(row["matter"].toString());
     }
@@ -197,12 +203,13 @@ bool MemoryManager::commitObservation(qint64 source, const QJsonObject &proposal
         return false;
     };
     QSqlQuery q(m_db);
-    q.prepare("SELECT input,subject FROM cognitive_source WHERE id=? AND outcome IS NULL");
+    q.prepare("SELECT input,subject,reported FROM cognitive_source WHERE id=? AND outcome IS NULL");
     q.addBindValue(source);
     if (!q.exec()) return abort("storage_error");
     if (!q.next()) return abort("source_unavailable");
     const QString input = q.value(0).toString();
     const QString subject = q.value(1).toString();
+    const QString reported = q.value(2).toString();
     q.finish();
     static const QSet<QString> statuses{"confirmed","tentative","disputed","unconfirmed","cancelled","ended"};
     static const QSet<QString> kinds{"self_report","reported","inference"};
@@ -212,20 +219,30 @@ bool MemoryManager::commitObservation(qint64 source, const QJsonObject &proposal
         const qint64 version = change["version"].toInteger(-1);
         const QString topic = change["topic"].toString().trimmed();
         const QString quote = change["quote"].toString().trimmed();
-        const QString status = change["status"].toString();
+        QString status = change["status"].toString();
         const QString kind = change["kind"].toString();
         const QString time = change["event_time"].toString();
         const auto understanding = change["understanding"].toString().trimmed();
+        if (proposal["semantics_version"].toInt() == 1 && !change.contains("semantics"))
+            return abort("missing_semantics");
+        if (change.contains("semantics")) {
+            if (!change["semantics"].isObject() || !MatterSemantics::valid(change["semantics"].toObject()))
+                return abort("invalid_semantics");
+            status = MatterSemantics::compatibilityStatus(change["semantics"].toObject());
+        }
         if (understanding.isEmpty() || understanding.size()>512 || !change["matter"].isString() || version < 0 || topic.isEmpty() || topic.size()>96
             || quote.isEmpty() || quote.size()>512 || !input.contains(quote)
-            || !statuses.contains(status) || !kinds.contains(kind) || time.size()>128
-            || (!time.isEmpty() && !input.contains(time)))
+            || !statuses.contains(status) || !kinds.contains(kind))
             return abort("invalid_change");
+        if (time.size()>128 || (!time.isEmpty() && !input.contains(time)))
+            return abort("invalid_event_time");
+        QJsonObject priorSemantics;
+        QString priorTime, priorReported;
         if (matter.isEmpty()) {
             if (version != 0) return abort("invalid_change");
             matter = QStringLiteral("m%1.%2").arg(source).arg(i);
         } else {
-            q.prepare("SELECT version,s.subject,s.id FROM matter_revision r JOIN cognitive_source s ON s.id=r.source "
+            q.prepare("SELECT version,s.subject,s.id,r.semantics,r.event_time,s.reported FROM matter_revision r JOIN cognitive_source s ON s.id=r.source "
                       "WHERE r.matter=? ORDER BY version DESC LIMIT 1");
             q.addBindValue(matter);
             if (!q.exec()) return abort("storage_error");
@@ -241,12 +258,40 @@ bool MemoryManager::commitObservation(qint64 source, const QJsonObject &proposal
                     {"reason",mismatch}};
                 return abort("base_mismatch");
             }
+            priorSemantics = QJsonDocument::fromJson(q.value(3).toByteArray()).object();
+            priorTime = q.value(4).toString();
+            priorReported = q.value(5).toString();
             q.finish();
         }
-        q.prepare("INSERT INTO matter_revision(matter,version,source,topic,status,quote,kind,event_time,understanding) "
-                  "VALUES(?,?,?,?,?,?,?,?,?)");
+        QJsonObject semantics = change["semantics"].toObject();
+        if (!semantics.isEmpty()) {
+            const auto expression = semantics["time_expression"].toString();
+            QString anchor;
+            if (!expression.isEmpty()) {
+                if (input.contains(expression)) anchor = reported;
+                else if (expression == priorSemantics["time_expression"].toString())
+                    anchor = priorSemantics["time_anchor"].toString();
+                else if (expression == priorTime) anchor = priorReported;
+                else {
+                    q.prepare("SELECT s.reported FROM matter_revision r JOIN cognitive_source s ON s.id=r.source "
+                              "WHERE r.matter=? AND r.event_time=? ORDER BY r.version DESC LIMIT 1");
+                    q.addBindValue(matter);
+                    q.addBindValue(expression);
+                    if (!q.exec()) return abort("storage_error");
+                    if (!q.next()) return abort("unsupported_time_scope");
+                    anchor = q.value(0).toString();
+                    q.finish();
+                }
+            }
+            semantics["time_anchor"] = anchor;
+            semantics["legacy"] = false;
+        }
+        q.prepare("INSERT INTO matter_revision(matter,version,source,topic,status,quote,kind,event_time,understanding,semantics) "
+                  "VALUES(?,?,?,?,?,?,?,?,?,?)");
         for (const QVariant &value : QVariantList{matter,source,source,topic,status,quote,kind,time,understanding})
             q.addBindValue(value);
+        q.addBindValue(semantics.isEmpty() ? QVariant() :
+            QVariant(QString::fromUtf8(QJsonDocument(semantics).toJson(QJsonDocument::Compact))));
         if (!q.exec()) return abort("storage_error");
     }
     for (const auto &item : historyEvidence) {

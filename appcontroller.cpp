@@ -325,18 +325,20 @@ void AppController::handleMakoReply(const QList<SentenceText> &sentences, const 
     } else {
         // QQ：文字回复走 QQ 渠道；情绪写入全局（D1 控制是否驱动桌宠立绘），
         // 不触发桌宠气泡/TTS（D2：播放与退火归桌宠渠道）。
-        QStringList replyParts;
-        for (const SentenceText &sentence : sentences) {
-            replyParts << sentence.zhText;
-        }
         Utterance utterance;
         utterance.channel = meta.channel;
         utterance.sessionId = meta.sessionId;
         utterance.speaker = meta.speaker;
-        utterance.text = replyParts.join(QString());
-        if (!m_qqChannel->sendUtterance(utterance)) {
-            recordInterruption("channel_unavailable");
-            return;
+        int submitted = 0;
+        for (const SentenceText &sentence : sentences) {
+            utterance.text = sentence.zhText;
+            if (!m_qqChannel->sendUtterance(utterance)) {
+                qWarning() << "[QQChannel] sentence submission interrupted submitted=" << submitted
+                           << "total=" << sentences.size();
+                recordInterruption(submitted ? "channel_partial_submission" : "channel_unavailable");
+                return;
+            }
+            ++submitted;
         }
         for (const auto &sentence : sentences) m_globalMood->applyTags(sentence.rawTags, meta.channel);
     }

@@ -59,7 +59,7 @@ bool QQChannelAdapter::sendUtterance(const Utterance &u)
     params["message"] = buildTextMessage(u.text);
     // 群聊场景可带 auto_escape，保持纯文本
     if (!m_client->sendAction(action, params)) return false;
-    qDebug() << "[QQChannel]发送:" << u.channel << u.sessionId
+    qDebug() << "[QQChannel]已接受发送请求（非送达确认）:" << u.channel << u.sessionId
              << "chars=" << u.text.size();
     if (debugFullLogsEnabled()) {
         qDebug().noquote() << "[QQChannel][debug] 发送:" << u.text;
