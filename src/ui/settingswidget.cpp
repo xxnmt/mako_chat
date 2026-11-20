@@ -64,12 +64,7 @@ void SettingsWidget::refreshHistoryTurnList()
     if (m_totalPages < 1){
         m_totalPages = 1;
     }
-    if(m_currentPage<m_totalPages){
-        m_currentPage=m_totalPages-1;
-    }
-    if(m_currentPage<0){
-        m_currentPage=0;
-    }
+    m_currentPage = qBound(0, m_currentPage, m_totalPages - 1);
     updatePageInfo();
     loadHistoryPage(m_currentPage);
 }
@@ -77,6 +72,7 @@ void SettingsWidget::refreshHistoryTurnList()
 void SettingsWidget::showEvent(QShowEvent *event)
 {
     QWidget::showEvent(event);
+    m_currentPage = 0;
     ui->section1_historyTurn->setParent(this);
     delete m_settingsPages;
     m_settingsPages = buildSettingsPages(

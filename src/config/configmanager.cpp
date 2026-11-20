@@ -272,6 +272,9 @@ bool ConfigManager::loadSetting()
             m_qqReply.masterAnyGroup = replyObj.value("master_any_group").toBool(false);
             m_qqReply.privateAllow = readIdArray(replyObj.value("private_allow").toArray());
             m_qqReply.groupAllow = readIdArray(replyObj.value("group_allow").toArray());
+            m_qqReply.restrictEmptyGroupList = replyObj.value("restrict_empty_group_list").toBool(false);
+            if (replyObj.value("private_memory_allow").isArray())
+                m_qqReply.privateMemoryAllow = readIdArray(replyObj.value("private_memory_allow").toArray());
         }
 
         m_qqGroupMemory.enabled = qqObj.value("group_memory_enabled").toBool(false);
@@ -312,9 +315,7 @@ bool ConfigManager::loadSetting()
     {
         QJsonObject ttsObj = rootObj["tts"].toObject();
         m_ttsMode = ttsObj.value("mode").toString("api");
-        m_ttsRef.audioFilePath = ttsObj.value("ref_audio_path").toString("");
-        m_ttsRef.promptText = ttsObj.value("prompt_text").toString("");
-        m_ttsRef.promptLanguage = ttsObj.value("prompt_lang").toString("ja");
+        m_ttsReferenceDirectory = ttsObj.value("reference_audio_dir").toString().trimmed();
         m_gptWeightsPath = ttsObj.value("gpt_weights_path").toString("");
         m_sovitsWeightsPath = ttsObj.value("sovits_weights_path").toString("");
         m_gptSovitsRootPath = ttsObj.value("gpt_sovits_root_path").toString("");
@@ -429,6 +430,12 @@ QJsonObject ConfigManager::effectiveSettings() const
     }
     replyObj.insert("private_allow", privateAllow);
     replyObj.insert("group_allow", groupAllow);
+    replyObj.insert("restrict_empty_group_list", m_qqReply.restrictEmptyGroupList);
+    if (m_qqReply.privateMemoryAllow) {
+        QJsonArray accounts;
+        for (const auto id : *m_qqReply.privateMemoryAllow) accounts.append(QString::number(id));
+        replyObj.insert("private_memory_allow", accounts);
+    }
     qqObj.insert("reply", replyObj);
 
     qqObj.insert("group_memory_enabled", m_qqGroupMemory.enabled);
@@ -469,9 +476,7 @@ QJsonObject ConfigManager::effectiveSettings() const
 
     QJsonObject ttsObj;
     ttsObj.insert("mode", m_ttsMode);
-    ttsObj.insert("ref_audio_path", m_ttsRef.audioFilePath);
-    ttsObj.insert("prompt_text", m_ttsRef.promptText);
-    ttsObj.insert("prompt_lang", m_ttsRef.promptLanguage);
+    ttsObj.insert("reference_audio_dir", m_ttsReferenceDirectory);
     ttsObj.insert("gpt_weights_path", m_gptWeightsPath);
     ttsObj.insert("sovits_weights_path", m_sovitsWeightsPath);
     ttsObj.insert("gpt_sovits_root_path", m_gptSovitsRootPath);
@@ -655,14 +660,15 @@ void ConfigManager::setTTSMode(const QString &mode)
     m_ttsMode=mode;
 }
 
-TTSReference ConfigManager::getTTSReference() const
+QString ConfigManager::defaultTTSReferenceDirectory() const
 {
-    return m_ttsRef;
+    return QDir(getAppDataPath()).filePath("reference_audio");
 }
 
-void ConfigManager::setTTSReference(const TTSReference &ref)
+QString ConfigManager::ttsReferenceDirectory() const
 {
-    m_ttsRef=ref;
+    if (m_ttsReferenceDirectory.isEmpty()) return defaultTTSReferenceDirectory();
+    return QDir(getAppDataPath()).absoluteFilePath(m_ttsReferenceDirectory);
 }
 
 QString ConfigManager::getGPTWeightsPath() const

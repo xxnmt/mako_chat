@@ -203,7 +203,9 @@ app_data/config/identity.json
 | `reply.private` | `"master"` | `none` / `master` / `allowlist` / `all` |
 | `reply.private_allow` | `[]` | `allowlist` 模式下的 QQ 号列表；master 始终允许 |
 | `reply.group` | `"none"` | `none` / `mention` / `all` |
-| `reply.group_allow` | `[]` | 允许处理的群号；为空表示不限制 |
+| `reply.group_allow` | `[]` | 允许回复的群号 |
+| `reply.restrict_empty_group_list` | `false` | 开启时，空群名单不授予回复权限。关闭时保留旧配置的空名单兼容行为 |
+| `reply.private_memory_allow` | 未设置 | 私聊可记录的账号。未设置时沿用私聊回复名单；明确空数组时，名单不授予记录权限。主人仍按全局记忆设置处理 |
 | `reply.master_any_group` | `false` | 是否允许 master 在非白名单群触发回复 |
 
 > 回复资格与记录资格独立。`group: mention` 下未 @ 机器人的群消息只记录（若记录资格允许），不进入大脑。
@@ -253,13 +255,11 @@ app_data/config/identity.json
 | `sovits_weights_path` | 空 | SoVITS 模型 `.pth` |
 | `gpt_model_dir` | 空 | GPT 模型目录 |
 | `sovits_model_dir` | 空 | SoVITS 模型目录 |
-| `ref_audio_path` | 空 | 默认参考音频；为空时按情绪映射选择 |
-| `prompt_text` | 空 | 参考音频对应文本 |
-| `prompt_lang` | `"ja"` | 参考音频语言 |
+| `reference_audio_dir` | 空（使用 `app_data/reference_audio`） | 参考音频文件夹。通过设置页选择或恢复默认，保存后在下次合成时生效 |
 
 运行行为（2026-11-19）：mock 使用模拟提供者，不启动 GPT-SoVITS，也不请求语音接口。api 尝试启动配置的 Python/API；启动失败或合成失败仍交付文字。保存设置会检查模式、Python 路径和根目录是否变化，变化时切换提供者，作废旧合成回调；普通设置保存不会重启服务。程序只停止自己创建的进程，9880 端口被外部服务占用时报告启动失败并保留外部服务。本轮未增加“接管已有外部 API”模式。
 
-参考音频与情绪映射由 `TTSReferenceManager` 读取 `tts_map.json`；具体资源要求见 [README](GPT_SOVITS_REFERENCE.md)。
+参考音频、对应台词和参考语言由 `TTSReferenceManager` 从所选文件夹内的 `tts_map.json` 按情绪读取。自选文件夹需要可读取的映射以及 `happyIdle` 对应的音频。旧固定参考字段已停止使用，本机初始化的默认文件夹继续沿用。具体资源要求见 [参考文档](GPT_SOVITS_REFERENCE.md)。
 
 ---
 
@@ -383,6 +383,10 @@ app_data/config/identity.json
 设置中心提供分类导航和搜索。配置通过开关、选择框、数字与时间控件、文件选择器和可增删的规则表编辑。角色设定使用专用文本区。每页保存时以磁盘最新内容为基准，仅应用本页修改的字段，并使用原子替换保留其他扩展项。同一个字段若已被外部修改，重新打开设置后可继续编辑。
 
 复杂设置旁的「?」可打开说明，显示选项或数值范围。百炼向量与重排端点留空时，输入框会以提示文字显示当前自动推导的地址。保存同页其他设置会保留端点的自动模式。
+
+QQ 群与私聊账号分别使用权限表。群的「允许记录」指长期群聊记忆，仍受群聊记忆开关和发送者规则约束。群的「允许回复」还需满足群聊触发条件，选择「仅被 @ 时」会检查 QQ 的真实 @ 消息段。编辑群权限后如果没有任何群勾选回复，设置页会限制空名单，避免意外扩大回复范围。
+
+密钥、令牌、账号、白名单和本机安装路径由使用者配置。参考音频映射来自默认或自选参考音频文件夹。向量模型、维度和接口地址的自动取值取决于已选服务。主动交流的每日上限与间隔用于后台创作回顾，定时计划字段目前仅保存设置。
 
 - API、记忆与身份策略用于后续请求，提示词在下次组装模型请求时读取。
 - QQ 地址、令牌或启用状态变化触发连接重配，成员刷新计时器同步更新。

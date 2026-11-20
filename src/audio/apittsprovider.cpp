@@ -27,7 +27,11 @@ void ApiTTSProvider::synthesize(const SentenceText &sentence)
     QUrl requestUrl(baseUrl+"/tts");
     qDebug()<<"[ApiTTS]RequestUrl:"<<requestUrl;
 
-    TTSReference ref=TTSReferenceManager::instance().getReferenceForEmotion(sentence.rawTags.value("emotion"));
+    const auto ref = TTSReferenceManager::instance().getReferenceForEmotion(sentence.rawTags.value("emotion"));
+    if (ref.audioFilePath.isEmpty()) {
+        emit synthesisFailed(QStringLiteral("参考音频不可用，请检查参考音频文件夹和 tts_map.json"), sentence);
+        return;
+    }
 
     // m_streamingMode = true;
 

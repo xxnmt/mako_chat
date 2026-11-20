@@ -271,6 +271,7 @@ target_link_libraries(tst_qqdelivery PRIVATE Qt6::Network Qt6::WebSockets)
 add_phase0_test(tst_settingspages
     tst_settingspages.cpp
     ${PROJECT_SOURCE_DIR}/src/ui/settingspages.cpp
+    ${PROJECT_SOURCE_DIR}/src/audio/ttsreferencemanager.cpp
     ${PROJECT_SOURCE_DIR}/src/config/configmanager.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/memorypolicy.cpp
     ${PROJECT_SOURCE_DIR}/src/channels/qq/qqreplypolicy.cpp

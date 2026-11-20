@@ -1,26 +1,20 @@
-#ifndef TTSREFERENCEMANAGER_H
-#define TTSREFERENCEMANAGER_H
+#pragma once
 
 #include <QString>
-#include <QJsonObject>
 #include "ttsreference.h"
-
 
 class TTSReferenceManager
 {
 public:
-    static TTSReferenceManager& instance() {
-        static TTSReferenceManager instance;
+    static const TTSReferenceManager &instance()
+    {
+        static const TTSReferenceManager instance;
         return instance;
     }
-    bool loadMap();
-    TTSReference getReferenceForEmotion(const QString &emotion)const;
+
+    static bool validateDirectory(const QString &directory, QString *error);
+    TTSReference getReferenceForEmotion(const QString &emotion) const;
+
 private:
-    TTSReferenceManager();
-    ~TTSReferenceManager() = default;
-
-    QJsonObject m_mapRoot;
-
+    TTSReferenceManager() = default;
 };
-
-#endif // TTSREFERENCEMANAGER_H

@@ -38,7 +38,8 @@ QQReplyDecision QQReplyPolicyEngine::decide(const QQInboundMessage &message,
         }
 
         const qlonglong groupId = message.sessionId.toLongLong();
-        bool groupAllowed = policy.groupAllow.isEmpty() || policy.groupAllow.contains(groupId);
+        bool groupAllowed = (!policy.restrictEmptyGroupList && policy.groupAllow.isEmpty())
+            || policy.groupAllow.contains(groupId);
         if (!groupAllowed && policy.masterAnyGroup && isMaster) {
             groupAllowed = true;
         }

@@ -159,10 +159,11 @@ QQInboundDecision QQInboundPolicyEngine::decide(
 
     if (message.channel == Channel::kQQPrivate) {
         const bool allowlisted = replyPolicy.privateAllow.contains(message.senderId.toLongLong());
-        if (!isOwner && !allowlisted) {
+        const bool memoryAllowed = isOwner || (replyPolicy.privateMemoryAllow
+            ? replyPolicy.privateMemoryAllow->contains(message.senderId.toLongLong()) : allowlisted);
+        if (!memoryAllowed) {
             // `all` 是显式兼容模式：允许回复，但不把非白名单内容落库。
-            if (replyPolicy.privateMode == QStringLiteral("all")
-                && replyDecision == QQReplyDecision::Reply) {
+            if (replyDecision == QQReplyDecision::Reply) {
                 decision.allowReply = true;
                 decision.ephemeralReply = true;
             }

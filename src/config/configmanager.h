@@ -9,7 +9,6 @@
 #include "memorypolicy.h"
 #include <QSettings>
 #include <QTime>
-#include "ttsreference.h"
 
 // QQ 协议端连接配置（setting.json 的 qq 段）
 struct QQConfig {
@@ -75,8 +74,8 @@ public:
     void setTTSUrl(const QString &ttsUrl);
     QString getTTSMode() const;
     void setTTSMode(const QString &mode);
-    TTSReference getTTSReference() const;
-    void setTTSReference(const TTSReference &ref);
+    QString defaultTTSReferenceDirectory() const;
+    QString ttsReferenceDirectory() const;
 
     QString getGPTWeightsPath() const;
     void setGPTWeightsPath(const QString &path);
@@ -141,7 +140,7 @@ private:
 
     QString m_ttsUrl;
     QString m_ttsMode = "api";
-    TTSReference m_ttsRef;
+    QString m_ttsReferenceDirectory;
     QString m_gptWeightsPath;
     QString m_sovitsWeightsPath;
     QString m_gptSovitsRootPath;

@@ -1,5 +1,6 @@
 #include "settingspages.h"
 #include "configmanager.h"
+#include "ttsreferencemanager.h"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -15,7 +16,8 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
-#include <QMessageBox>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QRegularExpression>
@@ -49,28 +51,46 @@ QString settingHelp(const Field &field)
         {"memory.retrieval.index_enabled", "维护本地片段索引，供词面检索和向量召回使用。"},
         {"memory.retrieval.auto_backfill", "启用后，在启动或应用配置时从已有记录回填空的索引。"},
         {"memory.retrieval.candidate_limit", "进入后续排序的候选数量上限，调高可能增加检索耗时。"},
-        {"memory.retrieval.rerank_enabled", "用重排模型对已召回的候选重新评分。"},
-        {"memory.retrieval.rerank_limit", "限制送入重排环节的候选数量。"},
+        {"memory.retrieval.rerank_enabled", "开启：将候选正文和查询交给配置的重排服务重新排序。关闭：保留本地检索排序，跳过重排服务。"},
+        {"memory.retrieval.rerank_limit", "限制送入重排环节的候选数量。值越高，服务能比较的候选越多，调用耗时和输入量也可能增加。关闭重排时该项不生效。"},
         {"memory.retrieval.embedding_enabled", "使用向量查找语义相近的文本，启用后后台会补齐缺失向量。"},
-        {"memory.retrieval.embedding_provider", "选择生成向量的服务。本地测试仅用于工程验证。"},
+        {"memory.retrieval.embedding_provider", "未指定：尚未选定向量服务。阿里云百炼：调用已配置端点和凭据计算语义向量。本地测试：用哈希向量验证索引流程，无法替代真实语义检索。"},
         {"memory.retrieval.embedding_model", "留空时，百炼使用 text-embedding-v4。"},
         {"memory.retrieval.embedding_dimension", "向量长度须与服务模型及索引一致。0 使用提供方默认值。"},
+        {"memory.retrieval.rerank_model", "重排服务接受的模型名称。百炼默认使用 qwen3-rerank，使用自定义服务时填写该服务支持的模型名称。"},
         {"memory.retrieval.embedding_api_key_env", "未配置百炼密钥时，用此名称读取环境变量。填写的是变量名。"},
         {"memory.retrieval.embedding_endpoint", "可填写完整向量接口地址。留空时从百炼服务地址推导。"},
         {"memory.retrieval.rerank_endpoint", "可填写完整重排接口地址。留空时从百炼服务地址推导。"},
-        {"memory.agent_mode", "模型工具由对话模型发起补查，独立规划使用单独的检索规划步骤。"},
+        {"memory.agent_mode", "模型工具：对话模型决定何时调用记忆工具。独立规划：先单独规划检索，再把找到的材料交给对话模型。"},
         {"memory.agent_protocol", "原生调用使用模型的工具接口，JSON 信封通过结构化正文表达工具调用。"},
+        {"memory.agent_trigger", "回忆类问题：独立规划模式按回忆意图决定是否启动。每轮：独立规划模式在每轮都尝试规划。模型工具模式由模型按需发起。"},
+        {"memory.agent_plan_v2", "开启后，独立规划使用按查找目标组织的新版计划。关闭后使用旧版检索规划协议。"},
+        {"memory.agent_max_rounds", "单轮对话允许的记忆补查轮数上限。前台仍受共享补查预算和重复调用限制。"},
+        {"memory.agent_timeout_ms", "独立规划模式的等待预算，单位是毫秒。到时返回已取得的资料。"},
+        {"memory.agent_max_results", "记忆补查返回的结果数量限制。详细内容可按工具支持的方式进一步核对。"},
         {"memory.owner_cross_channel_private", "允许在主人私密会话中使用其他私密渠道的个人记忆。"},
         {"memory.privacy_rules", "添加规则名称、匹配方式、匹配内容及处理方式。匹配支持关键字、原文和正则。处理支持脱敏或拦截。"},
         {"memory.blind_zones", "逐行填写渠道和会话标识。桌宠会话使用 default，QQ 使用目标账号或群号。"},
         {"qq.reply.master_any_group", "允许主人在回复群列表之外触发回应。实际触发仍按渠道回复策略判断。"},
-        {"qq.group_memory_mode", "逐群选择严格白名单或群授权，并填写群号。"},
+        {"qq.reply.group", "关闭：不回群消息。仅被 @ 时：消息必须包含指向茉子的 QQ @ 消息段。全部：无需 @，仍检查群及发送者权限。"},
+        {"qq.reply.private", "关闭：不回私聊。仅主人：只回复已绑定主人账号。允许列表：回复主人及表中勾选允许回复的账号。全部：可回复所有账号，是否记录按记录权限判断。"},
+        {"qq.reply.restrict_empty_group_list", "开启：群回复表没有勾选项时，按空白名单处理。关闭：空名单沿用原有兼容行为，所有群可进入后续回复策略。主人例外、群触发方式和发送者权限仍分别检查。"},
+        {"qq.group_permissions", "允许记录：该群可参与长期群聊记忆，仍需启用群聊记忆，并遵守下方的群记忆模式。允许回复：该群进入回复名单，仍受 @ 方式和发送者权限约束。短期回复历史由短期记忆开关单独控制。"},
+        {"qq.private_permissions", "允许记录：该账号可进入记忆，仍受长短期记忆开关控制。允许回复：在私聊回应范围为允许列表时纳入回复名单。主人和全部模式有各自的全局规则。"},
+        {"qq.group_memory_mode", "严格白名单 strict_whitelist：只记录主人和该群发送者白名单。群授权 group_authorized：开启群聊记忆且群允许记录时，可记录普通成员；回复仍检查发送者权限。"},
         {"qq.group_sender_allowlist", "按群填写允许记录的发送者账号。多个账号用空格或逗号分隔。"},
         {"qq.membership_max_age_minutes", "判断已缓存群成员信息是否过期的时间。"},
         {"qq.membership_refresh_minutes", "刷新群成员缓存的间隔。0 关闭定时刷新。"},
-        {"tts.mode", "模拟播放只按字数计算节奏。GPT-SoVITS 模式使用合成语音。"},
-        {"tts.prompt_lang", "选择参考音频中实际使用的语言。"},
+        {"qq.group_retention_days", "配置保留期限，单位为天。当前只保存此值，自动到期清理尚未接入。"},
+        {"memory.interaction_gap_seconds", "相邻消息间隔超过此值时，可切为新的互动片段。显式引用关系仍参与分段。"},
+        {"memory.interaction_max_events", "一段互动最多容纳的消息数量。达到上限后开始下一段。"},
+        {"memory.interaction_max_minutes", "一段互动从首条消息开始计算的最长分钟数。达到上限后开始下一段。"},
+        {"tts.mode", "模拟播放：按文字长度模拟节奏，不合成音频。GPT-SoVITS：调用语音服务生成音频，失败时仍播放文字。"},
+        {"tts.reference_audio_dir", "默认使用 app_data/reference_audio。其他文件夹需包含 tts_map.json 和对应的音频。音频、台词和语言随情绪从映射中选择，缺失时使用 happyIdle。"},
         {"proactive.targets", "填写可主动联系的渠道及会话标识，桌宠会话填 default。"},
+        {"proactive.idle_seconds", "从最近一次会话活动开始计时。达到该秒数后才允许进行后台创作回顾或尝试主动联系。0 表示没有额外空闲等待。"},
+        {"proactive.daily_limit", "每天最多领取多少次后台创作回顾任务。0 停止领取。这个上限按回顾任务计数。"},
+        {"proactive.cooldown_seconds", "两次后台创作回顾之间的间隔，单位为秒。运行时至少等待 60 秒。"},
         {"proactive.schedule", "可填写 HH:mm 及 fixed（固定）或 random（随机）。当前只保存，定时调度尚未接入。"},
         {"memory.debug_full_logs", "开启后记录对话正文和模型请求，用于诊断。"},
     };
@@ -140,6 +160,90 @@ QJsonArray idList(const QString &text)
         ids.append(QString::number(id));
     }
     return ids;
+}
+
+bool isPermissionTable(const Field &field)
+{
+    return field.type == "group_permissions" || field.type == "private_permissions";
+}
+
+QStringList permissionPath(const Field &field, bool record)
+{
+    if (field.type == "group_permissions")
+        return record ? QStringList{"qq", "group_memory_allow"} : QStringList{"qq", "reply", "group_allow"};
+    return {"qq", "reply", record ? "private_memory_allow" : "private_allow"};
+}
+
+QJsonObject permissionLists(const QJsonObject &root, const Field &field)
+{
+    const auto replies = readPath(root, permissionPath(field, false)).toArray();
+    auto records = readPath(root, permissionPath(field, true));
+    if (field.type == "private_permissions" && !records.isArray()) records = replies;
+    return {{"record", records.toArray()}, {"reply", replies}};
+}
+
+Binding permissionBinding(const Field &field, const QJsonObject &lists, QLabel *label, QWidget *parent)
+{
+    auto *container = new QWidget(parent);
+    auto *layout = new QVBoxLayout(container);
+    layout->setContentsMargins(0, 0, 0, 0);
+    auto *table = new QTableWidget(0, 3, container);
+    table->setHorizontalHeaderLabels({
+        field.type == "group_permissions" ? QStringLiteral("群号") : QStringLiteral("QQ 账号"),
+        QStringLiteral("允许记录"), QStringLiteral("允许回复")});
+    table->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+    table->setSelectionBehavior(QAbstractItemView::SelectRows);
+    table->setMinimumHeight(145);
+    table->setMaximumHeight(220);
+    layout->addWidget(table);
+    auto append = [table](const QString &id, bool record, bool reply) {
+        const auto row = table->rowCount();
+        table->insertRow(row);
+        table->setItem(row, 0, new QTableWidgetItem(id));
+        for (int column : {1, 2}) {
+            auto *item = new QTableWidgetItem;
+            item->setFlags(Qt::ItemIsEnabled | Qt::ItemIsSelectable | Qt::ItemIsUserCheckable);
+            item->setCheckState((column == 1 ? record : reply) ? Qt::Checked : Qt::Unchecked);
+            table->setItem(row, column, item);
+        }
+    };
+    QMap<qlonglong, QPair<bool, bool>> permissions;
+    for (const auto &id : lists["record"].toArray()) permissions[id.toVariant().toLongLong()].first = true;
+    for (const auto &id : lists["reply"].toArray()) permissions[id.toVariant().toLongLong()].second = true;
+    for (auto it = permissions.cbegin(); it != permissions.cend(); ++it)
+        append(QString::number(it.key()), it.value().first, it.value().second);
+    auto *actions = new QHBoxLayout;
+    auto *add = new QPushButton(QStringLiteral("添加"), container);
+    auto *remove = new QPushButton(QStringLiteral("移除所选"), container);
+    actions->addWidget(add);
+    actions->addWidget(remove);
+    actions->addStretch();
+    layout->addLayout(actions);
+    QObject::connect(add, &QPushButton::clicked, container, [table, append] {
+        append({}, false, false);
+        auto *item = table->item(table->rowCount() - 1, 0);
+        table->setCurrentItem(item);
+        table->editItem(item);
+    });
+    QObject::connect(remove, &QPushButton::clicked, container, [table] {
+        auto rows = table->selectionModel()->selectedRows();
+        std::sort(rows.begin(), rows.end(), [](const auto &a, const auto &b) { return a.row() > b.row(); });
+        for (const auto &row : rows) table->removeRow(row.row());
+    });
+    return {field, container, label, [table] {
+        QJsonArray records, replies;
+        QSet<QString> seen;
+        for (int row = 0; row < table->rowCount(); ++row) {
+            const auto ids = idList(table->item(row, 0)->text());
+            if (ids.size() != 1 || seen.contains(ids.first().toString()))
+                throw QStringLiteral("每行须填写一个唯一的号码");
+            const auto id = ids.first().toString();
+            seen.insert(id);
+            if (table->item(row, 1)->checkState() == Qt::Checked) records.append(id);
+            if (table->item(row, 2)->checkState() == Qt::Checked) replies.append(id);
+        }
+        return QJsonValue(QJsonObject{{"record", records}, {"reply", replies}});
+    }, {}};
 }
 
 struct TableColumn { QString key; QString label; QStringList choices; };
@@ -254,6 +358,7 @@ Binding buildField(const Field &field, const QJsonValue &value, QWidget *parent)
 {
     auto *label = new QLabel(field.label, parent);
     label->setWordWrap(true);
+    if (isPermissionTable(field)) return permissionBinding(field, value.toObject(), label, parent);
     if (field.type == "bool") {
         auto *box = new QCheckBox(parent);
         box->setChecked(value.toBool());
@@ -294,11 +399,22 @@ Binding buildField(const Field &field, const QJsonValue &value, QWidget *parent)
         || field.type == "zones" || field.type == "modes" || field.type == "senders")
         return tableBinding(field, value, label, parent);
 
-    auto *text = new QLineEdit(field.type == "ids" ? idsText(value.toArray()) : value.toString(), parent);
+    const bool referenceDirectory = field.type == "reference_directory";
+    const auto defaultDirectory = referenceDirectory
+        ? ConfigManager::instance().defaultTTSReferenceDirectory() : QString();
+    const auto initialText = referenceDirectory
+        ? ConfigManager::instance().ttsReferenceDirectory()
+        : field.type == "ids" ? idsText(value.toArray()) : value.toString();
+    auto *text = new QLineEdit(initialText, parent);
+    if (referenceDirectory) {
+        text->setReadOnly(true);
+        text->setToolTip(initialText);
+        QObject::connect(text, &QLineEdit::textChanged, text, &QLineEdit::setToolTip);
+    }
     if (field.type == "secret") text->setEchoMode(QLineEdit::Password);
     if (field.type == "ids") text->setPlaceholderText(QStringLiteral("多个号码以空格或逗号分隔"));
     QWidget *row = text;
-    if (field.type == "file" || field.type == "directory" || field.type == "secret") {
+    if (field.type == "file" || field.type == "directory" || field.type == "secret" || referenceDirectory) {
         row = new QWidget(parent);
         auto *layout = new QHBoxLayout(row);
         layout->setContentsMargins(0, 0, 0, 0);
@@ -312,13 +428,24 @@ Binding buildField(const Field &field, const QJsonValue &value, QWidget *parent)
                 button->setText(show ? QStringLiteral("隐藏") : QStringLiteral("显示"));
                 return;
             }
-            const auto selected = field.type == "directory"
+            const auto selected = field.type == "directory" || referenceDirectory
                 ? QFileDialog::getExistingDirectory(row, field.label, text->text())
                 : QFileDialog::getOpenFileName(row, field.label, text->text());
             if (!selected.isEmpty()) text->setText(QDir::toNativeSeparators(selected));
         });
+        if (referenceDirectory) {
+            auto *reset = new QPushButton(QStringLiteral("恢复默认"), row);
+            layout->addWidget(reset);
+            QObject::connect(reset, &QPushButton::clicked, row, [text, defaultDirectory] {
+                text->setText(defaultDirectory);
+            });
+        }
     }
-    return {field, row, label, [text, field]() -> QJsonValue {
+    return {field, row, label, [text, field, referenceDirectory, defaultDirectory]() -> QJsonValue {
+        if (referenceDirectory) {
+            const auto path = QDir::cleanPath(text->text());
+            return path == QDir::cleanPath(defaultDirectory) ? QString() : path;
+        }
         if (field.type == "ids") return idList(text->text());
         return text->text().trimmed();
     }, {}};
@@ -352,9 +479,7 @@ QList<Page> pages()
                 field("tts.gpt_sovits_root_path", "GPT-SoVITS 安装目录", "", "directory"),
             }},
             {"参考音频", {
-                field("tts.ref_audio_path", "参考音频文件", "", "file"),
-                field("tts.prompt_text", "参考音频对应的台词", "", "multiline"),
-                field("tts.prompt_lang", "参考语言", "ja", "choice:ja=日语|zh=中文|en=英语|ko=韩语|yue=粤语"),
+                field("tts.reference_audio_dir", "参考音频文件夹", "", "reference_directory"),
             }},
             {"模型文件", {
                 field("tts.gpt_weights_path", "GPT 权重", "", "file"),
@@ -379,7 +504,7 @@ QList<Page> pages()
                 field("memory.retrieval.rerank_endpoint", "重排端点", "", "text"),
                 field("memory.retrieval.rerank_model", "重排模型", "qwen3-rerank", "text"),
                 field("memory.retrieval.embedding_enabled", "启用向量召回", false, "bool"),
-                field("memory.retrieval.embedding_provider", "向量服务", "", "choice:=自动|dashscope=阿里云百炼|local_hash_test=本地测试"),
+                field("memory.retrieval.embedding_provider", "向量服务", "", "choice:=未指定|dashscope=阿里云百炼|local_hash_test=本地测试"),
                 field("memory.retrieval.embedding_endpoint", "向量端点", "", "text"),
                 field("memory.retrieval.embedding_api_key_env", "向量密钥环境变量", "DASHSCOPE_API_KEY", "text"),
                 field("memory.retrieval.embedding_model", "向量模型", "", "text"),
@@ -404,15 +529,15 @@ QList<Page> pages()
             }},
             {"回复范围", {
                 field("qq.reply.private", "私聊回应范围", "master", "choice:none=关闭|master=仅主人|allowlist=允许列表|all=全部"),
-                field("qq.reply.group", "群聊回应方式", "none", "choice:none=关闭|mention=仅被提及时|all=全部"),
+                field("qq.reply.group", "群聊回应方式", "none", "choice:none=关闭|mention=仅被 @ 时|all=全部"),
                 field("qq.reply.master_any_group", "主人可在任意群触发", false, "bool"),
-                field("qq.reply.private_allow", "允许回复的私聊账号", QJsonArray{}, "ids"),
-                field("qq.reply.group_allow", "允许回复的群", QJsonArray{}, "ids"),
+                field("qq.reply.restrict_empty_group_list", "空名单也限制群回复", false, "bool"),
+                field("qq.group_permissions", "群权限", QJsonObject{}, "group_permissions"),
+                field("qq.private_permissions", "私聊账号权限", QJsonObject{}, "private_permissions"),
             }},
             {"群聊记忆", {
                 field("qq.group_memory_enabled", "启用群聊记忆", false, "bool"),
-                field("qq.group_memory_allow", "允许记录的群", QJsonArray{}, "ids"),
-                field("qq.group_retention_days", "保留天数", 30, "num:1:3650"),
+                field("qq.group_retention_days", "保留天数（清理暂未接入）", 30, "num:1:3650"),
                 field("qq.membership_refresh_minutes", "成员刷新间隔（分钟）", 30, "num:0:1440"),
                 field("qq.membership_max_age_minutes", "成员缓存有效期（分钟）", 1440, "num:1:10080"),
                 field("qq.group_memory_mode", "各群记忆模式", QJsonObject{}, "modes"),
@@ -462,9 +587,9 @@ QList<Page> pages()
             {"活动和联系", {
                 field("proactive.enabled", "允许主动联系", false, "bool"),
                 field("proactive.private_writing", "允许私下写作与回顾", false, "bool"),
-                field("proactive.daily_limit", "每日联系上限", 3, "num:0:999"),
-                field("proactive.cooldown_seconds", "联系冷却（秒）", 900, "num:0:604800"),
-                field("proactive.idle_seconds", "空闲多久后可以联系（秒）", 1800, "num:0:604800"),
+                field("proactive.daily_limit", "每日回顾上限", 3, "num:0:999"),
+                field("proactive.cooldown_seconds", "回顾间隔（秒）", 900, "num:60:604800"),
+                field("proactive.idle_seconds", "空闲等待（秒）", 1800, "num:0:604800"),
                 field("proactive.quiet_hours.start", "安静开始", "23:00", "time"),
                 field("proactive.quiet_hours.end", "安静结束", "08:00", "time"),
                 field("proactive.targets", "允许联系的会话", QJsonArray{}, "targets"),
@@ -549,7 +674,8 @@ PageView buildPage(const Page &page, const std::function<void()> &applied, QWidg
         form->setVerticalSpacing(12);
         QList<int> indexes;
         for (const auto &field : group.fields) {
-            const auto configured = readPath(*snapshot, field.path);
+            const auto configured = isPermissionTable(field)
+                ? QJsonValue(permissionLists(*snapshot, field)) : readPath(*snapshot, field.path);
             auto value = prompt ? QJsonValue(promptText) : configured;
             const auto key = field.path.join('.');
             const bool derivedEndpoint = key == "memory.retrieval.embedding_endpoint"
@@ -567,6 +693,14 @@ PageView buildPage(const Page &page, const std::function<void()> &applied, QWidg
                 auto *endpoint = qobject_cast<QLineEdit *>(binding.row);
                 endpoint->setPlaceholderText(runtime.toString());
                 endpoint->setToolTip(QStringLiteral("当前自动使用 %1").arg(runtime.toString()));
+            }
+            const auto provider = readPath(effective, {"memory", "retrieval", "embedding_provider"}).toString();
+            if (key == "memory.retrieval.embedding_model" && provider == "dashscope")
+                qobject_cast<QLineEdit *>(binding.row)->setPlaceholderText(QStringLiteral("自动使用 text-embedding-v4"));
+            if (key == "memory.retrieval.embedding_dimension") {
+                auto *dimension = qobject_cast<QSpinBox *>(binding.row);
+                if (provider == "dashscope") dimension->setSpecialValueText(QStringLiteral("自动（1024）"));
+                else if (provider == "local_hash_test") dimension->setSpecialValueText(QStringLiteral("自动（64）"));
             }
             try { binding.initial = binding.value(); }
             catch (const QString &) { binding.initial = value; }
@@ -586,9 +720,17 @@ PageView buildPage(const Page &page, const std::function<void()> &applied, QWidg
                 labelLayout->addWidget(button);
                 labelLayout->addStretch();
                 QObject::connect(button, &QToolButton::clicked, card, [card, title = field.label, help] {
-                    QMessageBox box(QMessageBox::Information, title, help, QMessageBox::Ok, card);
-                    box.setTextFormat(Qt::PlainText);
-                    box.exec();
+                    QDialog dialog(card);
+                    dialog.setWindowTitle(title);
+                    dialog.resize(470, 280);
+                    auto *layout = new QVBoxLayout(&dialog);
+                    auto *body = new QPlainTextEdit(help, &dialog);
+                    body->setReadOnly(true);
+                    layout->addWidget(body);
+                    auto *close = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
+                    QObject::connect(close, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+                    layout->addWidget(close);
+                    dialog.exec();
                 });
             }
             form->addRow(label, binding.row);
@@ -625,6 +767,7 @@ PageView buildPage(const Page &page, const std::function<void()> &applied, QWidg
             }
             auto merged = fresh.object();
             QByteArray updated;
+            bool restrictedAfterRemoval = false;
             QList<QPair<int, QJsonValue>> edits;
             for (int index = 0; index < bindings->size(); ++index) {
                 const auto &binding = bindings->at(index);
@@ -635,18 +778,39 @@ PageView buildPage(const Page &page, const std::function<void()> &applied, QWidg
                     return;
                 }
                 if (value == binding.initial) continue;
-                if (prompt ? latest != *promptSnapshot
-                           : readPath(fresh.object(), binding.field.path) != readPath(*snapshot, binding.field.path)) {
+                const bool permissions = isPermissionTable(binding.field);
+                const bool changedExternally = permissions
+                    ? permissionLists(fresh.object(), binding.field) != permissionLists(*snapshot, binding.field)
+                    : readPath(fresh.object(), binding.field.path) != readPath(*snapshot, binding.field.path);
+                if (prompt ? latest != *promptSnapshot : changedExternally) {
                     feedback->setText(QStringLiteral("此设置已在其他位置修改，请重新打开设置后再编辑。"));
                     return;
                 }
                 if (prompt) updated = value.toString().toUtf8();
-                else setPath(merged, binding.field.path, value);
+                else if (permissions) {
+                    const auto lists = value.toObject();
+                    setPath(merged, permissionPath(binding.field, true), lists["record"]);
+                    setPath(merged, permissionPath(binding.field, false), lists["reply"]);
+                    // A list edited down to zero must not open replies to every group.
+                    if (binding.field.type == "group_permissions" && lists["reply"].toArray().isEmpty()) {
+                        setPath(merged, {"qq", "reply", "restrict_empty_group_list"}, true);
+                        restrictedAfterRemoval = true;
+                    }
+                } else setPath(merged, binding.field.path, value);
                 edits.append({index, value});
             }
             if (edits.isEmpty()) {
                 feedback->setText(QStringLiteral("没有需要保存的修改。"));
                 return;
+            }
+            for (const auto &[index, value] : edits) {
+                if (bindings->at(index).field.type != "reference_directory" || value.toString().isEmpty())
+                    continue;
+                QString error;
+                if (!TTSReferenceManager::validateDirectory(value.toString(), &error)) {
+                    feedback->setText(error);
+                    return;
+                }
             }
             if (!prompt) updated = QJsonDocument(merged).toJson();
             QString error;
@@ -657,11 +821,25 @@ PageView buildPage(const Page &page, const std::function<void()> &applied, QWidg
             for (const auto &[index, value] : edits) {
                 auto &binding = (*bindings)[index];
                 binding.initial = value;
-                if (!prompt) setPath(*snapshot, binding.field.path, value);
+                if (!prompt && isPermissionTable(binding.field)) {
+                    setPath(*snapshot, permissionPath(binding.field, true), value.toObject()["record"]);
+                    setPath(*snapshot, permissionPath(binding.field, false), value.toObject()["reply"]);
+                } else if (!prompt) setPath(*snapshot, binding.field.path, value);
             }
             if (prompt) *promptSnapshot = updated;
+            if (restrictedAfterRemoval) {
+                const QStringList restriction{"qq", "reply", "restrict_empty_group_list"};
+                setPath(*snapshot, restriction, true);
+                for (auto &binding : *bindings) {
+                    if (binding.field.path != restriction) continue;
+                    qobject_cast<QCheckBox *>(binding.row)->setChecked(true);
+                    binding.initial = true;
+                }
+            }
             applied();
-            feedback->setText(QStringLiteral("已保存并应用。"));
+            feedback->setText(restrictedAfterRemoval
+                ? QStringLiteral("已保存。回复名单为空，已启用空名单限制。")
+                : QStringLiteral("已保存并应用。"));
         });
     return view;
 }

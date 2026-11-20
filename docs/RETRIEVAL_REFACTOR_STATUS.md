@@ -89,7 +89,7 @@ mock 使用 MockTTSProvider，不创建进程管理器。api 启动失败时保�
 
 最终冻结清单在 build/phase_a_acceptance/final_manifest.json，记录基线 HEAD、未提交改动的文件快照与补丁、最终 exe、测试结果、工具驱动与回放哈希。冻结只证明本轮文件身份；历史探索捕获和表达回放不冒充最终二进制上的完整 app 回归。记录含本机私聊/群聊资料，不纳入 Git。
 
-本轮最终 Debug 构建成功，CTest 16/16 通过；补充 API 等待中切换 mock 的队列顺序用例后，TTS 套件再次通过。最终对象文件重新链接工具驱动后，四份真实模型参数离线重放全部通过，时间范围与首次一致；未新增付费调用。测试输出为 build/phase-a-tests.log 与 build/phase-a-tts-final.log。
+本轮最终 Debug 构建成功，CTest 16/16 通过；补充 API 等待中切换 mock 的队列顺序用例后，TTS 套件再次通过。最终对象文件重新链接工具驱动后，四份真实模型参数离线重放全部通过，时间范围与首次一致；未新增付费调用。测试输出已归档到 build/archive/phase-a/phase-a-tests.log 与 build/archive/phase-a/phase-a-tts-final.log。
 
 
 ## 2026-11-19：事项进度、时间范围与表达审计

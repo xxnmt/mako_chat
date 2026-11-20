@@ -1,60 +1,52 @@
 #include "ttsreferencemanager.h"
 #include "configmanager.h"
 
-#include <QFile>
-#include <QJsonDocument>
-#include <QJsonParseError>
-#include <QDebug>
 #include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
 
-bool TTSReferenceManager::loadMap()
+namespace {
+QJsonObject readReferenceMap(const QDir &directory)
 {
-    QString mapPath=ConfigManager::instance().getAppDataPath()+"/reference_audio/tts_map.json";
-    QFile file(mapPath);
-    if(!file.open(QIODevice::ReadOnly|QIODevice::Text)){
-        qDebug()<<"[TTSRM]打开tts_map失败:"<<mapPath;
-        return false;
-    }
-    QByteArray data=file.readAll();
-    file.close();
+    QFile file(directory.filePath("tts_map.json"));
+    if (!file.open(QIODevice::ReadOnly)) return {};
+    return QJsonDocument::fromJson(file.readAll()).object();
+}
 
-    QJsonParseError error;
-    QJsonDocument doc=QJsonDocument::fromJson(data,&error);
-    if(error.error != QJsonParseError::NoError){
-        qDebug()<<"[TTSRM]ttsmap解析失败:"<<error.error;
+TTSReference resolveReference(const QDir &directory, const QJsonObject &entry)
+{
+    const auto audio = entry.value("audio_file").toString().trimmed();
+    if (audio.isEmpty()) return {};
+    const auto path = directory.absoluteFilePath(audio);
+    if (!QFileInfo(path).isFile()) return {};
+    return {path, entry.value("prompt_text").toString(),
+            entry.value("prompt_language").toString("ja")};
+}
+} // namespace
+
+bool TTSReferenceManager::validateDirectory(const QString &path, QString *error)
+{
+    const QDir directory(path);
+    const auto map = readReferenceMap(directory);
+    if (map.isEmpty()) {
+        if (error) *error = QStringLiteral("所选文件夹需要一个可读取的 tts_map.json。");
         return false;
     }
-    m_mapRoot=doc.object();
-    qDebug()<<"[TTSRM]:ttsmap成功加载";
+    if (resolveReference(directory, map.value("happyIdle").toObject()).audioFilePath.isEmpty()) {
+        if (error) *error = QStringLiteral("tts_map.json 需要 happyIdle 条目，并指向存在的参考音频。");
+        return false;
+    }
     return true;
 }
 
 TTSReference TTSReferenceManager::getReferenceForEmotion(const QString &emotion) const
 {
-    TTSReference ref;
-    if (m_mapRoot.contains(emotion) && m_mapRoot[emotion].isObject()) {
-        QJsonObject obj = m_mapRoot[emotion].toObject();
-        ref.audioFilePath = obj.value("audio_file").toString();
-        ref.promptText = obj.value("prompt_text").toString();
-        ref.promptLanguage = obj.value("prompt_language").toString("ja");
-    }
-    else if (m_mapRoot.contains("happyIdle") && m_mapRoot["happyIdle"].isObject()) {
-        QJsonObject obj = m_mapRoot["happyIdle"].toObject();
-        ref.audioFilePath = obj.value("audio_file").toString();
-        ref.promptText = obj.value("prompt_text").toString();
-        ref.promptLanguage = obj.value("prompt_language").toString("ja");
-    }
-
-    QFileInfo fileInfo(ref.audioFilePath);
-    if (!fileInfo.isAbsolute()) {
-        ref.audioFilePath = ConfigManager::instance().getAppDataPath() + "/reference_audio/" + ref.audioFilePath;
-    }
-    return ref;
+    const QDir directory(ConfigManager::instance().ttsReferenceDirectory());
+    const auto map = readReferenceMap(directory);
+    auto reference = resolveReference(directory, map.value(emotion).toObject());
+    if (reference.audioFilePath.isEmpty())
+        reference = resolveReference(directory, map.value("happyIdle").toObject());
+    return reference;
 }
-
-TTSReferenceManager::TTSReferenceManager()
-{
-    loadMap();
-}
-
-

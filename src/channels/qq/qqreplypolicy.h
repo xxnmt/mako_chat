@@ -4,6 +4,7 @@
 #include <QString>
 #include <QStringList>
 #include <QList>
+#include <optional>
 
 #include "qqmessageparser.h"
 
@@ -13,8 +14,10 @@ struct QQReplyPolicy
     QString privateMode = QStringLiteral("master"); // none / master / allowlist / all
     QString groupMode = QStringLiteral("none");     // none / mention / all
     QList<qlonglong> privateAllow;
+    std::optional<QList<qlonglong>> privateMemoryAllow;
     QList<qlonglong> groupAllow;
     bool masterAnyGroup = false;
+    bool restrictEmptyGroupList = false;
 };
 
 enum class QQReplyDecision {
