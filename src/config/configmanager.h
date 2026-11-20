@@ -3,6 +3,7 @@
 
 #include <QString>
 #include <QStringList>
+#include <QJsonObject>
 
 #include "qqreplypolicy.h"
 #include "memorypolicy.h"
@@ -56,6 +57,7 @@ public:
     bool loadSetting();
     bool writeConfigDocument(const QString &name, const QByteArray &contents, QString *error);
     bool saveSetting();
+    QJsonObject effectiveSettings() const;
 
 
     // 删除拷贝构造和赋值操作，确保单例纯粹性

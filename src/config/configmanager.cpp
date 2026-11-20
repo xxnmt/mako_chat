@@ -328,18 +328,8 @@ bool ConfigManager::loadSetting()
 
 }
 
-bool ConfigManager::saveSetting()
+QJsonObject ConfigManager::effectiveSettings() const
 {
-    QJsonObject existing;
-    QFile previous(m_configFilePath);
-    if (previous.exists()) {
-        if (!previous.open(QIODevice::ReadOnly)) return false;
-        const auto document = QJsonDocument::fromJson(previous.readAll());
-        previous.close();
-        if (!document.isObject()) return false;
-        existing = document.object();
-    }
-
     QJsonObject apiObj;
     apiObj.insert("deepseek_api_key", m_apiKey);
     apiObj.insert("dashscope_api_key", m_dashscopeApiKey);
@@ -489,8 +479,22 @@ bool ConfigManager::saveSetting()
     ttsObj.insert("sovits_model_dir", m_sovitsModelDir);
     ttsObj.insert("python_path", m_pythonPath);
     rootObj.insert("tts", ttsObj);
+    return rootObj;
+}
 
+bool ConfigManager::saveSetting()
+{
+    QJsonObject existing;
+    QFile previous(m_configFilePath);
+    if (previous.exists()) {
+        if (!previous.open(QIODevice::ReadOnly)) return false;
+        const auto document = QJsonDocument::fromJson(previous.readAll());
+        previous.close();
+        if (!document.isObject()) return false;
+        existing = document.object();
+    }
 
+    const auto rootObj = effectiveSettings();
     for (auto section = rootObj.constBegin(); section != rootObj.constEnd(); ++section) {
         auto preserved = existing.value(section.key()).toObject();
         const auto values = section.value().toObject();

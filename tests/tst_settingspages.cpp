@@ -8,6 +8,8 @@
 #include <QPushButton>
 #include <QSpinBox>
 #include <QStackedWidget>
+#include <QMessageBox>
+#include <QToolButton>
 
 #include "configmanager.h"
 #include "settingspages.h"
@@ -20,7 +22,7 @@ private slots:
     {
         auto &config = ConfigManager::instance();
         const QByteArray initial =
-            R"({"memory":{"short_term_length":15,"retrieval":{"rerank_enabled":true,"extension":7}},"api":{"deepseek_api_key":"fixture-secret"}})";
+            R"({"memory":{"short_term_length":15,"retrieval":{"rerank_enabled":true,"extension":7}},"api":{"deepseek_api_key":"fixture-secret","dashscope_base_url":"https://example.test/"}})";
         QVERIFY(config.writeConfigDocument("setting.json", initial, nullptr));
         int applied = 0;
         QWidget host;
@@ -39,6 +41,21 @@ private slots:
         if (!preview.isEmpty()) QVERIFY(root->grab().save(preview));
         auto *secret = root->findChild<QWidget *>("api.deepseek_api_key")->findChild<QLineEdit *>();
         QCOMPARE(secret->echoMode(), QLineEdit::Password);
+        auto *endpoint = root->findChild<QLineEdit *>("memory.retrieval.embedding_endpoint");
+        QVERIFY(endpoint);
+        QVERIFY(endpoint->text().isEmpty());
+        QCOMPARE(endpoint->placeholderText(), QStringLiteral("https://example.test/compatible-mode/v1/embeddings"));
+        auto *help = root->findChild<QToolButton *>("memory.retrieval.candidate_limit.help");
+        QVERIFY(help);
+        bool displayedRange = false;
+        QTimer::singleShot(0, &host, [&] {
+            if (auto *box = qobject_cast<QMessageBox *>(QApplication::activeModalWidget())) {
+                displayedRange = box->text().contains(QStringLiteral("10 至 200"));
+                box->accept();
+            }
+        });
+        help->click();
+        QVERIFY(displayedRange);
         search->setText("rerank_enabled");
         QCOMPARE(navigation->currentItem()->text(), QStringLiteral("记忆与检索"));
         auto *rerank = root->findChild<QCheckBox *>("memory.retrieval.rerank_enabled");
@@ -59,6 +76,7 @@ private slots:
         QVERIFY(bytes.contains("\"extension\": 7"));
         QVERIFY(bytes.contains("fixture-secret"));
         QVERIFY(!bytes.contains("candidate_limit"));
+        QVERIFY(!bytes.contains("embedding_endpoint"));
         search->setText(QStringLiteral("历史会话"));
         QCOMPARE(stack->currentWidget(), history);
     }

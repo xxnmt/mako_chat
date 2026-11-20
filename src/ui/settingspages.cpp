@@ -24,6 +24,7 @@
 #include <QStackedWidget>
 #include <QTableWidget>
 #include <QTimeEdit>
+#include <QToolButton>
 #include <algorithm>
 #include <memory>
 
@@ -41,6 +42,56 @@ struct Binding {
     std::function<QJsonValue()> value;
     QJsonValue initial;
 };
+
+QString settingHelp(const Field &field)
+{
+    static const QHash<QString, QString> explanations{
+        {"memory.retrieval.index_enabled", "维护本地片段索引，供词面检索和向量召回使用。"},
+        {"memory.retrieval.auto_backfill", "启用后，在启动或应用配置时从已有记录回填空的索引。"},
+        {"memory.retrieval.candidate_limit", "进入后续排序的候选数量上限，调高可能增加检索耗时。"},
+        {"memory.retrieval.rerank_enabled", "用重排模型对已召回的候选重新评分。"},
+        {"memory.retrieval.rerank_limit", "限制送入重排环节的候选数量。"},
+        {"memory.retrieval.embedding_enabled", "使用向量查找语义相近的文本，启用后后台会补齐缺失向量。"},
+        {"memory.retrieval.embedding_provider", "选择生成向量的服务。本地测试仅用于工程验证。"},
+        {"memory.retrieval.embedding_model", "留空时，百炼使用 text-embedding-v4。"},
+        {"memory.retrieval.embedding_dimension", "向量长度须与服务模型及索引一致。0 使用提供方默认值。"},
+        {"memory.retrieval.embedding_api_key_env", "未配置百炼密钥时，用此名称读取环境变量。填写的是变量名。"},
+        {"memory.retrieval.embedding_endpoint", "可填写完整向量接口地址。留空时从百炼服务地址推导。"},
+        {"memory.retrieval.rerank_endpoint", "可填写完整重排接口地址。留空时从百炼服务地址推导。"},
+        {"memory.agent_mode", "模型工具由对话模型发起补查，独立规划使用单独的检索规划步骤。"},
+        {"memory.agent_protocol", "原生调用使用模型的工具接口，JSON 信封通过结构化正文表达工具调用。"},
+        {"memory.owner_cross_channel_private", "允许在主人私密会话中使用其他私密渠道的个人记忆。"},
+        {"memory.privacy_rules", "添加规则名称、匹配方式、匹配内容及处理方式。匹配支持关键字、原文和正则。处理支持脱敏或拦截。"},
+        {"memory.blind_zones", "逐行填写渠道和会话标识。桌宠会话使用 default，QQ 使用目标账号或群号。"},
+        {"qq.reply.master_any_group", "允许主人在回复群列表之外触发回应。实际触发仍按渠道回复策略判断。"},
+        {"qq.group_memory_mode", "逐群选择严格白名单或群授权，并填写群号。"},
+        {"qq.group_sender_allowlist", "按群填写允许记录的发送者账号。多个账号用空格或逗号分隔。"},
+        {"qq.membership_max_age_minutes", "判断已缓存群成员信息是否过期的时间。"},
+        {"qq.membership_refresh_minutes", "刷新群成员缓存的间隔。0 关闭定时刷新。"},
+        {"tts.mode", "模拟播放只按字数计算节奏。GPT-SoVITS 模式使用合成语音。"},
+        {"tts.prompt_lang", "选择参考音频中实际使用的语言。"},
+        {"proactive.targets", "填写可主动联系的渠道及会话标识，桌宠会话填 default。"},
+        {"proactive.schedule", "可填写 HH:mm 及 fixed（固定）或 random（随机）。当前只保存，定时调度尚未接入。"},
+        {"memory.debug_full_logs", "开启后记录对话正文和模型请求，用于诊断。"},
+    };
+    const auto path = field.path.join('.');
+    QString help = explanations.value(path);
+    if (help.isEmpty() && path.startsWith("memory.recent_group_context."))
+        help = QStringLiteral("控制群聊近期上下文可以纳入模型的范围或数量。");
+    if (help.isEmpty()) return {};
+    if (field.type.startsWith("num:")) {
+        const auto bounds = field.type.split(':');
+        help += QStringLiteral("\n\n可配置范围 %1 至 %2").arg(bounds[1], bounds[2]);
+    } else if (field.type.startsWith("choice:")) {
+        QStringList choices;
+        for (const auto &entry : field.type.mid(7).split('|'))
+            choices.append(entry.section('=', -1));
+        help += QStringLiteral("\n\n可选值 %1").arg(choices.join(QStringLiteral("、")));
+    } else if (field.type == "bool") {
+        help += QStringLiteral("\n\n可选值 开启、关闭");
+    }
+    return help;
+}
 
 QJsonValue readPath(const QJsonObject &object, const QStringList &path)
 {
@@ -477,6 +528,13 @@ PageView buildPage(const Page &page, const std::function<void()> &applied, QWidg
     const auto document = QJsonDocument::fromJson(loaded);
     const bool readable = read && (prompt || loaded.isEmpty() || document.isObject());
     if (document.isObject()) *snapshot = document.object();
+    const auto effective = page.file == "setting.json"
+        ? ConfigManager::instance().effectiveSettings() : QJsonObject{};
+    QString promptText = QString::fromUtf8(loaded);
+    if (prompt && loaded.isEmpty()) {
+        QFile bundled(":/image/default_config/prompt.txt");
+        if (bundled.open(QIODevice::ReadOnly)) promptText = QString::fromUtf8(bundled.readAll());
+    }
     PageView view{panel, std::make_shared<QList<Binding>>(), {}};
 
     for (const auto &group : page.groups) {
@@ -491,15 +549,49 @@ PageView buildPage(const Page &page, const std::function<void()> &applied, QWidg
         form->setVerticalSpacing(12);
         QList<int> indexes;
         for (const auto &field : group.fields) {
-            auto value = prompt ? QJsonValue(QString::fromUtf8(loaded)) : readPath(*snapshot, field.path);
+            const auto configured = readPath(*snapshot, field.path);
+            auto value = prompt ? QJsonValue(promptText) : configured;
+            const auto key = field.path.join('.');
+            const bool derivedEndpoint = key == "memory.retrieval.embedding_endpoint"
+                || key == "memory.retrieval.rerank_endpoint";
+            const auto runtime = readPath(effective, field.path);
+            if (!derivedEndpoint && !runtime.isUndefined() && !runtime.isArray() && !runtime.isObject()
+                && (configured.isUndefined() || configured.type() != runtime.type()))
+                value = runtime;
             if (value.isUndefined()) value = field.fallback;
             auto binding = buildField(field, value, card);
-            binding.row->setObjectName(field.path.join('.'));
+            binding.row->setObjectName(key);
             binding.row->setAccessibleName(field.label);
             binding.label->setBuddy(binding.row);
+            if (derivedEndpoint && value.toString().isEmpty() && !runtime.toString().isEmpty()) {
+                auto *endpoint = qobject_cast<QLineEdit *>(binding.row);
+                endpoint->setPlaceholderText(runtime.toString());
+                endpoint->setToolTip(QStringLiteral("当前自动使用 %1").arg(runtime.toString()));
+            }
             try { binding.initial = binding.value(); }
             catch (const QString &) { binding.initial = value; }
-            form->addRow(binding.label, binding.row);
+            QWidget *label = binding.label;
+            const auto help = settingHelp(field);
+            if (!help.isEmpty()) {
+                label = new QWidget(card);
+                auto *labelLayout = new QHBoxLayout(label);
+                labelLayout->setContentsMargins(0, 0, 0, 0);
+                labelLayout->addWidget(binding.label);
+                auto *button = new QToolButton(label);
+                button->setText(QStringLiteral("?"));
+                button->setAutoRaise(true);
+                button->setAccessibleName(field.label + QStringLiteral("说明"));
+                button->setObjectName(key + ".help");
+                button->setToolTip(QStringLiteral("查看说明和允许的值"));
+                labelLayout->addWidget(button);
+                labelLayout->addStretch();
+                QObject::connect(button, &QToolButton::clicked, card, [card, title = field.label, help] {
+                    QMessageBox box(QMessageBox::Information, title, help, QMessageBox::Ok, card);
+                    box.setTextFormat(Qt::PlainText);
+                    box.exec();
+                });
+            }
+            form->addRow(label, binding.row);
             indexes.append(view.bindings->size());
             view.bindings->append(std::move(binding));
         }
