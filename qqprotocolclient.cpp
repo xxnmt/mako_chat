@@ -23,6 +23,11 @@ QQProtocolClient::QQProtocolClient(QObject *parent)
 
     m_reconnectTimer.setSingleShot(true);
     connect(&m_reconnectTimer, &QTimer::timeout, this, &QQProtocolClient::openSocket);
+    m_pacingTimer.setSingleShot(true);
+    m_pacingTimer.setTimerType(Qt::PreciseTimer);
+    connect(&m_pacingTimer, &QTimer::timeout, this, [this] {
+        if (m_activeSend.isEmpty()) sendNextAction();
+    });
     m_sendTimeout.setSingleShot(true);
     m_sendTimeout.setInterval(30000);
     connect(&m_sendTimeout, &QTimer::timeout, this, [this] {
@@ -65,6 +70,9 @@ void QQProtocolClient::stop()
     m_running = false;
     m_reconnectTimer.stop();
     m_sendTimeout.stop();
+    m_pacingTimer.stop();
+    m_lastSubmission.invalidate();
+    m_lastPlaybackMs = 0;
     m_pendingActions.clear();
     m_sendQueue.clear();
     m_activeSend.clear();
@@ -110,6 +118,9 @@ void QQProtocolClient::onDisconnected()
     }
     m_sendTimeout.stop();
     if (!m_sendQueue.isEmpty()) qWarning() << "[QQ] disconnected; discard queued sends=" << m_sendQueue.size();
+    m_pacingTimer.stop();
+    m_lastSubmission.invalidate();
+    m_lastPlaybackMs = 0;
     m_pendingActions.clear();
     m_sendQueue.clear();
     m_activeSend.clear();
@@ -136,7 +147,7 @@ void QQProtocolClient::scheduleReconnect()
 }
 
 bool QQProtocolClient::sendAction(const QString &action, const QJsonObject &params,
-                                  const QString &echo)
+                                  const QString &echo, int playbackMs)
 {
     if (!isConnected()) {
         qDebug() << "[QQ]动作发送失败（未连接）:" << action;
@@ -147,7 +158,7 @@ bool QQProtocolClient::sendAction(const QString &action, const QJsonObject &para
         : echo;
     if (action.startsWith(QStringLiteral("send_"))) {
         if (m_pendingActions.contains(actualEcho)) return false;
-        m_pendingActions.insert(actualEcho, PendingAction{action, params, 0});
+        m_pendingActions.insert(actualEcho, PendingAction{action, params, 0, false, qMax(0,playbackMs)});
         m_sendQueue.enqueue(actualEcho);
         if (m_sendQueue.size() == 1) sendNextAction();
         return m_pendingActions.contains(actualEcho);
@@ -162,14 +173,26 @@ void QQProtocolClient::sendNextAction()
 {
     if (m_sendQueue.isEmpty()) return;
     const auto echo = m_sendQueue.head();
-    m_activeSend = echo;
     const auto pending = m_pendingActions.value(echo);
+    if (pending.attempts == 0 && m_lastSubmission.isValid()) {
+        const auto remaining = qint64(m_lastPlaybackMs) - m_lastSubmission.elapsed();
+        if (remaining > 0) {
+            qDebug() << "[QQ] sentence pacing remaining_ms=" << remaining << "echo=" << echo;
+            m_pacingTimer.start(int(remaining));
+            return;
+        }
+    }
+    m_pacingTimer.stop();
+    m_activeSend = echo;
     qDebug() << "[QQ] submitting queued action" << pending.action << "echo=" << echo;
     if (!isConnected() || !sendPayload(pending.action,pending.params,echo)) {
         qWarning() << "[QQ] queued action submission failed" << echo;
+        m_lastPlaybackMs = 0;
         finishSendAction();
         return;
     }
+    m_lastSubmission.start();
+    m_lastPlaybackMs = pending.playbackMs;
     m_sendTimeout.start();
 }
 
@@ -242,6 +265,7 @@ void QQProtocolClient::onTextMessageReceived(const QString &message)
                     }
                 });
             } else if (it != m_pendingActions.end()) {
+                m_lastPlaybackMs = 0; // Explicit rejection: there is no text to read.
                 finishSendAction();
             }
         } else if (it != m_pendingActions.end()) {

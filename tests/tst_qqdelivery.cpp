@@ -4,10 +4,46 @@
 #include <QJsonDocument>
 #include "qqchanneladapter.h"
 #include "qqprotocolclient.h"
+#include "textplaybacktiming.h"
 
 class TestQQDelivery : public QObject {
     Q_OBJECT
 private slots:
+    void textPacingAndSlowAcknowledgement() {
+        QCOMPARE(simulatedTextPlaybackMs(""),1000);
+        QCOMPARE(simulatedTextPlaybackMs("12345678"),2000);
+        QWebSocketServer server("pacing-test",QWebSocketServer::NonSecureMode);
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QJsonObject> sends;
+        QList<qint64> times;
+        QElapsedTimer clock;clock.start();
+        QWebSocket *peer=nullptr;
+        connect(&server,&QWebSocketServer::newConnection,&server,[&] {
+            peer=server.nextPendingConnection();peer->setParent(&server);
+            connect(peer,&QWebSocket::textMessageReceived,&server,[&](const QString &text) {
+                const auto obj=QJsonDocument::fromJson(text.toUtf8()).object();
+                if(obj["action"].toString().startsWith("send_")) {sends.append(obj);times.append(clock.elapsed());}
+            });
+        });
+        QQProtocolClient client;QQConfig cfg;cfg.enabled=true;
+        cfg.wsUrl=QString("ws://127.0.0.1:%1").arg(server.serverPort());client.setConfig(cfg);client.start();
+        QTRY_VERIFY(client.isConnected() && peer);
+        QQChannelAdapter adapter;adapter.setClient(&client);
+        Utterance u;u.channel=Channel::kQQPrivate;u.sessionId="12345";u.text="四个文字";
+        QVERIFY(adapter.sendUtterance(u));QVERIFY(adapter.sendUtterance(u));QVERIFY(adapter.sendUtterance(u));
+        QTRY_COMPARE(sends.size(),1);
+        auto ack=[&](int i) {peer->sendTextMessage(QString::fromUtf8(QJsonDocument(QJsonObject{
+            {"echo",sends[i]["echo"]},{"status","ok"},{"retcode",0}}).toJson()));};
+        ack(0);QTest::qWait(350);QCOMPARE(sends.size(),1);
+        QTRY_COMPARE_WITH_TIMEOUT(sends.size(),2,2000);
+        QVERIFY(times[1]-times[0]>=950);
+        QTest::qWait(1100);QCOMPARE(sends.size(),2); // Clock alone cannot advance without receipt.
+        const auto ackAt=clock.elapsed();ack(1);
+        QTRY_COMPARE_WITH_TIMEOUT(sends.size(),3,700);
+        QVERIFY(times[2]-ackAt<700); // Slow receipt does not add a second full delay.
+        QVERIFY(adapter.sendUtterance(u));ack(2);QTest::qWait(100);
+        client.stop();QTest::qWait(1100);QCOMPARE(sends.size(),3);
+    }
     void orderedSentences_data() {
         QTest::addColumn<QString>("channel");
         QTest::newRow("private") << Channel::kQQPrivate;

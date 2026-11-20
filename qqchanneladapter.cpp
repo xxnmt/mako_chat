@@ -1,6 +1,7 @@
 #include "qqchanneladapter.h"
 #include "debuglog.h"
 #include "qqprotocolclient.h"
+#include "textplaybacktiming.h"
 
 #include <QJsonArray>
 #include <QJsonObject>
@@ -58,7 +59,7 @@ bool QQChannelAdapter::sendUtterance(const Utterance &u)
 
     params["message"] = buildTextMessage(u.text);
     // 群聊场景可带 auto_escape，保持纯文本
-    if (!m_client->sendAction(action, params)) return false;
+    if (!m_client->sendAction(action, params, {}, simulatedTextPlaybackMs(u.text))) return false;
     qDebug() << "[QQChannel]已接受发送请求（非送达确认）:" << u.channel << u.sessionId
              << "chars=" << u.text.size();
     if (debugFullLogsEnabled()) {

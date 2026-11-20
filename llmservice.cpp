@@ -815,11 +815,6 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
              << "systemLen=" << finalSystemPrompt.size()
              << "memoryData=" << !memoryData.isEmpty()
              << "userLen=" << enhancedInput.size();
-    if (debugFullLogsEnabled()) {
-        qDebug().noquote() << "[LLM][debug] messages:"
-                           << QString::fromUtf8(
-                                  QJsonDocument(messagesArray).toJson(QJsonDocument::Indented));
-    }
 
     if (!m_run.consultedKeys.isEmpty()) {
         m_run.beforeConsultation = m_run.evidence;
@@ -965,6 +960,10 @@ void LLMService::sendChatRequest(const QJsonArray &messages,
 
     request.setTransferTimeout(120000);
     m_lastRequestMessages = requestMessages;
+    if (debugFullLogsEnabled()) {
+        qDebug().noquote() << "[LLM][debug] messages:"
+                           << QString::fromUtf8(QJsonDocument(requestMessages).toJson(QJsonDocument::Indented));
+    }
     auto *reply = m_networkManager->post(request, QJsonDocument(rootObj).toJson());
     if (!m_run.consultedKeys.isEmpty()) m_consultationReply = reply;
     reply->setProperty("runId", m_run.meta.runId);

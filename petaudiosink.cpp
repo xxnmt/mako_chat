@@ -1,4 +1,5 @@
 #include "petaudiosink.h"
+#include "textplaybacktiming.h"
 
 #include <QDebug>
 
@@ -143,7 +144,7 @@ void PetAudioSink::processPlayQueue()
     if (item.audioPath.isEmpty()) {
         // MockTTSProvider：按日文字数模拟播放时长
         m_mockSampleRate = 24000;
-        int playDuration = qMax(1000, item.sentence.jaText.length() * 250);
+        int playDuration = simulatedTextPlaybackMs(item.sentence.jaText);
         emit sentenceStarted(item.sentence);
         qDebug() << "[PetAudio]模拟播放:" << item.sentence.zhText << playDuration << "ms";
         m_mockTimer->start(playDuration);

@@ -8,6 +8,7 @@
 #include <QJsonValue>
 #include <QHash>
 #include <QQueue>
+#include <QElapsedTimer>
 
 #include "configmanager.h"
 
@@ -27,7 +28,7 @@ public:
 
     // 发送 OneBot 动作（唯一 echo）。send_* 按回执串行；true 表示接受提交/入队，非送达证明。
     bool sendAction(const QString &action, const QJsonObject &params = QJsonObject(),
-                    const QString &echo = QString());
+                    const QString &echo = QString(), int playbackMs = 0);
 
 signals:
     void connected();
@@ -62,11 +63,15 @@ private:
         QJsonObject params;
         int attempts = 0;
         bool waitingRetry = false;
+        int playbackMs = 0;
     };
     QHash<QString, PendingAction> m_pendingActions;
     QQueue<QString> m_sendQueue;
     QTimer m_sendTimeout;
     QString m_activeSend;
+    QTimer m_pacingTimer;
+    QElapsedTimer m_lastSubmission;
+    int m_lastPlaybackMs = 0;
 };
 
 #endif // QQPROTOCOLCLIENT_H
