@@ -1,0 +1,91 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+  <class>SettingsWidget</class>
+  <widget class="QWidget" name="SettingsWidget">
+    <property name="geometry">
+      <rect>
+        <x>0</x>
+        <y>0</y>
+        <width>611</width>
+        <height>953</height>
+      </rect>
+    </property>
+    <property name="windowTitle">
+      <string>Form</string>
+    </property>
+    <layout class="QVBoxLayout" name="horizontalLayout">
+      <item>
+        <widget class="QWidget" name="section1_historyTurn" native="true">
+          <layout class="QVBoxLayout" name="verticalLayout_9">
+            <item>
+              <widget class="QLabel" name="label_26">
+                <property name="text">
+                  <string>历史会话记录</string>
+                </property>
+              </widget>
+            </item>
+            <item>
+              <widget class="QWidget" name="widget_29" native="true">
+                <layout class="QVBoxLayout" name="verticalLayout_10">
+                  <item>
+                    <widget class="QTableView" name="tableView_historyTurn">
+                      <property name="minimumSize">
+                        <size>
+                          <width>0</width>
+                          <height>300</height>
+                        </size>
+                      </property>
+                    </widget>
+                  </item>
+                </layout>
+              </widget>
+            </item>
+            <item>
+              <widget class="QWidget" name="widget_28" native="true">
+                <layout class="QHBoxLayout" name="horizontalLayout_24">
+                  <item>
+                    <widget class="QPushButton" name="btn_deleteSelectedMemory">
+                      <property name="text">
+                        <string>清除已选</string>
+                      </property>
+                    </widget>
+                  </item>
+                  <item>
+                    <widget class="QPushButton" name="btn_claenAllMemory">
+                      <property name="text">
+                        <string>清除全部记录</string>
+                      </property>
+                    </widget>
+                  </item>
+                  <item>
+                    <widget class="QPushButton" name="btn_previousMemoryPage">
+                      <property name="text">
+                        <string>上一页</string>
+                      </property>
+                    </widget>
+                  </item>
+                  <item>
+                    <widget class="QLabel" name="label_MemoryPage">
+                      <property name="text">
+                        <string>TextLabel</string>
+                      </property>
+                    </widget>
+                  </item>
+                  <item>
+                    <widget class="QPushButton" name="btn_nextMemoryPage">
+                      <property name="text">
+                        <string>下一页</string>
+                      </property>
+                    </widget>
+                  </item>
+                </layout>
+              </widget>
+            </item>
+          </layout>
+        </widget>
+      </item>
+    </layout>
+  </widget>
+  <resources />
+  <connections />
+</ui>

@@ -4,21 +4,21 @@
 qt6_add_resources(CALENDAR_RESOURCES ${PROJECT_SOURCE_DIR}/calendar.qrc)
 
 set(PHASE0_CORE_SOURCES
-    ${PROJECT_SOURCE_DIR}/memorymanager.h
-    ${PROJECT_SOURCE_DIR}/memorymanager.cpp
-    ${PROJECT_SOURCE_DIR}/matterstore.cpp
-    ${PROJECT_SOURCE_DIR}/configmanager.h
-    ${PROJECT_SOURCE_DIR}/configmanager.cpp
-    ${PROJECT_SOURCE_DIR}/memorypolicy.h
-    ${PROJECT_SOURCE_DIR}/memorypolicy.cpp
-    ${PROJECT_SOURCE_DIR}/qqreplypolicy.h
-    ${PROJECT_SOURCE_DIR}/qqreplypolicy.cpp
-    ${PROJECT_SOURCE_DIR}/recentcontext.h
-    ${PROJECT_SOURCE_DIR}/recentcontext.cpp
-    ${PROJECT_SOURCE_DIR}/qqmessageparser.h
-    ${PROJECT_SOURCE_DIR}/qqmessageparser.cpp
-    ${PROJECT_SOURCE_DIR}/sessionrouter.h
-    ${PROJECT_SOURCE_DIR}/sessionrouter.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memorymanager.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memorymanager.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/matterstore.cpp
+    ${PROJECT_SOURCE_DIR}/src/config/configmanager.h
+    ${PROJECT_SOURCE_DIR}/src/config/configmanager.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memorypolicy.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memorypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqreplypolicy.h
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqreplypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/recentcontext.h
+    ${PROJECT_SOURCE_DIR}/src/memory/recentcontext.cpp
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.h
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.cpp
+    ${PROJECT_SOURCE_DIR}/src/app/sessionrouter.h
+    ${PROJECT_SOURCE_DIR}/src/app/sessionrouter.cpp
 )
 
 # ctest 直接运行 exe 时需能找到 Qt 与 MinGW 运行库
@@ -31,7 +31,7 @@ string(REPLACE ";" "\\;" _test_path_escaped "${_test_path}")
 
 function(add_phase0_test name)
     qt_add_executable(${name} ${ARGN})
-    target_include_directories(${name} PRIVATE ${PROJECT_SOURCE_DIR})
+    target_include_directories(${name} PRIVATE ${MAKO_INCLUDE_DIRS})
     target_link_libraries(${name} PRIVATE Qt6::Core Qt6::Sql Qt6::Test)
     set_target_properties(${name} PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
@@ -45,164 +45,164 @@ endfunction()
 
 add_phase0_test(tst_memorymanager
     tst_memorymanager.cpp
-    ${PROJECT_SOURCE_DIR}/benchmarksnapshot.cpp
-    ${PROJECT_SOURCE_DIR}/configmanager.cpp
-    ${PROJECT_SOURCE_DIR}/memorypolicy.cpp
-    ${PROJECT_SOURCE_DIR}/qqreplypolicy.cpp
-    ${PROJECT_SOURCE_DIR}/memorymanager.h
-    ${PROJECT_SOURCE_DIR}/memorymanager.cpp
-    ${PROJECT_SOURCE_DIR}/memoryevidence.h
-    ${PROJECT_SOURCE_DIR}/memoryevidence.cpp
-    ${PROJECT_SOURCE_DIR}/memoryretrieval.h
-    ${PROJECT_SOURCE_DIR}/memoryretrieval.cpp
-    ${PROJECT_SOURCE_DIR}/memoryembedding.h
-    ${PROJECT_SOURCE_DIR}/memoryembedding.cpp
-    ${PROJECT_SOURCE_DIR}/memorydashscope.h
-    ${PROJECT_SOURCE_DIR}/memorydashscope.cpp
-    ${PROJECT_SOURCE_DIR}/memoryindexworker.h
-    ${PROJECT_SOURCE_DIR}/memoryindexworker.cpp
-    ${PROJECT_SOURCE_DIR}/matterstore.cpp
-    ${PROJECT_SOURCE_DIR}/recentcontext.h
-    ${PROJECT_SOURCE_DIR}/recentcontext.cpp
-    ${PROJECT_SOURCE_DIR}/qqmessageparser.h
-    ${PROJECT_SOURCE_DIR}/qqmessageparser.cpp
+    ${PROJECT_SOURCE_DIR}/src/benchmark/benchmarksnapshot.cpp
+    ${PROJECT_SOURCE_DIR}/src/config/configmanager.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memorypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqreplypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memorymanager.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memorymanager.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryevidence.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryevidence.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryretrieval.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryretrieval.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryembedding.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryembedding.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memorydashscope.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memorydashscope.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryindexworker.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryindexworker.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/matterstore.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/recentcontext.h
+    ${PROJECT_SOURCE_DIR}/src/memory/recentcontext.cpp
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.h
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.cpp
 )
 target_link_libraries(tst_memorymanager PRIVATE Qt6::Network)
 
 add_phase0_test(tst_configmanager
     tst_configmanager.cpp
-    ${PROJECT_SOURCE_DIR}/configmanager.h
-    ${PROJECT_SOURCE_DIR}/configmanager.cpp
-    ${PROJECT_SOURCE_DIR}/memorypolicy.h
-    ${PROJECT_SOURCE_DIR}/memorypolicy.cpp
-    ${PROJECT_SOURCE_DIR}/qqreplypolicy.h
-    ${PROJECT_SOURCE_DIR}/qqreplypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/src/config/configmanager.h
+    ${PROJECT_SOURCE_DIR}/src/config/configmanager.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memorypolicy.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memorypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqreplypolicy.h
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqreplypolicy.cpp
 )
 
 add_phase0_test(tst_memorypolicy
     tst_memorypolicy.cpp
-    ${PROJECT_SOURCE_DIR}/memorypolicy.h
-    ${PROJECT_SOURCE_DIR}/memorypolicy.cpp
-    ${PROJECT_SOURCE_DIR}/qqreplypolicy.h
-    ${PROJECT_SOURCE_DIR}/qqreplypolicy.cpp
-    ${PROJECT_SOURCE_DIR}/qqmessageparser.h
-    ${PROJECT_SOURCE_DIR}/qqmessageparser.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memorypolicy.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memorypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqreplypolicy.h
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqreplypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.h
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.cpp
 )
 
 add_phase0_test(tst_recentcontext
     tst_recentcontext.cpp
-    ${PROJECT_SOURCE_DIR}/recentcontext.h
-    ${PROJECT_SOURCE_DIR}/recentcontext.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/recentcontext.h
+    ${PROJECT_SOURCE_DIR}/src/memory/recentcontext.cpp
 )
 
 add_phase0_test(tst_memorytextutils
     tst_memorytextutils.cpp
-    ${PROJECT_SOURCE_DIR}/memorytextutils.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memorytextutils.h
 )
 
 add_phase0_test(tst_memoryaccesspolicy
     tst_memoryaccesspolicy.cpp
-    ${PROJECT_SOURCE_DIR}/memoryaccesspolicy.h
-    ${PROJECT_SOURCE_DIR}/memoryaccesspolicy.cpp
-    ${PROJECT_SOURCE_DIR}/historyturn.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryaccesspolicy.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryaccesspolicy.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/historyturn.h
 )
 
 add_phase0_test(tst_groupmembership
     tst_groupmembership.cpp
-    ${PROJECT_SOURCE_DIR}/groupmembershipservice.h
-    ${PROJECT_SOURCE_DIR}/groupmembershipservice.cpp
-    ${PROJECT_SOURCE_DIR}/qqprotocolclient.h
-    ${PROJECT_SOURCE_DIR}/qqprotocolclient.cpp
-    ${PROJECT_SOURCE_DIR}/memorymanager.h
-    ${PROJECT_SOURCE_DIR}/memorymanager.cpp
-    ${PROJECT_SOURCE_DIR}/matterstore.cpp
-    ${PROJECT_SOURCE_DIR}/recentcontext.h
-    ${PROJECT_SOURCE_DIR}/recentcontext.cpp
-    ${PROJECT_SOURCE_DIR}/qqmessageparser.h
-    ${PROJECT_SOURCE_DIR}/qqmessageparser.cpp
-    ${PROJECT_SOURCE_DIR}/configmanager.h
-    ${PROJECT_SOURCE_DIR}/configmanager.cpp
-    ${PROJECT_SOURCE_DIR}/memorypolicy.h
-    ${PROJECT_SOURCE_DIR}/memorypolicy.cpp
-    ${PROJECT_SOURCE_DIR}/qqreplypolicy.h
-    ${PROJECT_SOURCE_DIR}/qqreplypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/groupmembershipservice.h
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/groupmembershipservice.cpp
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqprotocolclient.h
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqprotocolclient.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memorymanager.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memorymanager.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/matterstore.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/recentcontext.h
+    ${PROJECT_SOURCE_DIR}/src/memory/recentcontext.cpp
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.h
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.cpp
+    ${PROJECT_SOURCE_DIR}/src/config/configmanager.h
+    ${PROJECT_SOURCE_DIR}/src/config/configmanager.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memorypolicy.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memorypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqreplypolicy.h
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqreplypolicy.cpp
 )
 target_link_libraries(tst_groupmembership PRIVATE Qt6::WebSockets Qt6::Network)
 
 add_phase0_test(tst_memoryagent
-    ${PROJECT_SOURCE_DIR}/cognitivecoordinator.cpp
+    ${PROJECT_SOURCE_DIR}/src/app/cognitivecoordinator.cpp
     tst_memoryagent.cpp
-    ${PROJECT_SOURCE_DIR}/llmservice.cpp
-    ${PROJECT_SOURCE_DIR}/memoryoutputguard.cpp
-    ${PROJECT_SOURCE_DIR}/configmanager.cpp
-    ${PROJECT_SOURCE_DIR}/promptassembler.cpp
-    ${PROJECT_SOURCE_DIR}/memoryevidence.cpp
-    ${PROJECT_SOURCE_DIR}/memoryretrieval.cpp
-    ${PROJECT_SOURCE_DIR}/memoryretrievalworker.cpp
-    ${PROJECT_SOURCE_DIR}/memoryembedding.cpp
-    ${PROJECT_SOURCE_DIR}/memorydashscope.cpp
+    ${PROJECT_SOURCE_DIR}/src/cognition/llmservice.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryoutputguard.cpp
+    ${PROJECT_SOURCE_DIR}/src/config/configmanager.cpp
+    ${PROJECT_SOURCE_DIR}/src/cognition/promptassembler.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryevidence.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryretrieval.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryretrievalworker.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryembedding.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memorydashscope.cpp
     ${CALENDAR_RESOURCES}
-    ${PROJECT_SOURCE_DIR}/memoryagenttypes.h
-    ${PROJECT_SOURCE_DIR}/memoryagent.h
-    ${PROJECT_SOURCE_DIR}/memoryagent.cpp
-    ${PROJECT_SOURCE_DIR}/memoryresultjson.h
-    ${PROJECT_SOURCE_DIR}/memoryresultjson.cpp
-    ${PROJECT_SOURCE_DIR}/memoryrecalltool.h
-    ${PROJECT_SOURCE_DIR}/memoryrecalltool.cpp
-    ${PROJECT_SOURCE_DIR}/memoryrecalltypes.h
-    ${PROJECT_SOURCE_DIR}/memoryrecalltypes.cpp
-    ${PROJECT_SOURCE_DIR}/memorytimeframe.h
-    ${PROJECT_SOURCE_DIR}/memorytimeframe.cpp
-    ${PROJECT_SOURCE_DIR}/festivalcalendar.h
-    ${PROJECT_SOURCE_DIR}/festivalcalendar.cpp
-    ${PROJECT_SOURCE_DIR}/timeframeresolver.h
-    ${PROJECT_SOURCE_DIR}/timeframeresolver.cpp
-    ${PROJECT_SOURCE_DIR}/memorysourcepolicy.h
-    ${PROJECT_SOURCE_DIR}/memorysourcepolicy.cpp
-    ${PROJECT_SOURCE_DIR}/memoryoverview.h
-    ${PROJECT_SOURCE_DIR}/memoryoverview.cpp
-    ${PROJECT_SOURCE_DIR}/memorytimeresolver.h
-    ${PROJECT_SOURCE_DIR}/memorytimeresolver.cpp
-    ${PROJECT_SOURCE_DIR}/memoryexecutor.h
-    ${PROJECT_SOURCE_DIR}/memoryexecutor.cpp
-    ${PROJECT_SOURCE_DIR}/memorymanager.h
-    ${PROJECT_SOURCE_DIR}/memorymanager.cpp
-    ${PROJECT_SOURCE_DIR}/matterstore.cpp
-    ${PROJECT_SOURCE_DIR}/memoryaccesspolicy.h
-    ${PROJECT_SOURCE_DIR}/memoryaccesspolicy.cpp
-    ${PROJECT_SOURCE_DIR}/memorytimerange.h
-    ${PROJECT_SOURCE_DIR}/memorytimerange.cpp
-    ${PROJECT_SOURCE_DIR}/recentcontext.h
-    ${PROJECT_SOURCE_DIR}/recentcontext.cpp
-    ${PROJECT_SOURCE_DIR}/memorytextutils.h
-    ${PROJECT_SOURCE_DIR}/memorypolicy.h
-    ${PROJECT_SOURCE_DIR}/memorypolicy.cpp
-    ${PROJECT_SOURCE_DIR}/qqreplypolicy.h
-    ${PROJECT_SOURCE_DIR}/qqreplypolicy.cpp
-    ${PROJECT_SOURCE_DIR}/qqmessageparser.h
-    ${PROJECT_SOURCE_DIR}/qqmessageparser.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryagenttypes.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryagent.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryagent.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryresultjson.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryresultjson.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryrecalltool.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryrecalltool.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryrecalltypes.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryrecalltypes.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memorytimeframe.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memorytimeframe.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/festivalcalendar.h
+    ${PROJECT_SOURCE_DIR}/src/memory/festivalcalendar.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/timeframeresolver.h
+    ${PROJECT_SOURCE_DIR}/src/memory/timeframeresolver.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memorysourcepolicy.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memorysourcepolicy.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryoverview.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryoverview.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memorytimeresolver.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memorytimeresolver.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryexecutor.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryexecutor.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memorymanager.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memorymanager.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/matterstore.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryaccesspolicy.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryaccesspolicy.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memorytimerange.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memorytimerange.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/recentcontext.h
+    ${PROJECT_SOURCE_DIR}/src/memory/recentcontext.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memorytextutils.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memorypolicy.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memorypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqreplypolicy.h
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqreplypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.h
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.cpp
 )
 target_link_libraries(tst_memoryagent PRIVATE Qt6::Network)
 
 add_phase0_test(tst_interactionsegmenter
     tst_interactionsegmenter.cpp
-    ${PROJECT_SOURCE_DIR}/interactionsegmenter.h
-    ${PROJECT_SOURCE_DIR}/interactionsegmenter.cpp
-    ${PROJECT_SOURCE_DIR}/memorypolicy.h
-    ${PROJECT_SOURCE_DIR}/qqmessageparser.h
-    ${PROJECT_SOURCE_DIR}/qqmessageparser.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/interactionsegmenter.h
+    ${PROJECT_SOURCE_DIR}/src/memory/interactionsegmenter.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memorypolicy.h
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.h
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.cpp
 )
 
 add_phase0_test(tst_memoryoutputguard
     tst_memoryoutputguard.cpp
-    ${PROJECT_SOURCE_DIR}/memoryoutputguard.h
-    ${PROJECT_SOURCE_DIR}/memoryoutputguard.cpp
-    ${PROJECT_SOURCE_DIR}/memorypolicy.h
-    ${PROJECT_SOURCE_DIR}/memorypolicy.cpp
-    ${PROJECT_SOURCE_DIR}/qqreplypolicy.h
-    ${PROJECT_SOURCE_DIR}/qqreplypolicy.cpp
-    ${PROJECT_SOURCE_DIR}/qqmessageparser.h
-    ${PROJECT_SOURCE_DIR}/qqmessageparser.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryoutputguard.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryoutputguard.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memorypolicy.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memorypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqreplypolicy.h
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqreplypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.h
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.cpp
 )
 
 add_phase0_test(tst_sessionrouter
@@ -212,58 +212,71 @@ add_phase0_test(tst_sessionrouter
 
 add_phase0_test(tst_promptassembler
     tst_promptassembler.cpp
-    ${PROJECT_SOURCE_DIR}/promptassembler.h
-    ${PROJECT_SOURCE_DIR}/promptassembler.cpp
-    ${PROJECT_SOURCE_DIR}/memoryevidence.h
-    ${PROJECT_SOURCE_DIR}/memoryevidence.cpp
-    ${PROJECT_SOURCE_DIR}/memoryrecalltypes.h
-    ${PROJECT_SOURCE_DIR}/memoryrecalltypes.cpp
-    ${PROJECT_SOURCE_DIR}/memorytimeframe.h
-    ${PROJECT_SOURCE_DIR}/memorytimeframe.cpp
-    ${PROJECT_SOURCE_DIR}/memoryresultjson.h
-    ${PROJECT_SOURCE_DIR}/memoryresultjson.cpp
+    ${PROJECT_SOURCE_DIR}/src/cognition/promptassembler.h
+    ${PROJECT_SOURCE_DIR}/src/cognition/promptassembler.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryevidence.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryevidence.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryrecalltypes.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryrecalltypes.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memorytimeframe.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memorytimeframe.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryresultjson.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryresultjson.cpp
 )
 
 add_phase0_test(tst_qqreplypolicy
     tst_qqreplypolicy.cpp
-    ${PROJECT_SOURCE_DIR}/qqreplypolicy.h
-    ${PROJECT_SOURCE_DIR}/qqreplypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqreplypolicy.h
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqreplypolicy.cpp
 )
 
 add_phase0_test(tst_qqmessageparser
     tst_qqmessageparser.cpp
-    ${PROJECT_SOURCE_DIR}/qqmessageparser.h
-    ${PROJECT_SOURCE_DIR}/qqmessageparser.cpp
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.h
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.cpp
 )
 
 add_phase0_test(tst_globalmoodstate
     tst_globalmoodstate.cpp
-    ${PROJECT_SOURCE_DIR}/globalmoodstate.h
-    ${PROJECT_SOURCE_DIR}/globalmoodstate.cpp
+    ${PROJECT_SOURCE_DIR}/src/ui/globalmoodstate.h
+    ${PROJECT_SOURCE_DIR}/src/ui/globalmoodstate.cpp
 )
 add_phase0_test(tst_ttslifecycle
     tst_ttslifecycle.cpp
-    ${PROJECT_SOURCE_DIR}/ttsservice.cpp
-    ${PROJECT_SOURCE_DIR}/ttsprocessmanager.cpp
-    ${PROJECT_SOURCE_DIR}/mockttsprovider.cpp
-    ${PROJECT_SOURCE_DIR}/apittsprovider.cpp
-    ${PROJECT_SOURCE_DIR}/ttsreferencemanager.cpp
-    ${PROJECT_SOURCE_DIR}/ittsprovider.h
-    ${PROJECT_SOURCE_DIR}/iaudiosink.h
-    ${PROJECT_SOURCE_DIR}/configmanager.cpp
-    ${PROJECT_SOURCE_DIR}/memorypolicy.cpp
-    ${PROJECT_SOURCE_DIR}/qqreplypolicy.cpp
-    ${PROJECT_SOURCE_DIR}/qqmessageparser.cpp
+    ${PROJECT_SOURCE_DIR}/src/audio/ttsservice.cpp
+    ${PROJECT_SOURCE_DIR}/src/audio/ttsprocessmanager.cpp
+    ${PROJECT_SOURCE_DIR}/src/audio/mockttsprovider.cpp
+    ${PROJECT_SOURCE_DIR}/src/audio/apittsprovider.cpp
+    ${PROJECT_SOURCE_DIR}/src/audio/ttsreferencemanager.cpp
+    ${PROJECT_SOURCE_DIR}/src/audio/ittsprovider.h
+    ${PROJECT_SOURCE_DIR}/src/audio/iaudiosink.h
+    ${PROJECT_SOURCE_DIR}/src/config/configmanager.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memorypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqreplypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.cpp
 )
 target_link_libraries(tst_ttslifecycle PRIVATE Qt6::Network)
 
 add_phase0_test(tst_qqdelivery
     tst_qqdelivery.cpp
-    ${PROJECT_SOURCE_DIR}/qqchanneladapter.cpp
-    ${PROJECT_SOURCE_DIR}/qqprotocolclient.cpp
-    ${PROJECT_SOURCE_DIR}/configmanager.cpp
-    ${PROJECT_SOURCE_DIR}/memorypolicy.cpp
-    ${PROJECT_SOURCE_DIR}/qqreplypolicy.cpp
-    ${PROJECT_SOURCE_DIR}/qqmessageparser.cpp
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqchanneladapter.cpp
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqprotocolclient.cpp
+    ${PROJECT_SOURCE_DIR}/src/config/configmanager.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memorypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqreplypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.cpp
 )
 target_link_libraries(tst_qqdelivery PRIVATE Qt6::Network Qt6::WebSockets)
+
+add_phase0_test(tst_settingspages
+    tst_settingspages.cpp
+    ${PROJECT_SOURCE_DIR}/src/ui/settingspages.cpp
+    ${PROJECT_SOURCE_DIR}/src/config/configmanager.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memorypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqreplypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.cpp
+)
+target_link_libraries(tst_settingspages PRIVATE Qt6::Widgets)
+set_target_properties(tst_settingspages PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests/settings-ui")
+set_property(TEST tst_settingspages APPEND PROPERTY ENVIRONMENT "QT_QPA_PLATFORM=offscreen")

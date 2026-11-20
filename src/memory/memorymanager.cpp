@@ -3510,17 +3510,22 @@ bool MemoryManager::closeGroupMembershipPeriod(const QString &groupId,
     return true;
 }
 
-void MemoryManager::seedIdentity(const QStringList &masterUserIds)
+void MemoryManager::updateMasterAccounts(const QStringList &masterUserIds)
 {
-    if (!m_db.isOpen() && !m_db.open()) {
-        return;
-    }
     m_masterUserIds.clear();
     for (const QString &id : masterUserIds) {
         if (!id.isEmpty()) {
             m_masterUserIds.insert(id);
         }
     }
+}
+
+void MemoryManager::seedIdentity(const QStringList &masterUserIds)
+{
+    if (!m_db.isOpen() && !m_db.open()) {
+        return;
+    }
+    updateMasterAccounts(masterUserIds);
     ensurePerson(QStringLiteral("owner"), QStringLiteral("owner"),
                  QStringLiteral("欧尼酱"));
 

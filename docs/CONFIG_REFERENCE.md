@@ -1,7 +1,6 @@
 # 配置参考：setting.json / identity.json
 
-> 源码基准为 P5 工程验收工作树，记忆库 v16。
-> 更新于 2026-11-15。
+> 记忆库结构版本为 v17。
 > 关联：[README](../README.md)、[ARCHITECTURE](ARCHITECTURE.md)、[STATUS](STATUS.md)
 
 > 2026-11-08 补充：当前请求串行化、跨渠道候选和空闲回顾已接入，仍存在真实对话更正丢失。实现与限制见 [连续性现状](ARCHITECTURE.md)，下一阶段见 [开发任务](ROADMAP.md)。下文 R3 授权描述适用于既有披露工具路径，不能覆盖新增内部证据路径。
@@ -11,8 +10,8 @@
 ## 0. 先读这几条
 
 1. `setting.json` 和 `identity.json` 都是**标准 JSON**，不支持 `//`、`/* */` 注释，也不支持尾随逗号。
-2. `setting.json` 由 `ConfigManager::saveSetting()` 按固定字段重写；即使手工加入注释或未知字段，设置界面保存后也会丢失。
-3. 大部分配置在**启动时加载**；修改后请重启应用。`identity.json` 支持 `reloadIdentity()`，普通用户仍建议重启。
+2. 普通设置保存会更新程序管理的字段，并保留其他配置扩展。
+3. 在设置中心的对应页面点击「保存并应用」后，应用更新运行时设置。
 4. 不要把 `deepseek_api_key`、QQ `access_token`、真实 QQ 号提交到 git。
 5. 本文只描述当前代码实际读取的字段；未列出的字段不会生效。
 
@@ -305,7 +304,7 @@ app_data/config/identity.json
 | `identity.master.qq` | `[]` | 主人 QQ 列表；全部归一为 `subject='user'` / `person_id='owner'` |
 | `memory.blind_zones` | `[]` | 不入长期记忆的渠道/会话；元素为 `{channel, session_id}` |
 | `memory.retrieval.index_enabled` | `true` | 启用 raw/chat 检索块。结构化来源直接读取原表 |
-| `memory.retrieval.auto_backfill` | `false` | 控制启动时是否从原始记录重建空的片段索引。已有片段的自动向量化由 `index_enabled` 和 `embedding_enabled` 控制。 |
+| `memory.retrieval.auto_backfill` | `false` | 控制启动或应用配置时是否从原始记录回填空的片段索引。已有片段的自动向量化由 `index_enabled` 和 `embedding_enabled` 控制。 |
 | `memory.retrieval.legacy_fallback` | 已撤销 | 旧字段会被忽略，下次保存时移除 |
 | `memory.retrieval.candidate_limit` | `40` | 每路候选上限 |
 | `memory.retrieval.rerank_limit` | `10` | 重排后上限，最终还受请求条数限制 |
@@ -379,3 +378,12 @@ app_data/config/identity.json
 - 身份未生效：检查 `identity.json` 的 `self/master` QQ 是否为字符串；启动日志应出现 `identity.json 加载完成: self N 个 / master N 个`。
 - 群成员快照不更新：检查 `qq.enabled`、`ws_url`、`membership_refresh_minutes`，以及日志中的 `[Membership]` 快照成功/失败。
 - 群记忆不生效：检查 `group_memory_enabled`、`group_memory_allow`、群模式与 sender allowlist；注意 `group_authorized` 只放宽记录，不放宽回复。
+## 设置中心热更新
+
+设置中心提供分类导航和搜索。配置通过开关、选择框、数字与时间控件、文件选择器和可增删的规则表编辑。角色设定使用专用文本区。每页保存时以磁盘最新内容为基准，仅应用本页修改的字段，并使用原子替换保留其他扩展项。同一个字段若已被外部修改，重新打开设置后可继续编辑。
+
+- API、记忆与身份策略用于后续请求，提示词在下次组装模型请求时读取。
+- QQ 地址、令牌或启用状态变化触发连接重配，成员刷新计时器同步更新。
+- 索引后台任务在下一批使用新的配置。空库回填按索引和回填开关决定。
+- 身份变更更新后续身份解析。已有历史记录的身份补录仍在启动流程中处理。
+- TTS、桌宠情绪跟随和时间设置通过运行时服务应用。模型端点及凭据需由使用者配置为可用值。

@@ -41,6 +41,8 @@ void GroupMembershipService::start()
         ConfigManager::instance().getQQGroupMemoryConfig();
     if (groups.membershipRefreshMinutes > 0) {
         m_refreshTimer->start(groups.membershipRefreshMinutes * 60 * 1000);
+    } else {
+        m_refreshTimer->stop();
     }
 }
 

@@ -6,6 +6,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QTime>
+#include <QScopeGuard>
 
 #include "configmanager.h"
 #include "debuglog.h"
@@ -80,6 +81,40 @@ private slots:
     {
         QFile::remove(m_identityPath);
         QFile::remove(m_configDir + "/setting.json");
+    }
+
+    void editorAppliesSettingsAndPreservesOptions()
+    {
+        auto &config = ConfigManager::instance();
+        const auto path = config.getConfigFilePath();
+        QFile previous(path);
+        const bool existed = previous.exists();
+        QByteArray original;
+        if (existed) {
+            QVERIFY(previous.open(QIODevice::ReadOnly));
+            original = previous.readAll();
+            previous.close();
+        }
+        const auto restore = qScopeGuard([&] {
+            if (existed) config.writeConfigDocument("setting.json", original, nullptr);
+            else QFile::remove(path);
+        });
+        const QByteArray contents = R"({"memory":{"short_term_length":25,"retrieval":{"rerank_enabled":false,"future_option":7}},"extra":{"enabled":true}})";
+        QString error;
+        QVERIFY2(config.writeConfigDocument("setting.json", contents, &error), qPrintable(error));
+        QCOMPARE(config.getShortMemoryLength(), 25);
+        QVERIFY(!config.getMemoryPolicyConfig().retrieval.rerankEnabled);
+        QVERIFY(!config.writeConfigDocument("setting.json", R"({"memory":{"retrieval":[]}})", &error));
+        QFile saved(path);
+        QVERIFY(saved.open(QIODevice::ReadOnly));
+        QCOMPARE(saved.readAll(), contents);
+        saved.close();
+        config.setShortMemoryLength(26);
+        QVERIFY(config.saveSetting());
+        QVERIFY(saved.open(QIODevice::ReadOnly));
+        const auto root = QJsonDocument::fromJson(saved.readAll()).object();
+        QCOMPARE(root["memory"].toObject()["retrieval"].toObject()["future_option"].toInt(), 7);
+        QVERIFY(root["extra"].toObject()["enabled"].toBool());
     }
 
     void parsesQQAccountLists()

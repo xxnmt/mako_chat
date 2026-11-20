@@ -8,13 +8,12 @@
 #include <memory>
 
 MemoryIndexWorker::MemoryIndexWorker(MemoryManager &memory, const MemoryRetrievalConfig &config)
-    : QThread(&memory), m_path(memory.databasePath()), m_config(config),
-      m_rebuild(config.indexEnabled && config.autoBackfill && memory.memoryChunkCount() == 0)
+    : QThread(&memory), m_path(memory.databasePath()), m_memory(memory), m_nextConfig(config)
 {
-    if (!config.indexEnabled || (!config.embeddingEnabled && !m_rebuild))
-        return;
     m_timer.setSingleShot(true);
     connect(&m_timer, &QTimer::timeout, this, [this] {
+        m_config = m_nextConfig;
+        m_rebuild = m_config.autoBackfill && m_memory.memoryChunkCount() == 0;
         m_policy = MemoryReadPolicy();
         m_busy = true;
         m_pending = false;
@@ -22,6 +21,11 @@ MemoryIndexWorker::MemoryIndexWorker(MemoryManager &memory, const MemoryRetrieva
     });
     connect(this, &QThread::finished, this, [this] {
         m_busy = false;
+        if (m_pending) {
+            schedule();
+            emit drained(m_error.isEmpty(), m_error);
+            return;
+        }
         if (!m_error.isEmpty()) {
             qWarning() << "[MemoryIndex] background indexing failed; retry in ms" << m_retryMs << m_error;
             m_timer.start(m_retryMs);
@@ -33,16 +37,26 @@ MemoryIndexWorker::MemoryIndexWorker(MemoryManager &memory, const MemoryRetrieva
         }
         emit drained(m_error.isEmpty(), m_error);
     }, Qt::QueuedConnection);
-    if (config.embeddingEnabled)
-        connect(&memory, &MemoryManager::searchChunksChanged, this, &MemoryIndexWorker::schedule);
+    connect(&memory, &MemoryManager::searchChunksChanged, this, &MemoryIndexWorker::schedule);
     schedule();
 }
 
 void MemoryIndexWorker::schedule()
 {
+    if (!m_nextConfig.indexEnabled || (!m_nextConfig.embeddingEnabled &&
+        (!m_nextConfig.autoBackfill || m_memory.memoryChunkCount() != 0))) return;
     m_pending = true;
     if (!m_busy && !m_timer.isActive())
         m_timer.start(250);
+}
+
+void MemoryIndexWorker::reconfigure(const MemoryRetrievalConfig &config)
+{
+    m_nextConfig = config;
+    m_timer.stop();
+    m_pending = m_busy;
+    if (m_busy) requestInterruption();
+    schedule();
 }
 
 MemoryIndexWorker::~MemoryIndexWorker()

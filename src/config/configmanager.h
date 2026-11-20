@@ -54,6 +54,7 @@ public:
     }
 
     bool loadSetting();
+    bool writeConfigDocument(const QString &name, const QByteArray &contents, QString *error);
     bool saveSetting();
 
 

@@ -65,6 +65,7 @@ private:
     SentenceText m_currentSentence;
     quint64 m_providerGeneration = 0;
     QStringList m_loadedConfig;
+    QStringList m_loadedWeights;
 
     ITTSProvider *m_provider = nullptr;   // 当前 TTS 抽象策略
     IAudioSink *m_audioSink = nullptr;    // 非所有权（由渠道持有）

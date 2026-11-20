@@ -47,6 +47,7 @@ private slots:
 signals:
 
 private:
+    class MemoryIndexWorker *m_memoryIndex = nullptr;
     void initConnections();
     void applyTimeSettings();   // 把 ConfigManager 的时间/退火配置应用到 TimeManager
     void applyPetTags(const QMap<QString, QString> &tags); // 桌宠：立绘 + 全局情绪同步

@@ -84,13 +84,11 @@ AppController::AppController(QObject *parent)
     m_memoryManager->seedIdentity(ConfigManager::instance().getMasterQQAccounts());
     const auto retrievalConfig =
         ConfigManager::instance().getMemoryPolicyConfig().retrieval;
-    new MemoryIndexWorker(*m_memoryManager, retrievalConfig);
+    m_memoryIndex = new MemoryIndexWorker(*m_memoryManager, retrievalConfig);
     // m_settingsWidget = new SettingsWidget;
     // m_settingsWidget->setMemoryManager(m_memoryManager);
-    // m_settingsWidget->setMemoryLength(ConfigManager::instance().getShortMemoryLength());
     m_settingsWidget =new SettingsWidget;
     m_settingsWidget->setMemoryManager(m_memoryManager);
-    m_settingsWidget->setMemoryLength(ConfigManager::instance().getShortMemoryLength());
 
     m_memoryManager->decayEpisodicMemory();        // 启动时执行一次情景记忆衰减
     m_llmService->setMemoryManager(m_memoryManager);
@@ -474,7 +472,14 @@ void AppController::initConnections()
     //     m_llmService->setApiKey(ConfigManager::instance().getApiKey());});
     connect(m_character, &CharacterWidget::settingsRequested, m_settingsWidget, &SettingsWidget::show);
     connect(m_settingsWidget, &SettingsWidget::settingsSaved, this, [this](){
-        m_llmService->setApiKey(ConfigManager::instance().getApiKey());
+        auto &config = ConfigManager::instance();
+        m_llmService->setApiKey(config.getApiKey());
+        m_globalMood->setFollowExternalMood(config.getFollowExternalMood());
+        m_memoryManager->updateMasterAccounts(config.getMasterQQAccounts());
+        m_qqClient->setConfig(config.getQQConfig());
+        m_qqClient->start();
+        m_membershipService->start();
+        m_memoryIndex->reconfigure(config.getMemoryPolicyConfig().retrieval);
         m_ttsService->reloadProvider();
         // TD-037：时间/退火配置热生效（start() 会立即重估昼夜状态）
         applyTimeSettings();
@@ -574,10 +579,6 @@ void AppController::initConnections()
                 <<", 关系更新"<<relUpdates.size()<<"条";
     });
 
-    connect(m_settingsWidget, &SettingsWidget::ttsModelSwitchRequested,
-            this, [this](const QString &gptPath, const QString &sovitsPath) {
-                m_ttsService->switchModel(gptPath, sovitsPath);
-            });
 
     connect(m_timeManager, &TimeManager::clotheChanged,m_appearance, [this](const QString &clothing) {
                 QMap<QString, QString> tags;

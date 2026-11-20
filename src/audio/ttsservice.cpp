@@ -45,8 +45,15 @@ void TTSService::reloadProvider()
 {
     const auto &config = ConfigManager::instance();
     const QStringList loadedConfig{config.getTTSMode(), config.getPythonPath(), config.getGPTSovitsRootPath()};
-    if (m_provider && loadedConfig == m_loadedConfig && !m_apiFailed) return;
+    const QStringList weights{config.getGPTWeightsPath(), config.getSoVITSWeightsPath()};
+    if (m_provider && loadedConfig == m_loadedConfig && !m_apiFailed) {
+        if (weights != m_loadedWeights && m_isApiReady)
+            switchModel(weights[0], weights[1]);
+        m_loadedWeights = weights;
+        return;
+    }
     m_loadedConfig = loadedConfig;
+    m_loadedWeights = weights;
     const quint64 generation = ++m_providerGeneration;
     if (m_isSynthesizing) m_ttsQueue.prepend(m_currentSentence);
     if (m_audioSink) m_audioSink->abortPendingStream();

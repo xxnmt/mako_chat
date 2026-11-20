@@ -8,6 +8,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
+#include <QSaveFile>
 
 namespace {
 
@@ -44,7 +45,7 @@ bool ConfigManager::loadSetting()
 
     QJsonParseError parseError;
     QJsonDocument doc = QJsonDocument::fromJson(fileData, &parseError);
-    if (parseError.error != QJsonParseError::NoError) {
+    if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
         qDebug()<<"[ConfigManager]配置文件 JSON 损坏，保留原文件，不自动覆盖";
         return false;
     }
@@ -307,8 +308,8 @@ bool ConfigManager::loadSetting()
         }
     }
 
-    //tts
-    if (rootObj.contains("tts") && rootObj["tts"].isObject()) {
+    // Missing fields are interpreted consistently on startup and reload.
+    {
         QJsonObject ttsObj = rootObj["tts"].toObject();
         m_ttsMode = ttsObj.value("mode").toString("api");
         m_ttsRef.audioFilePath = ttsObj.value("ref_audio_path").toString("");
@@ -319,7 +320,7 @@ bool ConfigManager::loadSetting()
         m_gptSovitsRootPath = ttsObj.value("gpt_sovits_root_path").toString("");
         m_gptModelDir = ttsObj.value("gpt_model_dir").toString("");
         m_sovitsModelDir = ttsObj.value("sovits_model_dir").toString("");
-         m_pythonPath = ttsObj.value("python_path").toString("");
+        m_pythonPath = ttsObj.value("python_path").toString("");
     }
 
     qDebug() << "[ConfigManager] 配置成功自本地加载:" << m_configFilePath;
@@ -329,11 +330,14 @@ bool ConfigManager::loadSetting()
 
 bool ConfigManager::saveSetting()
 {
-    QFile file(m_configFilePath);
-    if(!file.open(QIODevice::WriteOnly |QIODevice::Text)){
-        qDebug()<<"[ConfigManager]无法写入配置文件:"<<m_configFilePath;
-        return false;
-
+    QJsonObject existing;
+    QFile previous(m_configFilePath);
+    if (previous.exists()) {
+        if (!previous.open(QIODevice::ReadOnly)) return false;
+        const auto document = QJsonDocument::fromJson(previous.readAll());
+        previous.close();
+        if (!document.isObject()) return false;
+        existing = document.object();
     }
 
     QJsonObject apiObj;
@@ -487,13 +491,79 @@ bool ConfigManager::saveSetting()
     rootObj.insert("tts", ttsObj);
 
 
-    QJsonDocument doc(rootObj);
-    file.write(doc.toJson(QJsonDocument::Indented));
-    file.close();
+    for (auto section = rootObj.constBegin(); section != rootObj.constEnd(); ++section) {
+        auto preserved = existing.value(section.key()).toObject();
+        const auto values = section.value().toObject();
+        for (auto value = values.constBegin(); value != values.constEnd(); ++value) {
+            if (value.key() == "retrieval" || value.key() == "recent_group_context" || value.key() == "reply") {
+                auto nested = preserved.value(value.key()).toObject();
+                const auto updates = value.value().toObject();
+                for (auto field = updates.constBegin(); field != updates.constEnd(); ++field)
+                    nested.insert(field.key(), field.value());
+                preserved.insert(value.key(), nested);
+            } else {
+                preserved.insert(value.key(), value.value());
+            }
+        }
+        existing.insert(section.key(), preserved);
+    }
+    QString error;
+    const bool saved = writeConfigDocument("setting.json", QJsonDocument(existing).toJson(), &error);
+    if (!saved) qWarning() << "[ConfigManager] 配置保存失败:" << error;
+    return saved;
+}
 
+bool ConfigManager::writeConfigDocument(const QString &name, const QByteArray &contents, QString *error)
+{
+    const auto fail = [error](const QString &message) {
+        if (error) *error = message;
+        return false;
+    };
+    if (name != "setting.json" && name != "identity.json" && name != "prompt.txt")
+        return fail(QStringLiteral("未知配置文件"));
+    if (name == "prompt.txt") {
+        if (QString::fromUtf8(contents).trimmed().isEmpty())
+            return fail(QStringLiteral("角色提示词不能为空"));
+    } else {
+        QJsonParseError parseError;
+        const auto document = QJsonDocument::fromJson(contents, &parseError);
+        if (!document.isObject())
+            return fail(parseError.error == QJsonParseError::NoError
+                        ? QStringLiteral("配置根节点必须为 JSON 对象") : parseError.errorString());
+        const auto root = document.object();
+        const QStringList sections = name == "setting.json"
+            ? QStringList{"api", "memory", "time", "qq", "tts"}
+            : QStringList{"identity", "memory", "appearance", "proactive"};
+        for (const auto &section : sections) {
+            if (root.contains(section) && !root.value(section).isObject())
+                return fail(QStringLiteral("%1 必须为 JSON 对象").arg(section));
+        }
+        const auto checkType = [&](const QString &section, const QString &key, QJsonValue::Type type) {
+            const auto value = root.value(section).toObject().value(key);
+            return value.isUndefined() || value.type() == type;
+        };
+        if (name == "setting.json") {
+            if (!checkType("memory", "retrieval", QJsonValue::Object)
+                || !checkType("memory", "recent_group_context", QJsonValue::Object)
+                || !checkType("memory", "privacy_rules", QJsonValue::Array)
+                || !checkType("qq", "reply", QJsonValue::Object)
+                || !checkType("qq", "group_memory_mode", QJsonValue::Object)
+                || !checkType("qq", "group_sender_allowlist", QJsonValue::Object))
+                return fail(QStringLiteral("请检查记忆与 QQ 嵌套字段的对象或数组类型"));
+        } else if (!checkType("identity", "self", QJsonValue::Object)
+                   || !checkType("identity", "master", QJsonValue::Object)
+                   || !checkType("memory", "blind_zones", QJsonValue::Array)
+                   || !checkType("proactive", "targets", QJsonValue::Array)
+                   || !checkType("proactive", "schedule", QJsonValue::Array)) {
+            return fail(QStringLiteral("请检查身份、盲区和主动活动字段的对象或数组类型"));
+        }
+    }
 
-
-    qDebug()<<"[ConfigManger]配置已保存:"<<m_configFilePath;
+    QSaveFile file(QDir(m_configDirPath).filePath(name));
+    if (!file.open(QIODevice::WriteOnly) || file.write(contents) != contents.size() || !file.commit())
+        return fail(file.errorString());
+    if (name == "setting.json") return loadSetting();
+    if (name == "identity.json") reloadIdentity();
     return true;
 }
 

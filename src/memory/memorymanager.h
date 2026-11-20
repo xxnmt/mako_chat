@@ -209,6 +209,7 @@ public:
     QStringList getKnownDisplayNamesForUserIds(const QStringList &userIds, int limit);
 
     // PR-3.0: person / person_identity
+    void updateMasterAccounts(const QStringList &masterUserIds);
     void seedIdentity(const QStringList &masterUserIds);
     QString resolvePersonId(const QString &platform,
                             const QString &platformUserId,

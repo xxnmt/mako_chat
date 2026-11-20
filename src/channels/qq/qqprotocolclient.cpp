@@ -44,6 +44,10 @@ QQProtocolClient::~QQProtocolClient()
 
 void QQProtocolClient::setConfig(const QQConfig &config)
 {
+    const bool reconnect = m_config.enabled != config.enabled
+        || m_config.wsUrl != config.wsUrl || m_config.accessToken != config.accessToken;
+    const bool wasRunning = m_running;
+    if (reconnect && wasRunning) stop();
     m_config = config;
 }
 

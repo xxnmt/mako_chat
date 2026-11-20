@@ -14,6 +14,7 @@ class MemoryIndexWorker final : public QThread
 public:
     MemoryIndexWorker(MemoryManager &memory, const MemoryRetrievalConfig &config);
     ~MemoryIndexWorker() override;
+    void reconfigure(const MemoryRetrievalConfig &config);
 
 signals:
     void drained(bool ok, const QString &error);
@@ -25,10 +26,12 @@ private:
     void schedule();
 
     QString m_path;
+    MemoryManager &m_memory;
+    MemoryRetrievalConfig m_nextConfig;
     MemoryRetrievalConfig m_config;
     MemoryReadPolicy m_policy;
     QTimer m_timer;
-    bool m_rebuild;
+    bool m_rebuild = false;
     bool m_busy = false;
     bool m_pending = false;
     int m_retryMs = 1000;
