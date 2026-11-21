@@ -46,7 +46,7 @@ void PrivateReview::receive(qlonglong id, int version, const QJsonObject &propos
     if (reflection) {
         const auto choice = proposal["choice"].toString();
         const auto contact = contactAllowed ? proposal["contact"].toObject() : QJsonObject{};
-        if (error.isEmpty() && store.finishPrivateReflection(id,version,choice,proposal["note"].toString(),contact)) {
+        if (error.isEmpty() && store.finishPrivateReflection(id,version,choice,proposal["note"].toString(),contact,proposal["_consulted"].toArray())) {
             qInfo() << "[Reflection] committed" << id << version << choice << contact["timing"].toString();
             if (choice=="consider" && contact["timing"].toString()=="now") emit contactProposed(id,version);
         } else {

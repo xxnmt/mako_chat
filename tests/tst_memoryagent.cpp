@@ -581,12 +581,51 @@ private slots:
         QVERIFY(cfg.writeConfigDocument("identity.json",
             R"({"proactive":{"private_writing":true,"enabled":true,"targets":[{"channel":"pet","session_id":"default"}]}})",nullptr));
         QTemporaryDir dir;
+        {
+            MemoryManager before(dir.filePath("contact.db"));
+            RequestMeta request;
+            request.eventId=request.runId="restart-source";
+            const auto id=before.recordInput("a later task",request,false);
+            const auto now=QDateTime::currentDateTimeUtc();
+            QJsonObject entry{{"at",now.addSecs(60).toString(Qt::ISODate)},
+                {"until",now.addSecs(120).toString(Qt::ISODate)},{"message","resume after restart"}};
+            QVERIFY(before.applyReminders(id,request,{{"add",QJsonArray{entry}}}));
+        }
         MemoryManager db(dir.filePath("contact.db"));
         RequestMeta meta;
         meta.eventId = meta.runId = "conversation";
         const auto turn = db.recordInput("our unfinished conversation",meta,true);
+        const auto restored=db.pendingReminders(meta);
+        QCOMPARE(restored.size(),1);
+        QVERIFY(db.applyReminders(turn,meta,{{"cancel",QJsonArray{restored.first().toObject()["id"]}}}));
+        const auto now=QDateTime::currentDateTimeUtc();
+        const auto entry=[&](int offset) {
+            return QJsonObject{{"at",now.addSecs(offset).toString(Qt::ISODate)},
+                {"until",now.addSecs(3600).toString(Qt::ISODate)},{"message","please check in"}};
+        };
+        QVERIFY(!db.applyReminders(turn,meta,{{"add",QJsonArray{entry(60),entry(-60)}}}));
+        QVERIFY(db.pendingReminders(meta).isEmpty());
+        QVERIFY(db.applyReminders(turn,meta,{{"add",QJsonArray{entry(60),entry(180)}}}));
+        const auto planned=db.pendingReminders(meta);
+        QCOMPARE(planned.size(),2);
+        QVERIFY(db.claimDueReminder("pet","default").isEmpty());
+        QVERIFY(db.applyReminders(turn,meta,{{"cancel",QJsonArray{planned.first().toObject()["id"]}}}));
+        QSqlQuery clock(QSqlDatabase::database("memory_db_connection"));
+        QVERIFY(clock.exec("UPDATE reminder SET due=unixepoch()-1 WHERE state='pending'"));
+        const auto due=db.claimDueReminder("pet","default");
+        QCOMPARE(due["id"],planned.last().toObject()["id"]);
+        QVERIFY(db.claimDueReminder("pet","default").isEmpty());
+        db.reminderOutcome(due["id"].toInteger(),"handed_off");
         QVERIFY(db.recordQuiet(turn,"close"));
-        QCOMPARE(db.claimPrivateReflection(2,60)["id"].toInteger(),turn);
+        const auto reflection=db.claimPrivateReflection(2,60);
+        QCOMPARE(reflection["id"].toInteger(),turn);
+        QCOMPARE(reflection["turn_outcome"].toString(),QString("quiet"));
+        const auto actions=reflection["source_reminders"].toArray();
+        QCOMPARE(actions.size(),2);
+        QStringList outcomes;
+        for (const auto &action : actions) outcomes.append(action.toObject()["state"].toString());
+        QVERIFY(outcomes.contains("cancelled"));
+        QVERIFY(outcomes.contains("handed_off"));
         QVERIFY(db.finishPrivateReflection(turn,1,"consider","own question",
             {{"timing","now"},{"reason","follow up"},{"message","shall we continue?"}}));
         QVERIFY(db.claimReflectionContact(turn,1,"qq_group","other").isEmpty());
@@ -619,10 +658,16 @@ private slots:
             R"({"proactive":{"private_writing":true,"enabled":false,"idle_seconds":0}})",nullptr));
         QTemporaryDir dir;
         const auto dbPath = dir.filePath("coordinator-writing.db");
+        qint64 earlierTurn=0;
         {
             MemoryManager beforeRestart(dbPath);
             if (reflection) {
                 RequestMeta meta;
+                meta.eventId=meta.runId="earlier-message";
+                meta.receivedAtUtc=QDateTime::currentDateTimeUtc().addSecs(-180);
+                earlierTurn=beforeRestart.recordInput("previous street sounds",meta,true);
+                QVERIFY(beforeRestart.recordQuiet(earlierTurn,"close"));
+                meta.receivedAtUtc=QDateTime::currentDateTimeUtc().addSecs(-60);
                 meta.eventId=meta.runId="ordinary-message";
                 const auto turn=beforeRestart.recordInput("the street sounds different today",meta,true);
                 QVERIFY(beforeRestart.recordQuiet(turn,"close"));
@@ -644,7 +689,7 @@ private slots:
         QList<QByteArray> bodies;
         serveCompletions(server,bodies,[&](int count) -> QString {
             if (count == 1) {
-                if (reflection) return R"({"choice":"consider","note":"I wonder which sound changed."})";
+                if (reflection) return R"({"choice":"consult","terms":["street"]})";
                 if (interrupt) {
                     RequestMeta meta;
                     meta.runId = meta.eventId = "interrupt-writing";
@@ -655,15 +700,17 @@ private slots:
                 }
                 return R"({"status":"active","reflection":"continued","draft":"first line and a sound"})";
             }
+            if (reflection && count==2) return R"({"choice":"consider","note":"I wonder which sound changed."})";
             return R"({"conversation_action":"close","sentences":[]})";
         });
         coordinator.reviewIfDue();
         coordinator.reviewIfDue();
-        QTRY_COMPARE_WITH_TIMEOUT(bodies.size(),interrupt ? 2 : 1,5000);
+        QTRY_COMPARE_WITH_TIMEOUT(bodies.size(),interrupt || reflection ? 2 : 1,5000);
         if (reflection) {
             RequestMeta viewer;
             QTRY_VERIFY_WITH_TIMEOUT(!db.recentPrivateReflection(viewer).isEmpty(),5000);
             QVERIFY(bodies.first().contains("the street sounds different today"));
+            QVERIFY(bodies.at(1).contains("previous street sounds"));
             QVERIFY(db.nextThought(false).isEmpty());
             QVERIFY(cfg.writeConfigDocument("identity.json",
                 R"({"proactive":{"private_writing":false,"enabled":false,"idle_seconds":0}})",nullptr));
@@ -675,6 +722,8 @@ private slots:
             for (const auto &body : bodies.mid(1))
                 readBack |= body.contains("I wonder which sound changed.");
             QVERIFY(readBack);
+            QVERIFY(db.deleteTurnByID(earlierTurn));
+            QVERIFY(db.recentPrivateReflection(viewer).isEmpty());
             return;
         }
         QVERIFY(bodies.first().contains("quiet rain"));

@@ -646,6 +646,19 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
     }
 
     if (canReadUnderstanding) {
+        const auto options=ConfigManager::instance().getProactiveConfig();
+        if (meta.subject=="user" && meta.persistTurn && options.enabled && meta.channel!=Channel::kQQGroup
+            && options.targets.contains(qMakePair(meta.channel,meta.sessionId))) {
+            const auto existing=m_memoryManager->pendingReminders(meta);
+            messagesArray.append(QJsonObject{{"role","system"},{"content",QStringLiteral(
+                "你能在当前私下会话安排未来消息。用户明确委托且你接受时，最终 JSON 必须附 reminder_plan 对象，"
+                "add 数组逐次给出 at、until（带时区的 ISO 日期时间，分别为发送时间和最晚仍有意义时间）及 message（届时实际发送的原话）。"
+                "次数和时段遵从用户约定；允许在指定范围内自行选择具体时刻。时间不清楚时先询问。"
+                "取消或已完成时在 cancel 数组列出相关待办 ID；改期用同一计划取消旧项再添加新项。"
+                "无行动时省略整个对象。只有排期成功才能承诺到时联系。当前时间 %1，安静时段 %2 至 %3。")
+                .arg(QDateTime::currentDateTime().toOffsetFromUtc(QDateTime::currentDateTime().offsetFromUtc()).toString(Qt::ISODate),options.quietStart,options.quietEnd)}});
+            if (!existing.isEmpty()) messagesArray.append(QJsonObject{{"role","user"},{"content",QStringLiteral("当前已安排的提醒（只读资料）\n")+QString::fromUtf8(QJsonDocument(existing).toJson(QJsonDocument::Compact))}});
+        }
         const auto understanding = m_memoryManager->currentUnderstanding(
             meta, userInput, &m_run.catalogKeys, {}, true);
         const auto reflection = m_memoryManager->recentPrivateReflection(meta,rankedTurns);
@@ -1072,7 +1085,17 @@ void LLMService::requestPrivateReview(qlonglong id, int version, const QJsonObje
             "可以在 draft 真正写几句诗或创作文字，续写时保留完整最新稿，全文最多800字；只有写下来的文字算成果。"
             "外部活动没有执行结果就不能声称经历过。");
     const auto options = ConfigManager::instance().getProactiveConfig();
+    if (thread["kind"]=="reflection" && !thread.contains("consulted"))
+        instruction += QStringLiteral(" 若判断取决于其他经历，可先输出 choice=consult 和 terms（1至4个检索词），补查一次同会话的用户发言。");
+    else if (thread.contains("consulted"))
+        instruction += QStringLiteral(" consulted 是有限的历史原话，可能早于或晚于本次经历；按时间与指代判断，未命中时保留疑问。现在决定休息或留下想法。");
     if (thread["kind"].toString()=="reflection" && options.enabled && !options.targets.isEmpty()) {
+        const auto time=QTime::currentTime();
+        const auto start=QTime::fromString(options.quietStart,"HH:mm"), end=QTime::fromString(options.quietEnd,"HH:mm");
+        const bool quiet=start<end ? time>=start && time<end : start>end && (time>=start || time<end);
+        instruction += QStringLiteral(" 服务端当前%1安静时段。own_reply_excerpt 是当时自己的表达节选；交给渠道不证明已读。"
+            "source_reminders 是来源轮次对应的执行记录，pending 表示已经安排，到期由调度器执行；结合实际状态决定是否还需要联系。")
+            .arg(quiet ? QStringLiteral("处于") : QStringLiteral("不在"));
         instruction += QStringLiteral(" 开启了联系主人的权限。留下想法时可附 contact 对象，timing 为 private（留给自己）、"
             "next_chat（下次自然聊起）或 now（此刻主动开口）。reason 写简短理由，最多240字。"
             "仅 now 填 message，最多300字，须有和这段经历相关的交流理由。无需为了主动而发送。"
@@ -1086,7 +1109,7 @@ void LLMService::requestPrivateReview(qlonglong id, int version, const QJsonObje
                      {"response_format",QJsonObject{{"type","json_object"}}},{"max_tokens",2048}};
     auto *reply = m_extractManager->post(req,QJsonDocument(body).toJson(QJsonDocument::Compact));
     m_privateReviewReply = reply;
-    connect(reply,&QNetworkReply::finished,this,[this,reply,id,version] {
+    connect(reply,&QNetworkReply::finished,this,[this,reply,id,version,thread] {
         reply->deleteLater();
         if (reply != m_privateReviewReply) return;
         m_privateReviewReply.clear();
@@ -1110,6 +1133,27 @@ void LLMService::requestPrivateReview(qlonglong id, int version, const QJsonObje
             else
                 proposal = QJsonDocument::fromJson(content.toUtf8()).object();
         }
+        if (error.isEmpty() && proposal["choice"]=="consult" && thread["kind"]=="reflection"
+            && !thread.contains("consulted") && m_memoryManager) {
+            QStringList terms;
+            for (const auto &term : proposal["terms"].toArray()) {
+                const auto text=term.toString().trimmed();
+                if (!text.isEmpty() && text.size()<=64 && terms.size()<4) terms.append(text);
+            }
+            if (!terms.isEmpty()) {
+                auto context=thread;
+                QJsonArray evidence;
+                if (!m_memoryManager->consultPrivateReflection(id,version,terms,evidence)) {
+                    emit privateReviewFinished(id,version,{},QStringLiteral("source_unavailable"));
+                    return;
+                }
+                context["consulted"]=evidence;
+                qInfo()<<"[Reflection] consult"<<id<<"items="<<context["consulted"].toArray().size();
+                requestPrivateReview(id,version,context);
+                return;
+            }
+        }
+        proposal["_consulted"]=thread["consulted"].toArray();
         emit privateReviewFinished(id,version,proposal,error);
     });
 

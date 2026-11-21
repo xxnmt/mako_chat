@@ -4558,6 +4558,23 @@ void MemoryManager::initDatabase(const QString &dbFilePath, const QString &conne
                 || !query.exec("PRAGMA user_version=19")) throw query.lastError();
             currentVersion = 19;
         }
+        if (currentVersion < 20) {
+            if (!query.exec("CREATE TABLE IF NOT EXISTS reminder(id INTEGER PRIMARY KEY AUTOINCREMENT,turn INTEGER NOT NULL,"
+                            "channel TEXT NOT NULL,session TEXT NOT NULL,due INTEGER NOT NULL,expires INTEGER NOT NULL,"
+                            "message TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'pending',UNIQUE(turn,due))")
+                || !query.exec("CREATE INDEX IF NOT EXISTS reminder_due ON reminder(state,channel,session,due)")
+                || !query.exec("CREATE TRIGGER IF NOT EXISTS forget_reminder AFTER DELETE ON chat_history BEGIN DELETE FROM reminder WHERE turn=OLD.id; END")
+                || !query.exec("PRAGMA user_version=20")) throw query.lastError();
+            currentVersion=20;
+        }
+        if (currentVersion<21) {
+            if (!query.exec("CREATE TABLE IF NOT EXISTS reflection_basis(turn INTEGER,source INTEGER,PRIMARY KEY(turn,source))")
+                || !query.exec("CREATE TRIGGER IF NOT EXISTS forget_reflection_basis AFTER DELETE ON chat_history BEGIN "
+                               "DELETE FROM private_reflection WHERE turn_id IN (SELECT turn FROM reflection_basis WHERE source=OLD.id); "
+                               "DELETE FROM reflection_basis WHERE source=OLD.id OR turn=OLD.id; END")
+                || !query.exec("PRAGMA user_version=21")) throw query.lastError();
+            currentVersion=21;
+        }
         if (!m_db.commit()) throw m_db.lastError();
         qDebug()<<"[MemoryManager]数据库初始化完成,结构版本为:"<<currentVersion;
     }

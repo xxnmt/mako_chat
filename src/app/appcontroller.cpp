@@ -208,6 +208,26 @@ AppController::AppController(QObject *parent)
     m_llmService->registerStateProvider([this](){return m_appearance->getCurrentStateDescription();});
 
     initConnections();
+    auto *reminders=new QTimer(this);
+    connect(reminders,&QTimer::timeout,this,[this] {
+        const auto options=ConfigManager::instance().getProactiveConfig();
+        const auto now=QTime::currentTime(), start=QTime::fromString(options.quietStart,"HH:mm"), end=QTime::fromString(options.quietEnd,"HH:mm");
+        if (!options.enabled || (start<end ? now>=start && now<end : start>end && (now>=start || now<end))) return;
+        for (const auto &target : options.targets) {
+            const bool pet=target.first==Channel::kPet;
+            if (!pet && !m_qqClient->isConnected()) continue;
+            const auto due=m_memoryManager->claimDueReminder(target.first,target.second);
+            if (due.isEmpty()) continue;
+            Utterance u;
+            u.channel=target.first; u.sessionId=target.second; u.text=due["message"].toString();
+            const auto id=due["id"].toInteger();
+            u.deliveryEcho=QString("reminder:%1").arg(id);
+            const bool ok=pet ? m_petChannel->sendUtterance(u) : m_qqChannel->sendUtterance(u);
+            m_memoryManager->reminderOutcome(id,ok ? "handed_off" : "rejected");
+            qInfo()<<"[Reminder] dispatch"<<id<<ok;
+        }
+    });
+    reminders->start(5000);
     connect(m_coordinator, &CognitiveCoordinator::contactProposed, this, [this](qlonglong turn,int version) {
         if (canContactNow()) {
             auto &cfg = ConfigManager::instance();
@@ -231,6 +251,11 @@ AppController::AppController(QObject *parent)
         qInfo() << "[ReflectionContact] withheld" << turn << version;
     });
     connect(m_qqClient, &QQProtocolClient::sendResult, this, [this](const QString &echo,const QString &outcome) {
+        if (echo.startsWith("reminder:")) {
+            m_memoryManager->reminderOutcome(echo.mid(9).toLongLong(),outcome);
+            qInfo()<<"[Reminder] receipt"<<echo<<outcome;
+            return;
+        }
         if (!echo.startsWith("reflection:")) return;
         const auto parts=echo.split(':');
         if (parts.size()==3 && m_memoryManager->recordContactOutcome(parts[1].toLongLong(),parts[2].toInt(),outcome))
@@ -337,6 +362,17 @@ void AppController::handleMakoReply(const QList<SentenceText> &sentences, const 
                                     const QString &userInput, const RequestMeta &meta)
 {
     if (!m_coordinator->owns(meta.runId)) return;
+    const auto response=QJsonDocument::fromJson(rawReply.toUtf8()).object();
+    if (response.contains("reminder_plan")) {
+        const bool saved=m_memoryManager->applyReminders(m_coordinator->turnId(),meta,response["reminder_plan"].toObject());
+        qInfo()<<"[Reminder] plan"<<meta.runId<<"committed="<<saved;
+        if (!saved) {
+            SentenceText notice;
+            notice.zhText=QStringLiteral("这次提醒安排没有保存成功。");
+            handleMakoReply({notice},QStringLiteral("{}"),userInput,meta);
+            return;
+        }
+    }
     // TD-034：本轮回复入队 TTS，记下它属于哪一轮（退火门控用）
     if (meta.channel == Channel::kPet) {
         m_lastPlaybackRound = m_coordinator->activeSequence();

@@ -118,9 +118,14 @@ public:
 
     QJsonObject claimPrivateReflection(int dailyLimit, int cooldownSeconds);
     bool finishPrivateReflection(qlonglong turn, int version, const QString &choice, const QString &note,
-                                 const QJsonObject &contact = {});
+                                 const QJsonObject &contact = {}, const QJsonArray &consulted = {});
+    bool consultPrivateReflection(qint64 turn, int version,const QStringList &terms,QJsonArray &results) const;
     QString claimReflectionContact(qlonglong turn, int version, const QString &channel, const QString &session);
     bool recordContactOutcome(qlonglong turn, int version, const QString &outcome);
+    QJsonArray pendingReminders(const RequestMeta &viewer) const;
+    bool applyReminders(qint64 turn,const RequestMeta &viewer,const QJsonObject &plan);
+    QJsonObject claimDueReminder(const QString &channel,const QString &session);
+    void reminderOutcome(qint64 id,const QString &state);
     bool deferPrivateReflection(qlonglong turn, int version);
     QJsonObject recentPrivateReflection(const RequestMeta &viewer, const QJsonArray &rankedTurns = {}) const;
     QJsonObject nextThought(bool dueOnly) const;

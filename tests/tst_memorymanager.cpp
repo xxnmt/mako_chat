@@ -224,7 +224,7 @@ private slots:
         QVERIFY(raw.exec("DROP TABLE matter_revision"));
         for (int reopen=0; reopen<2; ++reopen) {
             MemoryManager db(path);
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),19);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),21);
             QCOMPARE(raw.scalar("SELECT state_updates FROM chat_history").toString(),QString("[]"));
             QVERIFY(db.matterHeads("user").isEmpty());
         }
@@ -585,7 +585,7 @@ private slots:
         }
         RawDb raw(path,"v17-semantics");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),19);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),21);
         QCOMPARE(raw.scalar("SELECT count(*) FROM matter_revision").toInt(),1);
         QVERIFY(raw.scalar("SELECT semantics IS NULL FROM matter_revision").toBool());
     }
@@ -659,7 +659,7 @@ private slots:
         RawDb raw(path,"lifecycle");
         QVERIFY(raw.open());
         QCOMPARE(raw.scalar("SELECT count(*) FROM matter_revision").toInt(),2);
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),19);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),21);
     }
 
     void currentUnderstandingRetainsLatestSelfReport()
@@ -1309,7 +1309,7 @@ private slots:
         }
         RawDb raw(path, "v15-verify");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 19);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 21);
     }
 
     void databaseBackupIsConsistent()
@@ -1329,7 +1329,7 @@ private slots:
         RawDb copy(backup, "backup-copy");
         QVERIFY(copy.open());
         QCOMPARE(copy.scalar("SELECT count(*) FROM chat_history").toInt(), 1);
-        QCOMPARE(copy.scalar("PRAGMA user_version").toInt(), 19);
+        QCOMPARE(copy.scalar("PRAGMA user_version").toInt(), 21);
         QVERIFY(copy.scalar("SELECT count(*) FROM memory_chunks").toInt() > 0);
     }
 
@@ -1566,7 +1566,7 @@ private slots:
             QVERIFY(raw.open());
 
             // 版本推进到 v3
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 19);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 21);
 
             // 列扩展（v2 渠道 + v3 轮次）
             const QStringList historyCols = raw.columns("chat_history");
@@ -1671,7 +1671,7 @@ private slots:
             MemoryManager second(dbPath);
             RawDb raw(dbPath, "verify2");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 19);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 21);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM chat_history").toInt(), 1);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM relationship_state").toInt(), 2);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM long_term_summary").toInt(), 1);
@@ -1688,7 +1688,7 @@ private slots:
             MemoryManager mm(dbPath);
             RawDb raw(dbPath, "fresh");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 19);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 21);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('raw_events')").toInt() > 0);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('memory_cursor')").toInt() > 0);
 
@@ -1895,7 +1895,7 @@ private slots:
         Q_UNUSED(mm);
         RawDb raw(dbPath, "v2verify");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 19);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 21);
         QCOMPARE(raw.scalar("SELECT user_input FROM chat_history").toString(), QStringLiteral("旧输入"));
         QCOMPARE(raw.scalar("SELECT turn_kind FROM chat_history").toString(), QStringLiteral("reply"));
         QCOMPARE(raw.scalar("SELECT subject FROM chat_history").toString(), QStringLiteral("user"));
