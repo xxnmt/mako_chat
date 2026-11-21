@@ -40,7 +40,9 @@ public:
     QJsonArray lastRequestMessages() const { return m_lastRequestMessages; }
     RetrievalResult lastRetrievalResult() const { return m_lastRetrievalResult; }
     QJsonObject lastResponseUsage() const { return m_lastResponseUsage; }
-    void reviewDueThought();
+    void requestPrivateReview(qlonglong id, int version, const QJsonObject &thread);
+    void cancelPrivateReview();
+    bool hasWritingProvider() const { return !m_apiKey.isEmpty(); }
     void processObservation();
     //Extract
     void extractMemoryAsync(const QList<HistoryTurn> &turns, qlonglong lastEndId, const QList<qlonglong> &sourceIds,
@@ -57,7 +59,7 @@ signals:
     //chat
     void sentencesReady(const QList<SentenceText> &sentences, const QString &rawReply,
                         const QString &userInput, const RequestMeta &meta);
-    void draftReadyToShare(const QString &activityRef, int version, const QString &draft);
+    void privateReviewFinished(qlonglong id, int version, const QJsonObject &proposal, const QString &error);
     void internetErrorSignal(const QString &errorMessage);
     //chat 回复内容异常（空/乱码/缺中文/缺日文/缺标签），不入库不走TTS
     void replyAbnormal(const QString &reason);
@@ -126,7 +128,7 @@ private:
 
 
     bool m_observationActive = false;
-    bool m_reviewActive = false;
+    QPointer<QNetworkReply> m_privateReviewReply;
     QNetworkAccessManager* m_networkManager;
     QNetworkAccessManager* m_extractManager;
     QNetworkAccessManager* m_interactionManager;

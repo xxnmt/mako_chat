@@ -2,6 +2,8 @@
 
 #include "utterance.h"
 #include "sentencedata.h"
+#include "privatereview.h"
+#include <QElapsedTimer>
 #include <QObject>
 #include <QQueue>
 #include <optional>
@@ -10,6 +12,7 @@ class LLMService;
 class MemoryManager;
 
 class CognitiveCoordinator final : public QObject {
+    Q_OBJECT
 public:
     CognitiveCoordinator(MemoryManager &memory, LLMService &model, QObject *parent);
     ~CognitiveCoordinator() override;
@@ -22,7 +25,14 @@ public:
     qint64 turnId() const { return active ? active->turnId : 0; }
     quint64 activeSequence() const { return active ? active->sequence : 0; }
     quint64 lastSequence() const { return sequence; }
+    bool idleForWriting() const;
+    void reviewIfDue();
+signals:
+    void contactProposed(qlonglong turn, int version);
+    void draftReadyToShare(const QString &ref, int version, const QString &draft);
 private:
+    PrivateReview review;
+    QElapsedTimer idle;
     struct Turn {
         QString text;
         RequestMeta meta;

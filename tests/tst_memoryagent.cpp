@@ -557,6 +557,140 @@ private slots:
         QVERIFY(recent.valid && recent.from <= now && recent.to > now);
     }
 
+    void coordinatorArbitratesWritingAndIncomingTurn_data()
+    {
+        QTest::addColumn<bool>("interrupt");
+        QTest::addColumn<bool>("reflection");
+        QTest::newRow("private-writing-with-contact-disabled") << false << false;
+        QTest::newRow("message-during-writing-request") << true << false;
+        QTest::newRow("idle-reflection-without-writing-or-contact") << false << true;
+    }
+
+    void privateContactCanOnlyBeHandedOffOnce()
+    {
+        auto &cfg = ConfigManager::instance();
+        const QString path = cfg.getConfigDirPath() + "/identity.json";
+        QFile old(path);
+        const bool existed = old.open(QIODevice::ReadOnly);
+        const auto original = old.readAll();
+        old.close();
+        const auto restore = qScopeGuard([&] {
+            if (existed) cfg.writeConfigDocument("identity.json",original,nullptr);
+            else { QFile::remove(path); cfg.reloadIdentity(); }
+        });
+        QVERIFY(cfg.writeConfigDocument("identity.json",
+            R"({"proactive":{"private_writing":true,"enabled":true,"targets":[{"channel":"pet","session_id":"default"}]}})",nullptr));
+        QTemporaryDir dir;
+        MemoryManager db(dir.filePath("contact.db"));
+        RequestMeta meta;
+        meta.eventId = meta.runId = "conversation";
+        const auto turn = db.recordInput("our unfinished conversation",meta,true);
+        QVERIFY(db.recordQuiet(turn,"close"));
+        QCOMPARE(db.claimPrivateReflection(2,60)["id"].toInteger(),turn);
+        QVERIFY(db.finishPrivateReflection(turn,1,"consider","own question",
+            {{"timing","now"},{"reason","follow up"},{"message","shall we continue?"}}));
+        QVERIFY(db.claimReflectionContact(turn,1,"qq_group","other").isEmpty());
+        QCOMPARE(db.claimReflectionContact(turn,1,"pet","default"),QString("shall we continue?"));
+        QVERIFY(db.claimReflectionContact(turn,1,"pet","default").isEmpty());
+        QVERIFY(db.recordContactOutcome(turn,1,"handed_off"));
+        QCOMPARE(db.recentPrivateReflection(meta)["handed_off_message"].toString(),QString("shall we continue?"));
+        QVERIFY(db.recordContactOutcome(turn,1,"unknown"));
+        QVERIFY(!db.recordContactOutcome(turn,1,"protocol_accepted"));
+        QVERIFY(!db.recentPrivateReflection(meta).contains("handed_off_message"));
+        QVERIFY(db.deleteTurnByID(turn));
+        QVERIFY(db.recentPrivateReflection(meta).isEmpty());
+    }
+
+    void coordinatorArbitratesWritingAndIncomingTurn()
+    {
+        QFETCH(bool, interrupt);
+        QFETCH(bool, reflection);
+        auto &cfg = ConfigManager::instance();
+        const QString path = cfg.getConfigDirPath() + "/identity.json";
+        QFile old(path);
+        const bool existed = old.open(QIODevice::ReadOnly);
+        const auto original = existed ? old.readAll() : QByteArray{};
+        old.close();
+        const auto restore = qScopeGuard([&] {
+            if (existed) cfg.writeConfigDocument("identity.json",original,nullptr);
+            else { QFile::remove(path); cfg.reloadIdentity(); }
+        });
+        QVERIFY(cfg.writeConfigDocument("identity.json",
+            R"({"proactive":{"private_writing":true,"enabled":false,"idle_seconds":0}})",nullptr));
+        QTemporaryDir dir;
+        const auto dbPath = dir.filePath("coordinator-writing.db");
+        {
+            MemoryManager beforeRestart(dbPath);
+            if (reflection) {
+                RequestMeta meta;
+                meta.eventId=meta.runId="ordinary-message";
+                const auto turn=beforeRestart.recordInput("the street sounds different today",meta,true);
+                QVERIFY(beforeRestart.recordQuiet(turn,"close"));
+            } else {
+                QVERIFY(beforeRestart.saveQATurn("write", R"({"personal_interest":"quiet rain"})", {}));
+                const auto initial = beforeRestart.nextThought(true);
+                QVERIFY(beforeRestart.finishThoughtReview(initial["id"].toInteger(),initial["version"].toInt(),
+                    {{"status","active"},{"reflection","opening"},{"draft","first line"},{"next_step","add a sound"}}));
+                QSqlQuery clock(QSqlDatabase::database("memory_db_connection"));
+                QVERIFY(clock.exec("UPDATE chat_history SET review_after=0"));
+            }
+        }
+        MemoryManager db(dbPath);
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        LLMService model("test",nullptr,QUrl(QString("http://127.0.0.1:%1/").arg(server.serverPort())));
+        model.setMemoryManager(&db);
+        CognitiveCoordinator coordinator(db,model,nullptr);
+        QList<QByteArray> bodies;
+        serveCompletions(server,bodies,[&](int count) -> QString {
+            if (count == 1) {
+                if (reflection) return R"({"choice":"consider","note":"I wonder which sound changed."})";
+                if (interrupt) {
+                    RequestMeta meta;
+                    meta.runId = meta.eventId = "interrupt-writing";
+                    meta.persistTurn = false;
+                    meta.longTermMemoryEnabled = false;
+                    coordinator.submit("下次聊",meta);
+                    coordinator.reviewIfDue();
+                }
+                return R"({"status":"active","reflection":"continued","draft":"first line and a sound"})";
+            }
+            return R"({"conversation_action":"close","sentences":[]})";
+        });
+        coordinator.reviewIfDue();
+        coordinator.reviewIfDue();
+        QTRY_COMPARE_WITH_TIMEOUT(bodies.size(),interrupt ? 2 : 1,5000);
+        if (reflection) {
+            RequestMeta viewer;
+            QTRY_VERIFY_WITH_TIMEOUT(!db.recentPrivateReflection(viewer).isEmpty(),5000);
+            QVERIFY(bodies.first().contains("the street sounds different today"));
+            QVERIFY(db.nextThought(false).isEmpty());
+            QVERIFY(cfg.writeConfigDocument("identity.json",
+                R"({"proactive":{"private_writing":false,"enabled":false,"idle_seconds":0}})",nullptr));
+            viewer.eventId=viewer.runId="follow-up";
+            coordinator.submit("hello",viewer);
+            QTRY_VERIFY_WITH_TIMEOUT(bodies.size()>=2,5000);
+            QTRY_VERIFY_WITH_TIMEOUT(!coordinator.busy(),5000);
+            bool readBack=false;
+            for (const auto &body : bodies.mid(1))
+                readBack |= body.contains("I wonder which sound changed.");
+            QVERIFY(readBack);
+            return;
+        }
+        QVERIFY(bodies.first().contains("quiet rain"));
+        QVERIFY(bodies.first().contains("first line"));
+        QVERIFY(bodies.first().contains("add a sound"));
+        if (interrupt) {
+            QTRY_VERIFY_WITH_TIMEOUT(!coordinator.busy(),5000);
+            const auto review = db.nextThought(true)["last_review"].toObject();
+            QCOMPARE(review["deferred_reason"].toString(),QString("incoming_message"));
+            QCOMPARE(review["draft"].toString(),QString("first line"));
+        } else {
+            QTRY_COMPARE_WITH_TIMEOUT(db.nextThought(false)["last_review"].toObject()["draft"].toString(),
+                                      QString("first line and a sound"),5000);
+        }
+    }
+
     void coordinatorCompletesBeforeAdvancing()
     {
         QTemporaryDir dir;

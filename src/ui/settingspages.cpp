@@ -87,11 +87,14 @@ QString settingHelp(const Field &field)
         {"memory.interaction_max_minutes", "一段互动从首条消息开始计算的最长分钟数。达到上限后开始下一段。"},
         {"tts.mode", "模拟播放：按文字长度模拟节奏，不合成音频。GPT-SoVITS：调用语音服务生成音频，失败时仍播放文字。"},
         {"tts.reference_audio_dir", "默认使用 app_data/reference_audio。其他文件夹需包含 tts_map.json 和对应的音频。音频、台词和语言随情绪从映射中选择，缺失时使用 happyIdle。"},
+        {"proactive.private_writing", "允许空闲时回顾最近的主人私下交流，留下自己的想法或休息，也可以继续到期的文字活动。两者共用每日上限和回顾间隔。主动联系另行设置。"},
         {"proactive.targets", "填写可主动联系的渠道及会话标识，桌宠会话填 default。"},
         {"proactive.idle_seconds", "从最近一次会话活动开始计时。达到该秒数后才允许进行后台创作回顾或尝试主动联系。0 表示没有额外空闲等待。"},
         {"proactive.daily_limit", "每天最多领取多少次后台创作回顾任务。0 停止领取。这个上限按回顾任务计数。"},
         {"proactive.cooldown_seconds", "两次后台创作回顾之间的间隔，单位为秒。运行时至少等待 60 秒。"},
         {"proactive.schedule", "可填写 HH:mm 及 fixed（固定）或 random（随机）。当前只保存，定时调度尚未接入。"},
+        {"logging.directory", "默认保存到程序目录的 app_data/logs。更换位置后，新日志从保存设置时起写到新目录。"},
+        {"logging.separate_runs", "开启后每次运行生成独立文件。关闭后按本地日期追加，跨午夜自动换文件。"},
         {"memory.debug_full_logs", "开启后记录对话正文和模型请求，用于诊断。"},
     };
     const auto path = field.path.join('.');
@@ -400,13 +403,15 @@ Binding buildField(const Field &field, const QJsonValue &value, QWidget *parent)
         return tableBinding(field, value, label, parent);
 
     const bool referenceDirectory = field.type == "reference_directory";
-    const auto defaultDirectory = referenceDirectory
+    const bool logDirectory = field.type == "log_directory";
+    const bool managedDirectory = referenceDirectory || logDirectory;
+    const auto defaultDirectory = logDirectory ? QDir(ConfigManager::instance().getAppDataPath()).filePath("logs") : referenceDirectory
         ? ConfigManager::instance().defaultTTSReferenceDirectory() : QString();
-    const auto initialText = referenceDirectory
+    const auto initialText = logDirectory ? ConfigManager::instance().logDirectory() : referenceDirectory
         ? ConfigManager::instance().ttsReferenceDirectory()
         : field.type == "ids" ? idsText(value.toArray()) : value.toString();
     auto *text = new QLineEdit(initialText, parent);
-    if (referenceDirectory) {
+    if (managedDirectory) {
         text->setReadOnly(true);
         text->setToolTip(initialText);
         QObject::connect(text, &QLineEdit::textChanged, text, &QLineEdit::setToolTip);
@@ -414,7 +419,7 @@ Binding buildField(const Field &field, const QJsonValue &value, QWidget *parent)
     if (field.type == "secret") text->setEchoMode(QLineEdit::Password);
     if (field.type == "ids") text->setPlaceholderText(QStringLiteral("多个号码以空格或逗号分隔"));
     QWidget *row = text;
-    if (field.type == "file" || field.type == "directory" || field.type == "secret" || referenceDirectory) {
+    if (field.type == "file" || field.type == "directory" || field.type == "secret" || managedDirectory) {
         row = new QWidget(parent);
         auto *layout = new QHBoxLayout(row);
         layout->setContentsMargins(0, 0, 0, 0);
@@ -428,12 +433,12 @@ Binding buildField(const Field &field, const QJsonValue &value, QWidget *parent)
                 button->setText(show ? QStringLiteral("隐藏") : QStringLiteral("显示"));
                 return;
             }
-            const auto selected = field.type == "directory" || referenceDirectory
+            const auto selected = field.type == "directory" || managedDirectory
                 ? QFileDialog::getExistingDirectory(row, field.label, text->text())
                 : QFileDialog::getOpenFileName(row, field.label, text->text());
             if (!selected.isEmpty()) text->setText(QDir::toNativeSeparators(selected));
         });
-        if (referenceDirectory) {
+        if (managedDirectory) {
             auto *reset = new QPushButton(QStringLiteral("恢复默认"), row);
             layout->addWidget(reset);
             QObject::connect(reset, &QPushButton::clicked, row, [text, defaultDirectory] {
@@ -441,8 +446,8 @@ Binding buildField(const Field &field, const QJsonValue &value, QWidget *parent)
             });
         }
     }
-    return {field, row, label, [text, field, referenceDirectory, defaultDirectory]() -> QJsonValue {
-        if (referenceDirectory) {
+    return {field, row, label, [text, field, managedDirectory, defaultDirectory]() -> QJsonValue {
+        if (managedDirectory) {
             const auto path = QDir::cleanPath(text->text());
             return path == QDir::cleanPath(defaultDirectory) ? QString() : path;
         }
@@ -570,6 +575,8 @@ QList<Page> pages()
                 field("memory.privacy_rules", "内容过滤规则", QJsonArray{}, "rules"),
             }},
             {"日志", {
+                field("logging.directory", "日志文件夹", "", "log_directory"),
+                field("logging.separate_runs", "每次启动单独创建日志", true, "bool"),
                 field("memory.debug_full_logs", "记录完整对话与模型请求", false, "bool"),
             }},
         }},
@@ -586,7 +593,7 @@ QList<Page> pages()
         {"主动交流", "设置自主写作、联系目标和安静时段。", "identity.json", {
             {"活动和联系", {
                 field("proactive.enabled", "允许主动联系", false, "bool"),
-                field("proactive.private_writing", "允许私下写作与回顾", false, "bool"),
+                field("proactive.private_writing", "允许私下回顾与创作", false, "bool"),
                 field("proactive.daily_limit", "每日回顾上限", 3, "num:0:999"),
                 field("proactive.cooldown_seconds", "回顾间隔（秒）", 900, "num:60:604800"),
                 field("proactive.idle_seconds", "空闲等待（秒）", 1800, "num:0:604800"),

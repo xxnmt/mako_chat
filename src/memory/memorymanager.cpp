@@ -173,8 +173,11 @@ bool MemoryManager::saveQATurn(const QString &userInput, const QString &rawReply
             : 0;
         const QString action = activityAction["action"].toString();
         const int expectedVersion = activityAction["expected_version"].toInt(-1);
-        if (activityId <= 0 || expectedVersion < 0
-            || !applyThoughtAction(activityId, expectedVersion, action)) {
+        if (meta.subject != "user" || meta.sensitive || !meta.longTermMemoryEnabled
+            || (meta.channel!=Channel::kPet && meta.channel!=Channel::kQQPrivate)
+            || activityId <= 0 || expectedVersion < 0
+            || !applyThoughtAction(activityId, expectedVersion, action,
+                                  activityAction["after_minutes"].toInt(-1), activityAction["reason"].toString())) {
             recordCognitiveAudit("activity_action_rejected", meta.runId, 0,
                 {{"activity_ref", ref}, {"action", action}, {"expected_version", expectedVersion}});
         }
@@ -269,30 +272,46 @@ QJsonObject MemoryManager::nextThought(bool dueOnly) const
             {"last_review",QJsonDocument::fromJson(q.value(3).toByteArray()).object()}};
 }
 
-bool MemoryManager::claimThoughtReview(qlonglong id, int dailyLimit, int cooldownSeconds)
+bool MemoryManager::chargePrivateReview(qlonglong turn, int dailyLimit, int cooldownSeconds)
 {
-    if (dailyLimit <= 0 || !m_db.transaction())
-        return false;
     QSqlQuery q(m_db);
     q.prepare(R"(
         INSERT INTO thought_review_log(turn_id,started_at)
-        SELECT id,unixepoch() FROM chat_history WHERE id=? AND thought IS NOT NULL
-        AND coalesce(review_after,0)<=unixepoch()
-        AND (SELECT count(*) FROM thought_review_log
+        SELECT ?,unixepoch() WHERE (SELECT count(*) FROM thought_review_log
              WHERE date(started_at,'unixepoch','localtime')=date('now','localtime')) < ?
         AND coalesce((SELECT max(started_at) FROM thought_review_log),0)+?<=unixepoch()
     )");
-    q.addBindValue(id);
+    q.addBindValue(turn);
     q.addBindValue(dailyLimit);
     q.addBindValue(qMax(60,cooldownSeconds));
-    if (q.exec() && q.numRowsAffected()==1) {
-        q.prepare("UPDATE chat_history SET review_after=unixepoch()+1800 WHERE id=?");
-        q.addBindValue(id);
-        if (q.exec() && m_db.commit())
-            return true;
-    }
+    return q.exec() && q.numRowsAffected()==1;
+}
+
+bool MemoryManager::claimThoughtReview(qlonglong id, int version, int dailyLimit, int cooldownSeconds)
+{
+    if (dailyLimit <= 0 || !m_db.transaction()) return false;
+    QSqlQuery q(m_db);
+    q.prepare("UPDATE chat_history SET review_after=unixepoch()+1800,thought_version=thought_version+1 "
+              "WHERE id=? AND thought IS NOT NULL AND thought_version=? AND sensitive=0 AND subject='user' "
+              "AND coalesce(json_extract(thought_result,'$.status'),'active')='active' "
+              "AND coalesce(review_after,0)<=unixepoch()");
+    q.addBindValue(id);
+    q.addBindValue(version);
+    if (q.exec() && q.numRowsAffected()==1 && chargePrivateReview(id,dailyLimit,cooldownSeconds)
+        && m_db.commit()) return true;
     m_db.rollback();
     return false;
+}
+
+bool MemoryManager::deferThoughtReview(qlonglong id, int version, const QString &reason)
+{
+    QSqlQuery q(m_db);
+    q.prepare("UPDATE chat_history SET thought_result=json_set(coalesce(thought_result,'{}'),'$.deferred_reason',?),"
+              "thought_version=thought_version+1,review_after=0 WHERE id=? AND thought_version=? AND thought IS NOT NULL");
+    q.addBindValue(reason);
+    q.addBindValue(id);
+    q.addBindValue(version);
+    return q.exec() && q.numRowsAffected()==1;
 }
 
 bool MemoryManager::finishThoughtReview(qlonglong id, int version, const QJsonObject &proposal)
@@ -301,7 +320,10 @@ bool MemoryManager::finishThoughtReview(qlonglong id, int version, const QJsonOb
     if (status != "active" && status != "paused" && status != "completed"
         && status != "abandoned")
         return false;
-    QJsonObject result{{"status",status}};
+    // A full draft is a replacement. Truncating it would silently lose earlier work.
+    if (proposal["draft"].toString().trimmed().size() > 800)
+        return false;
+    QJsonObject result{{"status",status},{"deferred_reason",QJsonValue::Null},{"paused_reason",QJsonValue::Null}};
     for (const auto &key : {"reflection","goal","progress","next_step","draft","mood","paused_reason"}) {
         const int limit = (QString(key) == "draft") ? 800 : 200;
         const QString value = proposal[key].toString().trimmed().left(limit);
@@ -313,7 +335,8 @@ bool MemoryManager::finishThoughtReview(qlonglong id, int version, const QJsonOb
     const int hours = qBound(1, proposal["review_hours"].toInt(24), 168);
     QSqlQuery q(m_db);
     q.prepare("UPDATE chat_history SET thought_result=json_patch(coalesce(thought_result,'{}'),?),thought_version=thought_version+1,"
-              "review_after=unixepoch()+? WHERE id=? AND thought_version=? AND thought IS NOT NULL");
+              "review_after=unixepoch()+? WHERE id=? AND thought_version=? AND thought IS NOT NULL AND sensitive=0 "
+              "AND coalesce(json_extract(thought_result,'$.status'),'active')='active'");
     q.addBindValue(QString::fromUtf8(QJsonDocument(result).toJson(QJsonDocument::Compact)));
     q.addBindValue(hours*3600);
     q.addBindValue(id);
@@ -321,8 +344,23 @@ bool MemoryManager::finishThoughtReview(qlonglong id, int version, const QJsonOb
     return q.exec() && q.numRowsAffected()==1;
 }
 
-bool MemoryManager::applyThoughtAction(qlonglong id, int expectedVersion, const QString &action)
+bool MemoryManager::applyThoughtAction(qlonglong id, int expectedVersion, const QString &action,
+                                     int afterMinutes, const QString &reason)
 {
+    if (action == "reschedule") {
+        if (afterMinutes<0 || afterMinutes>7*24*60 || reason.trimmed().isEmpty() || reason.size()>200)
+            return false;
+        QSqlQuery q(m_db);
+        q.prepare("UPDATE chat_history SET review_after=unixepoch()+?,thought_version=thought_version+1,"
+                  "thought_result=json_set(coalesce(thought_result,'{}'),'$.schedule_reason',?) "
+                  "WHERE id=? AND thought_version=? AND thought IS NOT NULL AND sensitive=0 "
+                  "AND coalesce(json_extract(thought_result,'$.status'),'active')='active'");
+        q.addBindValue(afterMinutes*60);
+        q.addBindValue(reason.trimmed());
+        q.addBindValue(id);
+        q.addBindValue(expectedVersion);
+        return q.exec() && q.numRowsAffected()==1;
+    }
     const QString status = action == "pause" ? QStringLiteral("paused")
         : action == "resume" ? QStringLiteral("active")
         : action == "abandon" ? QStringLiteral("abandoned")
@@ -330,14 +368,19 @@ bool MemoryManager::applyThoughtAction(qlonglong id, int expectedVersion, const 
     if (status.isEmpty() || id <= 0 || expectedVersion < 0)
         return false;
     QJsonObject patch{{"status", status}};
+    patch["paused_reason"] = QJsonValue::Null;
     if (action == "pause") patch["paused_reason"] = QStringLiteral("user_paused");
     QSqlQuery q(m_db);
     q.prepare("UPDATE chat_history SET thought_result=json_patch(coalesce(thought_result,'{}'),?),"
               "thought_version=thought_version+1,review_after=0 "
-              "WHERE id=? AND thought_version=? AND thought IS NOT NULL");
+              "WHERE id=? AND thought_version=? AND thought IS NOT NULL AND sensitive=0 "
+              "AND CASE coalesce(json_extract(thought_result,'$.status'),'active') "
+              "WHEN 'paused' THEN ? IN ('resume','abandon') WHEN 'active' THEN ? IN ('pause','abandon') ELSE 0 END");
     q.addBindValue(QString::fromUtf8(QJsonDocument(patch).toJson(QJsonDocument::Compact)));
     q.addBindValue(id);
     q.addBindValue(expectedVersion);
+    q.addBindValue(action);
+    q.addBindValue(action);
     if (!q.exec() || q.numRowsAffected()!=1) {
         qWarning() << "[MemoryManager]activity action rejected:" << id << expectedVersion << action;
         return false;
@@ -358,7 +401,7 @@ bool MemoryManager::hasActiveThought(const QString &subject) const
 bool MemoryManager::canShareThought(qlonglong id, int expectedVersion) const
 {
     QSqlQuery q(m_db);
-    q.prepare("SELECT 1 FROM chat_history WHERE id=? AND thought IS NOT NULL AND thought_version=? "
+    q.prepare("SELECT 1 FROM chat_history WHERE id=? AND thought IS NOT NULL AND sensitive=0 AND thought_version=? "
               "AND coalesce(json_extract(thought_result,'$.status'),'active') IN ('active','completed')");
     q.addBindValue(id);
     q.addBindValue(expectedVersion);
@@ -4484,6 +4527,27 @@ void MemoryManager::initDatabase(const QString &dbFilePath, const QString &conne
                 throw query.lastError();
             if (!query.exec("PRAGMA user_version=17")) throw query.lastError();
             currentVersion = 17;
+        }
+        if (currentVersion < 18) {
+            if (!query.exec("CREATE TABLE IF NOT EXISTS private_reflection(turn_id INTEGER PRIMARY KEY,"
+                            "version INTEGER NOT NULL,state TEXT NOT NULL,eligible_at INTEGER NOT NULL,"
+                            "note TEXT,updated_at INTEGER NOT NULL)")
+                || !query.exec("CREATE TRIGGER IF NOT EXISTS forget_private_reflection AFTER DELETE ON chat_history "
+                               "BEGIN DELETE FROM private_reflection WHERE turn_id=OLD.id; END")
+                || !query.exec("CREATE TRIGGER IF NOT EXISTS forget_reflection_source AFTER DELETE ON cognitive_source "
+                               "BEGIN DELETE FROM private_reflection WHERE turn_id IN "
+                               "(SELECT id FROM chat_history WHERE cognitive_event=OLD.event); END")
+                || !query.exec("PRAGMA user_version=18")) throw query.lastError();
+            currentVersion = 18;
+        }
+        if (currentVersion < 19) {
+            if (!query.exec("CREATE TABLE IF NOT EXISTS reflection_contact(turn_id INTEGER PRIMARY KEY,"
+                            "version INTEGER NOT NULL,timing TEXT NOT NULL,reason TEXT,message TEXT,"
+                            "outcome TEXT NOT NULL,channel TEXT,session TEXT)")
+                || !query.exec("CREATE TRIGGER IF NOT EXISTS forget_reflection_contact AFTER DELETE ON private_reflection "
+                               "BEGIN DELETE FROM reflection_contact WHERE turn_id=OLD.turn_id; END")
+                || !query.exec("PRAGMA user_version=19")) throw query.lastError();
+            currentVersion = 19;
         }
         if (!m_db.commit()) throw m_db.lastError();
         qDebug()<<"[MemoryManager]数据库初始化完成,结构版本为:"<<currentVersion;

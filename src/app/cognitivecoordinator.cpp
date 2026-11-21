@@ -5,8 +5,17 @@
 #include <QTimer>
 
 CognitiveCoordinator::CognitiveCoordinator(MemoryManager &memory, LLMService &model, QObject *parent)
-    : QObject(parent), store(memory), service(model)
+    : QObject(parent), review(memory), store(memory), service(model)
 {
+    idle.start();
+    connect(&review, &PrivateReview::requested, &service, &LLMService::requestPrivateReview);
+    connect(&review, &PrivateReview::cancelled, &service, &LLMService::cancelPrivateReview);
+    connect(&service, &LLMService::privateReviewFinished, &review, &PrivateReview::receive);
+    connect(&review, &PrivateReview::contactProposed, this, &CognitiveCoordinator::contactProposed);
+    connect(&review, &PrivateReview::shareRequested, this, &CognitiveCoordinator::draftReadyToShare);
+    auto *reviewTimer = new QTimer(this);
+    connect(reviewTimer, &QTimer::timeout, this, &CognitiveCoordinator::reviewIfDue);
+    reviewTimer->start(60000);
     auto *retryTimer = new QTimer(this);
     connect(retryTimer,&QTimer::timeout,&service,&LLMService::processObservation);
     retryTimer->start(30000);
@@ -22,13 +31,31 @@ CognitiveCoordinator::CognitiveCoordinator(MemoryManager &memory, LLMService &mo
 
 CognitiveCoordinator::~CognitiveCoordinator()
 {
+    review.yieldAttention(QStringLiteral("shutdown"));
     if (!finishing && turnId()) store.interruptTurn(turnId(), "shutdown");
     for (const auto &turn : std::as_const(pending))
         if (turn.turnId) store.interruptTurn(turn.turnId, "shutdown");
 }
 
+void CognitiveCoordinator::reviewIfDue()
+{
+    auto &cfg = ConfigManager::instance();
+    if (!idleForWriting() || !cfg.getMemoryPolicyConfig().longTermMemoryEnabled
+        || !service.hasWritingProvider()) return;
+    const auto options = cfg.getProactiveConfig();
+    review.wake(options.dailyLimit, options.cooldownSeconds);
+}
+
+bool CognitiveCoordinator::idleForWriting() const
+{
+    const auto options = ConfigManager::instance().getProactiveConfig();
+    return options.privateWriting && !busy() && idle.elapsed()/1000 >= options.idleSeconds;
+}
+
 void CognitiveCoordinator::submit(const QString &input, const RequestMeta &meta)
 {
+    idle.restart();
+    review.yieldAttention(QStringLiteral("incoming_message"));
     auto &config = ConfigManager::instance();
     const bool observe = config.getMemoryPolicyConfig().longTermMemoryEnabled &&
                          !config.isBlindZone(meta.channel, meta.sessionId);

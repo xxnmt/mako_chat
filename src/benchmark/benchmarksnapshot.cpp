@@ -63,6 +63,7 @@ bool restrictSnapshot(QSqlDatabase db, int turn, QDateTime at)
         "OR coalesce(julianday(updated_at,'utc')<=julianday(:at),0)=0",
         "DELETE FROM episodic_memory WHERE coalesce(julianday(content_recorded_at)<=julianday(:at),0)=0",
         "DELETE FROM cognitive_source WHERE coalesce(julianday(reported)<=julianday(:at),0)=0",
+        "DELETE FROM private_reflection WHERE updated_at>=unixepoch(:at)",
         "DELETE FROM matter_revision WHERE coalesce(julianday(recorded)<=julianday(:at),0)=0",
         "DELETE FROM character_profile WHERE coalesce(julianday(updated_at,'utc')<=julianday(:at),0)=0",
         "DELETE FROM relationship_state WHERE coalesce(julianday(updated_at,'utc')<=julianday(:at),0)=0",

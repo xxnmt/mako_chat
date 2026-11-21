@@ -6,6 +6,8 @@
 #include <QJsonDocument>
 
 #include <memory>
+#include <QScopeGuard>
+#include "runtimelog.h"
 
 #include "appcontroller.h"
 #include "configmanager.h"
@@ -20,6 +22,8 @@ int main(int argc, char *argv[]) {
     // QCoreApplication::setOrganizationName("MakoDesktop");
 
     QApplication a(argc, argv);
+    RuntimeLog::start(QDir(a.applicationDirPath()).filePath("app_data"));
+    const auto closeLog = qScopeGuard([]{ RuntimeLog::stop(); });
     if (a.arguments().contains(QStringLiteral("--bench-import")))
         return runBenchmarkImport(a.arguments());
     if (a.arguments().contains(QStringLiteral("--bench-ask")))

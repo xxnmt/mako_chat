@@ -112,6 +112,8 @@ public:
     QString getConfigDirPath()const;
     QString getConfigFilePath()const;
     QString getAppDataPath()const;
+    QString logDirectory() const;
+    bool separateLogRuns() const { return m_separateLogRuns; }
     QString getMemoryPath()const;
 
     // ===== 多渠道扩展配置（identity.json，Phase 0 只读解析，缺失时用默认值）=====
@@ -170,6 +172,8 @@ private:
     mutable ProactiveConfig m_proactive;
     void ensureIdentityLoaded() const;
 
+    QString m_logDirectory;
+    bool m_separateLogRuns = true;
     QString m_configDirPath;
     QString m_configFilePath;
     QString m_gptModelDir;

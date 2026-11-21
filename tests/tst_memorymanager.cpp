@@ -18,6 +18,7 @@
 #include "memoryembedding.h"
 #include "memoryindexworker.h"
 #include "utterance.h"
+#include "privatereview.h"
 
 // 独立于 MemoryManager 的原始连接，用于建 v1 库/直接校验表结构。
 // 注意：QSqlDatabase 句柄必须在 removeDatabase 前析构（close() 内先释放 m_db）。
@@ -223,7 +224,7 @@ private slots:
         QVERIFY(raw.exec("DROP TABLE matter_revision"));
         for (int reopen=0; reopen<2; ++reopen) {
             MemoryManager db(path);
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),17);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),19);
             QCOMPARE(raw.scalar("SELECT state_updates FROM chat_history").toString(),QString("[]"));
             QVERIFY(db.matterHeads("user").isEmpty());
         }
@@ -544,12 +545,12 @@ private slots:
             auto thought = db.nextThought(true);
             id = thought["id"].toInteger();
             QVERIFY(id > 0);
-            QVERIFY(db.claimThoughtReview(id,1,900));
-            QVERIFY(!db.claimThoughtReview(id,1,900));
+            QVERIFY(db.claimThoughtReview(id,0,1,900));
+            QVERIFY(!db.claimThoughtReview(id,0,1,900));
             const QJsonObject review{{"status","completed"},{"reflection","写好了两句"},
                                      {"draft","屋檐轻响，雨在窗上停了一停。"}};
-            QVERIFY(db.finishThoughtReview(id,0,review));
-            QVERIFY(!db.finishThoughtReview(id,0,review));
+            QVERIFY(db.finishThoughtReview(id,1,review));
+            QVERIFY(!db.finishThoughtReview(id,1,review));
         }
         MemoryManager db(path);
         QVERIFY(db.nextThought(true).isEmpty());
@@ -584,7 +585,7 @@ private slots:
         }
         RawDb raw(path,"v17-semantics");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),17);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),19);
         QCOMPARE(raw.scalar("SELECT count(*) FROM matter_revision").toInt(),1);
         QVERIFY(raw.scalar("SELECT semantics IS NULL FROM matter_revision").toBool());
     }
@@ -658,7 +659,7 @@ private slots:
         RawDb raw(path,"lifecycle");
         QVERIFY(raw.open());
         QCOMPARE(raw.scalar("SELECT count(*) FROM matter_revision").toInt(),2);
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),17);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),19);
     }
 
     void currentUnderstandingRetainsLatestSelfReport()
@@ -700,6 +701,155 @@ private slots:
         QVERIFY(selfReport["evidence_ref"].toString().startsWith("source/"));
     }
 
+    void writingResumesFromCommittedDraftAfterInterruption()
+    {
+        QTemporaryDir dir;
+        const auto path = dir.filePath("writing.db");
+        const QJsonObject chapter{{"status","active"},{"reflection","opening written"},
+                                  {"draft","first paragraph"},{"next_step","second paragraph"}};
+        qlonglong id = 0;
+        int interruptedVersion = 0;
+        {
+            MemoryManager db(path);
+            QVERIFY(db.saveQATurn("write", R"({"personal_interest":"rain"})", {}));
+            PrivateReview writing(db);
+            QSignalSpy requests(&writing, &PrivateReview::requested);
+            QSignalSpy cancellations(&writing, &PrivateReview::cancelled);
+            writing.wake(5,60);
+            writing.wake(5,60);
+            QCOMPARE(requests.size(),1);
+            id = requests.first()[0].toLongLong();
+            writing.receive(id,requests.first()[1].toInt(),chapter,{});
+            // Advance only the stored due time and budget clock in this isolated fixture.
+            RawDb clock(path,"advance-review");
+            QVERIFY(clock.open());
+            QVERIFY(clock.exec("UPDATE chat_history SET review_after=0"));
+            QVERIFY(clock.exec("UPDATE thought_review_log SET started_at=started_at-120"));
+            writing.wake(5,60);
+            QCOMPARE(requests.size(),2);
+            interruptedVersion = requests.last()[1].toInt();
+            writing.yieldAttention("incoming_message");
+            QCOMPARE(cancellations.size(),1);
+            writing.wake(5,60);
+            QCOMPARE(requests.size(),2); // Interrupted work still consumed budget.
+            const auto saved = db.nextThought(true)["last_review"].toObject();
+            QCOMPARE(saved["draft"].toString(),QString("first paragraph"));
+            QCOMPARE(saved["deferred_reason"].toString(),QString("incoming_message"));
+            QVERIFY(clock.exec("UPDATE thought_review_log SET started_at=started_at-120"));
+        }
+        MemoryManager db(path);
+        PrivateReview restored(db);
+        QSignalSpy requests(&restored, &PrivateReview::requested);
+        QSignalSpy shares(&restored, &PrivateReview::shareRequested);
+        restored.wake(5,60);
+        QCOMPARE(requests.size(),1);
+        const auto attempt = requests.first();
+        const auto context = attempt[2].toJsonObject()["last_review"].toObject();
+        QCOMPARE(context["next_step"].toString(),QString("second paragraph"));
+        QCOMPARE(context["draft"].toString(),QString("first paragraph"));
+        const QJsonObject finalDraft{{"status","completed"},{"reflection","finished"},
+                                     {"draft","first paragraph and second paragraph"},{"share_with_owner",true}};
+        restored.receive(id,interruptedVersion,finalDraft,{});
+        QVERIFY(!db.finishThoughtReview(id,interruptedVersion,finalDraft));
+        QCOMPARE(shares.size(),0);
+        restored.receive(id,attempt[1].toInt(),finalDraft,{});
+        QCOMPARE(shares.size(),1);
+        QCOMPARE(db.nextThought(false)["last_review"].toObject()["draft"],finalDraft["draft"]);
+        QVERIFY(db.nextThought(true).isEmpty());
+    }
+
+    void expiredWritingClaimRejectsOldAttempt()
+    {
+        QTemporaryDir dir;
+        const auto path = dir.filePath("expired.db");
+        qlonglong id = 0;
+        int version = 0;
+        {
+            MemoryManager db(path);
+            QVERIFY(db.saveQATurn("write", R"({"personal_interest":"a poem"})", {}));
+            PrivateReview writing(db);
+            QSignalSpy requests(&writing, &PrivateReview::requested);
+            writing.wake(3,60);
+            QCOMPARE(requests.size(),1);
+            id = requests.first()[0].toLongLong();
+            version = requests.first()[1].toInt();
+            // Simulate losing the process without a graceful shutdown event.
+        }
+        MemoryManager db(path);
+        PrivateReview writing(db);
+        QSignalSpy requests(&writing, &PrivateReview::requested);
+        writing.wake(3,60);
+        QVERIFY(requests.isEmpty());
+        RawDb clock(path,"expire-claim");
+        QVERIFY(clock.open());
+        QVERIFY(clock.exec("UPDATE thought_review_log SET started_at=started_at-2000"));
+        QVERIFY(clock.exec("UPDATE chat_history SET review_after=unixepoch()-1"));
+        writing.wake(3,60);
+        QCOMPARE(requests.size(),1);
+        const int newVersion = requests.first()[1].toInt();
+        QVERIFY(newVersion > version);
+        QVERIFY(!db.deferThoughtReview(id,version,"stale"));
+        writing.receive(id,newVersion,{{"status","active"},{"reflection","edited"},{"draft",QString(801,'x')}},{});
+        QCOMPARE(db.nextThought(true)["last_review"].toObject()["deferred_reason"].toString(),
+                 QString("invalid_or_stale_proposal"));
+        QVERIFY(!db.nextThought(true)["last_review"].toObject().contains("draft"));
+    }
+
+    void writingCannotShareAfterAbandonOrDeletion()
+    {
+        for (const bool remove : {false,true}) {
+            QTemporaryDir dir;
+            MemoryManager db(dir.filePath("cancel.db"));
+            QVERIFY(db.saveQATurn("write", R"({"personal_interest":"rain"})", {}));
+            PrivateReview writing(db);
+            QSignalSpy requests(&writing, &PrivateReview::requested);
+            QSignalSpy shares(&writing, &PrivateReview::shareRequested);
+            writing.wake(5,60);
+            QCOMPARE(requests.size(),1);
+            const auto id = requests.first()[0].toLongLong();
+            const auto version = requests.first()[1].toInt();
+            if (remove) QVERIFY(db.deleteTurnByID(id));
+            else QVERIFY(db.applyThoughtAction(id,version,"abandon"));
+            writing.receive(id,version,{{"status","active"},{"reflection","late"},{"draft","late"},{"share_with_owner",true}},{});
+            QCOMPARE(shares.size(),0);
+            QVERIFY(db.nextThought(true).isEmpty());
+        }
+    }
+
+    void independentReflectionRespectsRestAndSourceLifetime()
+    {
+        QTemporaryDir dir;
+        MemoryManager db(dir.filePath("reflection.db"));
+        RequestMeta meta;
+        meta.eventId = meta.runId = "first";
+        const auto first = db.recordInput("a conversation without a task",meta,true);
+        QVERIFY(db.recordQuiet(first,"close"));
+        QVERIFY(db.nextThought(true).isEmpty());
+        const auto claim = db.claimPrivateReflection(2,60);
+        QCOMPARE(claim["id"].toInteger(),first);
+        QVERIFY(db.deferPrivateReflection(first,1));
+        QVERIFY(!db.finishPrivateReflection(first,1,"consider","late"));
+        QVERIFY(db.claimPrivateReflection(2,60).isEmpty());
+        RawDb clock(dir.filePath("reflection.db"),"reflection-clock");
+        QVERIFY(clock.open());
+        QVERIFY(clock.exec("UPDATE thought_review_log SET started_at=started_at-120"));
+        QCOMPARE(db.claimPrivateReflection(2,60)["version"].toInt(),2);
+        QVERIFY(db.finishPrivateReflection(first,2,"rest",""));
+        QVERIFY(clock.exec("UPDATE thought_review_log SET started_at=started_at-120"));
+        QVERIFY(db.claimPrivateReflection(3,60).isEmpty());
+        meta.eventId = meta.runId = "second";
+        const auto second = db.recordInput("another ordinary experience",meta,true);
+        QVERIFY(db.recordQuiet(second,"close"));
+        QVERIFY(db.claimPrivateReflection(2,60).isEmpty());
+        QCOMPARE(db.claimPrivateReflection(3,60)["id"].toInteger(),second);
+        QVERIFY(db.finishPrivateReflection(second,1,"consider","own question"));
+        QCOMPARE(db.recentPrivateReflection(meta)["own_reflection"].toString(),QString("own question"));
+        meta.channel=Channel::kQQGroup;
+        QVERIFY(db.recentPrivateReflection(meta).isEmpty());
+        QVERIFY(db.deleteTurnByID(second));
+        QCOMPARE(clock.scalar("SELECT count(*) FROM private_reflection WHERE state='consider'").toInt(),0);
+    }
+
     void activityActionsRequireExpectedVersion()
     {
         QTemporaryDir dir;
@@ -722,6 +872,10 @@ private slots:
             const int v2 = after["version"].toInt();
             QCOMPARE(v2, version + 1);
 
+            QVERIFY(!db.applyThoughtAction(id,v2,"resume"));
+            QVERIFY(db.nextThought(true).isEmpty());
+            QCOMPARE(db.nextThought(false)["version"].toInt(),v2);
+            QVERIFY(!db.applyThoughtAction(id,v2,"reschedule",0,""));
             QVERIFY(db.applyThoughtAction(id, v2, "pause"));
             QVERIFY(db.nextThought(true).isEmpty());
             QVERIFY(!db.canShareThought(id, v2 + 1));
@@ -733,7 +887,10 @@ private slots:
             QCOMPARE(resumed["id"].toInteger(), id);
             const int v3 = resumed["version"].toInt();
 
-            QVERIFY(db.applyThoughtAction(id, v3, "abandon"));
+            QVERIFY(db.applyThoughtAction(id,v3,"reschedule",120,"revisit later"));
+            QVERIFY(db.nextThought(true).isEmpty());
+            QCOMPARE(db.nextThought(false)["last_review"].toObject()["schedule_reason"].toString(),QString("revisit later"));
+            QVERIFY(db.applyThoughtAction(id, v3+1, "abandon"));
             QVERIFY(!db.hasActiveThought("user"));
             QVERIFY(db.nextThought(true).isEmpty());
         }
@@ -1143,7 +1300,7 @@ private slots:
         }
         RawDb raw(path, "v15-verify");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 17);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 19);
     }
 
     void databaseBackupIsConsistent()
@@ -1163,7 +1320,7 @@ private slots:
         RawDb copy(backup, "backup-copy");
         QVERIFY(copy.open());
         QCOMPARE(copy.scalar("SELECT count(*) FROM chat_history").toInt(), 1);
-        QCOMPARE(copy.scalar("PRAGMA user_version").toInt(), 17);
+        QCOMPARE(copy.scalar("PRAGMA user_version").toInt(), 19);
         QVERIFY(copy.scalar("SELECT count(*) FROM memory_chunks").toInt() > 0);
     }
 
@@ -1400,7 +1557,7 @@ private slots:
             QVERIFY(raw.open());
 
             // 版本推进到 v3
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 17);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 19);
 
             // 列扩展（v2 渠道 + v3 轮次）
             const QStringList historyCols = raw.columns("chat_history");
@@ -1505,7 +1662,7 @@ private slots:
             MemoryManager second(dbPath);
             RawDb raw(dbPath, "verify2");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 17);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 19);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM chat_history").toInt(), 1);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM relationship_state").toInt(), 2);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM long_term_summary").toInt(), 1);
@@ -1522,7 +1679,7 @@ private slots:
             MemoryManager mm(dbPath);
             RawDb raw(dbPath, "fresh");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 17);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 19);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('raw_events')").toInt() > 0);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('memory_cursor')").toInt() > 0);
 
@@ -1729,7 +1886,7 @@ private slots:
         Q_UNUSED(mm);
         RawDb raw(dbPath, "v2verify");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 17);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 19);
         QCOMPARE(raw.scalar("SELECT user_input FROM chat_history").toString(), QStringLiteral("旧输入"));
         QCOMPARE(raw.scalar("SELECT turn_kind FROM chat_history").toString(), QStringLiteral("reply"));
         QCOMPARE(raw.scalar("SELECT subject FROM chat_history").toString(), QStringLiteral("user"));

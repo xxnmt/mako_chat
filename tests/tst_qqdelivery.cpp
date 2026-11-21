@@ -63,6 +63,7 @@ private slots:
             });
         });
         QQProtocolClient client;
+        QSignalSpy receipts(&client, &QQProtocolClient::sendResult);
         QQConfig config;config.enabled=true;
         config.wsUrl=QString("ws://127.0.0.1:%1").arg(server.serverPort());
         client.setConfig(config);client.start();
@@ -70,6 +71,7 @@ private slots:
         QQChannelAdapter adapter;adapter.setClient(&client);
         Utterance u;u.channel=channel;u.sessionId="12345";
         for(const QString &text:{QString("第一句。还有同单元的内容。"),QString("第二句"),QString("第三句")}) {
+            u.deliveryEcho = text == "第一句。还有同单元的内容。" ? QStringLiteral("reflection:12:1") : QString();
             u.text=text;QVERIFY(adapter.sendUtterance(u));
         }
         QTRY_COMPARE(sends.size(),1);
@@ -89,12 +91,17 @@ private slots:
         QCOMPARE(sends[1],sends[0]);
         ack(sends[1],true,0);
         QTRY_COMPARE(sends.size(),3);
+        QCOMPARE(receipts.size(),1);
+        QCOMPARE(receipts.first().at(0).toString(),QString("reflection:12:1"));
+        QCOMPARE(receipts.first().at(1).toString(),QString("protocol_accepted"));
         QCOMPARE(content(sends[2]),QString("第二句"));
         QVERIFY(sends[2]["echo"]!=sends[0]["echo"]);
         ack(sends[0],true,0); // Duplicate must not advance the second sentence.
         QTest::qWait(50);QCOMPARE(sends.size(),3);
         ack(sends[2],false,1404); // Explicit terminal failure does not replay the batch.
         QTRY_COMPARE(sends.size(),4);
+        QCOMPARE(receipts.size(),2);
+        QCOMPARE(receipts.last().at(1).toString(),QString("rejected"));
         QCOMPARE(content(sends[3]),QString("第三句"));
         QVERIFY(sends[3]["echo"]!=sends[2]["echo"]);
         u.text="不应在重连后补发";QVERIFY(adapter.sendUtterance(u));

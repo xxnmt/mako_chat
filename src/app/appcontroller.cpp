@@ -1,6 +1,7 @@
 #include "appcontroller.h"
 #include "memoryindexworker.h"
 #include "cognitivecoordinator.h"
+#include "runtimelog.h"
 #include "characterwidget.h"
 #include "bubblewidget.h"
 #include "llmservice.h"
@@ -206,14 +207,35 @@ AppController::AppController(QObject *parent)
     m_llmService->registerStateProvider([this](){return m_appearance->getCurrentStateDescription();});
 
     initConnections();
-    m_idle.start();
-    auto *reviewTimer = new QTimer(this);
-    connect(reviewTimer, &QTimer::timeout, this, [this] {
-        if (canReviewThought())
-            m_llmService->reviewDueThought();
+    connect(m_coordinator, &CognitiveCoordinator::contactProposed, this, [this](qlonglong turn,int version) {
+        if (canContactNow()) {
+            auto &cfg = ConfigManager::instance();
+            for (const auto &target : cfg.getProactiveConfig().targets) {
+                const bool pet = target.first==Channel::kPet;
+                if (!pet && !m_qqClient->isConnected()) continue;
+                Utterance u;
+                u.channel=target.first;
+                u.sessionId=target.second;
+                u.text=m_memoryManager->claimReflectionContact(turn,version,u.channel,u.sessionId);
+                if (u.text.isEmpty()) continue;
+                u.deliveryEcho=QString("reflection:%1:%2").arg(turn).arg(version);
+                const bool submitted = pet ? m_petChannel->sendUtterance(u) : m_qqChannel->sendUtterance(u);
+                const QString outcome = submitted ? QStringLiteral("handed_off") : QStringLiteral("rejected");
+                m_memoryManager->recordContactOutcome(turn,version,outcome);
+                qInfo() << "[ReflectionContact]" << turn << version << u.channel << outcome;
+                return;
+            }
+        }
+        m_memoryManager->recordContactOutcome(turn,version,"withheld");
+        qInfo() << "[ReflectionContact] withheld" << turn << version;
     });
-    reviewTimer->start(60000);
-    connect(m_llmService, &LLMService::draftReadyToShare, this, [this](const QString &activityRef, int version, const QString &draft) {
+    connect(m_qqClient, &QQProtocolClient::sendResult, this, [this](const QString &echo,const QString &outcome) {
+        if (!echo.startsWith("reflection:")) return;
+        const auto parts=echo.split(':');
+        if (parts.size()==3 && m_memoryManager->recordContactOutcome(parts[1].toLongLong(),parts[2].toInt(),outcome))
+            qInfo() << "[ReflectionContact]" << echo << outcome;
+    });
+    connect(m_coordinator, &CognitiveCoordinator::draftReadyToShare, this, [this](const QString &activityRef, int version, const QString &draft) {
         if (!canContactNow())
             return;
         const qlonglong activityId = activityRef.startsWith(QStringLiteral("thought/"))
@@ -250,6 +272,8 @@ AppController::AppController(QObject *parent)
 
 AppController::~AppController()
 {
+    if (m_qqClient)
+        m_qqClient->stop();
     delete m_coordinator;
 
     //1. 优先析构 AnchorManager（因为它持有了 m_character 及各个 UI 窗口的指针）
@@ -295,10 +319,6 @@ AppController::~AppController()
     if (m_memoryManager) {
         delete m_memoryManager;
         m_memoryManager = nullptr;
-    }
-
-    if (m_qqClient) {
-        m_qqClient->stop();
     }
 
     qDebug()<<"[AppController]:所有中枢资源已安全清理完毕";
@@ -367,19 +387,10 @@ void AppController::handleMakoReply(const QList<SentenceText> &sentences, const 
 }
 
 
-bool AppController::canReviewThought() const
-{
-    const auto cfg = ConfigManager::instance().getProactiveConfig();
-    if (!cfg.privateWriting || m_coordinator->busy() || m_idle.elapsed()/1000 < cfg.idleSeconds)
-        return false;
-    return true;
-}
-
 bool AppController::canContactNow() const
 {
     const auto cfg = ConfigManager::instance().getProactiveConfig();
-    if (!cfg.enabled || !cfg.privateWriting || m_coordinator->busy()
-        || m_idle.elapsed()/1000 < cfg.idleSeconds)
+    if (!cfg.enabled || !m_coordinator->idleForWriting())
         return false;
     const auto now = QTime::currentTime();
     const auto start = QTime::fromString(cfg.quietStart, "HH:mm");
@@ -473,6 +484,9 @@ void AppController::initConnections()
     connect(m_character, &CharacterWidget::settingsRequested, m_settingsWidget, &SettingsWidget::show);
     connect(m_settingsWidget, &SettingsWidget::settingsSaved, this, [this](){
         auto &config = ConfigManager::instance();
+        QString logError;
+        if (!RuntimeLog::configure(config.logDirectory(),config.separateLogRuns(),&logError))
+            qWarning().noquote() << "[RuntimeLog] could not switch directory:" << logError;
         m_llmService->setApiKey(config.getApiKey());
         m_globalMood->setFollowExternalMood(config.getFollowExternalMood());
         m_memoryManager->updateMasterAccounts(config.getMasterQQAccounts());
@@ -492,7 +506,6 @@ void AppController::initConnections()
     connect(m_sessionRouter, &SessionRouter::requestReply, this,
             [this](const QString &userText, const QList<HistoryTurn> &history, const RequestMeta &meta) {
         Q_UNUSED(history);
-        m_idle.restart();
         m_timeManager->notifyUserInputStarted();
         m_coordinator->submit(userText, meta);
     });

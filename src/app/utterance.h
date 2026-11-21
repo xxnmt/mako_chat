@@ -44,6 +44,7 @@ struct Utterance {
     QString channel = Channel::kPet;
     QString sessionId = Channel::kDefaultSession;
     QString speaker;                // 触发本句的说话人（群聊场景）
+    QString deliveryEcho; // Optional correlation for an outbound action.
 };
 
 #endif // UTTERANCE_H

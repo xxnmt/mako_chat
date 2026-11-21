@@ -115,13 +115,22 @@ public:
     bool embedSearchChunks(MemoryEmbeddingProvider *provider, int limit = 2000,
                            QString *error = nullptr, const MemoryReadPolicy *policy = nullptr);
 
+    QJsonObject claimPrivateReflection(int dailyLimit, int cooldownSeconds);
+    bool finishPrivateReflection(qlonglong turn, int version, const QString &choice, const QString &note,
+                                 const QJsonObject &contact = {});
+    QString claimReflectionContact(qlonglong turn, int version, const QString &channel, const QString &session);
+    bool recordContactOutcome(qlonglong turn, int version, const QString &outcome);
+    bool deferPrivateReflection(qlonglong turn, int version);
+    QJsonObject recentPrivateReflection(const RequestMeta &viewer) const;
     QJsonObject nextThought(bool dueOnly) const;
-    bool claimThoughtReview(qlonglong id, int dailyLimit, int cooldownSeconds);
+    bool claimThoughtReview(qlonglong id, int version, int dailyLimit, int cooldownSeconds);
+    bool deferThoughtReview(qlonglong id, int version, const QString &reason);
     bool finishThoughtReview(qlonglong id, int version, const QJsonObject &proposal);
     // Activity actions are conditional on a stable row id and the expected
     // thought_version, so a late review callback cannot revive a paused or
     // abandoned activity.
-    bool applyThoughtAction(qlonglong id, int expectedVersion, const QString &action);
+    bool applyThoughtAction(qlonglong id, int expectedVersion, const QString &action,
+                            int afterMinutes = -1, const QString &reason = {});
     bool hasActiveThought(const QString &subject = QStringLiteral("user")) const;
     bool canShareThought(qlonglong id, int expectedVersion) const;
 
@@ -296,6 +305,7 @@ signals:
     void searchChunksChanged();
 
 private:
+    bool chargePrivateReview(qlonglong turn, int dailyLimit, int cooldownSeconds);
     void initDatabase(const QString &dbFilePath, const QString &connectionName = QString());
     bool upsertMemoryChunk(const MemoryChunkWrite &chunk);
     bool indexRawEvent(qlonglong id);

@@ -11,6 +11,7 @@ qt6_add_resources(RESOURCE_FILES image.qrc calendar.qrc)
 
 qt_add_executable(Windows_AI
     WIN32 MACOSX_BUNDLE
+    src/app/runtimelog.cpp
     src/app/main.cpp
     src/ui/characterwidget.cpp
     src/ui/characterwidget.h
@@ -46,6 +47,7 @@ qt_add_executable(Windows_AI
     src/cognition/promptassembler.h src/cognition/promptassembler.cpp
     src/benchmark/benchmarkrunner.h src/benchmark/benchmarkrunner.cpp src/benchmark/benchmarksnapshot.h src/benchmark/benchmarksnapshot.cpp
     src/app/appcontroller.h src/app/appcontroller.cpp
+    src/app/privatereview.cpp src/app/privatereview.h
     src/app/cognitivecoordinator.h src/app/cognitivecoordinator.cpp
     src/app/sentencedata.h
     src/ui/appearancemanager.h src/ui/appearancemanager.cpp
@@ -54,7 +56,7 @@ qt_add_executable(Windows_AI
     src/ui/chatwidget.h src/ui/chatwidget.cpp
     src/ui/anchorstrategy.h
     src/ui/anchormanager.h src/ui/anchormanager.cpp
-    src/memory/memorymanager.h src/memory/memorymanager.cpp src/memory/matterstore.cpp
+    src/memory/memorymanager.h src/memory/memorymanager.cpp src/memory/matterstore.cpp src/memory/privatereflection.cpp
     src/memory/historyturn.h
     src/app/utterance.h
     src/app/ichanneladapter.h

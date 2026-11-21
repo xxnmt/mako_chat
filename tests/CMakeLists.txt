@@ -6,7 +6,7 @@ qt6_add_resources(CALENDAR_RESOURCES ${PROJECT_SOURCE_DIR}/calendar.qrc)
 set(PHASE0_CORE_SOURCES
     ${PROJECT_SOURCE_DIR}/src/memory/memorymanager.h
     ${PROJECT_SOURCE_DIR}/src/memory/memorymanager.cpp
-    ${PROJECT_SOURCE_DIR}/src/memory/matterstore.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/matterstore.cpp ${PROJECT_SOURCE_DIR}/src/memory/privatereflection.cpp
     ${PROJECT_SOURCE_DIR}/src/config/configmanager.h
     ${PROJECT_SOURCE_DIR}/src/config/configmanager.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/memorypolicy.h
@@ -43,8 +43,12 @@ function(add_phase0_test name)
     )
 endfunction()
 
+add_phase0_test(tst_runtimelog tst_runtimelog.cpp ${PROJECT_SOURCE_DIR}/src/app/runtimelog.cpp)
+
 add_phase0_test(tst_memorymanager
     tst_memorymanager.cpp
+    ${PROJECT_SOURCE_DIR}/src/app/privatereview.cpp
+    ${PROJECT_SOURCE_DIR}/src/app/privatereview.h
     ${PROJECT_SOURCE_DIR}/src/benchmark/benchmarksnapshot.cpp
     ${PROJECT_SOURCE_DIR}/src/config/configmanager.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/memorypolicy.cpp
@@ -61,7 +65,7 @@ add_phase0_test(tst_memorymanager
     ${PROJECT_SOURCE_DIR}/src/memory/memorydashscope.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/memoryindexworker.h
     ${PROJECT_SOURCE_DIR}/src/memory/memoryindexworker.cpp
-    ${PROJECT_SOURCE_DIR}/src/memory/matterstore.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/matterstore.cpp ${PROJECT_SOURCE_DIR}/src/memory/privatereflection.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/recentcontext.h
     ${PROJECT_SOURCE_DIR}/src/memory/recentcontext.cpp
     ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.h
@@ -115,7 +119,7 @@ add_phase0_test(tst_groupmembership
     ${PROJECT_SOURCE_DIR}/src/channels/qq/qqprotocolclient.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/memorymanager.h
     ${PROJECT_SOURCE_DIR}/src/memory/memorymanager.cpp
-    ${PROJECT_SOURCE_DIR}/src/memory/matterstore.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/matterstore.cpp ${PROJECT_SOURCE_DIR}/src/memory/privatereflection.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/recentcontext.h
     ${PROJECT_SOURCE_DIR}/src/memory/recentcontext.cpp
     ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.h
@@ -130,6 +134,7 @@ add_phase0_test(tst_groupmembership
 target_link_libraries(tst_groupmembership PRIVATE Qt6::WebSockets Qt6::Network)
 
 add_phase0_test(tst_memoryagent
+    ${PROJECT_SOURCE_DIR}/src/app/privatereview.cpp
     ${PROJECT_SOURCE_DIR}/src/app/cognitivecoordinator.cpp
     tst_memoryagent.cpp
     ${PROJECT_SOURCE_DIR}/src/cognition/llmservice.cpp
@@ -167,7 +172,7 @@ add_phase0_test(tst_memoryagent
     ${PROJECT_SOURCE_DIR}/src/memory/memoryexecutor.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/memorymanager.h
     ${PROJECT_SOURCE_DIR}/src/memory/memorymanager.cpp
-    ${PROJECT_SOURCE_DIR}/src/memory/matterstore.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/matterstore.cpp ${PROJECT_SOURCE_DIR}/src/memory/privatereflection.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/memoryaccesspolicy.h
     ${PROJECT_SOURCE_DIR}/src/memory/memoryaccesspolicy.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/memorytimerange.h
@@ -183,6 +188,8 @@ add_phase0_test(tst_memoryagent
     ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.cpp
 )
 target_link_libraries(tst_memoryagent PRIVATE Qt6::Network)
+set_target_properties(tst_memoryagent PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests/memory-agent")
 
 add_phase0_test(tst_interactionsegmenter
     tst_interactionsegmenter.cpp

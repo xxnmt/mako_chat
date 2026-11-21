@@ -322,7 +322,7 @@ app_data/config/identity.json
 | `memory.retrieval.rerank_model` | `qwen3-rerank` | 重排模型 |
 | `appearance.follow_external_mood` | `true` | D1：QQ 等外部渠道情绪是否驱动桌宠立绘 |
 | `proactive.enabled` | `false` | 启用主动联系与草稿分享，默认关闭 |
-| `proactive.private_writing` | `false` | 允许后台私下写作/回顾；与主动联系分开授权。关闭后仍保留已有草稿 |
+| `proactive.private_writing` | `false` | 允许空闲时回顾普通私下交流或继续写作，二者共享每日上限与冷却。主动联系另行授权，关闭回顾时保留已有记录 |
 | `proactive.daily_limit` | `3` | 每日后台回顾/写作尝试上限；尝试额度持久化 |
 | `proactive.cooldown_seconds` | `900` | 后台回顾/写作尝试最小间隔，服务端至少 60 秒 |
 | `proactive.idle_seconds` | `1800` | 开始回顾/写作所需的前台输入空闲时长 |
@@ -393,3 +393,9 @@ QQ 群与私聊账号分别使用权限表。群的「允许记录」指长期�
 - 索引后台任务在下一批使用新的配置。空库回填按索引和回填开关决定。
 - 身份变更更新后续身份解析。已有历史记录的身份补录仍在启动流程中处理。
 - TTS、桌宠情绪跟随和时间设置通过运行时服务应用。模型端点及凭据需由使用者配置为可用值。
+
+### 实时日志
+
+「设置 → 隐私与日志 → 日志」显示当前日志目录，可以浏览选择或恢复默认。默认位置为可执行文件旁的 `app_data/logs`。`logging.directory` 留空使用默认位置，相对路径从 `app_data` 解析。保存后，后续输出立即切换到新目录，原有文件保留。
+
+`logging.separate_runs` 默认开启。每次启动生成带本地时间、毫秒和随机后缀的独立文件；关闭后，同一天的运行追加到 `logs_yyyyMMdd.txt`。Qt 日志保留控制台输出，文件以 UTF-8 记录时间、级别和原文，每条写入后立即刷新，可在程序运行期间查看。刷新到操作系统可保留进程被强制结束前已写出的内容，突然断电时仍取决于磁盘缓存。完整提示词和消息正文继续受 `memory.debug_full_logs` 控制。

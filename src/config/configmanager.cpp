@@ -1,4 +1,5 @@
 #include "configmanager.h"
+#include <QTemporaryFile>
 #include "debuglog.h"
 #include "utterance.h"
 
@@ -51,6 +52,9 @@ bool ConfigManager::loadSetting()
     }
 
     QJsonObject rootObj = doc.object();
+    const auto logging = rootObj["logging"].toObject();
+    m_logDirectory = logging["directory"].toString().trimmed();
+    m_separateLogRuns = logging["separate_runs"].toBool(true);
 
     // 读取 api 模块下的参数
     if (rootObj.contains("api") && rootObj["api"].isObject()) {
@@ -469,6 +473,7 @@ QJsonObject ConfigManager::effectiveSettings() const
     qqObj.insert("group_sender_allowlist", senderAllowMap);
 
     QJsonObject rootObj;
+    rootObj.insert("logging", QJsonObject{{"directory",m_logDirectory},{"separate_runs",m_separateLogRuns}});
     rootObj.insert("api", apiObj);
     rootObj.insert("memory", memoryObj);
     rootObj.insert("time", timeObj);
@@ -552,6 +557,18 @@ bool ConfigManager::writeConfigDocument(const QString &name, const QByteArray &c
             return value.isUndefined() || value.type() == type;
         };
         if (name == "setting.json") {
+            if ((root.contains("logging") && !root["logging"].isObject())
+                || !checkType("logging","directory",QJsonValue::String)
+                || !checkType("logging","separate_runs",QJsonValue::Bool))
+                return fail(QStringLiteral("日志设置格式无效"));
+            const auto logging = root["logging"].toObject();
+            const auto directory = logging["directory"].toString().trimmed();
+            if (directory != m_logDirectory || logging["separate_runs"].toBool(true)!=m_separateLogRuns) {
+                const QDir target(QDir(getAppDataPath()).absoluteFilePath(directory.isEmpty() ? "logs" : directory));
+                QTemporaryFile probe(target.filePath(".mako-log-XXXXXX"));
+                if (!target.mkpath(".") || !probe.open())
+                    return fail(QStringLiteral("无法写入日志目录：") + target.path());
+            }
             if (!checkType("memory", "retrieval", QJsonValue::Object)
                 || !checkType("memory", "recent_group_context", QJsonValue::Object)
                 || !checkType("memory", "privacy_rules", QJsonValue::Array)
@@ -805,6 +822,11 @@ QString ConfigManager::getAppDataPath() const
     QDir appPath(m_configDirPath);
     appPath.cdUp();
     return appPath.absolutePath();
+}
+
+QString ConfigManager::logDirectory() const
+{
+    return QDir(getAppDataPath()).absoluteFilePath(m_logDirectory.isEmpty() ? QStringLiteral("logs") : m_logDirectory);
 }
 
 QString ConfigManager::getMemoryPath() const

@@ -33,6 +33,7 @@ QQProtocolClient::QQProtocolClient(QObject *parent)
     connect(&m_sendTimeout, &QTimer::timeout, this, [this] {
         if (m_sendQueue.isEmpty()) return;
         qWarning() << "[QQ] send acknowledgement timeout; delivery unknown, no replay" << m_sendQueue.head();
+        emit sendResult(m_sendQueue.head(),"unknown");
         finishSendAction();
     });
 }
@@ -77,6 +78,8 @@ void QQProtocolClient::stop()
     m_pacingTimer.stop();
     m_lastSubmission.invalidate();
     m_lastPlaybackMs = 0;
+    for (const auto &echo : std::as_const(m_sendQueue))
+        emit sendResult(echo,echo==m_activeSend ? "unknown" : "rejected");
     m_pendingActions.clear();
     m_sendQueue.clear();
     m_activeSend.clear();
@@ -125,6 +128,8 @@ void QQProtocolClient::onDisconnected()
     m_pacingTimer.stop();
     m_lastSubmission.invalidate();
     m_lastPlaybackMs = 0;
+    for (const auto &echo : std::as_const(m_sendQueue))
+        emit sendResult(echo,echo==m_activeSend ? "unknown" : "rejected");
     m_pendingActions.clear();
     m_sendQueue.clear();
     m_activeSend.clear();
@@ -192,6 +197,7 @@ void QQProtocolClient::sendNextAction()
     if (!isConnected() || !sendPayload(pending.action,pending.params,echo)) {
         qWarning() << "[QQ] queued action submission failed" << echo;
         m_lastPlaybackMs = 0;
+        emit sendResult(echo,"rejected");
         finishSendAction();
         return;
     }
@@ -270,9 +276,11 @@ void QQProtocolClient::onTextMessageReceived(const QString &message)
                 });
             } else if (it != m_pendingActions.end()) {
                 m_lastPlaybackMs = 0; // Explicit rejection: there is no text to read.
+                emit sendResult(echo,"rejected");
                 finishSendAction();
             }
         } else if (it != m_pendingActions.end()) {
+            emit sendResult(echo,"protocol_accepted");
             finishSendAction();
         }
         return;

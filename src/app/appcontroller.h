@@ -4,7 +4,6 @@
 #include <QObject>
 #include <QQueue>
 #include <QMap>
-#include <QElapsedTimer>
 #include "sentencedata.h"
 #include "utterance.h"
 
@@ -53,10 +52,8 @@ private:
     void applyPetTags(const QMap<QString, QString> &tags); // 桌宠：立绘 + 全局情绪同步
 
     CognitiveCoordinator *m_coordinator;
-    QElapsedTimer m_idle;
     void resumeMoodTimers();
     void recordInterruption(const QString &reason);
-    bool canReviewThought() const;
     bool canContactNow() const;
 
     CharacterWidget *m_character;
