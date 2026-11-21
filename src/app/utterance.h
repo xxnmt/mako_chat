@@ -5,6 +5,7 @@
 #include <QMetaType>
 #include <QDateTime>
 #include <QMap>
+#include <QJsonArray>
 
 // 渠道常量（与 DB 的 channel 列、config 的 [memory] blindZones 取值保持一致）
 namespace Channel {
@@ -32,6 +33,8 @@ struct RequestMeta {
     bool longTermMemoryEnabled = true;          // 是否允许触发长期提取
     QString turnKind = QStringLiteral("reply"); // 轮次类型：reply / proactive / perception
     QString triggerEventIds;                    // 触发事件 id 列表（JSON 数组，指向 raw_events.id）
+    QString replyToMessageId;
+    QJsonArray inputEvents; // Ordered, sanitized messages supplied together to the foreground model.
 };
 
 Q_DECLARE_METATYPE(RequestMeta)

@@ -844,6 +844,15 @@ private slots:
         QCOMPARE(db.claimPrivateReflection(3,60)["id"].toInteger(),second);
         QVERIFY(db.finishPrivateReflection(second,1,"consider","own question"));
         QCOMPARE(db.recentPrivateReflection(meta)["own_reflection"].toString(),QString("own question"));
+        meta.eventId = meta.runId = "third";
+        const auto third = db.recordInput("unrelated later event",meta,true);
+        QVERIFY(db.recordQuiet(third,"close"));
+        QVERIFY(clock.exec("UPDATE thought_review_log SET started_at=started_at-120"));
+        QCOMPARE(db.claimPrivateReflection(4,60)["id"].toInteger(),third);
+        QVERIFY(db.finishPrivateReflection(third,1,"consider","newer unrelated note"));
+        QCOMPARE(db.recentPrivateReflection(meta)["source_turn"].toInteger(),third);
+        QCOMPARE(db.recentPrivateReflection(meta,QJsonArray{second})["source_turn"].toInteger(),second);
+        QVERIFY(db.deleteTurnByID(third));
         meta.channel=Channel::kQQGroup;
         QVERIFY(db.recentPrivateReflection(meta).isEmpty());
         QVERIFY(db.deleteTurnByID(second));

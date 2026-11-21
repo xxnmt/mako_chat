@@ -264,6 +264,7 @@ void SettingsWidget::loadHistoryPage(int page)
         if (turn.state == "quiet") replyText = QStringLiteral("主动安静 · ") + turn.detail;
         else if (turn.state == "interrupted") replyText = QStringLiteral("处理中断 · ") + turn.detail;
         else if (turn.state == "received") replyText = QStringLiteral("已收到输入，未记录处理结果");
+        else if (turn.state == "grouped") replyText = QStringLiteral("与后续输入合并处理 · ") + turn.detail;
         else if (turn.state == "legacy") {
             const auto legacy = QJsonDocument::fromJson(turn.rawReply.toUtf8()).object();
             if (legacy["sentences"].isArray() && legacy["sentences"].toArray().isEmpty())

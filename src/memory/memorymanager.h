@@ -76,6 +76,7 @@ public:
 
     qint64 recordInput(const QString &input, const RequestMeta &meta, bool observe = false);
     bool recordQuiet(qint64 turn, const QString &action);
+    bool linkGroupedInput(qint64 previousTurn, qint64 followingTurn);
     bool interruptTurn(qint64 turn, const QString &reason);
     bool enqueueObservation(const RequestMeta &meta, const QString &input);
     QJsonObject pendingObservation(qint64 source = 0) const;
@@ -121,7 +122,7 @@ public:
     QString claimReflectionContact(qlonglong turn, int version, const QString &channel, const QString &session);
     bool recordContactOutcome(qlonglong turn, int version, const QString &outcome);
     bool deferPrivateReflection(qlonglong turn, int version);
-    QJsonObject recentPrivateReflection(const RequestMeta &viewer) const;
+    QJsonObject recentPrivateReflection(const RequestMeta &viewer, const QJsonArray &rankedTurns = {}) const;
     QJsonObject nextThought(bool dueOnly) const;
     bool claimThoughtReview(qlonglong id, int version, int dailyLimit, int cooldownSeconds);
     bool deferThoughtReview(qlonglong id, int version, const QString &reason);

@@ -26,7 +26,8 @@ public:
                      bool useShortContext = true,
                      bool longTermMemory = true,
                      bool sensitive = false,
-                     const QDateTime &occurredAt = {});
+                     const QDateTime &occurredAt = {}, const QString &replyToMessageId = {},
+                     const QString &platformMessageId = {}, const QJsonArray &imageSegments = {});
 
 signals:
     // 交给大脑侧（AppController → LLMService::askDeepSeek）

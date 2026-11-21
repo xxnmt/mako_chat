@@ -113,6 +113,7 @@ public:
     QString getConfigFilePath()const;
     QString getAppDataPath()const;
     QString logDirectory() const;
+    int inputPauseMs() const { return m_inputPauseMs; }
     bool separateLogRuns() const { return m_separateLogRuns; }
     QString getMemoryPath()const;
 
@@ -173,6 +174,7 @@ private:
     void ensureIdentityLoaded() const;
 
     QString m_logDirectory;
+    int m_inputPauseMs = 1600;
     bool m_separateLogRuns = true;
     QString m_configDirPath;
     QString m_configFilePath;

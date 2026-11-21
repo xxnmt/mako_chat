@@ -6,6 +6,7 @@
 #include <QElapsedTimer>
 #include <QObject>
 #include <QQueue>
+#include <QTimer>
 #include <optional>
 
 class LLMService;
@@ -33,11 +34,16 @@ signals:
 private:
     PrivateReview review;
     QElapsedTimer idle;
+    QElapsedTimer arrivalClock;
+    QTimer collectTimer;
     struct Turn {
         QString text;
         RequestMeta meta;
         quint64 sequence;
         qint64 turnId;
+        qint64 firstTurn;
+        qint64 firstArrival;
+        qint64 readyAt;
     };
     void advance();
     void finish();

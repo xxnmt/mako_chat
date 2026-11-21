@@ -109,6 +109,7 @@ private slots:
         const QQInboundMessage message = QQMessageParser::parse(event);
         QVERIFY(message.valid);
         QCOMPARE(message.text, QStringLiteral("[图片][语音][表情]"));
+        QCOMPARE(message.imageSegments,QJsonArray{0});
     }
 
     void detectsSelfMessage()

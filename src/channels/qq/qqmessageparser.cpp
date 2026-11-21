@@ -106,8 +106,10 @@ QQInboundMessage QQMessageParser::parse(const QJsonObject &event)
     const QJsonValue messageValue = event.value("message");
     if (messageValue.isArray()) {
         const QJsonArray segments = messageValue.toArray();
-        for (const QJsonValue &segmentValue : segments) {
-            const QJsonObject segment = segmentValue.toObject();
+        for (qsizetype index = 0; index < segments.size(); ++index) {
+            const QJsonObject segment = segments.at(index).toObject();
+            if (segment.value("type").toString() == "image")
+                message.imageSegments.append(index);
             if (segment.value("type").toString() == QStringLiteral("reply")) {
                 message.replyToMessageId =
                     idToString(segment.value("data").toObject().value("id"));

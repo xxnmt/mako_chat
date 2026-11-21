@@ -4,10 +4,26 @@
 #include "memorymanager.h"
 #include <QTimer>
 
+namespace {
+constexpr int maximumWindowMs = 6000;
+
+bool sameInputStream(const RequestMeta &a, const RequestMeta &b)
+{
+    return a.turnKind == "reply" && b.turnKind == "reply" && a.channel == b.channel
+        && a.sessionId == b.sessionId && a.subject == b.subject && a.actorId == b.actorId
+        && (a.channel == Channel::kPet || !a.actorId.isEmpty())
+        && a.replyToMessageId == b.replyToMessageId && a.sensitive == b.sensitive
+        && a.persistTurn == b.persistTurn && a.longTermMemoryEnabled == b.longTermMemoryEnabled;
+}
+}
+
 CognitiveCoordinator::CognitiveCoordinator(MemoryManager &memory, LLMService &model, QObject *parent)
     : QObject(parent), review(memory), store(memory), service(model)
 {
     idle.start();
+    arrivalClock.start();
+    collectTimer.setSingleShot(true);
+    connect(&collectTimer, &QTimer::timeout, this, &CognitiveCoordinator::advance);
     connect(&review, &PrivateReview::requested, &service, &LLMService::requestPrivateReview);
     connect(&review, &PrivateReview::cancelled, &service, &LLMService::cancelPrivateReview);
     connect(&service, &LLMService::privateReviewFinished, &review, &PrivateReview::receive);
@@ -60,7 +76,25 @@ void CognitiveCoordinator::submit(const QString &input, const RequestMeta &meta)
     const bool observe = config.getMemoryPolicyConfig().longTermMemoryEnabled &&
                          !config.isBlindZone(meta.channel, meta.sessionId);
     const auto id = store.recordInput(input, meta, observe);
-    pending.enqueue({input, meta, ++sequence, id});
+    const auto now = arrivalClock.elapsed();
+    const int quietWindowMs = config.inputPauseMs();
+    ++sequence;
+    if (quietWindowMs > 0 && !pending.isEmpty() && now < pending.back().readyAt
+        && sameInputStream(pending.back().meta, meta)
+        && (!meta.persistTurn || (id && pending.back().turnId && store.linkGroupedInput(pending.back().turnId,id)))) {
+        auto &turn = pending.back();
+        turn.text += '\n' + input;
+        auto parts = turn.meta.inputEvents;
+        for (const auto &part : meta.inputEvents) parts.append(part);
+        turn.meta = meta;
+        turn.meta.inputEvents = parts;
+        turn.turnId = id;
+        turn.sequence = sequence;
+        turn.readyAt = qMin(now + quietWindowMs, turn.firstArrival + maximumWindowMs);
+        qInfo() << "[Conversation] grouped inputs" << turn.firstTurn << id;
+    } else {
+        pending.enqueue({input, meta, sequence, id, id, now, now + quietWindowMs});
+    }
     advance();
     if (observe && id) service.processObservation();
 }
@@ -68,10 +102,15 @@ void CognitiveCoordinator::submit(const QString &input, const RequestMeta &meta)
 void CognitiveCoordinator::advance()
 {
     if (active || pending.isEmpty()) return;
+    const auto remaining = pending.head().readyAt - arrivalClock.elapsed();
+    if (remaining > 0) {
+        collectTimer.start(int(remaining));
+        return;
+    }
     active = pending.dequeue();
     const auto &meta = active->meta;
     const auto history = meta.persistTurn
-        ? store.getHistoryTurn(ConfigManager::instance().getShortMemoryLength(), meta.channel, meta.sessionId, turnId())
+        ? store.getHistoryTurn(ConfigManager::instance().getShortMemoryLength(), meta.channel, meta.sessionId, active->firstTurn)
         : QList<HistoryTurn>{};
     service.askDeepSeek(active->text, history, meta);
 }

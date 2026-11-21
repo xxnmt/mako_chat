@@ -1,6 +1,7 @@
 #include "memorymanager.h"
 #include "memoryreadpolicy.h"
 #include <QScopeGuard>
+#include <QJsonDocument>
 #include <QSqlQuery>
 
 namespace {
@@ -149,7 +150,7 @@ bool MemoryManager::deferPrivateReflection(qlonglong turn, int version)
     return q.exec() && q.numRowsAffected()==1;
 }
 
-QJsonObject MemoryManager::recentPrivateReflection(const RequestMeta &viewer) const
+QJsonObject MemoryManager::recentPrivateReflection(const RequestMeta &viewer, const QJsonArray &rankedTurns) const
 {
     if (viewer.subject!="user" || viewer.sensitive || !viewer.longTermMemoryEnabled
         || (viewer.channel!="pet" && viewer.channel!="qq_private")) return {};
@@ -157,9 +158,11 @@ QJsonObject MemoryManager::recentPrivateReflection(const RequestMeta &viewer) co
     if (!policy.allowsSession(viewer.channel,viewer.sessionId)) return {};
     QSqlQuery q(m_db);
     q.prepare("SELECT r.turn_id,r.note,h.channel,h.session_id,s.input,c.timing,c.outcome,c.message,c.channel,c.session" + sourceRows +
-              "JOIN private_reflection r ON r.turn_id=h.id LEFT JOIN reflection_contact c ON c.turn_id=r.turn_id WHERE " + eligible +
+              "JOIN private_reflection r ON r.turn_id=h.id LEFT JOIN reflection_contact c ON c.turn_id=r.turn_id "
+              "LEFT JOIN json_each(?) hit ON hit.value=h.id WHERE " + eligible +
               " AND r.state='consider' AND (? OR (h.channel=? AND h.session_id=?)) "
-              "ORDER BY r.updated_at DESC,r.turn_id DESC LIMIT 12");
+              "ORDER BY hit.key IS NULL,hit.key,r.updated_at DESC,r.turn_id DESC LIMIT 12");
+    q.addBindValue(QString::fromUtf8(QJsonDocument(rankedTurns).toJson(QJsonDocument::Compact)));
     q.addBindValue(ConfigManager::instance().getMemoryPolicyConfig().agent.ownerCrossChannelPrivate);
     q.addBindValue(viewer.channel);
     q.addBindValue(viewer.sessionId);

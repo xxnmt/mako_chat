@@ -234,6 +234,15 @@ qint64 MemoryManager::recordInput(const QString &input, const RequestMeta &meta,
     return 0;
 }
 
+bool MemoryManager::linkGroupedInput(qint64 previousTurn, qint64 followingTurn)
+{
+    QSqlQuery query(m_db);
+    query.prepare("UPDATE chat_history SET turn_state='grouped',turn_detail=? WHERE id=? AND turn_state='received'");
+    query.addBindValue(QString::number(followingTurn));
+    query.addBindValue(previousTurn);
+    return query.exec() && query.numRowsAffected() == 1;
+}
+
 bool MemoryManager::recordQuiet(qint64 turn, const QString &action)
 {
     if (action != "close" && action != "defer") return false;

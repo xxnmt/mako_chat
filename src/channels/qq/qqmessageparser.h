@@ -4,6 +4,7 @@
 #include <QString>
 #include <QDateTime>
 #include <QJsonObject>
+#include <QJsonArray>
 
 // OneBot v11 入站消息（私聊/群聊）的统一解析结果
 struct QQInboundMessage
@@ -16,6 +17,7 @@ struct QQInboundMessage
     QString senderId;      // 发送者 QQ（稳定身份）
     QString messageId;     // 平台消息 ID（去重）
     QString replyToMessageId; // OneBot reply/quote 目标（可空）
+    QJsonArray imageSegments; // Zero-based positions in the platform message.
     QString text;          // 纯文本（图片/语音等转为占位符）
     QString rawJson;       // 原始事件 JSON（raw_events.payload）
     QDateTime occurredAt;

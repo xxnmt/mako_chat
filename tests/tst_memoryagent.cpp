@@ -691,8 +691,21 @@ private slots:
         }
     }
 
+    void coordinatorCompletesBeforeAdvancing_data()
+    {
+        QTest::addColumn<bool>("sameStream");
+        QTest::addColumn<QString>("secondActor");
+        QTest::addColumn<QString>("secondQuote");
+        QTest::newRow("same-speaker-burst") << true << QString("123") << QString();
+        QTest::newRow("different-speakers") << false << QString("456") << QString();
+        QTest::newRow("changed-reply-target") << false << QString("123") << QString("987");
+    }
+
     void coordinatorCompletesBeforeAdvancing()
     {
+        QFETCH(bool,sameStream);
+        QFETCH(QString,secondActor);
+        QFETCH(QString,secondQuote);
         QTemporaryDir dir;
         MemoryManager db(dir.filePath("coordinator.db"));
         QTcpServer server;
@@ -708,17 +721,39 @@ private slots:
         connect(&model,&LLMService::sentencesReady,this,[&](const QList<SentenceText> &s,const QString &raw,
             const QString &input,const RequestMeta &meta){ QVERIFY(coordinator.handedOff(input,raw,s,meta)); });
         RequestMeta meta;
+        meta.channel=Channel::kQQGroup;
+        meta.actorId="123";
         meta.longTermMemoryEnabled=false;
         meta.eventId=meta.runId="first";
+        meta.inputEvents={QJsonObject{{"event","first"},{"text","下次聊"}}};
         coordinator.submit("下次聊",meta);
         meta.eventId=meta.runId="second";
+        meta.actorId=secondActor;
+        meta.replyToMessageId=secondQuote;
+        meta.inputEvents={QJsonObject{{"event","second"},{"text","还有一件事"}}};
         coordinator.submit("还有一件事",meta);
         QTRY_VERIFY_WITH_TIMEOUT(!coordinator.busy(),5000);
         const auto rows=db.getHistoryTurn(0,10);
         QCOMPARE(rows.size(),2);
-        QCOMPARE(rows.first().state,QString("handed_off"));
-        QCOMPARE(rows.last().state,QString("quiet"));
-        QCOMPARE(bodies.size(),2);
+        QCOMPARE(rows.first().state,sameStream ? QString("quiet") : QString("handed_off"));
+        QCOMPARE(rows.last().state,sameStream ? QString("grouped") : QString("quiet"));
+        QCOMPARE(bodies.size(),sameStream ? 1 : 2);
+        if (sameStream) {
+            QCOMPARE(rows.last().detail,QString::number(rows.first().id));
+            QCOMPARE(rows.last().userInput,QString("下次聊"));
+            QCOMPARE(rows.first().userInput,QString("还有一件事"));
+            QVERIFY(bodies.first().contains("下次聊"));
+            QVERIFY(bodies.first().contains("还有一件事"));
+            const auto messages=QJsonDocument::fromJson(bodies.first()).object()["messages"].toArray();
+            QString content;
+            for (const auto &message : messages) {
+                const auto item=message.toObject();
+                if (item["role"]=="user" && item["content"].toString().startsWith("当前输入按接收顺序"))
+                    content=item["content"].toString();
+            }
+            QVERIFY(content.indexOf("下次聊") >= 0);
+            QVERIFY(content.indexOf("还有一件事") > content.indexOf("下次聊"));
+        }
     }
 
     void initTestCase()

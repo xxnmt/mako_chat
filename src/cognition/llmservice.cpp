@@ -580,9 +580,22 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
         }
         messagesArray.append(QJsonObject{{"role","system"},{"content",instruction}});
     }
-    m_run.evidence.insert("current_input", QJsonObject{{"scope","current_utterance"},{"event",meta.eventId},{"speaker_role","user"}});
+    QJsonObject currentEvidence{{"scope","current_utterance"},{"event",meta.eventId},{"speaker_role","user"}};
+    if (meta.inputEvents.size() > 1) {
+        QJsonArray events;
+        for (const auto &part : meta.inputEvents)
+            events.append(part.toObject()["event"]);
+        currentEvidence["events"] = events;
+    }
+    m_run.evidence.insert("current_input",currentEvidence);
+    QJsonArray rankedTurns;
     for (const auto &value : privateEvidence) {
         const auto item = value.toObject();
+        auto turn = item["turn"].toInteger();
+        const QString source = item["source_ref"].toString(item["evidence_ref"].toString());
+        if (!turn && source.startsWith("chat/"))
+            turn = source.mid(5).section(':',0,0).toLongLong();
+        if (turn > 0 && !rankedTurns.contains(turn)) rankedTurns.append(turn);
         const auto ref = item.contains("turn") ? QString("chat/%1").arg(item["turn"].toInteger())
                                                : item["evidence_ref"].toString();
         if (ref.isEmpty()) continue;
@@ -635,7 +648,7 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
     if (canReadUnderstanding) {
         const auto understanding = m_memoryManager->currentUnderstanding(
             meta, userInput, &m_run.catalogKeys, {}, true);
-        const auto reflection = m_memoryManager->recentPrivateReflection(meta);
+        const auto reflection = m_memoryManager->recentPrivateReflection(meta,rankedTurns);
         if (!reflection.isEmpty()) {
             m_run.evidence.insert(reflection["ref"].toString(),QJsonObject{
                 {"scope","private_reflection"},{"speaker_role","assistant"},{"source_turn",reflection["source_turn"]}});
@@ -815,7 +828,13 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
 
     QJsonObject userMessage;
     userMessage["role"] = "user";
-    const QString enhancedInput = userInput + "\n\n【输出要求】请直接输出符合约定格式的JSON，不要输出任何其他文本、解释或思考内容。";
+    QString currentInput = userInput;
+    const auto lastPart = meta.inputEvents.isEmpty() ? QJsonObject{} : meta.inputEvents.last().toObject();
+    if (meta.inputEvents.size() > 1 || lastPart.contains("reply_to") || lastPart.contains("image_segments")) {
+        currentInput = QStringLiteral("当前输入按接收顺序列出。reply_to 是明确引用的消息 ID，image_segments 只表示图片位置，当前未提供像素。\n")
+                     + QString::fromUtf8(QJsonDocument(meta.inputEvents).toJson(QJsonDocument::Compact));
+    }
+    const QString enhancedInput = currentInput + "\n\n【输出要求】请直接输出符合约定格式的JSON，不要输出任何其他文本、解释或思考内容。";
     userMessage["content"] = enhancedInput;
     messagesArray.append(userMessage);
 

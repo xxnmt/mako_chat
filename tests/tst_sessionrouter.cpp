@@ -76,7 +76,7 @@ private slots:
         // QQ 群输入：历史只含对应会话桶
         captured = Captured{};
         router.submitInput(Channel::kQQGroup, "group:123",
-                           QStringLiteral("小明"), QStringLiteral("在吗"));
+                           QStringLiteral("小明"), QStringLiteral("在吗"),{},true,true,false,{},"37","42",{1});
         QCOMPARE(captured.count, 1);
         QCOMPARE(captured.history.size(), 1);
         QCOMPARE(captured.history.at(0).userInput, QStringLiteral("群聊历史"));
@@ -84,6 +84,10 @@ private slots:
         QCOMPARE(captured.meta.sessionId, QStringLiteral("group:123"));
         QCOMPARE(captured.meta.speaker, QStringLiteral("小明"));
         QCOMPARE(captured.meta.subject, QStringLiteral("user"));
+        const auto part = captured.meta.inputEvents.first().toObject();
+        QCOMPARE(part["reply_to"].toString(),QString("37"));
+        QCOMPARE(part["message_id"].toString(),QString("42"));
+        QCOMPARE(part["image_segments"].toArray(),QJsonArray{1});
     }
 
     void ephemeralInputSkipsHistoryAndPersistence()

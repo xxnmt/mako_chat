@@ -52,6 +52,7 @@ bool ConfigManager::loadSetting()
     }
 
     QJsonObject rootObj = doc.object();
+    m_inputPauseMs = qBound(0,rootObj["conversation"].toObject()["input_pause_ms"].toInt(1600),6000);
     const auto logging = rootObj["logging"].toObject();
     m_logDirectory = logging["directory"].toString().trimmed();
     m_separateLogRuns = logging["separate_runs"].toBool(true);
@@ -474,6 +475,7 @@ QJsonObject ConfigManager::effectiveSettings() const
 
     QJsonObject rootObj;
     rootObj.insert("logging", QJsonObject{{"directory",m_logDirectory},{"separate_runs",m_separateLogRuns}});
+    rootObj.insert("conversation", QJsonObject{{"input_pause_ms",m_inputPauseMs}});
     rootObj.insert("api", apiObj);
     rootObj.insert("memory", memoryObj);
     rootObj.insert("time", timeObj);
@@ -546,7 +548,7 @@ bool ConfigManager::writeConfigDocument(const QString &name, const QByteArray &c
                         ? QStringLiteral("配置根节点必须为 JSON 对象") : parseError.errorString());
         const auto root = document.object();
         const QStringList sections = name == "setting.json"
-            ? QStringList{"api", "memory", "time", "qq", "tts"}
+            ? QStringList{"api", "memory", "time", "qq", "tts", "conversation"}
             : QStringList{"identity", "memory", "appearance", "proactive"};
         for (const auto &section : sections) {
             if (root.contains(section) && !root.value(section).isObject())
@@ -557,6 +559,9 @@ bool ConfigManager::writeConfigDocument(const QString &name, const QByteArray &c
             return value.isUndefined() || value.type() == type;
         };
         if (name == "setting.json") {
+            const auto pause = root["conversation"].toObject().value("input_pause_ms");
+            if (!pause.isUndefined() && (!pause.isDouble() || pause.toInt(-1)<0 || pause.toInt()>6000))
+                return fail(QStringLiteral("连续输入等待须为 0 至 6000 毫秒的整数"));
             if ((root.contains("logging") && !root["logging"].isObject())
                 || !checkType("logging","directory",QJsonValue::String)
                 || !checkType("logging","separate_runs",QJsonValue::Bool))

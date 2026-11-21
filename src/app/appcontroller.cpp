@@ -192,7 +192,8 @@ AppController::AppController(QObject *parent)
         m_sessionRouter->submitInput(message.channel, message.sessionId,
                                      message.speaker, sanitized.text, message.senderId,
                                      decision.persistChat, decision.persistRaw,
-                                     sanitized.redacted, message.occurredAt);
+                                     sanitized.redacted, message.occurredAt, message.replyToMessageId,
+                                     message.messageId, message.imageSegments);
     });
     if (ConfigManager::instance().getQQConfig().enabled) {
         m_qqClient->start();

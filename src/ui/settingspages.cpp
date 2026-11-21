@@ -94,6 +94,7 @@ QString settingHelp(const Field &field)
         {"proactive.cooldown_seconds", "两次后台创作回顾之间的间隔，单位为秒。运行时至少等待 60 秒。"},
         {"proactive.schedule", "可填写 HH:mm 及 fixed（固定）或 random（随机）。当前只保存，定时调度尚未接入。"},
         {"logging.directory", "默认保存到程序目录的 app_data/logs。更换位置后，新日志从保存设置时起写到新目录。"},
+        {"conversation.input_pause_ms", "同一会话、发送者和引用目标的连续输入可一起回答。每条新输入重新计时，从第一条起最多等待 6 秒。0 表示逐条处理。"},
         {"logging.separate_runs", "开启后每次运行生成独立文件。关闭后按本地日期追加，跨午夜自动换文件。"},
         {"memory.debug_full_logs", "开启后记录对话正文和模型请求，用于诊断。"},
     };
@@ -495,6 +496,7 @@ QList<Page> pages()
         }},
         {"记忆与检索", "管理对话上下文、检索与索引。", "setting.json", {
             {"对话记忆", {
+                field("conversation.input_pause_ms", "连续输入等待（毫秒）", 1600, "num:0:6000"),
                 field("memory.short_context_enabled", "使用近期对话", true, "bool"),
                 field("memory.short_term_length", "近期对话轮数", 15, "num:0:999"),
                 field("memory.long_term_memory_enabled", "使用长期记忆", true, "bool"),
