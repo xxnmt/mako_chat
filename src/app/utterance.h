@@ -34,6 +34,7 @@ struct RequestMeta {
     QString turnKind = QStringLiteral("reply"); // 轮次类型：reply / proactive / perception
     QString triggerEventIds;                    // 触发事件 id 列表（JSON 数组，指向 raw_events.id）
     QString replyToMessageId;
+    QMap<QString,QMap<int,QString>> imageSources; // Transient locators by event and segment, never included in message JSON.
     QJsonArray inputEvents; // Ordered, sanitized messages supplied together to the foreground model.
 };
 

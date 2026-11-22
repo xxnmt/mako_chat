@@ -2,6 +2,7 @@
 #define QQMESSAGEPARSER_H
 
 #include <QString>
+#include <QMap>
 #include <QDateTime>
 #include <QJsonObject>
 #include <QJsonArray>
@@ -17,6 +18,7 @@ struct QQInboundMessage
     QString senderId;      // 发送者 QQ（稳定身份）
     QString messageId;     // 平台消息 ID（去重）
     QString replyToMessageId; // OneBot reply/quote 目标（可空）
+    QMap<int,QString> imageSources;
     QJsonArray imageSegments; // Zero-based positions in the platform message.
     QString text;          // 纯文本（图片/语音等转为占位符）
     QString rawJson;       // 原始事件 JSON（raw_events.payload）

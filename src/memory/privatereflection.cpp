@@ -13,7 +13,17 @@ const QString eligible = QStringLiteral(
     " h.subject='user' AND h.sensitive=0 AND h.channel IN ('pet','qq_private') "
     "AND h.turn_state IN ('handed_off','quiet') AND h.turn_kind='reply' ");
 
-bool basisVisible(const QSqlDatabase &db,qint64 turn,const MemoryReadPolicy &policy)
+bool visibleSession(const QString &channel,const QString &session,const QString &viewerChannel,const QString &viewerSession)
+{
+    if (channel==viewerChannel && session==viewerSession) return true;
+    auto &cfg=ConfigManager::instance();
+    return cfg.getMemoryPolicyConfig().agent.ownerCrossChannelPrivate &&
+           ((channel==Channel::kPet && session==Channel::kDefaultSession) ||
+            (channel==Channel::kQQPrivate && cfg.isMasterQQ(session)));
+}
+
+bool basisVisible(const QSqlDatabase &db,qint64 turn,const MemoryReadPolicy &policy,
+                  const QString &viewerChannel,const QString &viewerSession)
 {
     QSqlQuery q(db);
     q.prepare("SELECT h.channel,h.session_id,h.user_input,h.sensitive FROM reflection_basis b "
@@ -21,7 +31,7 @@ bool basisVisible(const QSqlDatabase &db,qint64 turn,const MemoryReadPolicy &pol
     q.addBindValue(turn);
     if (!q.exec()) return false;
     while(q.next())
-        if (q.value(0).isNull() || q.value(3).toBool() || !policy.allows(q.value(0).toString(),q.value(1).toString(),q.value(2).toString())) return false;
+        if (q.value(0).isNull() || q.value(3).toBool() || !visibleSession(q.value(0).toString(),q.value(1).toString(),viewerChannel,viewerSession) || !policy.allows(q.value(0).toString(),q.value(1).toString(),q.value(2).toString())) return false;
     return true;
 }
 }
@@ -71,10 +81,46 @@ QJsonObject MemoryManager::claimPrivateReflection(int dailyLimit, int cooldownSe
                     {"state",q.value(1).toString()},{"message",message}});
         }
         return {{"id",id},{"version",version},{"kind","reflection"},{"owner_statement",input.left(1000)},
-                {"source_channel",channel},{"source_reminders",actions},
+                {"source_channel",channel},{"source_session",session},{"source_reminders",actions},
                 {"reported_at",reported},{"excerpt_truncated",input.size()>1000},{"turn_outcome",handoff},{"own_reply_excerpt",ownReply.left(1200)}};
     }
     return {};
+}
+
+QJsonObject MemoryManager::reflectionHistory(qint64 turn,int version,const QJsonArray &rankedTurns) const
+{
+    QSqlQuery q(m_db);
+    q.prepare("SELECT h.channel,h.session_id,s.input,s.reported" + sourceRows +
+              "JOIN private_reflection r ON r.turn_id=h.id WHERE "+eligible+
+              " AND h.id=? AND r.version=? AND r.state='pending'");
+    q.addBindValue(turn);
+    q.addBindValue(version);
+    const MemoryReadPolicy policy;
+    if (!q.exec() || !q.next() || !policy.allows(q.value(0).toString(),q.value(1).toString(),q.value(2).toString()))
+        return {};
+    RequestMeta viewer;
+    viewer.channel=q.value(0).toString();
+    viewer.sessionId=q.value(1).toString();
+    const auto reported=q.value(3).toString();
+    q.finish();
+    q.prepare("SELECT h.id,h.channel,h.session_id,h.user_input,s.reported FROM json_each(?) hit "
+              "JOIN chat_history h ON h.id=hit.value JOIN cognitive_source s ON s.event=h.cognitive_event "
+              "WHERE "+eligible+" AND s.input=h.user_input AND h.id<>? AND julianday(s.reported)<=julianday(?) ORDER BY hit.key LIMIT 6");
+    q.addBindValue(QString::fromUtf8(QJsonDocument(rankedTurns).toJson(QJsonDocument::Compact)));
+    q.addBindValue(turn);
+    q.addBindValue(reported);
+    if (!q.exec()) return {};
+    QJsonArray rows,ids;
+    while (q.next()) {
+        const auto channel=q.value(1).toString(),session=q.value(2).toString(),text=q.value(3).toString();
+        if (!visibleSession(channel,session,viewer.channel,viewer.sessionId) || !policy.allows(channel,session,text)) continue;
+        ids.append(q.value(0).toLongLong());
+        rows.append(QJsonObject{{"turn",ids.last()},{"channel",channel},{"text",text.left(512)},{"reported_at",q.value(4).toString()}});
+    }
+    const auto prior=recentPrivateReflection(viewer,ids,true);
+    QJsonObject result{{"history",rows}};
+    if (!prior.isEmpty()) result["prior"]=prior;
+    return result;
 }
 
 bool MemoryManager::consultPrivateReflection(qint64 turn,int version,const QStringList &terms,QJsonArray &results) const
@@ -100,7 +146,8 @@ bool MemoryManager::consultPrivateReflection(qint64 turn,int version,const QStri
 }
 
 bool MemoryManager::finishPrivateReflection(qlonglong turn, int version, const QString &choice, const QString &note,
-                                            const QJsonObject &contact,const QJsonArray &consulted)
+                                            const QJsonObject &contact,const QJsonArray &consulted,
+                                            const QJsonObject &prior,const QString &priorAction)
 {
     if (choice != "rest" && choice != "consider") return false;
     if (choice == "consider" && (note.trimmed().isEmpty() || note.size()>240)) return false;
@@ -114,15 +161,41 @@ bool MemoryManager::finishPrivateReflection(qlonglong turn, int version, const Q
     const auto channel = q.value(0).toString(), session = q.value(1).toString();
     if (!policy.allows(channel,session,q.value(2).toString()) || !policy.allows(channel,session,note)) return false;
     q.finish();
+    if (!priorAction.isEmpty() && (prior.isEmpty() ||
+        (priorAction!="resolve" && !(priorAction=="revise" && choice=="consider")))) return false;
+    if (!prior.isEmpty()) {
+        const auto previous=prior["source_turn"].toInteger();
+        RequestMeta viewer;
+        viewer.channel=channel;
+        viewer.sessionId=session;
+        if (previous==turn || recentPrivateReflection(viewer,QJsonArray{previous},true)!=prior) return false;
+        // The new note may rely on any evidence that supported the previous note.
+        q.prepare("INSERT OR IGNORE INTO reflection_basis(turn,source) SELECT ?,source FROM reflection_basis WHERE turn=?");
+        q.addBindValue(turn);
+        q.addBindValue(previous);
+        if (!q.exec()) return false;
+        q.prepare("INSERT OR IGNORE INTO reflection_basis(turn,source) VALUES(?,?)");
+        q.addBindValue(turn);
+        q.addBindValue(previous);
+        if (!q.exec()) return false;
+        if (!priorAction.isEmpty()) {
+            q.prepare("INSERT INTO reflection_change(turn,prior_turn,action) VALUES(?,?,?)");
+            q.addBindValue(turn);
+            q.addBindValue(previous);
+            q.addBindValue(priorAction);
+            if (!q.exec()) return false;
+        }
+    }
     for (const auto &value : consulted) {
         const auto row=value.toObject();
-        q.prepare("SELECT user_input FROM chat_history WHERE id=? AND subject='user' AND sensitive=0 AND channel=? AND session_id=?");
-        q.addBindValue(row["turn"].toInteger()); q.addBindValue(channel); q.addBindValue(session);
+        q.prepare("SELECT user_input,channel,session_id FROM chat_history WHERE id=? AND subject='user' AND sensitive=0");
+        q.addBindValue(row["turn"].toInteger());
         if (!q.exec() || !q.next()) return false;
         const auto text=q.value(0).toString();
-        if (text.left(512)!=row["text"].toString() || !policy.allows(channel,session,text)) return false;
+        if (row["turn"].toInteger()==turn || !visibleSession(q.value(1).toString(),q.value(2).toString(),channel,session) ||
+            text.left(512)!=row["text"].toString() || !policy.allows(q.value(1).toString(),q.value(2).toString(),text)) return false;
         q.finish();
-        q.prepare("INSERT INTO reflection_basis(turn,source) VALUES(?,?)");
+        q.prepare("INSERT OR IGNORE INTO reflection_basis(turn,source) VALUES(?,?)");
         q.addBindValue(turn); q.addBindValue(row["turn"].toInteger());
         if (!q.exec()) return false;
     }
@@ -169,14 +242,15 @@ QString MemoryManager::claimReflectionContact(qlonglong turn, int version, const
     q.prepare("SELECT c.message,h.channel,h.session_id,s.input" + sourceRows +
               "JOIN private_reflection r ON r.turn_id=h.id JOIN reflection_contact c ON c.turn_id=r.turn_id "
               "WHERE " + eligible + " AND c.turn_id=? AND c.version=? AND r.version=c.version "
-              "AND r.state='consider' AND c.outcome='proposed'");
+              "AND r.state='consider' AND c.outcome='proposed' AND NOT EXISTS "
+              "(SELECT 1 FROM reflection_change WHERE prior_turn=r.turn_id)");
     q.addBindValue(turn);
     q.addBindValue(version);
     if (!q.exec() || !q.next()) return {};
     const auto message=q.value(0).toString(), sourceChannel=q.value(1).toString(), sourceSession=q.value(2).toString();
     const MemoryReadPolicy policy;
     if ((!memory.agent.ownerCrossChannelPrivate && (sourceChannel!=channel || sourceSession!=session))
-        || !basisVisible(m_db,turn,policy)
+        || !basisVisible(m_db,turn,policy,channel,session)
         || !policy.allows(sourceChannel,sourceSession,q.value(3).toString()) || !policy.allows(channel,session,message)) return {};
     q.finish();
     q.prepare("UPDATE reflection_contact SET outcome='dispatching',channel=?,session=? "
@@ -214,19 +288,21 @@ bool MemoryManager::deferPrivateReflection(qlonglong turn, int version)
     return q.exec() && q.numRowsAffected()==1;
 }
 
-QJsonObject MemoryManager::recentPrivateReflection(const RequestMeta &viewer, const QJsonArray &rankedTurns) const
+QJsonObject MemoryManager::recentPrivateReflection(const RequestMeta &viewer, const QJsonArray &rankedTurns,bool requireRanked) const
 {
     if (viewer.subject!="user" || viewer.sensitive || !viewer.longTermMemoryEnabled
         || (viewer.channel!="pet" && viewer.channel!="qq_private")) return {};
     const MemoryReadPolicy policy;
     if (!policy.allowsSession(viewer.channel,viewer.sessionId)) return {};
     QSqlQuery q(m_db);
-    q.prepare("SELECT r.turn_id,r.note,h.channel,h.session_id,s.input,c.timing,c.outcome,c.message,c.channel,c.session" + sourceRows +
+    q.prepare("SELECT r.turn_id,r.note,h.channel,h.session_id,s.input,c.timing,c.outcome,c.message,c.channel,c.session,r.version,c.reason,s.reported" + sourceRows +
               "JOIN private_reflection r ON r.turn_id=h.id LEFT JOIN reflection_contact c ON c.turn_id=r.turn_id "
               "LEFT JOIN json_each(?) hit ON hit.value=h.id WHERE " + eligible +
-              " AND r.state='consider' AND (? OR (h.channel=? AND h.session_id=?)) "
+              " AND r.state='consider' AND NOT EXISTS (SELECT 1 FROM reflection_change WHERE prior_turn=r.turn_id) "
+              " AND (?=0 OR hit.key IS NOT NULL) AND (? OR (h.channel=? AND h.session_id=?)) "
               "ORDER BY hit.key IS NULL,hit.key,r.updated_at DESC,r.turn_id DESC LIMIT 12");
     q.addBindValue(QString::fromUtf8(QJsonDocument(rankedTurns).toJson(QJsonDocument::Compact)));
+    q.addBindValue(int(requireRanked));
     q.addBindValue(ConfigManager::instance().getMemoryPolicyConfig().agent.ownerCrossChannelPrivate);
     q.addBindValue(viewer.channel);
     q.addBindValue(viewer.sessionId);
@@ -234,10 +310,11 @@ QJsonObject MemoryManager::recentPrivateReflection(const RequestMeta &viewer, co
     while (q.next()) {
         const auto channel=q.value(2).toString(), session=q.value(3).toString();
         const auto note=q.value(1).toString();
-        if (!basisVisible(m_db,q.value(0).toLongLong(),policy)) continue;
+        if (!visibleSession(channel,session,viewer.channel,viewer.sessionId) || !basisVisible(m_db,q.value(0).toLongLong(),policy,viewer.channel,viewer.sessionId)) continue;
         if (!policy.allows(channel,session,q.value(4).toString()) || !policy.allows(channel,session,note)) continue;
-        QJsonObject record {{"ref",QString("reflection/%1").arg(q.value(0).toLongLong())},{"source_turn",q.value(0).toLongLong()},{"own_reflection",note}};
+        QJsonObject record {{"ref",QString("reflection/%1").arg(q.value(0).toLongLong())},{"source_turn",q.value(0).toLongLong()},{"own_reflection",note},{"version",q.value(10).toInt()},{"reported_at",q.value(12).toString()}};
         if (!q.value(5).isNull()) {
+            if (policy.allows(channel,session,q.value(11).toString())) record["contact_reason"]=q.value(11).toString();
             record["contact_timing"]=q.value(5).toString();
             record["contact_outcome"]=q.value(6).toString();
             if ((q.value(6).toString()=="handed_off" || q.value(6).toString()=="protocol_accepted") && q.value(8).toString()==viewer.channel

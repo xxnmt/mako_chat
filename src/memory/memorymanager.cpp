@@ -4575,6 +4575,17 @@ void MemoryManager::initDatabase(const QString &dbFilePath, const QString &conne
                 || !query.exec("PRAGMA user_version=21")) throw query.lastError();
             currentVersion=21;
         }
+        if (currentVersion<22) {
+            if (!query.exec("CREATE TABLE IF NOT EXISTS reflection_change(turn INTEGER PRIMARY KEY,prior_turn INTEGER UNIQUE NOT NULL,"
+                            "action TEXT NOT NULL CHECK(action IN ('revise','resolve')))")
+                || !query.exec("CREATE TRIGGER IF NOT EXISTS forget_reflection_change AFTER DELETE ON private_reflection BEGIN "
+                               "DELETE FROM reflection_change WHERE turn=OLD.turn_id OR prior_turn=OLD.turn_id; END")
+                || !query.exec("CREATE TRIGGER IF NOT EXISTS forget_reflection_evidence AFTER DELETE ON cognitive_source BEGIN "
+                               "DELETE FROM private_reflection WHERE turn_id IN (SELECT b.turn FROM reflection_basis b "
+                               "JOIN chat_history h ON h.id=b.source WHERE h.cognitive_event=OLD.event); END")
+                || !query.exec("PRAGMA user_version=22")) throw query.lastError();
+            currentVersion=22;
+        }
         if (!m_db.commit()) throw m_db.lastError();
         qDebug()<<"[MemoryManager]数据库初始化完成,结构版本为:"<<currentVersion;
     }

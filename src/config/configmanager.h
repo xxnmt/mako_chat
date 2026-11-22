@@ -65,6 +65,8 @@ public:
 
     QString getApiKey() const;
     void setApiKey(const QString &apiKey);
+    bool visionEnabled() const { return m_visionEnabled; }
+    QString visionModel() const { return m_visionModel; }
     QString getDashScopeApiKey() const;
     void setDashScopeApiKey(const QString &apiKey);
     QString getDashScopeBaseUrl() const;
@@ -138,6 +140,8 @@ private:
     void initAppDataPath();
 
     QString m_apiKey;
+    bool m_visionEnabled=false;
+    QString m_visionModel="qwen3-vl-plus";
     QString m_dashscopeApiKey;
     QString m_dashscopeBaseUrl;
 

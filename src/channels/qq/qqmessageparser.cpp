@@ -108,8 +108,11 @@ QQInboundMessage QQMessageParser::parse(const QJsonObject &event)
         const QJsonArray segments = messageValue.toArray();
         for (qsizetype index = 0; index < segments.size(); ++index) {
             const QJsonObject segment = segments.at(index).toObject();
-            if (segment.value("type").toString() == "image")
+            if (segment.value("type").toString() == "image") {
                 message.imageSegments.append(index);
+                const auto url=segment.value("data").toObject().value("url").toString();
+                if (!url.isEmpty()) message.imageSources.insert(index,url);
+            }
             if (segment.value("type").toString() == QStringLiteral("reply")) {
                 message.replyToMessageId =
                     idToString(segment.value("data").toObject().value("id"));

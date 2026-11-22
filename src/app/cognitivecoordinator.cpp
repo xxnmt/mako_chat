@@ -86,7 +86,10 @@ void CognitiveCoordinator::submit(const QString &input, const RequestMeta &meta)
         turn.text += '\n' + input;
         auto parts = turn.meta.inputEvents;
         for (const auto &part : meta.inputEvents) parts.append(part);
+        auto sources=turn.meta.imageSources;
+        sources.insert(meta.imageSources);
         turn.meta = meta;
+        turn.meta.imageSources=std::move(sources);
         turn.meta.inputEvents = parts;
         turn.turnId = id;
         turn.sequence = sequence;

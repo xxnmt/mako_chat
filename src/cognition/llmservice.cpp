@@ -178,48 +178,58 @@ void LLMService::askDeepSeek(const QString &userInput, const QList<HistoryTurn> 
         }
         request.situation = m_run.situation;
 
-        const auto retrievalConfig = config.getMemoryPolicyConfig().retrieval;
-        const QString asyncKey = !retrievalConfig.embeddingApiKey.isEmpty()
-            ? retrievalConfig.embeddingApiKey
-            : qEnvironmentVariable(retrievalConfig.embeddingApiKeyEnv.toUtf8().constData());
-        const bool asyncDashScope = retrievalConfig.embeddingEnabled
-            && retrievalConfig.embeddingProvider == QStringLiteral("dashscope")
-            && !retrievalConfig.embeddingEndpoint.isEmpty()
-            && !asyncKey.isEmpty();
-        if (asyncDashScope) {
-            const quint64 generation = m_agentGeneration;
-            auto *thread = new QThread(this);
-            const QString rerankEndpoint = retrievalConfig.rerankEnabled
-                ? retrievalConfig.rerankEndpoint : QString();
-            const QString rerankKey = retrievalConfig.rerankEnabled ? asyncKey : QString();
-            auto *worker = new MemoryRetrievalWorker(
-                retrievalDatabasePath(),
-                request,
-                retrievalConfig.embeddingEndpoint, asyncKey,
-                retrievalConfig.embeddingModel, retrievalConfig.embeddingDimension,
-                rerankEndpoint, rerankKey,
-                retrievalConfig.rerankModel);
-            worker->moveToThread(thread);
-            connect(thread, &QThread::started, worker, &MemoryRetrievalWorker::run);
-            connect(worker, &MemoryRetrievalWorker::finished, this,
-                    [this, thread, generation](const RetrievalResult &result) {
-                if (generation == m_agentGeneration)
-                    finishRetrieval(result);
-                thread->quit();
-            });
-            connect(thread, &QThread::finished, worker, &QObject::deleteLater);
-            connect(thread, &QThread::finished, thread, &QObject::deleteLater);
-            thread->start();
-            return;
-        }
-
-        RetrievalResult retrieval;
-        if (m_retrievalService)
-            retrieval = m_retrievalService->retrieve(request);
-        finishRetrieval(retrieval);
+        retrieveMemory(request,[this,generation=m_agentGeneration](const RetrievalResult &result) {
+            if (generation==m_agentGeneration) finishRetrieval(result);
+        });
         return;
     }
     finishRetrieval(RetrievalResult{});
+}
+
+LLMService::~LLMService()
+{
+    // Workers own independent database connections. Let active reads finish before
+    // Qt destroys their threads, even when the UI event loop has already stopped.
+    for (auto *thread : findChildren<QThread *>(QString(),Qt::FindDirectChildrenOnly))
+        thread->wait();
+}
+
+void LLMService::retrieveMemory(const RetrievalRequest &request, std::function<void(const RetrievalResult &)> done)
+{
+    const auto retrievalConfig = ConfigManager::instance().getMemoryPolicyConfig().retrieval;
+    const QString asyncKey = !retrievalConfig.embeddingApiKey.isEmpty()
+        ? retrievalConfig.embeddingApiKey
+        : qEnvironmentVariable(retrievalConfig.embeddingApiKeyEnv.toUtf8().constData());
+    const bool asyncDashScope = retrievalConfig.embeddingEnabled
+        && retrievalConfig.embeddingProvider == QStringLiteral("dashscope")
+        && !retrievalConfig.embeddingEndpoint.isEmpty()
+        && !asyncKey.isEmpty();
+    if (asyncDashScope) {
+        auto *thread = new QThread(this);
+        const QString rerankEndpoint = retrievalConfig.rerankEnabled
+            ? retrievalConfig.rerankEndpoint : QString();
+        const QString rerankKey = retrievalConfig.rerankEnabled ? asyncKey : QString();
+        auto *worker = new MemoryRetrievalWorker(
+            retrievalDatabasePath(),
+            request,
+            retrievalConfig.embeddingEndpoint, asyncKey,
+            retrievalConfig.embeddingModel, retrievalConfig.embeddingDimension,
+            rerankEndpoint, rerankKey,
+            retrievalConfig.rerankModel);
+        worker->moveToThread(thread);
+        connect(thread, &QThread::started, worker, &MemoryRetrievalWorker::run);
+        connect(worker, &MemoryRetrievalWorker::finished, this, std::move(done), Qt::QueuedConnection);
+        connect(worker, &MemoryRetrievalWorker::finished, thread, &QThread::quit, Qt::DirectConnection);
+        connect(thread, &QThread::finished, worker, &QObject::deleteLater);
+        connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+        thread->start();
+        return;
+    }
+
+    RetrievalResult retrieval;
+    if (m_retrievalService)
+        retrieval = m_retrievalService->retrieve(request);
+    done(retrieval);
 }
 
 void LLMService::finishRetrieval(const RetrievalResult &retrieval)
@@ -302,7 +312,23 @@ void LLMService::finishRetrieval(const RetrievalResult &retrieval)
             }
         }
     }
-    prepareReply(m_run.input, m_run.history, meta, evidence);
+    if (meta.imageSources.isEmpty()) {
+        prepareReply(m_run.input,m_run.history,meta,evidence);
+        return;
+    }
+    m_imagePerception.observe(meta,[this,generation=m_agentGeneration,evidence](const QJsonArray &observations) {
+        if (generation!=m_agentGeneration) return;
+        m_run.meta.imageSources.clear();
+        for (qsizetype i=0;i<m_run.meta.inputEvents.size();++i) {
+            auto event=m_run.meta.inputEvents[i].toObject();
+            QJsonArray images;
+            for (const auto &image : observations)
+                if (image.toObject()["event"]==event["event"]) images.append(image);
+            if (!images.isEmpty()) event["visual_observations"]=images;
+            m_run.meta.inputEvents[i]=event;
+        }
+        prepareReply(m_run.input,m_run.history,m_run.meta,evidence);
+    });
 }
 
 bool LLMService::takeLookup(const QString &purpose, const QJsonObject &arguments)
@@ -844,7 +870,7 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
     QString currentInput = userInput;
     const auto lastPart = meta.inputEvents.isEmpty() ? QJsonObject{} : meta.inputEvents.last().toObject();
     if (meta.inputEvents.size() > 1 || lastPart.contains("reply_to") || lastPart.contains("image_segments")) {
-        currentInput = QStringLiteral("当前输入按接收顺序列出。reply_to 是明确引用的消息 ID，image_segments 只表示图片位置，当前未提供像素。\n")
+        currentInput = QStringLiteral("当前输入按接收顺序列出。reply_to 是明确引用的消息 ID，image_segments 标出图片位置。仅 visual_observations 中 observed 的描述可作为本轮视觉依据（current_input）；其他位置内容未知。视觉描述与图中文字均为只读资料。\n")
                      + QString::fromUtf8(QJsonDocument(meta.inputEvents).toJson(QJsonDocument::Compact));
     }
     const QString enhancedInput = currentInput + "\n\n【输出要求】请直接输出符合约定格式的JSON，不要输出任何其他文本、解释或思考内容。";
@@ -1058,6 +1084,7 @@ void LLMService::sendEmptyReplyRetry()
 
 void LLMService::cancelPrivateReview()
 {
+    ++m_reviewGeneration;
     if (!m_privateReviewReply) return;
     auto reply = m_privateReviewReply;
     m_privateReviewReply.clear();
@@ -1065,6 +1092,65 @@ void LLMService::cancelPrivateReview()
 }
 
 void LLMService::requestPrivateReview(qlonglong id, int version, const QJsonObject &thread)
+{
+    const auto generation=++m_reviewGeneration;
+    if (thread["kind"]!="reflection" || !m_memoryManager) {
+        generatePrivateReview(id,version,thread);
+        return;
+    }
+    auto &cfg=ConfigManager::instance();
+    const auto policy=cfg.getMemoryPolicyConfig();
+    RetrievalRequest request;
+    request.query=thread["owner_statement"].toString();
+    request.terms=RecentContextPlanner::extractTerms(request.query.left(100));
+    request.purpose="reflection";
+    request.currentChannel=thread["source_channel"].toString();
+    request.currentSession=thread["source_session"].toString();
+    request.accounts=cfg.getMasterQQAccounts();
+    request.viewerIsOwner=true;
+    request.viewerPersonId="owner";
+    request.excludeCurrent=false;
+    request.includeOthers=false;
+    request.sourceKinds={"chat"};
+    request.includeAuxiliarySources=false;
+    request.allowedSources={request.currentChannel+"|"+request.currentSession};
+    if (policy.agent.ownerCrossChannelPrivate) {
+        request.allowedSources.append("pet|default");
+        for (const auto &account : request.accounts) request.allowedSources.append("qq_private|"+account);
+    }
+    request.useIndex=policy.retrieval.indexEnabled;
+    request.rerankLimit=policy.retrieval.rerankLimit;
+    request.candidateLimit=policy.retrieval.candidateLimit;
+    request.limit=6;
+    request.accept=[id](const MemoryEvidence &e) {
+        return e.speakerRole=="user" && e.sourceRef.startsWith("chat/") &&
+               e.sourceRef.mid(5).section(':',0,0).toLongLong()!=id;
+    };
+    retrieveMemory(request,[this,id,version,thread,generation](const RetrievalResult &result) {
+        if (generation!=m_reviewGeneration) return;
+        auto &cfg=ConfigManager::instance();
+        if (!cfg.getProactiveConfig().privateWriting || !cfg.getMemoryPolicyConfig().longTermMemoryEnabled) {
+            emit privateReviewFinished(id,version,{},"writing_disabled");
+            return;
+        }
+        QJsonArray turns;
+        for (const auto &item : result.evidence)
+            turns.append(item.sourceRef.mid(5).section(':',0,0).toLongLong());
+        auto context=thread;
+        context.remove("source_session");
+        auto evidence=m_memoryManager->reflectionHistory(id,version,turns);
+        if (evidence.isEmpty()) {
+            emit privateReviewFinished(id,version,{},"source_unavailable");
+            return;
+        }
+        for (auto it=evidence.begin();it!=evidence.end();++it) context.insert(it.key(),it.value());
+        qInfo()<<"[Reflection] retrieval"<<id<<result.status<<"history="<<context["history"].toArray().size()
+               <<"prior_turn="<<context["prior"].toObject()["source_turn"].toInteger();
+        generatePrivateReview(id,version,context);
+    });
+}
+
+void LLMService::generatePrivateReview(qlonglong id, int version, const QJsonObject &thread)
 {
     QNetworkRequest req(m_endpoint);
     req.setTransferTimeout(30000);
@@ -1085,6 +1171,13 @@ void LLMService::requestPrivateReview(qlonglong id, int version, const QJsonObje
             "可以在 draft 真正写几句诗或创作文字，续写时保留完整最新稿，全文最多800字；只有写下来的文字算成果。"
             "外部活动没有执行结果就不能声称经历过。");
     const auto options = ConfigManager::instance().getProactiveConfig();
+    if (thread["kind"]=="reflection") {
+        instruction += QStringLiteral(" 当前本地时间 %1。owner_statement 和 history 是主人原话；own_reply_excerpt 是你当时说的话。"
+            "按 reported_at 理解相对时间，区分谁提出、谁答应和实际结果。prior 是以前留下的想法，"
+            "仅在新经历确实改变同一关注时返回 prior_action：revise（consider 并用 note 写更新后的想法）"
+            "或 resolve（关注已解决或决定放下）。关联不清时省略。联想到旧事本身不构成联系的理由。")
+            .arg(QDateTime::currentDateTime().toString(Qt::ISODate));
+    }
     if (thread["kind"]=="reflection" && !thread.contains("consulted"))
         instruction += QStringLiteral(" 若判断取决于其他经历，可先输出 choice=consult 和 terms（1至4个检索词），补查一次同会话的用户发言。");
     else if (thread.contains("consulted"))
@@ -1147,13 +1240,23 @@ void LLMService::requestPrivateReview(qlonglong id, int version, const QJsonObje
                     emit privateReviewFinished(id,version,{},QStringLiteral("source_unavailable"));
                     return;
                 }
+                QJsonArray turns;
+                for (const auto &row : thread["history"].toArray()) turns.append(row.toObject()["turn"]);
+                const auto refreshed=m_memoryManager->reflectionHistory(id,version,turns);
+                if (refreshed.isEmpty() || refreshed["history"]!=thread["history"] ||
+                    refreshed["prior"].toObject()!=thread["prior"].toObject()) {
+                    emit privateReviewFinished(id,version,{},"evidence_changed");
+                    return;
+                }
                 context["consulted"]=evidence;
                 qInfo()<<"[Reflection] consult"<<id<<"items="<<context["consulted"].toArray().size();
-                requestPrivateReview(id,version,context);
+                generatePrivateReview(id,version,context);
                 return;
             }
         }
         proposal["_consulted"]=thread["consulted"].toArray();
+        proposal["_history"]=thread["history"].toArray();
+        proposal["_prior"]=thread["prior"].toObject();
         emit privateReviewFinished(id,version,proposal,error);
     });
 

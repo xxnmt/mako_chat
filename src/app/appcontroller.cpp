@@ -193,7 +193,7 @@ AppController::AppController(QObject *parent)
                                      message.speaker, sanitized.text, message.senderId,
                                      decision.persistChat, decision.persistRaw,
                                      sanitized.redacted, message.occurredAt, message.replyToMessageId,
-                                     message.messageId, message.imageSegments);
+                                     message.messageId, message.imageSegments,message.imageSources);
     });
     if (ConfigManager::instance().getQQConfig().enabled) {
         m_qqClient->start();
@@ -546,7 +546,7 @@ void AppController::initConnections()
         m_timeManager->notifyUserInputStarted();
         m_coordinator->submit(userText, meta);
     });
-    connect(m_chatWidget,&ChatWidget::textSubmitted,this,[this](const QString &text){
+    connect(m_chatWidget,&ChatWidget::textSubmitted,this,[this](const QString &text,const QString &imageFile){
         const MemoryPolicyConfig memoryPolicy =
             ConfigManager::instance().getMemoryPolicyConfig();
         const SanitizeResult sanitized = SensitiveContentFilter::sanitize(
@@ -559,7 +559,9 @@ void AppController::initConnections()
                                      QStringLiteral("欧尼酱"), sanitized.text, QString(),
                                      memoryPolicy.shortContextEnabled,
                                      memoryPolicy.longTermMemoryEnabled,
-                                     sanitized.redacted);
+                                     sanitized.redacted, {}, {}, {},
+                                     imageFile.isEmpty() ? QJsonArray{} : QJsonArray{0},
+                                     imageFile.isEmpty() ? QMap<int,QString>{} : QMap<int,QString>{{0,imageFile}});
     });
     connect(m_llmService, &LLMService::memoryExtractionReady, this,
             [this](const QJsonObject &extractionResult, qlonglong lastEndId,

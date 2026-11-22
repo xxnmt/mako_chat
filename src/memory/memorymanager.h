@@ -118,7 +118,9 @@ public:
 
     QJsonObject claimPrivateReflection(int dailyLimit, int cooldownSeconds);
     bool finishPrivateReflection(qlonglong turn, int version, const QString &choice, const QString &note,
-                                 const QJsonObject &contact = {}, const QJsonArray &consulted = {});
+                                 const QJsonObject &contact = {}, const QJsonArray &consulted = {},
+                                 const QJsonObject &prior = {}, const QString &priorAction = {});
+    QJsonObject reflectionHistory(qint64 turn,int version,const QJsonArray &rankedTurns) const;
     bool consultPrivateReflection(qint64 turn, int version,const QStringList &terms,QJsonArray &results) const;
     QString claimReflectionContact(qlonglong turn, int version, const QString &channel, const QString &session);
     bool recordContactOutcome(qlonglong turn, int version, const QString &outcome);
@@ -127,7 +129,7 @@ public:
     QJsonObject claimDueReminder(const QString &channel,const QString &session);
     void reminderOutcome(qint64 id,const QString &state);
     bool deferPrivateReflection(qlonglong turn, int version);
-    QJsonObject recentPrivateReflection(const RequestMeta &viewer, const QJsonArray &rankedTurns = {}) const;
+    QJsonObject recentPrivateReflection(const RequestMeta &viewer, const QJsonArray &rankedTurns = {}, bool requireRanked = false) const;
     QJsonObject nextThought(bool dueOnly) const;
     bool claimThoughtReview(qlonglong id, int version, int dailyLimit, int cooldownSeconds);
     bool deferThoughtReview(qlonglong id, int version, const QString &reason);

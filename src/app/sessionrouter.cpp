@@ -41,7 +41,8 @@ bool SessionRouter::submitInput(const QString &channel, const QString &sessionId
                                 bool useShortContext,
                                 bool longTermMemory,
                                 bool sensitive, const QDateTime &occurredAt, const QString &replyToMessageId,
-                                const QString &platformMessageId, const QJsonArray &imageSegments)
+                                const QString &platformMessageId, const QJsonArray &imageSegments,
+                                const QMap<int,QString> &imageSources)
 {
     if (text.trimmed().isEmpty()) {
         qDebug() << "[SessionRouter]空输入，忽略";
@@ -69,6 +70,7 @@ bool SessionRouter::submitInput(const QString &channel, const QString &sessionId
     if (!platformMessageId.isEmpty()) part["message_id"] = platformMessageId;
     if (!replyToMessageId.isEmpty()) part["reply_to"] = replyToMessageId;
     if (!imageSegments.isEmpty() && !sensitive) part["image_segments"] = imageSegments;
+    if (!imageSources.isEmpty() && !sensitive) meta.imageSources.insert(meta.eventId,imageSources);
     meta.inputEvents.append(part);
     meta.sensitive = sensitive;
     meta.persistTurn = useShortContext;

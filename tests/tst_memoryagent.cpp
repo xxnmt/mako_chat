@@ -25,6 +25,7 @@
 #include "evidenceaudit.h"
 #include "expressioncontract.h"
 #include "memoryresultjson.h"
+#include <QImage>
 
 namespace {
 
@@ -44,7 +45,7 @@ void serveCompletions(QTcpServer &server,QList<QByteArray> &bodies,std::function
             socket->readAll();
             bodies.append(bytes.mid(header+4));
             const QString answer = respond(bodies.size());
-            QJsonObject msg{{"message",QJsonObject{{"content",answer}}}};
+            QJsonObject msg{{"finish_reason","stop"},{"message",QJsonObject{{"content",answer}}}};
             const auto body = QJsonDocument(QJsonObject{{"choices",QJsonArray{msg}}}).toJson();
             socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "
                           + QByteArray::number(body.size()) + "\r\n\r\n" + body);
@@ -640,6 +641,67 @@ private slots:
         QVERIFY(db.recentPrivateReflection(meta).isEmpty());
     }
 
+    void visionEntersOnlyItsCurrentEvent_data()
+    {
+        QTest::addColumn<QString>("mode");
+        for (const auto name : {"pet","qq","unreadable","disabled","filtered","malformed"})
+            QTest::newRow(name)<<QString(name);
+    }
+
+    void visionEntersOnlyItsCurrentEvent()
+    {
+        QFETCH(QString,mode);
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        const auto base=QString("http://127.0.0.1:%1").arg(server.serverPort());
+        auto &cfg=ConfigManager::instance();
+        QFile config(cfg.getConfigFilePath());
+        const bool existed=config.open(QIODevice::ReadOnly);
+        const auto original=existed ? config.readAll() : QByteArray{};
+        config.close();
+        const auto restore=qScopeGuard([&] {
+            cfg.writeConfigDocument("setting.json",existed ? original : QByteArray("{}"),nullptr);
+            if (!existed) QFile::remove(config.fileName());
+        });
+        const QJsonObject api{{"dashscope_base_url",base},{"dashscope_api_key","vision-test"},{"vision_enabled",mode!="disabled"}};
+        QVERIFY(cfg.writeConfigDocument("setting.json",QJsonDocument(QJsonObject{{"api",api}}).toJson(),nullptr));
+        QTemporaryDir dir;
+        const auto path=dir.filePath("private-local-file.png");
+        QImage image(32,32,QImage::Format_RGB32);
+        image.fill(Qt::green);
+        QVERIFY(image.save(path));
+        const auto expected=mode=="pet" || mode=="qq" || mode=="malformed";
+        QList<QByteArray> bodies;
+        serveCompletions(server,bodies,[&](int n) -> QString {
+            if (expected && n==1) return mode=="malformed" ? "not json" :
+                R"({"images":[{"id":1,"observation":"synthetic green square"}]})";
+            return R"({"conversation_action":"close","sentences":[]})";
+        });
+        RequestMeta meta;
+        meta.eventId=meta.runId="test-image";
+        meta.sensitive=mode=="filtered";
+        meta.channel=mode=="qq" || mode=="unreadable" ? Channel::kQQPrivate : Channel::kPet;
+        meta.inputEvents={QJsonObject{{"event","first"},{"text","hello"}},
+                          QJsonObject{{"event",meta.eventId},{"text","image caption"},{"image_segments",QJsonArray{2}}}};
+        const QString locator=mode=="qq" ? "https://gchat.qpic.cn/example?token=transient" : path;
+        meta.imageSources[meta.eventId].insert(2,locator);
+        LLMService model("chat-test",nullptr,QUrl(base+"/chat"));
+        model.askDeepSeek("hello\nimage caption",{},meta);
+        QTRY_VERIFY_WITH_TIMEOUT(bodies.size()>=(expected ? 2 : 1),5000);
+        const auto chat=bodies[expected ? 1 : 0];
+        QVERIFY(!chat.contains(path.toUtf8()));
+        QVERIFY(!chat.contains("data:image"));
+        QVERIFY(!chat.contains("token=transient"));
+        QCOMPARE(chat.contains("synthetic green square"),mode=="pet" || mode=="qq");
+        if (expected) {
+            const auto frames=QJsonDocument::fromJson(bodies.first()).object()["messages"].toArray().last().toObject()["content"].toArray();
+            const auto url=frames.last().toObject()["image_url"].toObject()["url"].toString();
+            if (mode=="qq") QCOMPARE(url,locator);
+            else QVERIFY(url.startsWith("data:image/png;base64,"));
+            QVERIFY(frames.first().toObject()["text"].toString().contains("image caption"));
+        }
+    }
+
     void coordinatorArbitratesWritingAndIncomingTurn()
     {
         QFETCH(bool, interrupt);
@@ -667,6 +729,10 @@ private slots:
                 meta.receivedAtUtc=QDateTime::currentDateTimeUtc().addSecs(-180);
                 earlierTurn=beforeRestart.recordInput("previous street sounds",meta,true);
                 QVERIFY(beforeRestart.recordQuiet(earlierTurn,"close"));
+                QCOMPARE(beforeRestart.claimPrivateReflection(3,60)["id"].toInteger(),earlierTurn);
+                QVERIFY(beforeRestart.finishPrivateReflection(earlierTurn,1,"consider","unanswered question about the street"));
+                QSqlQuery clock(QSqlDatabase::database("memory_db_connection"));
+                QVERIFY(clock.exec("UPDATE thought_review_log SET started_at=started_at-3600"));
                 meta.receivedAtUtc=QDateTime::currentDateTimeUtc().addSecs(-60);
                 meta.eventId=meta.runId="ordinary-message";
                 const auto turn=beforeRestart.recordInput("the street sounds different today",meta,true);
@@ -700,7 +766,7 @@ private slots:
                 }
                 return R"({"status":"active","reflection":"continued","draft":"first line and a sound"})";
             }
-            if (reflection && count==2) return R"({"choice":"consider","note":"I wonder which sound changed."})";
+            if (reflection && count==2) return R"({"choice":"consider","note":"I wonder which sound changed.","prior_action":"revise"})";
             return R"({"conversation_action":"close","sentences":[]})";
         });
         coordinator.reviewIfDue();
@@ -708,7 +774,9 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(bodies.size(),interrupt || reflection ? 2 : 1,5000);
         if (reflection) {
             RequestMeta viewer;
-            QTRY_VERIFY_WITH_TIMEOUT(!db.recentPrivateReflection(viewer).isEmpty(),5000);
+            QTRY_COMPARE_WITH_TIMEOUT(db.recentPrivateReflection(viewer)["own_reflection"].toString(),QString("I wonder which sound changed."),5000);
+            QVERIFY(bodies.first().contains("unanswered question about the street"));
+            QVERIFY(bodies.first().contains("previous street sounds"));
             QVERIFY(bodies.first().contains("the street sounds different today"));
             QVERIFY(bodies.at(1).contains("previous street sounds"));
             QVERIFY(db.nextThought(false).isEmpty());

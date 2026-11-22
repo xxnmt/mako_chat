@@ -224,7 +224,7 @@ private slots:
         QVERIFY(raw.exec("DROP TABLE matter_revision"));
         for (int reopen=0; reopen<2; ++reopen) {
             MemoryManager db(path);
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),21);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),22);
             QCOMPARE(raw.scalar("SELECT state_updates FROM chat_history").toString(),QString("[]"));
             QVERIFY(db.matterHeads("user").isEmpty());
         }
@@ -585,7 +585,7 @@ private slots:
         }
         RawDb raw(path,"v17-semantics");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),21);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),22);
         QCOMPARE(raw.scalar("SELECT count(*) FROM matter_revision").toInt(),1);
         QVERIFY(raw.scalar("SELECT semantics IS NULL FROM matter_revision").toBool());
     }
@@ -659,7 +659,7 @@ private slots:
         RawDb raw(path,"lifecycle");
         QVERIFY(raw.open());
         QCOMPARE(raw.scalar("SELECT count(*) FROM matter_revision").toInt(),2);
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),21);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),22);
     }
 
     void currentUnderstandingRetainsLatestSelfReport()
@@ -857,6 +857,97 @@ private slots:
         QVERIFY(db.recentPrivateReflection(meta).isEmpty());
         QVERIFY(db.deleteTurnByID(second));
         QCOMPARE(clock.scalar("SELECT count(*) FROM private_reflection WHERE state='consider'").toInt(),0);
+    }
+
+    void reflectionReconsideration_data()
+    {
+        QTest::addColumn<QString>("action");
+        QTest::newRow("retain") << QString{};
+        QTest::newRow("revise") << QString("revise");
+        QTest::newRow("resolve") << QString("resolve");
+    }
+
+    void reflectionReconsideration()
+    {
+        QFETCH(QString,action);
+        QTemporaryDir dir;
+        const auto path=dir.filePath("attention.db");
+        qint64 oldTurn=0,newTurn=0;
+        RequestMeta meta;
+        {
+            MemoryManager db(path);
+            meta.eventId=meta.runId="first";
+            meta.receivedAtUtc=QDateTime::currentDateTimeUtc().addSecs(-120);
+            oldTurn=db.recordInput("opening is uncertain",meta,true);
+            QVERIFY(db.recordQuiet(oldTurn,"close"));
+            QCOMPARE(db.claimPrivateReflection(4,60)["id"].toInteger(),oldTurn);
+            QVERIFY(db.finishPrivateReflection(oldTurn,1,"consider","I wonder when it opens"));
+            RawDb clock(path,"attention-clock");
+            QVERIFY(clock.open());
+            QVERIFY(clock.exec("UPDATE thought_review_log SET started_at=started_at-120"));
+            meta.eventId=meta.runId="update";
+            meta.receivedAtUtc=QDateTime::currentDateTimeUtc();
+            newTurn=db.recordInput("the opening was confirmed",meta,true);
+            QVERIFY(db.recordQuiet(newTurn,"close"));
+            QCOMPARE(db.claimPrivateReflection(4,60)["id"].toInteger(),newTurn);
+            QVERIFY(!db.reflectionHistory(newTurn,1,{}).contains("prior"));
+            const auto evidence=db.reflectionHistory(newTurn,1,{oldTurn});
+            const auto prior=evidence["prior"].toObject();
+            QCOMPARE(prior["source_turn"].toInteger(),oldTurn);
+            const auto history=evidence["history"].toArray();
+            QCOMPARE(history.size(),1);
+            QVERIFY(!db.finishPrivateReflection(newTurn,2,"consider","stale",{},history,prior,action));
+            auto invalid=prior;
+            invalid["version"]=99;
+            QVERIFY(!db.finishPrivateReflection(newTurn,1,"consider","stale",{},history,invalid,action));
+            const auto choice=action=="resolve" ? "rest" : "consider";
+            QVERIFY(db.finishPrivateReflection(newTurn,1,choice,"new perspective",{},history,prior,action));
+        }
+        MemoryManager db(path);
+        QCOMPARE(db.recentPrivateReflection(meta,{oldTurn},true).isEmpty(),!action.isEmpty());
+        QCOMPARE(db.recentPrivateReflection(meta,{newTurn},true).isEmpty(),action=="resolve");
+        QVERIFY(db.deleteTurnByID(newTurn));
+        QCOMPARE(db.recentPrivateReflection(meta,{oldTurn},true)["source_turn"].toInteger(),oldTurn);
+    }
+
+    void changedCrossChannelPolicyInvalidatesReview()
+    {
+        auto &config=ConfigManager::instance();
+        QFile file(config.getConfigFilePath());
+        const bool existed=file.open(QIODevice::ReadOnly);
+        const auto original=existed ? file.readAll() : QByteArray{};
+        file.close();
+        const auto restore=qScopeGuard([&] {
+            config.writeConfigDocument("setting.json",existed ? original : QByteArray("{}"),nullptr);
+            if (!existed) QFile::remove(file.fileName());
+        });
+        QVERIFY(config.writeConfigDocument("setting.json",R"({"memory":{"owner_cross_channel_private":true}})",nullptr));
+        QTemporaryDir dir;
+        const auto path=dir.filePath("cross.db");
+        MemoryManager db(path);
+        RequestMeta meta;
+        meta.runId=meta.eventId="first";
+        meta.receivedAtUtc=QDateTime::currentDateTimeUtc().addSecs(-120);
+        const auto first=db.recordInput("an earlier observation",meta,true);
+        QVERIFY(db.recordQuiet(first,"close"));
+        QCOMPARE(db.claimPrivateReflection(3,60)["id"].toInteger(),first);
+        QVERIFY(db.finishPrivateReflection(first,1,"consider","a private question"));
+        RawDb clock(path,"cross-clock");
+        QVERIFY(clock.open());
+        QVERIFY(clock.exec("UPDATE thought_review_log SET started_at=started_at-120"));
+        meta.runId=meta.eventId="second";
+        meta.receivedAtUtc=QDateTime::currentDateTimeUtc();
+        meta.channel="qq_private";
+        meta.actorId=meta.sessionId="10001";
+        const auto second=db.recordInput("the situation changed",meta,true);
+        QVERIFY(db.recordQuiet(second,"close"));
+        QCOMPARE(db.claimPrivateReflection(3,60)["id"].toInteger(),second);
+        const auto data=db.reflectionHistory(second,1,{first});
+        QCOMPARE(data["prior"].toObject()["source_turn"].toInteger(),first);
+        QVERIFY(config.writeConfigDocument("setting.json",R"({"memory":{"owner_cross_channel_private":false}})",nullptr));
+        QVERIFY(db.reflectionHistory(second,1,{first})["history"].toArray().isEmpty());
+        QVERIFY(!db.finishPrivateReflection(second,1,"rest","",{},data["history"].toArray(),data["prior"].toObject(),"resolve"));
+        QVERIFY(db.finishPrivateReflection(second,1,"rest",""));
     }
 
     void activityActionsRequireExpectedVersion()
@@ -1309,7 +1400,7 @@ private slots:
         }
         RawDb raw(path, "v15-verify");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 21);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 22);
     }
 
     void databaseBackupIsConsistent()
@@ -1329,7 +1420,7 @@ private slots:
         RawDb copy(backup, "backup-copy");
         QVERIFY(copy.open());
         QCOMPARE(copy.scalar("SELECT count(*) FROM chat_history").toInt(), 1);
-        QCOMPARE(copy.scalar("PRAGMA user_version").toInt(), 21);
+        QCOMPARE(copy.scalar("PRAGMA user_version").toInt(), 22);
         QVERIFY(copy.scalar("SELECT count(*) FROM memory_chunks").toInt() > 0);
     }
 
@@ -1566,7 +1657,7 @@ private slots:
             QVERIFY(raw.open());
 
             // 版本推进到 v3
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 21);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 22);
 
             // 列扩展（v2 渠道 + v3 轮次）
             const QStringList historyCols = raw.columns("chat_history");
@@ -1671,7 +1762,7 @@ private slots:
             MemoryManager second(dbPath);
             RawDb raw(dbPath, "verify2");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 21);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 22);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM chat_history").toInt(), 1);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM relationship_state").toInt(), 2);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM long_term_summary").toInt(), 1);
@@ -1688,7 +1779,7 @@ private slots:
             MemoryManager mm(dbPath);
             RawDb raw(dbPath, "fresh");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 21);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 22);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('raw_events')").toInt() > 0);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('memory_cursor')").toInt() > 0);
 
@@ -1895,7 +1986,7 @@ private slots:
         Q_UNUSED(mm);
         RawDb raw(dbPath, "v2verify");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 21);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 22);
         QCOMPARE(raw.scalar("SELECT user_input FROM chat_history").toString(), QStringLiteral("旧输入"));
         QCOMPARE(raw.scalar("SELECT turn_kind FROM chat_history").toString(), QStringLiteral("reply"));
         QCOMPARE(raw.scalar("SELECT subject FROM chat_history").toString(), QStringLiteral("user"));

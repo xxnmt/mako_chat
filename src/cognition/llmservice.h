@@ -17,6 +17,7 @@
 #include "memoryagenttypes.h"
 #include "memoryrecalltool.h"
 #include "memoryretrieval.h"
+#include "imageperception.h"
 #include "memoryretrievalworker.h"
 
 class MemoryManager;
@@ -28,6 +29,7 @@ class LLMService : public QObject
 public:
     explicit LLMService(const QString& apiKey,QObject *parent = nullptr,
                         QUrl endpoint = QUrl(QStringLiteral("https://api.deepseek.com/chat/completions")));
+    ~LLMService() override;
     //config
     void setApiKey(const QString &apiKey);
     //chat
@@ -105,6 +107,10 @@ private:
     void sendEmptyReplyRetry();
     void sendPendingReply(const QJsonObject &agentMessage = QJsonObject(),
                           bool partial = false);
+    quint64 m_reviewGeneration = 0;
+    void generatePrivateReview(qlonglong id, int version, const QJsonObject &thread);
+    void retrieveMemory(const RetrievalRequest &request, std::function<void(const RetrievalResult &)> done);
+    ImagePerception m_imagePerception;
     void finishRetrieval(const RetrievalResult &result);
 
     // 主 Conversation Agent 的记忆工具路径。

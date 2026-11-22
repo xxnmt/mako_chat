@@ -137,6 +137,7 @@ add_phase0_test(tst_memoryagent
     ${PROJECT_SOURCE_DIR}/src/app/privatereview.cpp
     ${PROJECT_SOURCE_DIR}/src/app/cognitivecoordinator.cpp
     tst_memoryagent.cpp
+    ${PROJECT_SOURCE_DIR}/src/cognition/imageperception.cpp
     ${PROJECT_SOURCE_DIR}/src/cognition/llmservice.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/memoryoutputguard.cpp
     ${PROJECT_SOURCE_DIR}/src/config/configmanager.cpp
@@ -187,7 +188,7 @@ add_phase0_test(tst_memoryagent
     ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.h
     ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.cpp
 )
-target_link_libraries(tst_memoryagent PRIVATE Qt6::Network)
+target_link_libraries(tst_memoryagent PRIVATE Qt6::Network Qt6::Gui)
 set_target_properties(tst_memoryagent PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests/memory-agent")
 

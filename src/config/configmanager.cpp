@@ -57,6 +57,9 @@ bool ConfigManager::loadSetting()
     m_logDirectory = logging["directory"].toString().trimmed();
     m_separateLogRuns = logging["separate_runs"].toBool(true);
 
+    m_visionEnabled=rootObj["api"].toObject()["vision_enabled"].toBool(false);
+    m_visionModel=rootObj["api"].toObject()["vision_model"].toString("qwen3-vl-plus").trimmed();
+
     // 读取 api 模块下的参数
     if (rootObj.contains("api") && rootObj["api"].isObject()) {
         QJsonObject apiObj = rootObj["api"].toObject();
@@ -340,6 +343,8 @@ QJsonObject ConfigManager::effectiveSettings() const
     apiObj.insert("deepseek_api_key", m_apiKey);
     apiObj.insert("dashscope_api_key", m_dashscopeApiKey);
     apiObj.insert("dashscope_base_url", m_dashscopeBaseUrl);
+    apiObj.insert("vision_enabled",m_visionEnabled);
+    apiObj.insert("vision_model",m_visionModel);
     apiObj.insert("gpt_sovits_url", m_ttsUrl);
 
     QJsonObject memoryObj;
