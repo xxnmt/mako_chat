@@ -100,14 +100,14 @@ private slots:
             "self_id":10001,"user_id":20001,"message_id":1,"time":1770000000,
             "sender":{"user_id":20001,"nickname":"A"},
             "message":[
-                {"type":"image","data":{"file":"a.jpg","url":"https://gchat.qpic.cn/example"}},
+                {"type":"image","data":{"file":"a.jpg","url":"https:\/\/multimedia.nt.qq.com.cn/download?rkey=opaque"}},
                 {"type":"record","data":{"file":"a.amr"}},
                 {"type":"face","data":{"id":"1"}}
             ]
         })");
 
         const QQInboundMessage message = QQMessageParser::parse(event);
-        QCOMPARE(message.imageSources.value(0),QString("https://gchat.qpic.cn/example"));
+        QCOMPARE(message.imageSources.value(0),QString("https://multimedia.nt.qq.com.cn/download?rkey=opaque"));
         QVERIFY(message.valid);
         QCOMPARE(message.text, QStringLiteral("[图片][语音][表情]"));
         QCOMPARE(message.imageSegments,QJsonArray{0});

@@ -33,7 +33,8 @@ QString qqImage(const QString &address)
     const auto host=url.host();
     if (!url.isValid() || !url.userInfo().isEmpty() || url.port()!=-1 ||
         (url.scheme()!="http" && url.scheme()!="https") ||
-        !(host.endsWith(".qpic.cn") || host=="multimedia.nt.qq.com")) return {};
+        !(host.endsWith(".qpic.cn") || host=="multimedia.nt.qq.com" ||
+          host=="multimedia.nt.qq.com.cn" || host=="gxh.vip.qq.com")) return {};
     url.setScheme("https");
     return url.toString(QUrl::FullyEncoded);
 }
@@ -58,24 +59,35 @@ void ImagePerception::observe(const RequestMeta &meta,std::function<void(QJsonAr
         return;
     }
     QJsonArray content,observations;
+    int missingLocator=0, unreadableFile=0, unsupportedAddress=0;
     for (const auto &part : meta.inputEvents) {
         const auto event=part.toObject();
         const auto id=event["event"].toString();
         const auto sources=meta.imageSources.value(id);
+        const auto caption=event["text"].toString().left(1000);
+        if (!caption.isEmpty()) content.append(QJsonObject{{"type","text"},{"text",caption}});
         for (const auto &segment : event["image_segments"].toArray()) {
             if (observations.size()>=4) break;
             const auto locator=sources.value(segment.toInt());
-            if (locator.isEmpty()) continue;
+            if (locator.isEmpty()) {
+                ++missingLocator;
+                continue;
+            }
             const auto url=meta.channel==Channel::kPet ? petImage(locator) : qqImage(locator);
-            if (url.isEmpty()) continue;
+            if (url.isEmpty()) {
+                if (meta.channel==Channel::kPet) ++unreadableFile;
+                else ++unsupportedAddress;
+                continue;
+            }
             observations.append(QJsonObject{{"event",id},{"segment",segment},{"status","unavailable"}});
-            content.append(QJsonObject{{"type","text"},{"text",QStringLiteral("图片编号 %1。同条消息的文字：%2")
-                    .arg(observations.size()).arg(event["text"].toString().left(1000))}});
+            content.append(QJsonObject{{"type","text"},{"text",QStringLiteral("图片编号 %1").arg(observations.size())}});
             content.append(QJsonObject{{"type","image_url"},{"image_url",QJsonObject{{"url",url}}}});
         }
     }
+    if (missingLocator || unreadableFile || unsupportedAddress)
+        qInfo()<<"[Vision] run="<<meta.runId<<"missing_locator="<<missingLocator
+               <<"unreadable_file="<<unreadableFile<<"unsupported_address="<<unsupportedAddress;
     if (observations.isEmpty()) {
-        qInfo()<<"[Vision] no readable image supplied";
         done({});
         return;
     }
@@ -95,7 +107,8 @@ void ImagePerception::observe(const RequestMeta &meta,std::function<void(QJsonAr
     QObject::connect(reply,&QNetworkReply::finished,&network,
         [reply,meta,done=std::move(done),observations]() mutable {
         reply->deleteLater();
-        const auto choices=QJsonDocument::fromJson(reply->readAll()).object()["choices"].toArray();
+        const auto response=reply->isReadable() ? QJsonDocument::fromJson(reply->readAll()).object() : QJsonObject{};
+        const auto choices=response["choices"].toArray();
         const auto choice=choices.isEmpty() ? QJsonObject{} : choices.first().toObject();
         auto &cfg=ConfigManager::instance();
         int observed=0;
@@ -119,6 +132,7 @@ void ImagePerception::observe(const RequestMeta &meta,std::function<void(QJsonAr
             }
         }
         qInfo()<<"[Vision] run="<<meta.runId<<"submitted="<<observations.size()<<"observed="<<observed
+               <<"network_error="<<int(reply->error())<<"finish="<<choice["finish_reason"].toString()
                <<"http="<<reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         done(observations);
     });

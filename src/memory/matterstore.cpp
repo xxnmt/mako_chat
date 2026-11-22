@@ -68,7 +68,10 @@ bool MemoryManager::enqueueObservation(const RequestMeta &meta, const QString &i
 QJsonObject MemoryManager::pendingObservation(qint64 source) const
 {
     QSqlQuery q(m_db);
-    q.prepare("SELECT id,run,subject,input,reported,channel,session,last_error FROM cognitive_source s "
+    q.prepare("SELECT id,run,subject,input,reported,channel,session,last_error,"
+              "CASE WHEN attempts>0 THEN (last_error='response_truncated' OR EXISTS (SELECT 1 FROM cognitive_audit a "
+              "WHERE a.source=s.id AND a.kind='observation_attempt' AND json_extract(a.data,'$.outcome')='response_truncated')) "
+              "ELSE 0 END FROM cognitive_source s "
                 "WHERE (:source=0 OR id=:source) AND outcome IS NULL AND due<=unixepoch() AND NOT EXISTS "
                 "(SELECT 1 FROM cognitive_source p WHERE p.subject=s.subject AND p.outcome IS NULL AND p.id<s.id) "
                 "ORDER BY id LIMIT 1");
@@ -78,7 +81,7 @@ QJsonObject MemoryManager::pendingObservation(qint64 source) const
     return {{"source",q.value(0).toLongLong()},{"run",q.value(1).toString()},
             {"subject",q.value(2).toString()},{"input",q.value(3).toString()},
             {"reported_at",q.value(4).toString()},{"channel",q.value(5).toString()},
-            {"session",q.value(6).toString()},{"previous_error",q.value(7).toString()}};
+            {"session",q.value(6).toString()},{"previous_error",q.value(7).toString()},{"truncated_before",q.value(8).toBool()}};
 }
 
 QJsonArray MemoryManager::matterHeads(const QString &subject, const QStringList &terms) const

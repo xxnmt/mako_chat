@@ -29,11 +29,12 @@
 
 namespace {
 
-void serveCompletions(QTcpServer &server,QList<QByteArray> &bodies,std::function<QString(int)> respond)
+void serveCompletions(QTcpServer &server,QList<QByteArray> &bodies,std::function<QString(int)> respond,
+                      std::function<QString(int)> finish=[](int){return QString("stop");})
 {
-    QObject::connect(&server,&QTcpServer::newConnection,&server,[&server,&bodies,respond] {
+    QObject::connect(&server,&QTcpServer::newConnection,&server,[&server,&bodies,respond,finish] {
         auto *socket = server.nextPendingConnection();
-        QObject::connect(socket,&QTcpSocket::readyRead,socket,[socket,&bodies,respond] {
+        QObject::connect(socket,&QTcpSocket::readyRead,socket,[socket,&bodies,respond,finish] {
             const auto bytes = socket->peek(socket->bytesAvailable());
             const auto header = bytes.indexOf("\r\n\r\n");
             if (header < 0)
@@ -45,7 +46,7 @@ void serveCompletions(QTcpServer &server,QList<QByteArray> &bodies,std::function
             socket->readAll();
             bodies.append(bytes.mid(header+4));
             const QString answer = respond(bodies.size());
-            QJsonObject msg{{"finish_reason","stop"},{"message",QJsonObject{{"content",answer}}}};
+            QJsonObject msg{{"finish_reason",finish(bodies.size())},{"message",QJsonObject{{"content",answer}}}};
             const auto body = QJsonDocument(QJsonObject{{"choices",QJsonArray{msg}}}).toJson();
             socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "
                           + QByteArray::number(body.size()) + "\r\n\r\n" + body);
@@ -641,10 +642,69 @@ private slots:
         QVERIFY(db.recentPrivateReflection(meta).isEmpty());
     }
 
+    void truncatedObservationReleasesQueue_data()
+    {
+        QTest::addColumn<bool>("persistent");
+        QTest::newRow("retry-with-output-budget")<<false;
+        QTest::newRow("retain-failure-and-advance")<<true;
+    }
+
+    void truncatedObservationReleasesQueue()
+    {
+        QFETCH(bool,persistent);
+        QTemporaryDir dir;
+        MemoryManager db(dir.filePath("observation.db"));
+        RequestMeta meta;
+        meta.eventId=meta.runId="first-observation";
+        meta.receivedAtUtc=QDateTime::currentDateTimeUtc();
+        QVERIFY(db.enqueueObservation(meta,"first experience"));
+        meta.eventId=meta.runId="second-observation";
+        QVERIFY(db.enqueueObservation(meta,"later experience"));
+        const auto source=db.pendingObservation()["source"].toInteger();
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QByteArray> bodies;
+        const int failures=persistent ? 4 : 1;
+        serveCompletions(server,bodies,[](int){return QString(R"({"outcome":"no_change","changes":[]})");},
+            [failures](int round){return round<=failures ? QString("length") : QString("stop");});
+        LLMService service("test",nullptr,QUrl(QString("http://127.0.0.1:%1").arg(server.serverPort())));
+        service.setMemoryManager(&db);
+        QSqlQuery q(QSqlDatabase::database("memory_db_connection"));
+        auto attempts=[&] {
+            q.prepare("SELECT attempts FROM cognitive_source WHERE id=?");
+            q.addBindValue(source);
+            const int count=q.exec() && q.next() ? q.value(0).toInt() : -1;
+            q.finish();
+            return count;
+        };
+        for (int round=1;round<=failures;++round) {
+            service.processObservation();
+            QTRY_COMPARE_WITH_TIMEOUT(attempts(),round,5000);
+            QVERIFY(q.exec("UPDATE cognitive_source SET due=0"));
+        }
+        service.processObservation();
+        auto completed=[&] {
+            q.exec("SELECT count(*) FROM cognitive_source WHERE outcome IS NOT NULL");
+            const int count=q.next() ? q.value(0).toInt() : 0;
+            q.finish();
+            return count;
+        };
+        QTRY_COMPARE_WITH_TIMEOUT(completed(),2,5000);
+        QCOMPARE(bodies.size(),persistent ? 5 : 3);
+        QVERIFY(!QJsonDocument::fromJson(bodies.first()).object().contains("thinking"));
+        QCOMPARE(QJsonDocument::fromJson(bodies[1]).object()["thinking"].toObject()["type"].toString(),QString("disabled"));
+        QVERIFY(!QJsonDocument::fromJson(bodies.last()).object().contains("thinking"));
+        QVERIFY(q.exec("SELECT outcome FROM cognitive_source ORDER BY id"));
+        QVERIFY(q.next());
+        QCOMPARE(q.value(0).toString(),persistent ? QString("review_required") : QString("no_change"));
+        QVERIFY(q.next());
+        QCOMPARE(q.value(0).toString(),QString("no_change"));
+    }
+
     void visionEntersOnlyItsCurrentEvent_data()
     {
         QTest::addColumn<QString>("mode");
-        for (const auto name : {"pet","qq","unreadable","disabled","filtered","malformed"})
+        for (const auto name : {"pet","qq","qq_sticker","unreadable","untrusted","disabled","filtered","malformed"})
             QTest::newRow(name)<<QString(name);
     }
 
@@ -670,7 +730,7 @@ private slots:
         QImage image(32,32,QImage::Format_RGB32);
         image.fill(Qt::green);
         QVERIFY(image.save(path));
-        const auto expected=mode=="pet" || mode=="qq" || mode=="malformed";
+        const auto expected=mode=="pet" || mode=="qq" || mode=="qq_sticker" || mode=="malformed";
         QList<QByteArray> bodies;
         serveCompletions(server,bodies,[&](int n) -> QString {
             if (expected && n==1) return mode=="malformed" ? "not json" :
@@ -680,10 +740,13 @@ private slots:
         RequestMeta meta;
         meta.eventId=meta.runId="test-image";
         meta.sensitive=mode=="filtered";
-        meta.channel=mode=="qq" || mode=="unreadable" ? Channel::kQQPrivate : Channel::kPet;
+        meta.channel=mode.startsWith("qq") || mode=="unreadable" || mode=="untrusted" ? Channel::kQQPrivate : Channel::kPet;
         meta.inputEvents={QJsonObject{{"event","first"},{"text","hello"}},
                           QJsonObject{{"event",meta.eventId},{"text","image caption"},{"image_segments",QJsonArray{2}}}};
-        const QString locator=mode=="qq" ? "https://gchat.qpic.cn/example?token=transient" : path;
+        QString locator=path;
+        if (mode=="qq") locator="https://multimedia.nt.qq.com.cn/download?rkey=transient";
+        if (mode=="qq_sticker") locator="https://gxh.vip.qq.com/item";
+        if (mode=="untrusted") locator="https://multimedia.nt.qq.com.cn.example.org/item";
         meta.imageSources[meta.eventId].insert(2,locator);
         LLMService model("chat-test",nullptr,QUrl(base+"/chat"));
         model.askDeepSeek("hello\nimage caption",{},meta);
@@ -691,14 +754,15 @@ private slots:
         const auto chat=bodies[expected ? 1 : 0];
         QVERIFY(!chat.contains(path.toUtf8()));
         QVERIFY(!chat.contains("data:image"));
-        QVERIFY(!chat.contains("token=transient"));
-        QCOMPARE(chat.contains("synthetic green square"),mode=="pet" || mode=="qq");
+        QVERIFY(!chat.contains("transient"));
+        QCOMPARE(chat.contains("synthetic green square"),mode=="pet" || mode.startsWith("qq"));
         if (expected) {
             const auto frames=QJsonDocument::fromJson(bodies.first()).object()["messages"].toArray().last().toObject()["content"].toArray();
             const auto url=frames.last().toObject()["image_url"].toObject()["url"].toString();
-            if (mode=="qq") QCOMPARE(url,locator);
+            if (mode.startsWith("qq")) QCOMPARE(url,locator);
             else QVERIFY(url.startsWith("data:image/png;base64,"));
-            QVERIFY(frames.first().toObject()["text"].toString().contains("image caption"));
+            QVERIFY(bodies.first().contains("image caption"));
+            QVERIFY(bodies.first().contains("hello"));
         }
     }
 
