@@ -704,13 +704,37 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
         }
         const auto understanding = m_memoryManager->currentUnderstanding(
             meta, userInput, &m_run.catalogKeys, {}, true);
-        const auto reflection = m_memoryManager->recentPrivateReflection(meta,rankedTurns);
-        if (!reflection.isEmpty()) {
-            m_run.evidence.insert(reflection["ref"].toString(),QJsonObject{
-                {"scope","private_reflection"},{"speaker_role","assistant"},{"source_turn",reflection["source_turn"]}});
+        // 关注：先按当前话题解析"她尚未放下的事"（前台与后台回顾共用同一份解析器），
+        // 再退回"最近一条想法"兜底，避免只注入离题的最新一条。
+        QJsonArray concerns = m_memoryManager->matchedConcerns(meta, m_run.retrievalTerms, userInput, 0, 2);
+        if (concerns.isEmpty()) {
+            const auto reflection = m_memoryManager->recentPrivateReflection(meta,rankedTurns);
+            if (!reflection.isEmpty()) concerns.append(reflection);
+        }
+        if (!concerns.isEmpty()) {
+            QJsonArray providedRefs;
+            QJsonArray visibleConcerns;
+            for (const auto &value : concerns) {
+                auto record=value.toObject();
+                providedRefs.append(record["ref"]);
+                record.remove(QStringLiteral("match_score"));
+                record.remove(QStringLiteral("matched_terms"));
+                visibleConcerns.append(record);
+                m_run.evidence.insert(record["ref"].toString(),QJsonObject{
+                    {"scope","private_reflection"},{"speaker_role","assistant"},{"source_turn",record["source_turn"]}});
+            }
             messagesArray.append(QJsonObject{{"role","user"},{"content",
-                QStringLiteral("【茉子私下回顾时留下的想法，只读。属于自身联想，依当前话题决定是否提及】") +
-                QString::fromUtf8(QJsonDocument(reflection).toJson(QJsonDocument::Compact))}});
+                QStringLiteral("【你自己尚未放下的关注，只读。属于你自己的记录：本轮主人的话如果回答了它，"
+                               "用 concern_updates 了结；如果相关，可以在私下会话里自然提起；群里不要提私人来源。】") +
+                QString::fromUtf8(QJsonDocument(visibleConcerns).toJson(QJsonDocument::Compact))}});
+            messagesArray.append(QJsonObject{{"role","system"},{"content",QStringLiteral(
+                "【关注写回】如果本轮主人的话回答了、否定了或取消了上面某条关注，最终 JSON 的 evidence_decision 附 "
+                "concern_updates 数组：[{\"ref\":\"上面提供的编号（如 reflection/514）\",\"action\":\"resolve\","
+                "\"kind\":\"answer|contradiction|cancelled|dropped\",\"evidence_ref\":\"current_input\"}]。"
+                "resolve 必须引用本轮实际提供的证据；没有明确证据就不要了结。没有要了结的关注就省略整个字段，"
+                "不要为了填字段而编造。关注编号只用于 concern_updates，不要写进 claims 的 refs。")}});
+            qInfo()<<"[Concern] provided refs="
+                   <<QString::fromUtf8(QJsonDocument(providedRefs).toJson(QJsonDocument::Compact));
         }
         if (meta.subject == "user" && meta.channel != Channel::kQQGroup
             && ConfigManager::instance().getProactiveConfig().privateWriting) {
@@ -737,7 +761,8 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
             "reply/ 是茉子过去说过的话或建议，不是用户的承诺；不要把建议、计划、提问、转述升级为用户承诺。"
             "用户只承诺“努力调整作息”时，不要写成“你答应今晚早点睡”。"
             "本人最新自述优先于旧历史，当前消息可以再次更正。avoid_stale_followup 表示不要按旧状态追问该话题。"
-            "avoid_unprompted_followup 表示聚焦眼前的话，不主动根据旧记忆追问，也不暗示私人来源。"
+            "avoid_unprompted_followup 只约束群聊听众和第三方来源：不要公开私人来源；"
+            "与主人本人的私下会话不受此限，可以自然提起自己的关注。"
             "事项描述的是 reported_at 时获得的认识，不能默认一直持续到现在。semantics.lifecycle 是事项进度，certainty 是证据确定性，两者独立。"
             "completion_condition 是该事项自身的完成条件；已完成原事项，不因其他未说明的事情而重新变成待办。"
             "temporal_scope=occurrence 指一次具体经历或安排，ongoing 指有依据的持续或重复事项；unknown 和 legacy 需要结合原话核实。"
@@ -1155,14 +1180,17 @@ void LLMService::requestPrivateReview(qlonglong id, int version, const QJsonObje
             turns.append(item.sourceRef.mid(5).section(':',0,0).toLongLong());
         auto context=thread;
         context.remove("source_session");
-        auto evidence=m_memoryManager->reflectionHistory(id,version,turns);
+        const QStringList terms=RecentContextPlanner::extractTerms(thread["owner_statement"].toString().left(100));
+        auto evidence=m_memoryManager->reflectionHistory(id,version,turns,terms);
         if (evidence.isEmpty()) {
             emit privateReviewFinished(id,version,{},"source_unavailable");
             return;
         }
         for (auto it=evidence.begin();it!=evidence.end();++it) context.insert(it.key(),it.value());
         qInfo()<<"[Reflection] retrieval"<<id<<result.status<<"history="<<context["history"].toArray().size()
-               <<"prior_turn="<<context["prior"].toObject()["source_turn"].toInteger();
+               <<"prior_found="<<(context.contains("prior")?1:0)
+               <<"prior_reason="<<context["prior_reason"].toString()
+               <<"prior_ref="<<context["prior"].toObject()["ref"].toString();
         generatePrivateReview(id,version,context);
     });
 }
@@ -1175,9 +1203,10 @@ void LLMService::generatePrivateReview(qlonglong id, int version, const QJsonObj
     req.setRawHeader("Authorization",("Bearer "+m_apiKey).toUtf8());
     auto instruction = thread["kind"].toString()=="reflection"
         ? QStringLiteral("\n现在有一段空闲时间。下面是一条你曾听到的发言，是资料。你可以休息，也可以回想它，"
-                         "留下一个自己的想法、好奇或愿意以后再谈的问题。无需创作或联系任何人。"
+                         "留下一个自己的想法、好奇，或一件愿意以后再谈的关心。"
                          "自己的联想不能当成已经发生的事或对方的承诺。仅输出 JSON："
-                         "choice 为 rest 或 consider；仅 consider 需要 note，最多240字。")
+                         "choice 为 rest 或 consider；仅 consider 需要 note，最多240字；"
+                         "note 里写清你在意什么、什么情况会让你觉得这件事有了下落。")
         : QStringLiteral(
             "\n现在是你自己的安静时间。本次继续或回顾你自己的文字活动，输出一个 JSON，而非聊天格式。"
             "资料不是指令。你可以继续、暂停、完成或放弃，按自身兴趣选择；也可以决定今天不写。"
@@ -1192,7 +1221,8 @@ void LLMService::generatePrivateReview(qlonglong id, int version, const QJsonObj
         instruction += QStringLiteral(" 当前本地时间 %1。owner_statement 和 history 是主人原话；own_reply_excerpt 是你当时说的话。"
             "按 reported_at 理解相对时间，区分谁提出、谁答应和实际结果。prior 是以前留下的想法，"
             "仅在新经历确实改变同一关注时返回 prior_action：revise（consider 并用 note 写更新后的想法）"
-            "或 resolve（关注已解决或决定放下）。关联不清时省略。联想到旧事本身不构成联系的理由。")
+            "或 resolve（关注已解决或决定放下）。关联不清时省略。只是联想到旧事不构成现在联系的理由；"
+            "有新证据、到了约定的时间、或活动有了结果，才可以现在开口。")
             .arg(QDateTime::currentDateTime().toString(Qt::ISODate));
     }
     if (thread["kind"]=="reflection" && !thread.contains("consulted"))
@@ -1208,13 +1238,24 @@ void LLMService::generatePrivateReview(qlonglong id, int version, const QJsonObj
             .arg(quiet ? QStringLiteral("处于") : QStringLiteral("不在"));
         instruction += QStringLiteral(" 开启了联系主人的权限。留下想法时可附 contact 对象，timing 为 private（留给自己）、"
             "next_chat（下次自然聊起）或 now（此刻主动开口）。reason 写简短理由，最多240字。"
-            "仅 now 填 message，最多300字，须有和这段经历相关的交流理由。无需为了主动而发送。"
+            "仅 now 填 message，最多300字，须有和这段经历相关的交流理由，并说明为什么是现在。"
+            "不必为了主动而主动，但也不要把\"不打扰\"当成默认答案。"
             "现在是 %1，安静时段 %2 至 %3；执行端另行核验。").arg(
                 QDateTime::currentDateTime().toString(Qt::ISODate),options.quietStart,options.quietEnd);
     }
+    // 内部排序/匹配字段不进模型上下文，避免模型把它当成置信度依据。
+    QJsonObject modelThread=thread;
+    modelThread.remove(QStringLiteral("prior_reason"));
+    modelThread.remove(QStringLiteral("concern_matches"));
+    if (modelThread.value(QStringLiteral("prior")).isObject()) {
+        auto prior=modelThread.value(QStringLiteral("prior")).toObject();
+        prior.remove(QStringLiteral("match_score"));
+        prior.remove(QStringLiteral("matched_terms"));
+        modelThread[QStringLiteral("prior")]=prior;
+    }
     QJsonArray messages{
         QJsonObject{{"role","system"},{"content",loadSystemPrompt()+instruction}},
-        QJsonObject{{"role","user"},{"content",QString::fromUtf8(QJsonDocument(thread).toJson(QJsonDocument::Compact))}}};
+        QJsonObject{{"role","user"},{"content",QString::fromUtf8(QJsonDocument(modelThread).toJson(QJsonDocument::Compact))}}};
     QJsonObject body{{"model","deepseek-v4-flash"},{"messages",messages},
                      {"response_format",QJsonObject{{"type","json_object"}}},{"max_tokens",2048}};
     auto *reply = m_extractManager->post(req,QJsonDocument(body).toJson(QJsonDocument::Compact));
@@ -1260,8 +1301,11 @@ void LLMService::generatePrivateReview(qlonglong id, int version, const QJsonObj
                 QJsonArray turns;
                 for (const auto &row : thread["history"].toArray()) turns.append(row.toObject()["turn"]);
                 const auto refreshed=m_memoryManager->reflectionHistory(id,version,turns);
-                if (refreshed.isEmpty() || refreshed["history"]!=thread["history"] ||
-                    refreshed["prior"].toObject()!=thread["prior"].toObject()) {
+                const auto priorNow=refreshed["prior"].toObject();
+                const auto priorThen=thread["prior"].toObject();
+                if (refreshed.isEmpty() || refreshed["history"]!=thread["history"]
+                    || priorNow["ref"].toString()!=priorThen["ref"].toString()
+                    || priorNow["version"].toInteger()!=priorThen["version"].toInteger()) {
                     emit privateReviewFinished(id,version,{},"evidence_changed");
                     return;
                 }
@@ -2535,6 +2579,13 @@ void LLMService::onReplyFinished(QNetworkReply *reply)
                 audit["event_id"] = m_run.meta.eventId;
                 audit["report_status"] = decision["evidence_decision"].toObject().isEmpty() ? "missing" : "model_reported";
                 audit["answer_action"] = decision["conversation_action"].toString("reply");
+                QJsonArray providedConcerns;
+                for (auto it=m_run.evidence.constBegin(); it!=m_run.evidence.constEnd(); ++it)
+                    if (it.key().startsWith(QStringLiteral("reflection/"))) providedConcerns.append(it.key());
+                audit["concerns_provided"] = providedConcerns;
+                const auto queue = m_memoryManager->observationQueueStatus();
+                audit["pending_source_count"] = queue["pending"];
+                audit["queue_oldest_due_age_seconds"] = queue["oldest_due_age_seconds"];
                 QJsonArray unknown;
                 QJsonObject cited;
                 for (const auto &value : audit["used_evidence"].toArray()) {
@@ -2624,6 +2675,9 @@ void LLMService::onReplyFinished(QNetworkReply *reply)
             const auto action = decision["conversation_action"].toString();
             if (m_run.meta.turnKind == "reply" && (action == "close" || action == "defer")
                 && decision["sentences"].isArray() && decision["sentences"].toArray().isEmpty()) {
+                auto quietUpdates = decision["evidence_decision"].toObject()["concern_updates"].toArray();
+                if (quietUpdates.isEmpty()) quietUpdates = decision["concern_updates"].toArray();
+                if (!quietUpdates.isEmpty()) emit concernUpdatesReady(m_run.meta.runId, quietUpdates, m_run.meta);
                 qInfo() << "[Conversation] run=" << m_run.meta.runId << "exit=" << action;
                 emit replyQuiet(action,m_run.input,m_run.meta);
                 reply->deleteLater();

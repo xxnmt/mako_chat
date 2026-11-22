@@ -1,8 +1,11 @@
 #include "memorymanager.h"
 #include "memoryreadpolicy.h"
+#include "recentcontext.h"
 #include <QScopeGuard>
 #include <QJsonDocument>
 #include <QSqlQuery>
+#include <algorithm>
+#include <QSet>
 
 namespace {
 // Keep eligibility identical at claim, completion and subsequent conversational read.
@@ -33,6 +36,38 @@ bool basisVisible(const QSqlDatabase &db,qint64 turn,const MemoryReadPolicy &pol
     while(q.next())
         if (q.value(0).isNull() || q.value(3).toBool() || !visibleSession(q.value(0).toString(),q.value(1).toString(),viewerChannel,viewerSession) || !policy.allows(q.value(0).toString(),q.value(1).toString(),q.value(2).toString())) return false;
     return true;
+}
+
+// 一条"关注"对模型可见的字段。前台注入与后台 prior 使用同一构造，避免两处形状不一致。
+QJsonObject buildConcernRecord(qlonglong turn,const QString &note,int version,const QString &reportedAt,
+                               const QString &sourceChannel,const QString &sourceSession,
+                               const QVariant &timing,const QVariant &outcome,const QVariant &message,
+                               const QVariant &contactReason,const QVariant &contactChannel,
+                               const QVariant &contactSession,const QString &viewerChannel,
+                               const QString &viewerSession,const MemoryReadPolicy &policy,
+                               bool includeSource)
+{
+    QJsonObject record{{"ref",QStringLiteral("reflection/%1").arg(turn)},
+                       {"source_turn",turn},
+                       {"own_reflection",note},
+                       {"version",version},
+                       {"reported_at",reportedAt}};
+    if (includeSource) {
+        record["source_channel"]=sourceChannel;
+        record["source_session"]=sourceSession;
+    }
+    if (!timing.isNull()) {
+        if (policy.allows(sourceChannel,sourceSession,contactReason.toString()))
+            record["contact_reason"]=contactReason.toString();
+        record["contact_timing"]=timing.toString();
+        record["contact_outcome"]=outcome.toString();
+        if ((outcome.toString()==QStringLiteral("handed_off")
+             || outcome.toString()==QStringLiteral("protocol_accepted"))
+            && contactChannel.toString()==viewerChannel && contactSession.toString()==viewerSession
+            && policy.allows(sourceChannel,sourceSession,message.toString()))
+            record["handed_off_message"]=message.toString();
+    }
+    return record;
 }
 }
 
@@ -87,7 +122,8 @@ QJsonObject MemoryManager::claimPrivateReflection(int dailyLimit, int cooldownSe
     return {};
 }
 
-QJsonObject MemoryManager::reflectionHistory(qint64 turn,int version,const QJsonArray &rankedTurns) const
+QJsonObject MemoryManager::reflectionHistory(qint64 turn,int version,const QJsonArray &rankedTurns,
+                                             const QStringList &terms) const
 {
     QSqlQuery q(m_db);
     q.prepare("SELECT h.channel,h.session_id,s.input,s.reported" + sourceRows +
@@ -101,7 +137,11 @@ QJsonObject MemoryManager::reflectionHistory(qint64 turn,int version,const QJson
     RequestMeta viewer;
     viewer.channel=q.value(0).toString();
     viewer.sessionId=q.value(1).toString();
+    viewer.subject=QStringLiteral("user");
+    viewer.sensitive=false;
+    viewer.longTermMemoryEnabled=true;
     const auto reported=q.value(3).toString();
+    const auto sourceInput=q.value(2).toString();
     q.finish();
     q.prepare("SELECT h.id,h.channel,h.session_id,h.user_input,s.reported FROM json_each(?) hit "
               "JOIN chat_history h ON h.id=hit.value JOIN cognitive_source s ON s.event=h.cognitive_event "
@@ -117,10 +157,189 @@ QJsonObject MemoryManager::reflectionHistory(qint64 turn,int version,const QJson
         ids.append(q.value(0).toLongLong());
         rows.append(QJsonObject{{"turn",ids.last()},{"channel",channel},{"text",text.left(512)},{"reported_at",q.value(4).toString()}});
     }
-    const auto prior=recentPrivateReflection(viewer,ids,true);
+    // 旧关注的发现顺序：先看"与本次来源发言相关、且仍然开放"的关注（不再要求检索命中），
+    // 再退回旧的"命中轮次上恰好挂着回顾"兜底。两处共用同一份关心，避免前台/后台各算一遍。
+    QStringList queryTerms=terms;
+    if (queryTerms.isEmpty())
+        queryTerms=RecentContextPlanner::extractTerms(sourceInput.left(100));
+    auto matched=matchedConcerns(viewer,queryTerms,sourceInput,turn,2,reported);
     QJsonObject result{{"history",rows}};
-    if (!prior.isEmpty()) result["prior"]=prior;
+    if (!matched.isEmpty()) {
+        result["prior"]=matched.first();
+        result["prior_reason"]=QStringLiteral("match");
+        result["concern_matches"]=matched.size();
+    } else {
+        const auto prior=recentPrivateReflection(viewer,ids,true);
+        if (!prior.isEmpty()) {
+            result["prior"]=prior;
+            result["prior_reason"]=QStringLiteral("ranked");
+        } else {
+            result["prior_reason"]=QStringLiteral("none");
+        }
+    }
     return result;
+}
+
+QJsonArray MemoryManager::matchedConcerns(const RequestMeta &viewer,const QStringList &terms,
+                                          const QString &queryText,qint64 excludeTurn,int limit,
+                                          const QString &beforeReported) const
+{
+    QJsonArray result;
+    if (viewer.subject!="user" || viewer.sensitive || !viewer.longTermMemoryEnabled
+        || (viewer.channel!=Channel::kPet && viewer.channel!=Channel::kQQPrivate)) return result;
+    const MemoryReadPolicy policy;
+    if (!policy.allowsSession(viewer.channel,viewer.sessionId)) return result;
+    QStringList clean;
+    for (const auto &term : terms) {
+        const auto value=term.trimmed().toLower();
+        if (value.isEmpty() || value.size()>16 || clean.contains(value)) continue;
+        clean.append(value);
+        if (clean.size()>=12) break;
+    }
+    if (limit<=0 || (queryText.isEmpty() && clean.isEmpty())) return result;
+    QSqlQuery q(m_db);
+    // beforeReported 只用于"回顾某一轮时，prior 必须早于该轮"；前台注入不需要这个上界。
+    // 不能把空串绑成占位参数：空 QString 会被绑成 SQL NULL，`?=''` 恒为假，会把候选全过滤掉。
+    QString sql = "SELECT r.turn_id,r.note,r.version,h.channel,h.session_id,s.input,s.reported,"
+                  "c.timing,c.outcome,c.reason,c.message,c.channel,c.session" + sourceRows +
+                  "JOIN private_reflection r ON r.turn_id=h.id "
+                  "LEFT JOIN reflection_contact c ON c.turn_id=r.turn_id WHERE " + eligible +
+                  " AND r.state='consider' AND NOT EXISTS (SELECT 1 FROM reflection_change WHERE prior_turn=r.turn_id)"
+                  " AND h.id<>?";
+    if (!beforeReported.isEmpty()) sql += " AND julianday(s.reported)<=julianday(?)";
+    sql += " ORDER BY r.updated_at DESC,r.turn_id DESC LIMIT 48";
+    q.prepare(sql);
+    q.addBindValue(excludeTurn);
+    if (!beforeReported.isEmpty()) q.addBindValue(beforeReported);
+    if (!q.exec()) return result;
+    struct Scored { QJsonObject record; double score; };
+    QList<Scored> scored;
+    while (q.next()) {
+        const auto concernTurn=q.value(0).toLongLong();
+        const auto note=q.value(1).toString();
+        const auto channel=q.value(3).toString(),session=q.value(4).toString(),input=q.value(5).toString();
+        if (!visibleSession(channel,session,viewer.channel,viewer.sessionId)) continue;
+        if (!basisVisible(m_db,concernTurn,policy,viewer.channel,viewer.sessionId)) continue;
+        if (!policy.allows(channel,session,input) || !policy.allows(channel,session,note)) continue;
+        int hits3=0,hits2=0,noteHits=0,quoteHits=0;
+        // 用关注 note 的连续片段去匹配"整条当前输入"，而不是只依赖旧抽词的尾部 16 个词，
+        // 这样长消息中段的回答（例如"没有荷包蛋呀"）也能命中旧的疑问。
+        // 收紧要则：命中一个 3 字连续片段，或至少两个不同的 2 字片段，避免"你/好/的"这类常见片段误命中。
+        if (!queryText.isEmpty() && note.size()>=2) {
+            QSet<QString> grams3;
+            for (int i=0;i+3<=note.size();++i) grams3.insert(note.mid(i,3));
+            for (const auto &gram : grams3)
+                if (queryText.contains(gram,Qt::CaseInsensitive)) ++hits3;
+            QSet<QString> grams2;
+            for (int i=0;i+2<=note.size();++i) grams2.insert(note.mid(i,2));
+            for (const auto &gram : grams2)
+                if (queryText.contains(gram,Qt::CaseInsensitive)) ++hits2;
+            noteHits=hits3*2+hits2;
+        }
+        for (const auto &term : clean) {
+            if (note.contains(term,Qt::CaseInsensitive)) ++noteHits;
+            if (input.contains(term,Qt::CaseInsensitive)) ++quoteHits;
+        }
+        // 只接受"关注文本与当前输入有连续重叠"的匹配：一个 3 字片段，或两个不同的 2 字片段。
+        // 不接受"仅抽词里一个常见词多处同时出现"的弱匹配，避免误了结一条真实关注。
+        if (queryText.isEmpty() || (hits3<1 && hits2<2)) continue;
+        const double score=hits3*2.0+hits2*0.5+quoteHits*0.5;
+        auto record=buildConcernRecord(concernTurn,note,q.value(2).toInt(),q.value(6).toString(),
+                                       channel,session,q.value(7),q.value(8),q.value(10),q.value(9),
+                                       q.value(11),q.value(12),viewer.channel,viewer.sessionId,policy,false);
+        record["match_score"]=score;
+        QJsonArray hitTerms;
+        for (const auto &term : clean)
+            if (note.contains(term,Qt::CaseInsensitive) || input.contains(term,Qt::CaseInsensitive))
+                hitTerms.append(term);
+        record["matched_terms"]=hitTerms;
+        scored.append({record,score});
+    }
+    std::stable_sort(scored.begin(),scored.end(),
+                     [](const Scored &a,const Scored &b){return a.score>b.score;});
+    for (int i=0;i<scored.size() && result.size()<limit;++i) result.append(scored.at(i).record);
+    return result;
+}
+
+QJsonObject MemoryManager::concernByHead(qint64 headTurn) const
+{
+    if (headTurn<=0) return {};
+    QSqlQuery q(m_db);
+    q.prepare("SELECT r.turn_id,r.note,r.version,h.channel,h.session_id,s.input,s.reported,"
+              "c.timing,c.outcome,c.reason,c.message,c.channel,c.session" + sourceRows +
+              "JOIN private_reflection r ON r.turn_id=h.id "
+              "LEFT JOIN reflection_contact c ON c.turn_id=r.turn_id WHERE " + eligible +
+              " AND h.id=? AND r.state='consider' AND NOT EXISTS (SELECT 1 FROM reflection_change WHERE prior_turn=r.turn_id)");
+    q.addBindValue(headTurn);
+    if (!q.exec() || !q.next()) return {};
+    const MemoryReadPolicy policy;
+    const auto channel=q.value(3).toString(),session=q.value(4).toString();
+    return buildConcernRecord(q.value(0).toLongLong(),q.value(1).toString(),q.value(2).toInt(),
+                              q.value(6).toString(),channel,session,q.value(7),q.value(8),q.value(10),
+                              q.value(9),q.value(11),q.value(12),channel,session,policy,true);
+}
+
+bool MemoryManager::resolveConcern(qlonglong headTurn,qlonglong byTurn,const QString &kind,
+                                   const QString &evidenceRef)
+{
+    static const QSet<QString> kinds{QStringLiteral("answer"),QStringLiteral("contradiction"),
+                                     QStringLiteral("cancelled"),QStringLiteral("dropped")};
+    if (headTurn<=0 || byTurn<=0 || !kinds.contains(kind) || evidenceRef.trimmed().isEmpty()) return false;
+    if (!m_db.transaction()) return false;
+    auto rollback=qScopeGuard([this]{m_db.rollback();});
+    QSqlQuery q(m_db);
+    q.prepare("SELECT r.version,h.channel,h.session_id,s.input" + sourceRows +
+              "JOIN private_reflection r ON r.turn_id=h.id WHERE " + eligible +
+              " AND h.id=? AND r.state='consider' AND NOT EXISTS (SELECT 1 FROM reflection_change WHERE prior_turn=r.turn_id)");
+    q.addBindValue(headTurn);
+    if (!q.exec() || !q.next()) return false;
+    const int version=q.value(0).toInt();
+    const auto headChannel=q.value(1).toString(),headSession=q.value(2).toString(),headInput=q.value(3).toString();
+    q.finish();
+    q.prepare("SELECT channel,session_id,user_input,subject,sensitive FROM chat_history WHERE id=?");
+    q.addBindValue(byTurn);
+    if (!q.exec() || !q.next()) return false;
+    const auto byChannel=q.value(0).toString(),bySession=q.value(1).toString();
+    if (q.value(3).toString()!=QStringLiteral("user") || q.value(4).toBool()) return false;
+    q.finish();
+    const MemoryReadPolicy policy;
+    if (!visibleSession(headChannel,headSession,byChannel,bySession)
+        || !basisVisible(m_db,headTurn,policy,byChannel,bySession)
+        || !policy.allows(headChannel,headSession,headInput)) return false;
+    if (evidenceRef!=QStringLiteral("current_input")) {
+        bool valid=false;
+        if (evidenceRef.startsWith(QStringLiteral("chat/"))) {
+            const auto refTurn=evidenceRef.mid(5).section(':',0,0).toLongLong();
+            q.prepare("SELECT channel,session_id,user_input FROM chat_history WHERE id=? AND subject='user' AND sensitive=0");
+            q.addBindValue(refTurn);
+            if (q.exec() && q.next())
+                valid=visibleSession(q.value(0).toString(),q.value(1).toString(),byChannel,bySession)
+                      && policy.allows(q.value(0).toString(),q.value(1).toString(),q.value(2).toString());
+        }
+        if (!valid) return false;
+    }
+    // 独立的了结流水：与回顾链的 reflection_change 分开，避免同一轮次的两种修订语义共用主键。
+    q.prepare("INSERT INTO concern_resolution(turn,prior_turn,action,kind) VALUES(?,?,'resolve',?)");
+    q.addBindValue(byTurn);
+    q.addBindValue(headTurn);
+    q.addBindValue(kind);
+    if (!q.exec() || q.numRowsAffected()!=1) return false;
+    q.prepare("INSERT OR IGNORE INTO reflection_basis(turn,source) SELECT ?,source FROM reflection_basis WHERE turn=?");
+    q.addBindValue(byTurn);
+    q.addBindValue(headTurn);
+    if (!q.exec()) return false;
+    q.prepare("INSERT OR IGNORE INTO reflection_basis(turn,source) VALUES(?,?)");
+    q.addBindValue(byTurn);
+    q.addBindValue(headTurn);
+    if (!q.exec()) return false;
+    q.prepare("UPDATE private_reflection SET state='resolved',updated_at=unixepoch() "
+              "WHERE turn_id=? AND version=? AND state='consider'");
+    q.addBindValue(headTurn);
+    q.addBindValue(version);
+    if (!q.exec() || q.numRowsAffected()!=1) return false;
+    if (!m_db.commit()) return false;
+    rollback.dismiss();
+    return true;
 }
 
 bool MemoryManager::consultPrivateReflection(qint64 turn,int version,const QStringList &terms,QJsonArray &results) const
@@ -165,10 +384,13 @@ bool MemoryManager::finishPrivateReflection(qlonglong turn, int version, const Q
         (priorAction!="resolve" && !(priorAction=="revise" && choice=="consider")))) return false;
     if (!prior.isEmpty()) {
         const auto previous=prior["source_turn"].toInteger();
-        RequestMeta viewer;
-        viewer.channel=channel;
-        viewer.sessionId=session;
-        if (previous==turn || recentPrivateReflection(viewer,QJsonArray{previous},true)!=prior) return false;
+        const auto current=concernByHead(previous);
+        if (previous<=0 || previous==turn || current.isEmpty()
+            || current["ref"].toString()!=prior["ref"].toString()
+            || current["version"].toInteger()!=prior["version"].toInteger()
+            || !basisVisible(m_db,previous,policy,channel,session)
+            || !visibleSession(current["source_channel"].toString(),current["source_session"].toString(),
+                               channel,session)) return false;
         // The new note may rely on any evidence that supported the previous note.
         q.prepare("INSERT OR IGNORE INTO reflection_basis(turn,source) SELECT ?,source FROM reflection_basis WHERE turn=?");
         q.addBindValue(turn);

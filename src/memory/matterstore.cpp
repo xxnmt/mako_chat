@@ -172,16 +172,71 @@ QJsonArray MemoryManager::internalMatters(const RequestMeta &meta, const QString
 
 void MemoryManager::deferObservation(qint64 source, const QString &reason, bool rejected)
 {
+    // 只有"再试也不会好"的失败才计入死信：网络/存储/证据变化属于可恢复，
+    // 不能让一次 5 小时的断网把正在退避的条目永久打成 review_required。
+    static const QSet<QString> terminalReasons{
+        QStringLiteral("invalid_json"),QStringLiteral("missing_choice"),
+        QStringLiteral("missing_content"),QStringLiteral("empty_completed"),
+        QStringLiteral("response_truncated"),QStringLiteral("invalid_proposal"),
+        QStringLiteral("invalid_change"),QStringLiteral("missing_semantics"),
+        QStringLiteral("invalid_semantics"),QStringLiteral("unsupported_time_scope"),
+        QStringLiteral("invalid_event_time"),QStringLiteral("base_mismatch")};
+    constexpr int kMaximumAttempts = 12;
+    const bool countsForDeadLetter = rejected || terminalReasons.contains(reason);
     QSqlQuery q(m_db);
     q.prepare("UPDATE cognitive_source SET attempts=attempts+1,last_error=?,"
-              "rejections=rejections+?,outcome=CASE WHEN ? AND rejections>=2 THEN 'review_required' END,"
+              "rejections=rejections+?,"
+              "outcome=CASE WHEN (? AND rejections>=2) OR (? AND attempts+1>=?) "
+              "THEN 'review_required' END,"
               "due=unixepoch()+min(3600,30*(1<<min(attempts,7))) "
               "WHERE id=? AND outcome IS NULL");
     q.addBindValue(reason);
     q.addBindValue(int(rejected));
     q.addBindValue(int(rejected));
+    q.addBindValue(int(countsForDeadLetter));
+    q.addBindValue(kMaximumAttempts);
     q.addBindValue(source);
-    if (!q.exec()) qWarning() << "[Cognition] retry_schedule_failed source=" << source;
+    if (!q.exec()) {
+        qWarning() << "[Cognition] retry_schedule_failed source=" << source;
+        return;
+    }
+    QSqlQuery read(m_db);
+    read.prepare("SELECT outcome,attempts FROM cognitive_source WHERE id=?");
+    read.addBindValue(source);
+    if (read.exec() && read.next() && read.value(0).toString()==QStringLiteral("review_required"))
+        qWarning() << "[Cognition] dead_letter source=" << source
+                   << "attempts=" << read.value(1).toInt() << "last_error=" << reason;
+}
+
+QJsonObject MemoryManager::observationQueueStatus() const
+{
+    QJsonObject result;
+    QSqlQuery q(m_db);
+    QJsonObject pendingByError, byOutcome;
+    int pending = 0;
+    if (q.exec("SELECT coalesce(last_error,''),count(*) FROM cognitive_source "
+               "WHERE outcome IS NULL GROUP BY 1")) {
+        while (q.next()) {
+            const auto key = q.value(0).toString().isEmpty() ? QStringLiteral("none") : q.value(0).toString();
+            pendingByError[key] = q.value(1).toInt();
+            pending += q.value(1).toInt();
+        }
+    }
+    result["pending"] = pending;
+    result["pending_by_last_error"] = pendingByError;
+    qint64 oldestDue = 0;
+    q.prepare("SELECT coalesce(min(due),0) FROM cognitive_source WHERE outcome IS NULL");
+    if (q.exec() && q.next()) oldestDue = q.value(0).toLongLong();
+    result["oldest_due_epoch"] = oldestDue;
+    if (oldestDue > 0) {
+        const auto now = QDateTime::currentSecsSinceEpoch();
+        result["oldest_due_age_seconds"] = qMax<qint64>(0, now - oldestDue);
+    }
+    if (q.exec("SELECT outcome,count(*) FROM cognitive_source WHERE outcome IS NOT NULL GROUP BY 1")) {
+        while (q.next()) byOutcome[q.value(0).toString()] = q.value(1).toInt();
+    }
+    result["by_outcome"] = byOutcome;
+    return result;
 }
 
 bool MemoryManager::commitObservation(qint64 source, const QJsonObject &proposal, QString *failure,

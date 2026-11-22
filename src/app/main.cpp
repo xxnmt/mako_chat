@@ -36,6 +36,12 @@ int main(int argc, char *argv[]) {
                                  .toJson(QJsonDocument::Indented);
         return 0;
     }
+    if (a.arguments().contains(QStringLiteral("--memory-queue-status"))) {
+        MemoryManager memory(ConfigManager::instance().getMemoryPath());
+        qInfo().noquote() << QJsonDocument(memory.observationQueueStatus())
+                                 .toJson(QJsonDocument::Indented);
+        return 0;
+    }
     if (a.arguments().contains(QStringLiteral("--backup-memory-db"))) {
         const QString source = ConfigManager::instance().getMemoryPath();
         const QString stamp = QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss"));

@@ -42,6 +42,29 @@ CognitiveCoordinator::CognitiveCoordinator(MemoryManager &memory, LLMService &mo
         finish();
     });
     connect(&service,&LLMService::replyAbnormal,this,&CognitiveCoordinator::interrupt);
+    connect(&service,&LLMService::concernUpdatesReady,this,
+            [this](const QString &runId,const QJsonArray &updates,const RequestMeta &meta) {
+        if (!owns(runId) || updates.isEmpty()) return;
+        const auto turn=turnId();
+        int committed=0, failed=0;
+        for (const auto &value : updates) {
+            const auto update=value.toObject();
+            const auto ref=update["ref"].toString();
+            const qlonglong head=ref.startsWith(QStringLiteral("reflection/"))
+                ? ref.mid(QStringLiteral("reflection/").size()).toLongLong() : 0;
+            if (head>0 && store.resolveConcern(head,turn,update["kind"].toString(),
+                                               update["evidence_ref"].toString())) {
+                ++committed;
+                qInfo()<<"[Concern] resolved by="<<turn<<"ref="<<ref<<"kind="<<update["kind"].toString();
+                continue;
+            }
+            ++failed;
+            qWarning()<<"[Concern] update_failed by="<<turn<<"ref="<<ref;
+        }
+        store.recordCognitiveAudit("concern_update",runId,0,
+            QJsonObject{{"event_id",meta.eventId},{"turn",turn},{"requested",updates.size()},
+                        {"committed",committed},{"failed",failed},{"updates",updates}});
+    });
     connect(&service,&LLMService::internetErrorSignal,this,[this] { interrupt("network_error"); });
 }
 

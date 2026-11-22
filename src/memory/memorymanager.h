@@ -120,7 +120,8 @@ public:
     bool finishPrivateReflection(qlonglong turn, int version, const QString &choice, const QString &note,
                                  const QJsonObject &contact = {}, const QJsonArray &consulted = {},
                                  const QJsonObject &prior = {}, const QString &priorAction = {});
-    QJsonObject reflectionHistory(qint64 turn,int version,const QJsonArray &rankedTurns) const;
+    QJsonObject reflectionHistory(qint64 turn,int version,const QJsonArray &rankedTurns,
+                                  const QStringList &terms = {}) const;
     bool consultPrivateReflection(qint64 turn, int version,const QStringList &terms,QJsonArray &results) const;
     QString claimReflectionContact(qlonglong turn, int version, const QString &channel, const QString &session);
     bool recordContactOutcome(qlonglong turn, int version, const QString &outcome);
@@ -130,6 +131,18 @@ public:
     void reminderOutcome(qint64 id,const QString &state);
     bool deferPrivateReflection(qlonglong turn, int version);
     QJsonObject recentPrivateReflection(const RequestMeta &viewer, const QJsonArray &rankedTurns = {}, bool requireRanked = false) const;
+    // 关注解析器：与当前输入相关的开放关注。前台注入与后台回顾共用同一份选择逻辑，
+    // 不再要求"旧关注的来源轮次恰好被检索命中"。
+    QJsonArray matchedConcerns(const RequestMeta &viewer, const QStringList &terms,
+                               const QString &queryText = QString(),
+                               qint64 excludeTurn = 0, int limit = 2,
+                               const QString &beforeReported = QString()) const;
+    QJsonObject concernByHead(qint64 headTurn) const;
+    // 从正常对话了结一个关注：答案到达、被否定或计划取消。提交后不再注入、不再重复追问。
+    bool resolveConcern(qlonglong headTurn, qlonglong byTurn, const QString &kind,
+                        const QString &evidenceRef);
+    // 认识更新队列的可观测性：用于区分"模型判断错"与"新资料还没处理到"。
+    QJsonObject observationQueueStatus() const;
     QJsonObject nextThought(bool dueOnly) const;
     bool claimThoughtReview(qlonglong id, int version, int dailyLimit, int cooldownSeconds);
     bool deferThoughtReview(qlonglong id, int version, const QString &reason);

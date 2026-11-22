@@ -399,8 +399,38 @@ void AppController::handleMakoReply(const QList<SentenceText> &sentences, const 
     }
 
     if (!m_coordinator->handedOff(userInput, rawReply, sentences, meta)) return;
-    if (!m_coordinator->turnId() || !meta.longTermMemoryEnabled) {
+    const qlonglong turnId=m_coordinator->turnId();
+    if (!turnId || !meta.longTermMemoryEnabled) {
         return;
+    }
+
+    // 关注写回：本轮主人的话如果回答了此前某个关注，立即了结，避免下一次再追问。
+    // 与回复解耦：写回失败不回滚已发出的回复，但必须留审计，便于区分"模型没判断"与"写回失败"。
+    const auto evidence=response.value("evidence_decision").toObject();
+    auto concernUpdates=evidence.value("concern_updates").toArray();
+    if (concernUpdates.isEmpty()) concernUpdates=response.value("concern_updates").toArray();
+    if (!concernUpdates.isEmpty() && m_memoryManager) {
+        int committed=0, failed=0;
+        for (const auto &value : concernUpdates) {
+            const auto update=value.toObject();
+            const auto ref=update["ref"].toString();
+            const qlonglong head=ref.startsWith(QStringLiteral("reflection/"))
+                ? ref.mid(QStringLiteral("reflection/").size()).toLongLong() : 0;
+            if (head>0 && m_memoryManager->resolveConcern(head,turnId,update["kind"].toString(),
+                                                          update["evidence_ref"].toString())) {
+                ++committed;
+                qInfo()<<"[Concern] resolved by="<<turnId<<"ref="<<ref<<"kind="<<update["kind"].toString();
+                continue;
+            }
+            ++failed;
+            qWarning()<<"[Concern] update_failed by="<<turnId<<"ref="<<ref
+                      <<"kind="<<update["kind"].toString();
+        }
+        m_memoryManager->recordCognitiveAudit("concern_update",meta.runId,0,
+            QJsonObject{{"event_id",meta.eventId},{"turn",turnId},
+                        {"requested",concernUpdates.size()},{"committed",committed},
+                        {"failed",failed},{"updates",concernUpdates}});
+        qInfo()<<"[Concern] update run="<<meta.runId<<"committed="<<committed<<"failed="<<failed;
     }
 
     qlonglong lastEndId = -1;

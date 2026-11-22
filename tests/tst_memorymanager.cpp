@@ -890,7 +890,12 @@ private slots:
             newTurn=db.recordInput("the opening was confirmed",meta,true);
             QVERIFY(db.recordQuiet(newTurn,"close"));
             QCOMPARE(db.claimPrivateReflection(4,60)["id"].toInteger(),newTurn);
-            QVERIFY(!db.reflectionHistory(newTurn,1,{}).contains("prior"));
+            // 新契约：与旧关注相关的当前输入不再要求"检索命中同一轮"，直接按关注内容匹配。
+            // 这两句语义上都关于 opening，所以现在无需 rankedTurns 也能选中旧关注；
+            // 真正的"无关输入不选中"由 tst_concern 的 priorReasonNoneWhenUnrelated 覆盖。
+            const auto autoEvidence=db.reflectionHistory(newTurn,1,{});
+            QCOMPARE(autoEvidence["prior_reason"].toString(),QStringLiteral("match"));
+            QCOMPARE(autoEvidence["prior"].toObject()["source_turn"].toInteger(),oldTurn);
             const auto evidence=db.reflectionHistory(newTurn,1,{oldTurn});
             const auto prior=evidence["prior"].toObject();
             QCOMPARE(prior["source_turn"].toInteger(),oldTurn);

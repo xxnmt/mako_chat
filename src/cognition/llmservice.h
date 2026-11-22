@@ -58,6 +58,8 @@ public:
 
 signals:
     void replyQuiet(const QString &action, const QString &userInput, const RequestMeta &meta);
+    // 模型决定 close/defer 且不出声时，关注写回仍然要落地（否则"这轮就算聊完了"会丢掉答案）。
+    void concernUpdatesReady(const QString &runId, const QJsonArray &updates, const RequestMeta &meta);
     //chat
     void sentencesReady(const QList<SentenceText> &sentences, const QString &rawReply,
                         const QString &userInput, const RequestMeta &meta);

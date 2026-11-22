@@ -4586,6 +4586,17 @@ void MemoryManager::initDatabase(const QString &dbFilePath, const QString &conne
                 || !query.exec("PRAGMA user_version=22")) throw query.lastError();
             currentVersion=22;
         }
+        // 关注了结的独立流水（v22 的补充表）。与 reflection_change（回顾链修订）分开：
+        // 前者由正常对话写回，后者由私下回顾写，共用 turn 主键会互相覆盖。
+        // 用 IF NOT EXISTS 幂等补表，不改变结构版本号，旧库升级与新库初始化走同一句。
+        if (!query.exec("CREATE TABLE IF NOT EXISTS concern_resolution(id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                        "turn INTEGER NOT NULL,prior_turn INTEGER NOT NULL UNIQUE,"
+                        "action TEXT NOT NULL,kind TEXT NOT NULL,"
+                        "recorded TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+            || !query.exec("CREATE INDEX IF NOT EXISTS concern_resolution_turn ON concern_resolution(turn)")
+            || !query.exec("CREATE TRIGGER IF NOT EXISTS forget_concern_resolution AFTER DELETE ON private_reflection "
+                           "BEGIN DELETE FROM concern_resolution WHERE prior_turn=OLD.turn_id; END"))
+            throw query.lastError();
         if (!m_db.commit()) throw m_db.lastError();
         qDebug()<<"[MemoryManager]数据库初始化完成,结构版本为:"<<currentVersion;
     }

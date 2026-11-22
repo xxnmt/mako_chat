@@ -289,3 +289,33 @@ target_link_libraries(tst_settingspages PRIVATE Qt6::Widgets)
 set_target_properties(tst_settingspages PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests/settings-ui")
 set_property(TEST tst_settingspages APPEND PROPERTY ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+# 关注（concern）能力回归：直接复用 tst_memorymanager 的整套源文件，
+# 只把测试入口换成 tst_concern.cpp，并与 tst_memorymanager 一样链接 Qt6::Network。
+add_phase0_test(tst_concern
+    tst_concern.cpp
+    ${PROJECT_SOURCE_DIR}/src/app/privatereview.cpp
+    ${PROJECT_SOURCE_DIR}/src/app/privatereview.h
+    ${PROJECT_SOURCE_DIR}/src/benchmark/benchmarksnapshot.cpp
+    ${PROJECT_SOURCE_DIR}/src/config/configmanager.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memorypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqreplypolicy.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memorymanager.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memorymanager.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryevidence.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryevidence.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryretrieval.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryretrieval.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryembedding.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryembedding.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memorydashscope.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memorydashscope.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryindexworker.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryindexworker.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/matterstore.cpp ${PROJECT_SOURCE_DIR}/src/memory/privatereflection.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/recentcontext.h
+    ${PROJECT_SOURCE_DIR}/src/memory/recentcontext.cpp
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.h
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.cpp
+)
+target_link_libraries(tst_concern PRIVATE Qt6::Network)
