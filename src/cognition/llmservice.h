@@ -42,6 +42,9 @@ public:
     QJsonArray lastRequestMessages() const { return m_lastRequestMessages; }
     RetrievalResult lastRetrievalResult() const { return m_lastRetrievalResult; }
     QJsonObject lastResponseUsage() const { return m_lastResponseUsage; }
+    // 当前被授予的能力清单：由 ConfigManager 配置与服务端状态生成（只读）。
+    // 前台提示词与私下回顾共用同一份数据源，避免两处各说一套。
+    QJsonObject capabilityManifest(const RequestMeta &meta) const;
     void requestPrivateReview(qlonglong id, int version, const QJsonObject &thread);
     void cancelPrivateReview();
     bool hasWritingProvider() const { return !m_apiKey.isEmpty(); }

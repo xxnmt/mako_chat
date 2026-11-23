@@ -144,6 +144,21 @@ private slots:
                                                             config.getMemoryPolicyConfig(), {});
         QVERIFY(decision.allowReply && decision.ephemeralReply);
         QVERIFY(!decision.persistRaw && !decision.persistChat);
+        search->setText(QStringLiteral("主动交流"));
+        // 执行端约束：联系每日上限、关注默认间隔与保留天数都要在设置页可编辑。
+        struct NumericField {
+            QString path;
+            int minimum;
+            int maximum;
+        };
+        for (const auto &item : {NumericField{QStringLiteral("proactive.contact_daily_limit"), 0, 99},
+                                 NumericField{QStringLiteral("proactive.concern_default_check_minutes"), 0, 10080},
+                                 NumericField{QStringLiteral("proactive.concern_retention_days"), 1, 365}}) {
+            auto *box = root->findChild<QSpinBox *>(item.path);
+            QVERIFY2(box, qPrintable(item.path));
+            QCOMPARE(box->minimum(), item.minimum);
+            QCOMPARE(box->maximum(), item.maximum);
+        }
         search->setText(QStringLiteral("历史会话"));
         QCOMPARE(stack->currentWidget(), history);
     }

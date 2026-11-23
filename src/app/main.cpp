@@ -16,9 +16,15 @@
 #include "memorydashscope.h"
 #include "benchmarkrunner.h"
 
+// 版本号由 CMake 的 project(VERSION) 注入；脱离 CMake 单独编译时回退 "dev"。
+#ifndef MAKO_APP_VERSION
+#define MAKO_APP_VERSION "dev"
+#endif
+
 int main(int argc, char *argv[]) {
     //不创建应用名会报错
     QCoreApplication::setApplicationName("Windows_AI");
+    QCoreApplication::setApplicationVersion(QStringLiteral(MAKO_APP_VERSION));
     // QCoreApplication::setOrganizationName("MakoDesktop");
 
     QApplication a(argc, argv);

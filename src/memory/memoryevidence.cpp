@@ -152,6 +152,8 @@ MemoryEvidence MemoryEvidence::fromChunk(const QJsonObject &row,
     evidence.recordedAt = parseTime(row.value(QStringLiteral("recorded_at")));
     evidence.privacy = row.value(QStringLiteral("privacy")).toString(QStringLiteral("unknown"));
     evidence.status = row.value(QStringLiteral("status")).toString(QStringLiteral("complete"));
+    // 情景记忆的结构化行会带上 importance；索引块和其它结构化来源没有该列，保持 0。
+    evidence.importance = row.value(QStringLiteral("importance")).toDouble(0.0);
     return evidence;
 }
 
@@ -196,6 +198,9 @@ QJsonObject MemoryEvidence::toJson() const
     object.insert(QStringLiteral("session"), session);
     object.insert(QStringLiteral("privacy"), privacy);
     object.insert(QStringLiteral("status"), status);
+    // 只在来源确有重要性时输出，避免给普通证据增加噪声字段。
+    if (importance > 0.0)
+        object.insert(QStringLiteral("importance"), importance);
     if (!expressionHint.isEmpty())
         object.insert(QStringLiteral("expression_hint"), expressionHint);
     if (!aboutIds.isEmpty())

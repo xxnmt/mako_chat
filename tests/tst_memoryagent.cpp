@@ -55,6 +55,25 @@ void serveCompletions(QTcpServer &server,QList<QByteArray> &bodies,std::function
     });
 }
 
+// 从请求体里取出"能力清单"那条 system 提示词，返回前缀之后的 JSON 文本。
+// 找不到时返回空串，便于断言"没有注入"。
+QString capabilityPromptText(const QByteArray &body)
+{
+    const QString prefix = QStringLiteral(
+        "【你当前被授予的能力（服务端核验，只读）。不要声称未列出的能力。】");
+    const QJsonArray messages = QJsonDocument::fromJson(body).object()
+                                    .value(QStringLiteral("messages")).toArray();
+    for (const auto &value : messages) {
+        const auto message = value.toObject();
+        const QString content = message.value(QStringLiteral("content")).toString();
+        if (message.value(QStringLiteral("role")).toString() == QStringLiteral("system")
+            && content.startsWith(prefix)) {
+            return content.mid(prefix.size());
+        }
+    }
+    return {};
+}
+
 MemoryAgentScope ownerGroupScope(const QString &groupId, const QDateTime &now)
 {
     MemoryAgentScope scope;
@@ -842,6 +861,9 @@ private slots:
             QVERIFY(bodies.first().contains("unanswered question about the street"));
             QVERIFY(bodies.first().contains("previous street sounds"));
             QVERIFY(bodies.first().contains("the street sounds different today"));
+            // 回顾提示词末行带一行能力摘要（联系目标/安静时段/写作开关），不是整段 JSON。
+            QVERIFY(bodies.first().contains(QStringLiteral("服务端核验的当前授权").toUtf8()));
+            QVERIFY(bodies.first().contains(QStringLiteral("私下写作开关").toUtf8()));
             QVERIFY(bodies.at(1).contains("previous street sounds"));
             QVERIFY(db.nextThought(false).isEmpty());
             QVERIFY(cfg.writeConfigDocument("identity.json",
@@ -978,6 +1000,162 @@ private slots:
         QCOMPARE(db.attentionBacklog()["by_state"].toObject()["done"].toInt(), 1);
         // 恢复优先于回顾：本轮没有启动新的回顾请求。
         QCOMPARE(bodies.size(), 0);
+    }
+
+    // 能力自感知：清单由当前配置生成，默认未授予的项给出 enabled=false 与简短原因。
+    void capabilityManifestReflectsConfig()
+    {
+        auto &cfg = ConfigManager::instance();
+        QFile setting(cfg.getConfigFilePath());
+        const bool settingExisted = setting.open(QIODevice::ReadOnly);
+        const QByteArray settingOriginal = settingExisted ? setting.readAll() : QByteArray{};
+        setting.close();
+        auto restoreSetting = qScopeGuard([&] {
+            cfg.writeConfigDocument("setting.json",
+                settingExisted ? settingOriginal : QByteArray("{}"), nullptr);
+            if (!settingExisted) QFile::remove(cfg.getConfigFilePath());
+        });
+        const QString identityPath = cfg.getConfigDirPath() + "/identity.json";
+        QFile identity(identityPath);
+        const bool identityExisted = identity.open(QIODevice::ReadOnly);
+        const QByteArray identityOriginal = identityExisted ? identity.readAll() : QByteArray{};
+        identity.close();
+        auto restoreIdentity = qScopeGuard([&] {
+            if (identityExisted) cfg.writeConfigDocument("identity.json", identityOriginal, nullptr);
+            else { QFile::remove(identityPath); cfg.reloadIdentity(); }
+        });
+
+        QVERIFY(cfg.writeConfigDocument("setting.json",
+            QJsonDocument(QJsonObject{{"memory", QJsonObject{{"long_term_memory_enabled", true}}}}).toJson(),
+            nullptr));
+        QVERIFY(cfg.writeConfigDocument("identity.json", QByteArray("{}"), nullptr));
+
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager db(dir.filePath("manifest.db"));
+        LLMService service("test", nullptr, QUrl(QStringLiteral("http://127.0.0.1:1")));
+        service.setMemoryManager(&db);
+
+        RequestMeta privateMeta; // 桌宠默认会话：pet/default
+        QJsonObject manifest = service.capabilityManifest(privateMeta);
+        QVERIFY(manifest.value("memory_recall").toObject().value("enabled").toBool());
+        const auto defaultContact = manifest.value("private_contact").toObject();
+        QVERIFY(!defaultContact.value("enabled").toBool());
+        QVERIFY(!defaultContact.value("reason").toString().isEmpty());
+        QVERIFY(!manifest.value("private_review").toObject().value("enabled").toBool());
+        QVERIFY(!manifest.value("reminder").toObject().value("enabled").toBool());
+        QVERIFY(manifest.value("tts").toObject().value("enabled").toBool());
+
+        // 群聊没有私下提醒，即使目标列表覆盖了当前会话也不能列入。
+        RequestMeta groupMeta;
+        groupMeta.channel = Channel::kQQGroup;
+        groupMeta.sessionId = QStringLiteral("30001");
+        groupMeta.actorId = QStringLiteral("10001");
+        QVERIFY(!service.capabilityManifest(groupMeta).value("reminder")
+                    .toObject().value("enabled").toBool());
+
+        // 开启主动联系 + 目标后：联系/提醒/写作真正可用，并带目标与安静时段。
+        QVERIFY(cfg.writeConfigDocument("identity.json", QByteArray(
+            R"({"proactive":{"enabled":true,"private_writing":true,"idle_seconds":600,)"
+            R"("quiet_hours":{"start":"22:30","end":"07:30"},)"
+            R"("targets":[{"channel":"pet","session_id":"default"}]}})"), nullptr));
+        manifest = service.capabilityManifest(privateMeta);
+        const auto contact = manifest.value("private_contact").toObject();
+        QVERIFY(contact.value("enabled").toBool());
+        QVERIFY(contact.value("targets").toArray().contains(QJsonValue(QStringLiteral("pet"))));
+        QCOMPARE(contact.value("quiet_hours").toObject().value("start").toString(),
+                 QStringLiteral("22:30"));
+        QCOMPARE(contact.value("idle_seconds").toInt(), 600);
+        const auto reminder = manifest.value("reminder").toObject();
+        QVERIFY(reminder.value("enabled").toBool());
+        QCOMPARE(reminder.value("channel").toString(), QStringLiteral("pet"));
+        QCOMPARE(reminder.value("quiet_hours").toObject().value("end").toString(),
+                 QStringLiteral("07:30"));
+        QVERIFY(manifest.value("private_review").toObject().value("enabled").toBool());
+
+        // 关闭长期记忆：memory_recall 不再出现，其余记忆相关能力也收回。
+        QVERIFY(cfg.writeConfigDocument("setting.json",
+            QJsonDocument(QJsonObject{{"memory", QJsonObject{{"long_term_memory_enabled", false}}}}).toJson(),
+            nullptr));
+        manifest = service.capabilityManifest(privateMeta);
+        QVERIFY(!manifest.contains(QStringLiteral("memory_recall")));
+        QVERIFY(!manifest.value("private_contact").toObject().value("enabled").toBool());
+        QVERIFY(!manifest.value("private_review").toObject().value("enabled").toBool());
+        QVERIFY(!manifest.value("reminder").toObject().value("enabled").toBool());
+    }
+
+    // 前台请求体必须带能力清单，且清单随配置变化；旧断言只做 contains，不依赖顺序。
+    void foregroundPromptCarriesCapabilityManifest()
+    {
+        auto &cfg = ConfigManager::instance();
+        QFile setting(cfg.getConfigFilePath());
+        const bool settingExisted = setting.open(QIODevice::ReadOnly);
+        const QByteArray settingOriginal = settingExisted ? setting.readAll() : QByteArray{};
+        setting.close();
+        auto restoreSetting = qScopeGuard([&] {
+            cfg.writeConfigDocument("setting.json",
+                settingExisted ? settingOriginal : QByteArray("{}"), nullptr);
+            if (!settingExisted) QFile::remove(cfg.getConfigFilePath());
+        });
+        const QString identityPath = cfg.getConfigDirPath() + "/identity.json";
+        QFile identity(identityPath);
+        const bool identityExisted = identity.open(QIODevice::ReadOnly);
+        const QByteArray identityOriginal = identityExisted ? identity.readAll() : QByteArray{};
+        identity.close();
+        auto restoreIdentity = qScopeGuard([&] {
+            if (identityExisted) cfg.writeConfigDocument("identity.json", identityOriginal, nullptr);
+            else { QFile::remove(identityPath); cfg.reloadIdentity(); }
+        });
+
+        QVERIFY(cfg.writeConfigDocument("setting.json",
+            QJsonDocument(QJsonObject{{"memory", QJsonObject{{"long_term_memory_enabled", true}}}}).toJson(),
+            nullptr));
+        QVERIFY(cfg.writeConfigDocument("identity.json", QByteArray(
+            R"({"proactive":{"enabled":true,"private_writing":true,)"
+            R"("targets":[{"channel":"pet","session_id":"default"}]}})"), nullptr));
+
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QByteArray> bodies;
+        serveCompletions(server, bodies, [](int) -> QString {
+            return QStringLiteral(
+                R"({"sentences":[{"zh_text":"好呀","ja_text":"いいよ","tags":{"emotion":"happy"}}]})");
+        });
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager db(dir.filePath("capability.db"));
+        LLMService service("test", nullptr,
+            QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.serverPort())));
+        service.setMemoryManager(&db);
+        QSignalSpy spoken(&service, &LLMService::sentencesReady);
+
+        RequestMeta meta; // pet/default，subject=user，persistTurn=true
+        meta.runId = meta.eventId = QStringLiteral("capability");
+        service.askDeepSeek(QStringLiteral("你好"), {}, meta);
+        QTRY_COMPARE_WITH_TIMEOUT(spoken.size(), 1, 5000);
+        QCOMPARE(bodies.size(), 1);
+        QVERIFY(bodies.last().contains(QStringLiteral("【你当前被授予的能力").toUtf8()));
+        const QString manifestText = capabilityPromptText(bodies.last());
+        QVERIFY(!manifestText.isEmpty());
+        const auto manifest = QJsonDocument::fromJson(manifestText.toUtf8()).object();
+        QVERIFY(manifest.value("memory_recall").toObject().value("enabled").toBool());
+        QVERIFY(manifest.value("private_contact").toObject().value("enabled").toBool());
+        QVERIFY(manifest.value("private_contact").toObject().value("targets").toArray()
+                    .contains(QJsonValue(QStringLiteral("pet"))));
+        QVERIFY(manifest.value("reminder").toObject().value("enabled").toBool());
+
+        // 关闭长期记忆后，下一轮请求的清单不再列 memory_recall。
+        QVERIFY(cfg.writeConfigDocument("setting.json",
+            QJsonDocument(QJsonObject{{"memory", QJsonObject{{"long_term_memory_enabled", false}}}}).toJson(),
+            nullptr));
+        meta.runId = meta.eventId = QStringLiteral("capability-disabled");
+        service.askDeepSeek(QStringLiteral("还记得吗"), {}, meta);
+        QTRY_COMPARE_WITH_TIMEOUT(spoken.size(), 2, 5000);
+        QCOMPARE(bodies.size(), 2);
+        const QString disabledText = capabilityPromptText(bodies.last());
+        QVERIFY(!disabledText.isEmpty());
+        const auto disabledManifest = QJsonDocument::fromJson(disabledText.toUtf8()).object();
+        QVERIFY(!disabledManifest.contains(QStringLiteral("memory_recall")));
     }
 
     void initTestCase()

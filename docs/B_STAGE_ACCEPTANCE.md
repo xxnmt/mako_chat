@@ -105,7 +105,18 @@
   delete from concern_resolution where prior_turn in (...);
   ```
 
-## 5. 已知边界（不作为失败）
+## 5. 改进批次的观测点（M5）
+
+- **日志会话头**：每个新日志文件第一条应为
+  `[RuntimeLog] session app=Windows_AI version=0.3 pid=... qt=6.11.1 build=... exe_dir=... config=... config_hash=<12位>`。
+  配置改动后 `config_hash` 会变，可用于判断"这次行为和上次不同是不是配置漂移"。
+- **能力清单**：前台每轮有一条 `【你当前被授予的能力（服务端核验，只读）…】` 的只读 JSON；若她声称了清单之外的能力（例如没开主动联系却说"我待会找你"），记一次契约偏差。
+- **重要性召回**：检索证据 JSON 中出现 `importance`；同一个重要事件（承诺、里程碑）在相关提问中应更靠前召回。可在 DB 里把某条 `episodic_memory.importance` 调高做对照（只读观测，不建议在正式库改数据）。
+- **主动联系日限额**：`contact_daily_limit`（默认 3）生效时，超限日志为 `[Contact] daily_limit reachable`；`delivery_ledger` 中当日 `kind='contact'` 行数不超过限额。
+- **关注默认间隔/保留期**：新关注未指定时间时按 `concern_default_check_minutes`（默认 720）排期；超过 `concern_retention_days`（默认 14）的旧关注不再按时间唤醒，但仍可被新证据命中。
+- **分享/联系重试**：`rejected` 最多补一次；`unknown` 不重发；均以 `delivery_ledger` 为准。
+
+## 6. 已知边界（不作为失败）
 
 - 多活动并行选择未实现（沿用单活动，ROADMAP 已列为后续）。
 - "先决定是否阅读消息"只留了 attention 事件与状态记录，不做元数据优先的门控（重构方案 §1.2 明确不扩大）。

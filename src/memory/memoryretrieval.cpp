@@ -288,6 +288,9 @@ QList<MemoryEvidence> HeuristicMemoryReranker::rerank(const QString &query,
             const double days = qMax(0.0, candidates.at(i).speechAt.secsTo(now) / 86400.0);
             score += 0.02 * qExp(-days / 30.0);
         }
+        // 重要情景记忆在同一查询下优先；没有重要性的来源不加分，原有分值完全不变。
+        if (candidates.at(i).importance > 0.0)
+            score += 0.75 * candidates.at(i).importance;
         scored.append({score, i});
     }
     std::stable_sort(scored.begin(), scored.end(), [](const auto &a, const auto &b) {

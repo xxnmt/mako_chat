@@ -305,3 +305,21 @@ ctest --output-on-failure
 ### 仍未完成
 
 B5 的 7 天实机连续运行、真实 QQ 主动联系到达、多活动并行选择、元数据优先阅读门控。
+
+---
+
+## 2026-11-23 · 改进批次（M5）
+
+针对用户提出的"重要事件记忆、能力自感知、主动可选项、设置项、日志命名"五个问题：
+
+| Agent | 范围 | 交付 |
+|---|---|---|
+| `r1-memory-config` | `MemoryEvidence` importance 进入检索与重排；proactive 新增三项配置；联系日限额、关注默认间隔/保留期执行端约束；设置页字段 | +4 用例（召回排序、日限额、默认间隔、保留期）+ config/settings 用例 |
+| `r2-capability-log` | `LLMService::capabilityManifest` 与前台/回顾注入；日志会话头（version/pid/qt/build/config_hash）；CMake 版本 | +3 用例（清单配置联动、前台注入、日志头） |
+| `lead` | 集成、构建修复（QByteArray::contains 类型）、全量回归、文档 | ctest 20/20 |
+
+关键决策与边界：
+- importance 只加在启发式重排（`+0.75*importance`），无 importance 时原分数不变；DashScope 重排不变。
+- 能力清单由配置与服务端状态生成，只列真正可用项；不可用项给 `enabled:false` + reason。
+- 日志不改文件名（毫秒时间戳已够），改为新增会话头与配置指纹；保留期/轮转未做。
+- 能力清单尚未包含 `current_activity`（当前活动只持久化未注入），列为下一步。

@@ -66,6 +66,9 @@ private slots:
         proactive.insert("daily_limit", 5);
         proactive.insert("cooldown_seconds", 600);
         proactive.insert("idle_seconds", 900);
+        proactive.insert("contact_daily_limit", 7);
+        proactive.insert("concern_default_check_minutes", 600);
+        proactive.insert("concern_retention_days", 30);
         proactive.insert("quiet_hours", quiet);
         proactive.insert("targets", QJsonArray{target1, target2});
         proactive.insert("schedule", QJsonArray{schedule});
@@ -155,6 +158,9 @@ private slots:
         QCOMPARE(cfg.dailyLimit, 5);
         QCOMPARE(cfg.cooldownSeconds, 600);
         QCOMPARE(cfg.idleSeconds, 900);
+        QCOMPARE(cfg.contactDailyLimit, 7);
+        QCOMPARE(cfg.concernDefaultCheckMinutes, 600);
+        QCOMPARE(cfg.concernRetentionDays, 30);
         QCOMPARE(cfg.quietStart, QStringLiteral("22:30"));
         QCOMPARE(cfg.quietEnd, QStringLiteral("07:00"));
         QCOMPARE(cfg.targets.size(), 2);
@@ -425,11 +431,60 @@ private slots:
         QCOMPARE(check.readAll(), broken);
     }
 
+    // 主动联系/关注的执行端约束：缺省值来自 ProactiveConfig，读取时按上下界夹紧。
+    void proactiveExecutionConfigDefaultsAndClamps()
+    {
+        ConfigManager &cfg = ConfigManager::instance();
+        // 缺省：identity.json 没给新键时使用默认值。
+        QJsonObject proactive;
+        proactive.insert("enabled", true);
+        QJsonObject root;
+        root.insert("proactive", proactive);
+        writeIdentityFile(root);
+        cfg.reloadIdentity();
+        ProactiveConfig parsed = cfg.getProactiveConfig();
+        QCOMPARE(parsed.contactDailyLimit, 3);
+        QCOMPARE(parsed.concernDefaultCheckMinutes, 720);
+        QCOMPARE(parsed.concernRetentionDays, 14);
+
+        // 下界夹紧。
+        proactive.insert("contact_daily_limit", -5);
+        proactive.insert("concern_default_check_minutes", -10);
+        proactive.insert("concern_retention_days", 0);
+        root.insert("proactive", proactive);
+        writeIdentityFile(root);
+        cfg.reloadIdentity();
+        parsed = cfg.getProactiveConfig();
+        QCOMPARE(parsed.contactDailyLimit, 0);
+        QCOMPARE(parsed.concernDefaultCheckMinutes, 0);
+        QCOMPARE(parsed.concernRetentionDays, 1);
+
+        // 上界夹紧。
+        proactive.insert("contact_daily_limit", 1000);
+        proactive.insert("concern_default_check_minutes", 20000);
+        proactive.insert("concern_retention_days", 1000);
+        root.insert("proactive", proactive);
+        writeIdentityFile(root);
+        cfg.reloadIdentity();
+        parsed = cfg.getProactiveConfig();
+        QCOMPARE(parsed.contactDailyLimit, 99);
+        QCOMPARE(parsed.concernDefaultCheckMinutes, 10080);
+        QCOMPARE(parsed.concernRetentionDays, 365);
+    }
+
 private:
     void writeSettingFile(const QJsonObject &root)
     {
         QFile file(m_configDir + "/setting.json");
         QVERIFY2(file.open(QIODevice::WriteOnly | QIODevice::Truncate), "无法写入 setting.json");
+        file.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+        file.close();
+    }
+
+    void writeIdentityFile(const QJsonObject &root)
+    {
+        QFile file(m_identityPath);
+        QVERIFY2(file.open(QIODevice::WriteOnly | QIODevice::Truncate), "无法写入 identity.json");
         file.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
         file.close();
     }

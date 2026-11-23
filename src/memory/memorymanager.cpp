@@ -708,15 +708,17 @@ QJsonArray MemoryManager::structuredMemoryRows(const QStringList &kinds, const Q
             return;
         }
         while (query.next()) {
+            // importance 只有情景记忆提供；其它结构化查询没有第 10 列，取值退化为 0。
             rows.append(QJsonObject{{"source_type", kind}, {"source_ref", kind + "/" + query.value(0).toString()},
                 {"text", query.value(1).toString()}, {"channel", query.value(2).toString()},
                 {"session", query.value(3).toString()}, {"speaker_id", query.value(4).toString()},
                 {"speaker_role", query.value(4).isNull() ? "unknown" : "user"},
                 {"speech_at", query.value(5).toString()}, {"event_time", query.value(6).toString()},
-                {"recorded_at", query.value(7).toString()}, {"derived", query.value(8).toString()}});
+                {"recorded_at", query.value(7).toString()}, {"derived", query.value(8).toString()},
+                {"importance", query.value(9).toDouble()}});
         }
     };
-    collect("episode", "SELECT id,content,origin,session_id,subject,NULL,event_time,content_recorded_at,'memory' "
+    collect("episode", "SELECT id,content,origin,session_id,subject,NULL,event_time,content_recorded_at,'memory',importance "
             "FROM episodic_memory WHERE status='active' AND (subject=? OR ?) AND (origin='pet' OR ?)",
             {subject, includeOthers, allEpisodic});
     if (includeOthers) {

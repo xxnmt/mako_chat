@@ -471,12 +471,30 @@ QJsonObject MemoryManager::claimDueConcern(int dailyLimit,int cooldownSeconds)
 {
     if (dailyLimit<=0 || !m_db.transaction()) return {};
     auto rollback=qScopeGuard([this]{m_db.rollback();});
+    // 保留期只约束"按时间到期"的回顾；新证据命中走 matchedConcerns，不受这里影响。
+    const int retentionDays=qBound(1,
+        ConfigManager::instance().getProactiveConfig().concernRetentionDays,365);
     QSqlQuery q(m_db);
+    // 到期但已超出保留期的关注不再领取；单独记一条日志，便于解释"到期却没被唤醒"。
+    {
+        QSqlQuery expired(m_db);
+        expired.prepare(QStringLiteral(
+            "SELECT r.turn_id") + sourceRows +
+            "JOIN private_reflection r ON r.turn_id=h.id WHERE " + eligible +
+            " AND r.state='consider' AND NOT EXISTS (SELECT 1 FROM reflection_change WHERE prior_turn=r.turn_id)"
+            " AND r.next_check_at>0 AND r.next_check_at<=unixepoch()"
+            " AND julianday(s.reported)<julianday('now','-" + QString::number(retentionDays) + " day')"
+            " ORDER BY r.next_check_at,r.turn_id LIMIT 24");
+        if (expired.exec())
+            while (expired.next())
+                qInfo()<<"[Concern] expired_by_retention turn="<<expired.value(0).toLongLong();
+    }
     // 只领"按时间到期"的开放关注；被回顾链修订过的旧行不再作为 head。
     q.prepare("SELECT r.turn_id,r.version,r.note,h.channel,h.session_id,s.input" + sourceRows +
               "JOIN private_reflection r ON r.turn_id=h.id WHERE " + eligible +
               " AND r.state='consider' AND NOT EXISTS (SELECT 1 FROM reflection_change WHERE prior_turn=r.turn_id)"
               " AND r.next_check_at>0 AND r.next_check_at<=unixepoch()"
+              " AND julianday(s.reported)>=julianday('now','-" + QString::number(retentionDays) + " day')"
               " ORDER BY r.next_check_at,r.turn_id LIMIT 24");
     if (!q.exec()) return {};
     struct Due {
@@ -619,7 +637,11 @@ bool MemoryManager::finishConcernReview(qlonglong turn,int version,const QJsonOb
     if (!actions.contains(action)) return false;
     const auto note=proposal["note"].toString().trimmed();
     if (note.size()>240) return false;
-    const int minutes=qBound(0,proposal["forget"].toObject()["next_check_after_minutes"].toInt(720),10080);
+    // 模型没给 next_check_after_minutes 时用配置的默认间隔；显式 0 仍表示"只在新证据时"。
+    const int concernDefaultMinutes =
+        ConfigManager::instance().getProactiveConfig().concernDefaultCheckMinutes;
+    const int minutes=qBound(0,proposal["forget"].toObject()["next_check_after_minutes"]
+                                    .toInt(concernDefaultMinutes),10080);
     if (!m_db.transaction()) return false;
     auto rollback=qScopeGuard([this]{m_db.rollback();});
     QSqlQuery q(m_db);
@@ -824,7 +846,11 @@ bool MemoryManager::finishPrivateReflection(qlonglong turn, int version, const Q
         if ((!topic.isEmpty() && !policy.allows(channel,session,topic))
             || (!watch.isEmpty() && !policy.allows(channel,session,watch))
             || (!matter.isEmpty() && !policy.allows(channel,session,matter))) return false;
-        const int minutes=qBound(0,concern["next_check_after_minutes"].toInt(720),10080);
+        // 模型没给 next_check_after_minutes 时用配置的默认间隔；显式 0 仍表示只在新证据时。
+        const int concernDefaultMinutes =
+            ConfigManager::instance().getProactiveConfig().concernDefaultCheckMinutes;
+        const int minutes=qBound(0,concern["next_check_after_minutes"]
+                                        .toInt(concernDefaultMinutes),10080);
         const qint64 delay=nextCheckAfter(minutes);
         // 修订时新行沿用旧关注的根轮次；否则用本轮次，已有根轮次则保留（同一 head 被重新回顾）。
         const int revise=priorAction=="revise" ? 1 : 0;
@@ -890,6 +916,18 @@ QString MemoryManager::claimReflectionContact(qlonglong turn, int version, const
         || !opts.targets.contains(qMakePair(channel,session))) return {};
     if (!(channel==Channel::kPet && session==Channel::kDefaultSession)
         && !(channel==Channel::kQQPrivate && cfg.isMasterQQ(session))) return {};
+    // 每日"现在联系"投递上限：按 delivery_ledger 的 contact 行计数。
+    // 同一 (kind,ref) 重试只复用同一行，不重复占额度；withheld 表示并未真正投递，不计入。
+    if (opts.contactDailyLimit > 0) {
+        QSqlQuery used(m_db);
+        if (used.exec("SELECT count(*) FROM delivery_ledger WHERE kind='contact' "
+                      "AND date(created_at,'localtime')=date('now','localtime') "
+                      "AND state<>'withheld'")
+            && used.next() && used.value(0).toInt() >= opts.contactDailyLimit) {
+            qInfo() << "[Contact] daily_limit reachable";
+            return {};
+        }
+    }
     if (!m_db.transaction()) return {};
     auto rollback=qScopeGuard([this]{m_db.rollback();});
     QSqlQuery q(m_db);

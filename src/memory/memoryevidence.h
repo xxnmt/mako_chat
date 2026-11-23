@@ -60,6 +60,8 @@ struct MemoryEvidence
     QString privacy = QStringLiteral("unknown");
     QString status = QStringLiteral("complete");
     QString expressionHint;
+    // 来源标注的重要性（0–1）。目前只有情景记忆提供；其它来源保持 0，不参与重排加分。
+    double importance = 0.0;
     bool own = false;
 
     static MemoryEvidence fromChunk(const QJsonObject &row,

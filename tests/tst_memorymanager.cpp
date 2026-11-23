@@ -166,12 +166,27 @@ public:
         }
     }
     // private_writing 明确保持 false：主动联系的可达性不应依赖后台写作开关。
-    bool enableContact()
+    // contactDailyLimit < 0 时不写该键，沿用配置默认值。
+    bool enableContact(int contactDailyLimit = -1)
     {
+        QJsonObject target{{"channel", Channel::kPet},
+                           {"session_id", Channel::kDefaultSession}};
+        QJsonObject proactive{{"enabled", true},
+                              {"private_writing", false},
+                              {"targets", QJsonArray{target}}};
+        if (contactDailyLimit >= 0)
+            proactive.insert("contact_daily_limit", contactDailyLimit);
+        QJsonObject root{{"proactive", proactive}};
         return ConfigManager::instance().writeConfigDocument(
             QStringLiteral("identity.json"),
-            R"({"proactive":{"enabled":true,"private_writing":false,"targets":[{"channel":"pet","session_id":"default"}]}})",
-            nullptr);
+            QJsonDocument(root).toJson(QJsonDocument::Compact), nullptr);
+    }
+
+    // 覆盖 proactive 的其它字段：析构时同样恢复原 identity.json。
+    bool writeIdentity(const QByteArray &contents)
+    {
+        return ConfigManager::instance().writeConfigDocument(
+            QStringLiteral("identity.json"), contents, nullptr);
     }
 
 private:
@@ -1657,6 +1672,44 @@ private slots:
                 found = true;
         QVERIFY(found);
         QVERIFY(result.evidence.size() <= 10);
+    }
+
+    // 重要事件：episodic_memory.importance 进入 MemoryEvidence，并参与本地启发式重排。
+    void episodicImportanceBoostsRerank()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager db(dir.filePath("episodic-importance.db"));
+        const QDateTime eventTime = QDateTime::currentDateTime().addSecs(-60);
+        // 两条内容等长、词面命中相同的情景记忆，只有 importance 不同。
+        QVERIFY(db.addEpisodicMemory(QStringLiteral("荷包蛋记录甲"), QStringLiteral("event"), 0.1,
+                                     eventTime));
+        QVERIFY(db.addEpisodicMemory(QStringLiteral("荷包蛋记录乙"), QStringLiteral("event"), 0.95,
+                                     eventTime));
+
+        RetrievalRequest request;
+        request.query = QStringLiteral("荷包蛋");
+        request.subject = QStringLiteral("user");
+        const auto items = MemoryRetrievalService(&db).retrieve(request).evidence;
+        QVERIFY(items.size() >= 2);
+        QStringList texts;
+        for (const auto &item : items)
+            texts.append(item.text);
+        // 同词面命中下，importance 更高的情景记忆排在前面。
+        QCOMPARE(texts.value(0), QStringLiteral("荷包蛋记录乙"));
+        QVERIFY(texts.contains(QStringLiteral("荷包蛋记录甲")));
+        QCOMPARE(items.first().sourceType, QStringLiteral("episode"));
+        QVERIFY(qAbs(items.first().importance - 0.95) < 1e-6);
+        // toJson 仅在 importance>0 时输出该字段。
+        const auto highJson = items.first().toJson();
+        QVERIFY(highJson.contains(QStringLiteral("importance")));
+        QVERIFY(qAbs(highJson.value(QStringLiteral("importance")).toDouble() - 0.95) < 1e-6);
+        for (const auto &item : items) {
+            if (item.text == QStringLiteral("荷包蛋记录甲")) {
+                QVERIFY(qAbs(item.importance - 0.1) < 1e-6);
+                QVERIFY(item.toJson().contains(QStringLiteral("importance")));
+            }
+        }
     }
 
     void rerankReceivesFilteredDedupedBoundedCandidatesAndFallsBack()
@@ -3164,6 +3217,140 @@ private slots:
             QVERIFY(raw.scalar(QStringLiteral("SELECT next_check_at FROM private_reflection WHERE turn_id=%1")
                                    .arg(contactTurn)).toLongLong() > 0);
         }
+    }
+
+    // 每日"现在联系"上限：达到上限后不再领取，0 表示不限制。
+    void contactDailyLimitBlocks()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath("contact-daily-limit.db");
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableContact(1));
+        MemoryManager db(path);
+        const auto seed = [&](const QString &event, const QString &input, const QString &note,
+                              const QString &message) {
+            return seedOpenConcern(db, concernTurnMeta(event), input, note, QJsonObject{},
+                                   QJsonObject{{"timing", "now"},
+                                               {"reason", QStringLiteral("到了约定时间")},
+                                               {"message", message}});
+        };
+
+        const qint64 first = seed(QStringLiteral("contact-limit-a"), QStringLiteral("第一件事"),
+                                  QStringLiteral("第一件事怎么样了"), QStringLiteral("在忙吗"));
+        QVERIFY(first > 0);
+        QCOMPARE(db.claimReflectionContact(first, 1, Channel::kPet, Channel::kDefaultSession),
+                 QStringLiteral("在忙吗"));
+        QVERIFY(rewindReviewCooldown(path, QStringLiteral("contact-limit-clock")));
+        const qint64 second = seed(QStringLiteral("contact-limit-b"), QStringLiteral("第二件事"),
+                                   QStringLiteral("第二件事怎么样了"), QStringLiteral("吃了吗"));
+        QVERIFY(second > 0);
+        // 当天已有一条未 withheld 的 contact 流水，limit=1 时第二条被挡住。
+        QVERIFY(db.claimReflectionContact(second, 1, Channel::kPet, Channel::kDefaultSession).isEmpty());
+
+        // 0 表示不限制：放宽后同一条可领取；再新增一条也能领取。
+        QVERIFY(identity.enableContact(0));
+        QCOMPARE(db.claimReflectionContact(second, 1, Channel::kPet, Channel::kDefaultSession),
+                 QStringLiteral("吃了吗"));
+        QVERIFY(rewindReviewCooldown(path, QStringLiteral("contact-limit-clock2")));
+        const qint64 third = seed(QStringLiteral("contact-limit-c"), QStringLiteral("第三件事"),
+                                  QStringLiteral("第三件事怎么样了"), QStringLiteral("睡了吗"));
+        QVERIFY(third > 0);
+        QVERIFY(!db.claimReflectionContact(third, 1, Channel::kPet, Channel::kDefaultSession).isEmpty());
+    }
+
+    // 关注默认间隔取 proactive.concern_default_check_minutes（默认 720 分钟）。
+    void concernDefaultUsesConfig()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        // 显式写入不含新键的 proactive 段，确保读到默认值而不是其它用例留下的配置。
+        QVERIFY(identity.enableContact());
+        QCOMPARE(ConfigManager::instance().getProactiveConfig().concernDefaultCheckMinutes, 720);
+
+        const auto nextCheckAfterConsider = [](MemoryManager &db, const QString &path,
+                                               const RequestMeta &meta, const QString &input,
+                                               const QString &note, const QString &tag) -> qint64 {
+            const qint64 turn = db.recordInput(input, meta, true);
+            if (turn <= 0 || !db.recordQuiet(turn, "close")) return -1;
+            const auto claim = db.claimPrivateReflection(12, 60);
+            if (claim["id"].toInteger() != turn) return -1;
+            if (!db.finishPrivateReflection(turn, 1, "consider", note)) return -1;
+            RawDb raw(path, tag);
+            if (!raw.open()) return -1;
+            return raw.scalar(QStringLiteral("SELECT next_check_at FROM private_reflection "
+                                             "WHERE turn_id=%1").arg(turn)).toLongLong();
+        };
+
+        const QString path = dir.filePath("concern-default.db");
+        qint64 nextCheck = -1;
+        {
+            MemoryManager db(path);
+            const qint64 before = QDateTime::currentSecsSinceEpoch();
+            nextCheck = nextCheckAfterConsider(
+                db, path, concernTurnMeta(QStringLiteral("concern-default")),
+                QStringLiteral("周末可能下雨"), QStringLiteral("周末天气怎么样"),
+                QStringLiteral("concern-default"));
+            QVERIFY2(qAbs(nextCheck - (before + 720 * 60)) <= 120,
+                     qPrintable(QString::number(nextCheck)));
+        }
+
+        // 换一个非默认值：说明间隔确实来自配置，而不是硬编码的 720。
+        QVERIFY(identity.writeIdentity(R"({"proactive":{"concern_default_check_minutes":60}})"));
+        QCOMPARE(ConfigManager::instance().getProactiveConfig().concernDefaultCheckMinutes, 60);
+        const QString customPath = dir.filePath("concern-default-custom.db");
+        qint64 customNext = -1;
+        {
+            MemoryManager custom(customPath);
+            const qint64 customBefore = QDateTime::currentSecsSinceEpoch();
+            customNext = nextCheckAfterConsider(
+                custom, customPath, concernTurnMeta(QStringLiteral("concern-default-custom")),
+                QStringLiteral("明天可能降温"), QStringLiteral("降温了没有"),
+                QStringLiteral("concern-default-custom"));
+            QVERIFY2(qAbs(customNext - (customBefore + 60 * 60)) <= 120,
+                     qPrintable(QString::number(customNext)));
+        }
+    }
+
+    // 保留期：来源 reported 超过 concern_retention_days 的关注不再按时间到期领取。
+    void dueConcernRespectsRetention()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath("concern-retention.db");
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.writeIdentity(R"({"proactive":{"concern_retention_days":14}})"));
+        MemoryManager db(path);
+        const qint64 turn = seedOpenConcern(
+            db, concernTurnMeta(QStringLiteral("concern-retention-a")),
+            QStringLiteral("明天想去看展览"), QStringLiteral("展览怎么样"),
+            QJsonObject{{"topic", QStringLiteral("展览")},
+                        {"watch", QStringLiteral("有没有去")},
+                        {"next_check_after_minutes", 60}});
+        QVERIFY(turn > 0);
+        {
+            RawDb raw(path, "concern-retention-setup");
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral("UPDATE private_reflection SET next_check_at=unixepoch()-1 "
+                                            "WHERE turn_id=%1").arg(turn)));
+            // 关注来源已过去 30 天，超过保留期 14 天。
+            QVERIFY(raw.exec(QStringLiteral(
+                "UPDATE cognitive_source SET reported=datetime('now','-30 day')")));
+        }
+        QVERIFY(rewindReviewCooldown(path, QStringLiteral("concern-retention-clock")));
+        QVERIFY(db.claimDueConcern(12, 60).isEmpty());
+
+        // 保留期只拦"按时间到期"；来源恢复为近期后同一条关注仍可领取。
+        {
+            RawDb raw(path, "concern-retention-restore");
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral("UPDATE cognitive_source SET reported=datetime('now')")));
+        }
+        QVERIFY(rewindReviewCooldown(path, QStringLiteral("concern-retention-clock2")));
+        const auto claimed = db.claimDueConcern(12, 60);
+        QCOMPARE(claimed["id"].toInteger(), turn);
+        QCOMPARE(claimed["kind"].toString(), QStringLiteral("concern"));
     }
 
     // B1：注意力事件状态机（v25）。同 (kind,ref) 幂等；claim 按 priority,id；终态不可回退。

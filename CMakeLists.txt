@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.19)
-project(Windows_AI LANGUAGES CXX)
+project(Windows_AI VERSION 0.3 LANGUAGES CXX)
 enable_language(RC)
 
 find_package(Qt6 6.5 REQUIRED COMPONENTS Core Widgets Network Sql Multimedia WebSockets)
@@ -96,6 +96,9 @@ target_link_libraries(Windows_AI
         Qt::Multimedia
         Qt::WebSockets
 )
+
+# 版本号由 project(VERSION) 注入，运行时日志会话头与 QCoreApplication 都会用到。
+target_compile_definitions(Windows_AI PRIVATE MAKO_APP_VERSION="${PROJECT_VERSION}")
 
 install(TARGETS Windows_AI
     BUNDLE  DESTINATION .

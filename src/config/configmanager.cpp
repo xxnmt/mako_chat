@@ -909,6 +909,13 @@ void ConfigManager::ensureIdentityLoaded() const
     m_proactive.dailyLimit = proObj.value("daily_limit").toInt(3);
     m_proactive.cooldownSeconds = proObj.value("cooldown_seconds").toInt(900);
     m_proactive.idleSeconds = proObj.value("idle_seconds").toInt(1800);
+    // 执行端约束：缺省值即默认行为；越界值在这里夹紧，运行期不再二次判断。
+    m_proactive.contactDailyLimit =
+        qBound(0, proObj.value("contact_daily_limit").toInt(3), 99);
+    m_proactive.concernDefaultCheckMinutes =
+        qBound(0, proObj.value("concern_default_check_minutes").toInt(720), 10080);
+    m_proactive.concernRetentionDays =
+        qBound(1, proObj.value("concern_retention_days").toInt(14), 365);
     QJsonObject quietObj = proObj.value("quiet_hours").toObject();
     m_proactive.quietStart = quietObj.value("start").toString("23:00");
     m_proactive.quietEnd = quietObj.value("end").toString("08:00");

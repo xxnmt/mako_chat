@@ -97,3 +97,21 @@
 验证：全量构建零错误；`ctest` 19/20（唯一失败 `tst_runtimelog` 属宿主进程管道环境问题）；`tst_memorymanager` 77 passed；`tst_concern` 通过；`tst_memoryagent` 通过。生产库已备份并完成 v22→v25 迁移（`user_version=25`，36 条开放关注回填）。
 
 **仍未完成（不冒充已验收）**：B5 的 7 天实机连续运行、真实 QQ 主动联系到达、多活动并行选择、元数据优先阅读门控。
+
+## 6. 改进批次（M5，2026-11-23）
+
+针对"重要事件记忆、能力自感知、主动选项、设置项、日志命名"五个问题的落地：
+
+| 问题 | 实现 | 验收 |
+|---|---|---|
+| 重要事件更强记忆 | `MemoryEvidence.importance` 从 `episodic_memory` 进入证据；启发式重排 `+0.75*importance`（无 importance 时分数不变）；衰减仍保护 `importance>=0.8` | `tst_memorymanager::episodicImportanceBoostsRerank`：同词面下高 importance 排前 |
+| 能力自感知 | `LLMService::capabilityManifest(meta)` 按配置生成 memory_recall/reminder/private_contact/private_review/vision/tts；前台注入只读清单，回顾提示词注入一行授权摘要 | `tst_memoryagent::capabilityManifestReflectsConfig`、`foregroundPromptCarriesCapabilityManifest` |
+| 主动选项额度 | 新配置 `proactive.contact_daily_limit`（默认 3，0 不限）；`claimReflectionContact` 按 `delivery_ledger` 当日计数拦截 | `tst_memorymanager::contactDailyLimitBlocks` |
+| 设置项 | 设置页新增联系日限额、关注默认检查间隔、关注保留期三项；config 解析与夹紧 | `tst_configmanager`、`tst_settingspages` |
+| 日志命名 | 文件名保持 `logs_<ms时间戳>_<随机会话id>`；新增会话头 `app/version/pid/qt/build/exe_dir/config/config_hash(SHA-256 前12)` | `tst_runtimelog::sessionHeaderDescribesRunAndConfig` |
+
+同时落地：`proactive.concern_default_check_minutes`（默认 720）替换硬编码默认；`proactive.concern_retention_days`（默认 14）限制到期回顾范围（新证据匹配不受限）。
+
+验证：全量构建零错误；`ctest` **20/20**；`tst_memorymanager` 81 passed / 1 skipped、`tst_memoryagent` 53 passed、`tst_configmanager` 16、`tst_settingspages` 3。
+
+**M5 仍未做**：能力清单的"当前活动/正在做的事"注入（只持久化未注入）；日志保留期/轮转；同义改写匹配；误了结 reopen；多活动并行。

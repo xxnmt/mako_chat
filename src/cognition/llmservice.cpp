@@ -364,6 +364,108 @@ bool LLMService::expressionBasisCurrent() const
     return true;
 }
 
+QJsonObject LLMService::capabilityManifest(const RequestMeta &meta) const
+{
+    auto &config = ConfigManager::instance();
+    const MemoryPolicyConfig policy = config.getMemoryPolicyConfig();
+    const ProactiveConfig proactive = config.getProactiveConfig();
+
+    // 关闭长期记忆后，前台记忆注入、回顾与投递链路都会停用；涉及记忆的能力
+    // 一律视为未授予（覆盖需求给定的判定条件，避免列出"看着开着但用不了"的项）。
+    const bool longTerm = policy.longTermMemoryEnabled;
+    const QString disabledByMemory = QStringLiteral("长期记忆未开启");
+
+    QJsonObject manifest;
+
+    // 记忆回忆：与 prepareReply 里的 toolMode 判定保持一致（渠道/turn 类型 +
+    // agent_mode=tool + 长期记忆开关），并且确实有记忆库可查时才列入。
+    // 未授予时不出现：这是正常的渠道差异，不必每轮都提醒她"不能查"。
+    if (m_memoryManager
+        && MemoryAgentPlanner::canExposeTools(meta, policy.agent)
+        && longTerm) {
+        manifest.insert(QStringLiteral("memory_recall"), QJsonObject{
+            {QStringLiteral("enabled"), true},
+            {QStringLiteral("note"), QStringLiteral("按需检索过去对话、长期事实、承诺和群聊记录")}});
+    }
+
+    // 提醒：只有当前私下会话本身在主动联系目标里、本轮会落库、且是主人本人
+    // 的私聊/桌宠会话时，才允许安排未来消息。
+    const bool reminder = longTerm
+        && proactive.enabled
+        && proactive.targets.contains(qMakePair(meta.channel, meta.sessionId))
+        && meta.persistTurn
+        && meta.subject == QStringLiteral("user")
+        && meta.channel != Channel::kQQGroup;
+    QJsonObject reminderCapability{
+        {QStringLiteral("enabled"), reminder},
+        {QStringLiteral("quiet_hours"), QJsonObject{{QStringLiteral("start"), proactive.quietStart},
+                                                    {QStringLiteral("end"), proactive.quietEnd}}}};
+    if (reminder) {
+        reminderCapability.insert(QStringLiteral("channel"), meta.channel);
+    } else {
+        reminderCapability.insert(QStringLiteral("reason"),
+                                  longTerm ? QStringLiteral("当前会话未开通提醒")
+                                           : disabledByMemory);
+    }
+    manifest.insert(QStringLiteral("reminder"), reminderCapability);
+
+    // 私下联系：总开关 + 目标列表决定授权。联系由回顾在合适理由下提议，
+    // 不是"随时可以打扰"的许可，所以写明 note。
+    QStringList contactTargets;
+    for (const auto &target : proactive.targets) {
+        if (!target.first.isEmpty() && !contactTargets.contains(target.first)) {
+            contactTargets.append(target.first);
+        }
+    }
+    const bool contact = longTerm && proactive.enabled && !proactive.targets.isEmpty();
+    QJsonObject contactCapability{
+        {QStringLiteral("enabled"), contact},
+        {QStringLiteral("targets"), QJsonArray::fromStringList(contactTargets)},
+        {QStringLiteral("quiet_hours"), QJsonObject{{QStringLiteral("start"), proactive.quietStart},
+                                                    {QStringLiteral("end"), proactive.quietEnd}}},
+        {QStringLiteral("idle_seconds"), proactive.idleSeconds},
+        {QStringLiteral("note"), QStringLiteral("只在有理由时由回顾提议，不自行打扰")}};
+    if (!contact) {
+        contactCapability.insert(
+            QStringLiteral("reason"),
+            !longTerm ? disabledByMemory
+                      : (proactive.targets.isEmpty() ? QStringLiteral("未配置联系目标")
+                                                     : QStringLiteral("主动联系未开启")));
+    }
+    manifest.insert(QStringLiteral("private_contact"), contactCapability);
+
+    // 私下回顾/写作：与 requestPrivateReview 的授权开关（private_writing）一致。
+    const bool review = longTerm && proactive.privateWriting;
+    QJsonObject reviewCapability{{QStringLiteral("enabled"), review}};
+    if (!review) {
+        reviewCapability.insert(QStringLiteral("reason"),
+                                longTerm ? QStringLiteral("私下写作/回顾未开启")
+                                         : disabledByMemory);
+    }
+    manifest.insert(QStringLiteral("private_review"), reviewCapability);
+
+    // 视觉：只判断 setting.json 的图片感知开关，不宣称本轮一定有图可看。
+    const bool vision = config.visionEnabled();
+    QJsonObject visionCapability{{QStringLiteral("enabled"), vision}};
+    if (!vision) {
+        visionCapability.insert(QStringLiteral("reason"), QStringLiteral("图片感知未开启"));
+    }
+    manifest.insert(QStringLiteral("vision"), visionCapability);
+
+    // 语音：API 模式且配置了语音服务地址才算可用；本地 mock 只是开发回退。
+    // 只有桌宠渠道会实际播放，QQ 渠道不播放，所以按渠道收窄。
+    const bool tts = meta.channel == Channel::kPet
+        && config.getTTSMode() == QStringLiteral("api")
+        && !config.getTTSUrl().trimmed().isEmpty();
+    QJsonObject ttsCapability{{QStringLiteral("enabled"), tts}};
+    if (!tts) {
+        ttsCapability.insert(QStringLiteral("reason"), QStringLiteral("当前渠道没有语音输出"));
+    }
+    manifest.insert(QStringLiteral("tts"), ttsCapability);
+
+    return manifest;
+}
+
 void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn> &historyQA,
                               const RequestMeta &meta, const QJsonArray &privateEvidence)
 {
@@ -845,6 +947,19 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
         }
     }
 
+    // 能力清单：服务端核验后的当前授权，只读。让她当轮就知道自己能做什么，
+    // 不要声称没有被授予的能力；清单为空时不注入。放在 CURRENT_UNDERSTANDING
+    // 这组只读资料附近，但不改变 avoid_unprompted_followup / concern_updates 契约。
+    const QJsonObject capabilities = capabilityManifest(m_run.meta);
+    if (!capabilities.isEmpty()) {
+        const QString manifestJson =
+            QString::fromUtf8(QJsonDocument(capabilities).toJson(QJsonDocument::Compact));
+        messagesArray.append(QJsonObject{{"role","system"},{"content",
+            QStringLiteral("【你当前被授予的能力（服务端核验，只读）。不要声称未列出的能力。】")
+                + manifestJson}});
+        qDebug().noquote() << "[LLM]能力清单:" << manifestJson;
+    }
+
     // 短期记忆：PromptAssembler 统一处理（proactive/感知 assistant-only、群聊说话人前缀）
     const QJsonArray historyMessages = PromptAssembler::buildHistoryMessages(historyQA, m_run.meta, &m_run.evidence);
     for (const QJsonValue &historyMessage : historyMessages) {
@@ -1272,6 +1387,27 @@ void LLMService::generatePrivateReview(qlonglong id, int version, const QJsonObj
             "不必为了主动而主动，但也不要把\"不打扰\"当成默认答案。"
             "现在是 %1，安静时段 %2 至 %3；执行端另行核验。").arg(
                 QDateTime::currentDateTime().toString(Qt::ISODate),options.quietStart,options.quietEnd);
+    }
+    // 回顾/写作只带一行能力摘要：联系目标、安静时段与写作开关来自同一份
+    // capabilityManifest，避免把前台整段 JSON 塞进回顾。
+    if (kind == QStringLiteral("concern") || kind == QStringLiteral("reflection")) {
+        const QJsonObject capabilities = capabilityManifest(RequestMeta{});
+        const auto contact = capabilities.value(QStringLiteral("private_contact")).toObject();
+        const auto quiet = contact.value(QStringLiteral("quiet_hours")).toObject();
+        QStringList targetNames;
+        for (const auto &value : contact.value(QStringLiteral("targets")).toArray()) {
+            const QString name = value.toString();
+            if (!name.isEmpty()) targetNames.append(name);
+        }
+        const QString contactText = contact.value(QStringLiteral("enabled")).toBool()
+            ? QStringLiteral("当前可联系目标：%1").arg(targetNames.join(QStringLiteral("、")))
+            : QStringLiteral("当前不可主动联系");
+        const bool writing = capabilities.value(QStringLiteral("private_review")).toObject()
+                                 .value(QStringLiteral("enabled")).toBool();
+        instruction += QStringLiteral("\n服务端核验的当前授权：%1；安静时段 %2 至 %3；私下写作开关：%4。").arg(
+            contactText, quiet.value(QStringLiteral("start")).toString(),
+            quiet.value(QStringLiteral("end")).toString(),
+            writing ? QStringLiteral("开") : QStringLiteral("关"));
     }
     // 内部排序/匹配字段不进模型上下文，避免模型把它当成置信度依据。
     QJsonObject modelThread=thread;

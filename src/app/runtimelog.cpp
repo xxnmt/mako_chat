@@ -1,5 +1,6 @@
 #include "runtimelog.h"
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
@@ -39,6 +40,24 @@ bool openFile(Sink &s, const QString &directory, bool separate, QDate date, QStr
     s.date = date;
     s.separate = separate;
     return true;
+}
+
+// 配置指纹：只读 setting.json + identity.json 的字节，拼起来取 SHA-256 前 12 位。
+// 用途是事后把日志和当时生效的配置对上号；绝不写回配置，也不暴露密钥原文。
+QString configFingerprint(const QString &configDir)
+{
+    QByteArray bytes;
+    bool any = false;
+    for (const QString &name : {QStringLiteral("setting.json"), QStringLiteral("identity.json")}) {
+        QFile file(QDir(configDir).filePath(name));
+        if (!file.exists() || !file.open(QIODevice::ReadOnly))
+            continue;
+        bytes += file.readAll();
+        any = true;
+    }
+    if (!any) return {};
+    return QString::fromLatin1(
+        QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex().left(12));
 }
 
 void handle(QtMsgType type, const QMessageLogContext &context, const QString &message)
@@ -95,8 +114,25 @@ void RuntimeLog::start(const QString &appData)
         QMutexLocker lock(&s.mutex);
         s.previous = qInstallMessageHandler(handle);
     }
+    // 会话头：身份、版本、运行环境与配置指纹放在同一条 INFO 里，方便事后
+    // 把一次运行和当时的配置对应起来。这里只读配置，不修改任何文件。
+    const QString configDir = QDir(appData).filePath("config");
+#ifdef QT_DEBUG
+    const QString build = QStringLiteral("debug");
+#else
+    const QString build = QStringLiteral("release");
+#endif
+    qInfo().noquote() << QStringLiteral(
+        "[RuntimeLog] session app=%1 version=%2 pid=%3 qt=%4 build=%5 exe_dir=%6 config=%7 config_hash=%8")
+        .arg(QCoreApplication::applicationName(),
+             QCoreApplication::applicationVersion(),
+             QString::number(QCoreApplication::applicationPid()),
+             QString::fromLatin1(qVersion()),
+             build,
+             QDir::toNativeSeparators(QCoreApplication::applicationDirPath()),
+             QDir::toNativeSeparators(configDir),
+             configFingerprint(configDir));
     if (!error.isEmpty()) qWarning().noquote() << "[RuntimeLog] requested directory unavailable:" << error;
-    qInfo().noquote() << "[RuntimeLog] started pid=" << QCoreApplication::applicationPid();
 }
 
 void RuntimeLog::stop()

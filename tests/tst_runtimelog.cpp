@@ -1,5 +1,6 @@
 #include "runtimelog.h"
 #include <QtTest>
+#include <QCryptographicHash>
 #include <QTemporaryDir>
 #include <QFile>
 #include <QProcess>
@@ -50,6 +51,46 @@ private slots:
         QVERIFY(daily.open(QIODevice::ReadOnly));
         QVERIFY(daily.readAll().contains("[WARN] after-switch"));
         QVERIFY(!file.readAll().contains("after-switch"));
+    }
+
+    void sessionHeaderDescribesRunAndConfig()
+    {
+        QTemporaryDir root;
+        QVERIFY(root.isValid());
+        QVERIFY(QDir(root.path()).mkdir("config"));
+        const QByteArray settings = R"({"logging":{"separate_runs":true}})";
+        const QByteArray identity = R"({"identity":{"master":{"qq":["10001"]}}})";
+        QFile setting(root.filePath("config/setting.json"));
+        QVERIFY(setting.open(QIODevice::WriteOnly));
+        QVERIFY(setting.write(settings) == settings.size());
+        setting.close();
+        QFile identityFile(root.filePath("config/identity.json"));
+        QVERIFY(identityFile.open(QIODevice::WriteOnly));
+        QVERIFY(identityFile.write(identity) == identity.size());
+        identityFile.close();
+
+        RuntimeLog::start(root.path());
+        auto guard = qScopeGuard([] { RuntimeLog::stop(); });
+        qInfo().noquote() << QStringLiteral("header-marker");
+
+        const QDir logs(root.filePath("logs"));
+        QCOMPARE(logs.entryList({"logs_*.txt"}).size(), 1);
+        QFile log(logs.filePath(logs.entryList({"logs_*.txt"}).first()));
+        QVERIFY(log.open(QIODevice::ReadOnly));
+        // 会话头必须是新文件的第一条记录。
+        const QString header = QString::fromUtf8(log.readLine());
+        QVERIFY(header.contains("[INFO]"));
+        QVERIFY(header.contains("pid="));
+        QVERIFY(header.contains("qt="));
+        QVERIFY(header.contains("config_hash="));
+        QVERIFY(header.contains("app="));
+        QVERIFY(header.contains("config="));
+        // 指纹只读配置字节：setting.json + identity.json 的 SHA-256 前 12 位。
+        const QByteArray expected =
+            QCryptographicHash::hash(settings + identity, QCryptographicHash::Sha256)
+                .toHex().left(12);
+        QVERIFY(header.contains(QStringLiteral("config_hash=") + QString::fromLatin1(expected)));
+        QVERIFY(log.readAll().contains("header-marker"));
     }
 
     void newRunAndProcessTermination()

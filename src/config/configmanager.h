@@ -43,6 +43,10 @@ struct ProactiveConfig {
     QString quietEnd = "08:00";
     int idleSeconds = 1800;                  // 闲聊冷却（自上次对话起）
     QList<ScheduleItem> schedule;            // 定时主动
+    // 执行端约束：主动联系额度与关注（concern）的到期策略。
+    int contactDailyLimit = 3;               // 每日"现在联系"投递上限；0=不限制
+    int concernDefaultCheckMinutes = 720;    // 关注默认多久后再考虑；0=只在新证据时
+    int concernRetentionDays = 14;           // 超过多少天的关注不再按时间到期回顾（仍可被新证据命中）
 };
 
 class ConfigManager
