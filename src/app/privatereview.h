@@ -6,7 +6,8 @@
 
 class MemoryManager;
 
-// One in-flight private review (existing activity or independent reflection). Its version also guards callbacks after restart.
+// 一次在途的私下回顾。领取优先级：到期活动 → 到期关注 → 新来源回顾。
+// version 同时用于防止进程重启后的迟到回调落库。
 class PrivateReview final : public QObject {
     Q_OBJECT
 public:
@@ -22,7 +23,10 @@ signals:
     void shareRequested(const QString &ref, int version, const QString &draft);
 
 private:
-    struct Attempt { qlonglong id; int version; bool reflection; bool contactAllowed; };
+    // Activity=自己的文字活动；Reflection=新来源回顾；Concern=到期关注回顾。
+    enum class Kind { Activity, Reflection, Concern };
+    struct Attempt { qlonglong id; int version; Kind kind; bool contactAllowed; };
+    static QString kindTag(Kind kind);
     MemoryManager &store;
     std::optional<Attempt> active;
 };

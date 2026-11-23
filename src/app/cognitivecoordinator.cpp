@@ -2,6 +2,8 @@
 #include "configmanager.h"
 #include "llmservice.h"
 #include "memorymanager.h"
+#include <QDateTime>
+#include <QJsonDocument>
 #include <QTimer>
 
 namespace {
@@ -39,6 +41,10 @@ CognitiveCoordinator::CognitiveCoordinator(MemoryManager &memory, LLMService &mo
         if (!owns(meta.runId)) return;
         if (turnId() && !store.recordQuiet(turnId(),action))
             qWarning() << "[Conversation] quiet decision not recorded" << meta.runId;
+        // B1：安静的答复也是一次"注意力处理完成"（close/defer 是明确终态），事件落 done，
+        // 不让 message 事件永久停在 pending 里污染 backlog。
+        if (active && active->attentionEvent > 0)
+            store.completeAttentionEvent(active->attentionEvent, QStringLiteral("done"), action);
         finish();
     });
     connect(&service,&LLMService::replyAbnormal,this,&CognitiveCoordinator::interrupt);
@@ -66,6 +72,11 @@ CognitiveCoordinator::CognitiveCoordinator(MemoryManager &memory, LLMService &mo
                         {"committed",committed},{"failed",failed},{"updates",updates}});
     });
     connect(&service,&LLMService::internetErrorSignal,this,[this] { interrupt("network_error"); });
+    // B1：进程启动时把崩溃遗留的 received 轮次登记为 recovery 事件（reference 幂等），
+    // 由 reviewIfDue 在启动后的第一轮优先恢复；同时记录本次启动时刻供观测。
+    qInfo() << "[Attention] recovery_queued=" << store.enqueueRecoveryEvents(120);
+    store.setAttentionState(QStringLiteral("last_start_at"),
+                            QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
 }
 
 CognitiveCoordinator::~CognitiveCoordinator()
@@ -74,21 +85,94 @@ CognitiveCoordinator::~CognitiveCoordinator()
     if (!finishing && turnId()) store.interruptTurn(turnId(), "shutdown");
     for (const auto &turn : std::as_const(pending))
         if (turn.turnId) store.interruptTurn(turn.turnId, "shutdown");
+    // 进程退出前把在途消息事件落终态，避免下次启动看到永远 pending 的消息。
+    if (active && active->attentionEvent > 0)
+        store.completeAttentionEvent(active->attentionEvent, QStringLiteral("abandoned"),
+                                     QStringLiteral("shutdown"));
 }
 
 void CognitiveCoordinator::reviewIfDue()
 {
+    // 每轮打一次 backlog，用于区分"没东西可回顾"和"回顾被事件挡住"。
+    const auto backlog = store.attentionBacklog();
+    qInfo().noquote() << QStringLiteral("[Attention] backlog=")
+        + QString::fromUtf8(QJsonDocument(backlog).toJson(QJsonDocument::Compact));
+    // 中断恢复优先于一切新回顾：recovery 是最高优先级事件，处理完本轮已排队的恢复就结束
+    // 本轮，避免回顾在"上次没说完的话还没收尾"时抢占注意力。只在确实存在 pending recovery
+    // 时才领取，避免把 message/due_wake 这类普通事件错误地置成 claimed。
+    if (backlog.value(QStringLiteral("pending")).toObject()
+            .value(QStringLiteral("recovery")).toInt() > 0) {
+        bool recoveredAny = false;
+        // 单次 tick 最多恢复 16 轮，防止异常数据把一次 tick 拖成长事务。
+        for (int recovered = 0; recovered < 16; ++recovered) {
+            const auto event = store.claimAttentionEvent();
+            if (event.value(QStringLiteral("kind")).toString() != QStringLiteral("recovery"))
+                break;
+            const auto turn = event.value(QStringLiteral("payload")).toObject()
+                                  .value(QStringLiteral("turn")).toInteger();
+            // turn 已不是 received（正常收尾或已删除）时 interruptTurn 返回 false，跳过即可；
+            // 事件本身仍要落终态，否则会永远卡在 claimed 挡住后续恢复。
+            if (turn > 0 && store.interruptTurn(turn, QStringLiteral("restart_recovery")))
+                qInfo() << "[Attention] recovered turn=" << turn;
+            store.completeAttentionEvent(event.value(QStringLiteral("id")).toInteger(),
+                                         QStringLiteral("done"), QStringLiteral("recovered"));
+            recoveredAny = true;
+            if (store.attentionBacklog().value(QStringLiteral("pending")).toObject()
+                    .value(QStringLiteral("recovery")).toInt() == 0)
+                break;
+        }
+        if (recoveredAny)
+            return;
+    }
     auto &cfg = ConfigManager::instance();
-    if (!idleForWriting() || !cfg.getMemoryPolicyConfig().longTermMemoryEnabled
-        || !service.hasWritingProvider()) return;
     const auto options = cfg.getProactiveConfig();
+    // 到期关注属于主动联系链（B4），privateWriting=false 但 proactive.enabled=true 时也要允许唤醒；
+    // 具体能领取到活动/关注/新来源中的哪一类，由 PrivateReview 与记忆层的领取规则决定。
+    QString reason;
+    if (!cfg.getMemoryPolicyConfig().longTermMemoryEnabled)
+        reason = QStringLiteral("memory_disabled");
+    else if (!options.privateWriting && !options.enabled)
+        reason = QStringLiteral("disabled");
+    else if (!service.hasWritingProvider())
+        reason = QStringLiteral("no_provider");
+    else if (!idleForAttention())
+        reason = QStringLiteral("no_idle");
+    if (!reason.isEmpty()) {
+        qInfo().noquote() << QStringLiteral("[Attention] idle skip reason=%1").arg(reason);
+        return;
+    }
+    // 空闲：登记一次"唤醒请求"事件（同一分钟幂等），按实际是否真的启动了回顾落 done。
+    store.setAttentionState(QStringLiteral("last_wake_at"),
+                            QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
+    const auto wakeEvent = store.enqueueAttentionEvent(
+        QStringLiteral("due_wake"),
+        QStringLiteral("idle:%1").arg(QDateTime::currentSecsSinceEpoch() / 60),
+        QJsonObject{{QStringLiteral("reason"), QStringLiteral("idle")}},
+        QStringLiteral("idle"), 30);
+    bool started = false;
+    // review.wake 同步 emit requested（或什么都不发），这里用一次性连接判断是否领到了工作。
+    const auto startedConnection = connect(&review, &PrivateReview::requested, this,
+        [&started](qlonglong, int, const QJsonObject &) { started = true; });
     review.wake(options.dailyLimit, options.cooldownSeconds);
+    disconnect(startedConnection);
+    store.setAttentionState(QStringLiteral("last_wake_at"),
+                            QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
+    if (wakeEvent > 0)
+        store.completeAttentionEvent(wakeEvent, QStringLiteral("done"),
+                                     started ? QStringLiteral("requested") : QStringLiteral("none"));
+}
+
+bool CognitiveCoordinator::idleForAttention() const
+{
+    const auto options = ConfigManager::instance().getProactiveConfig();
+    return !busy() && idle.elapsed()/1000 >= options.idleSeconds;
 }
 
 bool CognitiveCoordinator::idleForWriting() const
 {
+    // 保持既有行为：后台写作首先要求 privateWriting，空闲判定复用 idleForAttention。
     const auto options = ConfigManager::instance().getProactiveConfig();
-    return options.privateWriting && !busy() && idle.elapsed()/1000 >= options.idleSeconds;
+    return options.privateWriting && idleForAttention();
 }
 
 void CognitiveCoordinator::submit(const QString &input, const RequestMeta &meta)
@@ -102,6 +186,15 @@ void CognitiveCoordinator::submit(const QString &input, const RequestMeta &meta)
     const auto now = arrivalClock.elapsed();
     const int quietWindowMs = config.inputPauseMs();
     ++sequence;
+    // B1：每条入站消息登记一个注意力事件，只为观测（不阻塞回复）。空 eventId 不产生事件；
+    // (kind,ref) 幂等，重复提交同一事件不会重复入队。
+    const qint64 attention = meta.eventId.isEmpty() ? 0
+        : store.enqueueAttentionEvent(
+              QStringLiteral("message"), meta.eventId,
+              QJsonObject{{QStringLiteral("channel"), meta.channel},
+                          {QStringLiteral("session"), meta.sessionId},
+                          {QStringLiteral("sequence"), qint64(sequence)}},
+              QString(), 50);
     if (quietWindowMs > 0 && !pending.isEmpty() && now < pending.back().readyAt
         && sameInputStream(pending.back().meta, meta)
         && (!meta.persistTurn || (id && pending.back().turnId && store.linkGroupedInput(pending.back().turnId,id)))) {
@@ -117,9 +210,11 @@ void CognitiveCoordinator::submit(const QString &input, const RequestMeta &meta)
         turn.turnId = id;
         turn.sequence = sequence;
         turn.readyAt = qMin(now + quietWindowMs, turn.firstArrival + maximumWindowMs);
+        // 合并后的轮次以最后一次提交的事件为代表（之前的事件自然留在 backlog 里可观测）。
+        turn.attentionEvent = attention;
         qInfo() << "[Conversation] grouped inputs" << turn.firstTurn << id;
     } else {
-        pending.enqueue({input, meta, sequence, id, id, now, now + quietWindowMs});
+        pending.enqueue({input, meta, sequence, id, id, now, now + quietWindowMs, attention});
     }
     advance();
     if (observe && id) service.processObservation();
@@ -147,6 +242,10 @@ void CognitiveCoordinator::interrupt(const QString &reason)
     qInfo() << "[Conversation] interrupted run=" << active->meta.runId << "reason=" << reason;
     if (turnId() && !store.interruptTurn(turnId(), reason))
         qWarning() << "[Conversation] interruption not recorded" << active->meta.runId;
+    // B1：被打断的消息事件落 abandoned；延后原因单独存档，供下次启动/审计解释。
+    if (active->attentionEvent > 0)
+        store.completeAttentionEvent(active->attentionEvent, QStringLiteral("abandoned"), reason);
+    store.setAttentionState(QStringLiteral("last_defer_reason"), reason);
     finish();
 }
 
@@ -156,6 +255,10 @@ bool CognitiveCoordinator::handedOff(const QString &input, const QString &reply,
     if (!owns(meta.runId)) return false;
     const bool saved = !turnId() || store.saveQATurn(input,reply,sentences,meta,turnId());
     if (!saved) qWarning() << "[Conversation] handoff not recorded" << meta.runId;
+    // B1：回复已交接给渠道，消息事件完成（失败时保持 pending，留待恢复/观测）。
+    if (saved && active->attentionEvent > 0)
+        store.completeAttentionEvent(active->attentionEvent, QStringLiteral("done"),
+                                     QStringLiteral("handed_off"));
     finish();
     return saved;
 }

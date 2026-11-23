@@ -27,6 +27,8 @@ public:
     quint64 activeSequence() const { return active ? active->sequence : 0; }
     quint64 lastSequence() const { return sequence; }
     bool idleForWriting() const;
+    // 是否已经足够安静、可以进入后台注意力（不区分 writing / 主动联系，由调用方决定用途）。
+    bool idleForAttention() const;
     void reviewIfDue();
 signals:
     void contactProposed(qlonglong turn, int version);
@@ -44,6 +46,9 @@ private:
         qint64 firstTurn;
         qint64 firstArrival;
         qint64 readyAt;
+        // B1：本轮对应的注意力事件 id（submit 入队）。只做观测：handedOff 落 done，
+        // interrupt 落 abandoned，不参与消息合并/仲裁。
+        qint64 attentionEvent = 0;
     };
     void advance();
     void finish();

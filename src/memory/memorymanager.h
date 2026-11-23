@@ -119,12 +119,16 @@ public:
     QJsonObject claimPrivateReflection(int dailyLimit, int cooldownSeconds);
     bool finishPrivateReflection(qlonglong turn, int version, const QString &choice, const QString &note,
                                  const QJsonObject &contact = {}, const QJsonArray &consulted = {},
-                                 const QJsonObject &prior = {}, const QString &priorAction = {});
+                                 const QJsonObject &prior = {}, const QString &priorAction = {},
+                                 const QJsonObject &concern = {});
     QJsonObject reflectionHistory(qint64 turn,int version,const QJsonArray &rankedTurns,
                                   const QStringList &terms = {}) const;
     bool consultPrivateReflection(qint64 turn, int version,const QStringList &terms,QJsonArray &results) const;
     QString claimReflectionContact(qlonglong turn, int version, const QString &channel, const QString &session);
     bool recordContactOutcome(qlonglong turn, int version, const QString &outcome);
+    // 上次投递被拒、且还没用完一次重试机会的联系。投递层（5s 调度）据此再次领取；
+    // 领取本身由 claimReflectionContact 原子完成，重复轮询不会重复发送。
+    QJsonArray retryableReflectionContacts(int limit = 4) const;
     QJsonArray pendingReminders(const RequestMeta &viewer) const;
     bool applyReminders(qint64 turn,const RequestMeta &viewer,const QJsonObject &plan);
     QJsonObject claimDueReminder(const QString &channel,const QString &session);
@@ -138,6 +142,11 @@ public:
                                qint64 excludeTurn = 0, int limit = 2,
                                const QString &beforeReported = QString()) const;
     QJsonObject concernByHead(qint64 headTurn) const;
+    // 到期回顾：不需要新用户消息，也不要求检索命中。领取时占用与回顾相同的预算/冷却。
+    QJsonObject claimDueConcern(int dailyLimit, int cooldownSeconds);
+    QJsonObject concernReviewContext(qint64 turn, int version) const;
+    bool finishConcernReview(qlonglong turn, int version, const QJsonObject &proposal);
+    bool deferConcernReview(qlonglong turn, int version, const QString &reason);
     // 从正常对话了结一个关注：答案到达、被否定或计划取消。提交后不再注入、不再重复追问。
     bool resolveConcern(qlonglong headTurn, qlonglong byTurn, const QString &kind,
                         const QString &evidenceRef);
@@ -153,7 +162,33 @@ public:
     bool applyThoughtAction(qlonglong id, int expectedVersion, const QString &action,
                             int afterMinutes = -1, const QString &reason = {});
     bool hasActiveThought(const QString &subject = QStringLiteral("user")) const;
+    // 分享去重：已送达（handed_off/protocol_accepted）不再分享；被拒最多补一次；
+    // 协议层"未知"不重发（可能已送达）。
     bool canShareThought(qlonglong id, int expectedVersion) const;
+    // 分享回执：把结果补进 thought_result 并存 delivery_ledger（kind='share'）。
+    bool recordShareOutcome(qlonglong activityId, int version, const QString &outcome,
+                            const QString &channel, const QString &session);
+
+    // B1：统一注意力事件。事件表是通用的"注意力待办"队列，不绑定单一调用方：
+    // 消息到达、到期唤醒、活动结果、崩溃恢复都按 (kind,ref) 幂等入队，协调器按
+    // priority 领取并落终态（done/abandoned）。payload 只做可观测/恢复用，不承载业务状态。
+    qlonglong enqueueAttentionEvent(const QString &kind, const QString &ref,
+                                    const QJsonObject &payload = {}, const QString &reason = {},
+                                    int priority = 50);
+    // 领取 pending 中 priority 最小（最高）且 id 最早的一条，置 claimed。
+    QJsonObject claimAttentionEvent();
+    // 只允许 pending/claimed → done/abandoned；影响 1 行才成功。
+    bool completeAttentionEvent(qlonglong id, const QString &state, const QString &reason = {});
+    QJsonObject attentionBacklog() const;
+    // 当前活动/切换原因等"当下状态"的键值存档（attention_state）。
+    void setAttentionState(const QString &key, const QString &value);
+    QString attentionState(const QString &key) const;
+    // 扫描进程中断遗留的 received 轮次，幂等入队 recovery 事件；返回新入队条数。
+    int enqueueRecoveryEvents(int olderThanSeconds = 120);
+    // 写一条"茉子主动说出的话"到历史与 raw_events，供下次对话回认与检索。
+    // 主动轮次 user_input 为 NULL、turn_kind='proactive'，不参与回顾/认识更新。
+    qlonglong recordProactiveMessage(const QString &channel, const QString &session, const QString &text,
+                                     const QString &kind, const QString &ref);
 
 //历史对话crud
     QList<HistoryTurn> getHistoryTurn(int N, const QString &channel = Channel::kPet, const QString &sessionId = Channel::kDefaultSession, qint64 beforeTurn = 0);

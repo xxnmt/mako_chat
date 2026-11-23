@@ -29,12 +29,28 @@
 
 #include <QDebug>
 #include <QTimer>
+#include <QHash>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QJsonDocument>
 
 namespace {
+
+// QQ 的发送结果异步回来时只有 deliveryEcho，这里暂存草稿分享的路由（渠道/会话/原文），
+// 供 sendResult 落分享回执并补写"茉子主动说过的话"。键为 share:<activityId>:<version>。
+// 只在主线程访问，条目在回执到达（或入队失败）时移除；重复分享同一版本时覆盖。
+struct ShareRoute {
+    QString channel;
+    QString session;
+    QString text;
+};
+
+QHash<QString, ShareRoute> &shareRoutes()
+{
+    static QHash<QString, ShareRoute> routes;
+    return routes;
+}
 
 bool isAllowedExtractionSubject(const QString &subject, const RequestMeta &meta)
 {
@@ -208,8 +224,39 @@ AppController::AppController(QObject *parent)
     m_llmService->registerStateProvider([this](){return m_appearance->getCurrentStateDescription();});
 
     initConnections();
+    // 主动投递成功后把"茉子主动说过的话"写进历史/raw_events，供下次对话回认与检索。
+    const auto recordProactive = [this](const QString &channel, const QString &session,
+                                        const QString &text, const QString &kind, const QString &ref) {
+        if (text.trimmed().isEmpty()) return;
+        if (m_memoryManager->recordProactiveMessage(channel, session, text, kind, ref) <= 0)
+            qWarning() << "[Proactive] history write failed:" << kind << ref;
+    };
+    // 联系投递：claim 自己保证"proposed 首投 + rejected 最多补一次"，这里只负责发送与回执。
+    // 返回本次投递的 outcome；空串表示没有可投递的目标（调用方据此判 withheld）。
+    const auto dispatchContact = [this, recordProactive](qlonglong turn, int version) -> QString {
+        auto &cfg = ConfigManager::instance();
+        for (const auto &target : cfg.getProactiveConfig().targets) {
+            const bool pet = target.first==Channel::kPet;
+            if (!pet && !m_qqClient->isConnected()) continue;
+            Utterance u;
+            u.channel=target.first;
+            u.sessionId=target.second;
+            u.text=m_memoryManager->claimReflectionContact(turn,version,u.channel,u.sessionId);
+            if (u.text.isEmpty()) continue;
+            const auto ref=QStringLiteral("reflection:%1:%2").arg(turn).arg(version);
+            u.deliveryEcho=ref;
+            const bool submitted = pet ? m_petChannel->sendUtterance(u) : m_qqChannel->sendUtterance(u);
+            const QString outcome = submitted ? QStringLiteral("handed_off") : QStringLiteral("rejected");
+            m_memoryManager->recordContactOutcome(turn,version,outcome);
+            if (submitted)
+                recordProactive(u.channel,u.sessionId,u.text,QStringLiteral("contact"),ref);
+            qInfo() << "[ReflectionContact]" << turn << version << u.channel << outcome;
+            return outcome;
+        }
+        return {};
+    };
     auto *reminders=new QTimer(this);
-    connect(reminders,&QTimer::timeout,this,[this] {
+    connect(reminders,&QTimer::timeout,this,[this, dispatchContact] {
         const auto options=ConfigManager::instance().getProactiveConfig();
         const auto now=QTime::currentTime(), start=QTime::fromString(options.quietStart,"HH:mm"), end=QTime::fromString(options.quietEnd,"HH:mm");
         if (!options.enabled || (start<end ? now>=start && now<end : start>end && (now>=start || now<end))) return;
@@ -224,29 +271,25 @@ AppController::AppController(QObject *parent)
             u.deliveryEcho=QString("reminder:%1").arg(id);
             const bool ok=pet ? m_petChannel->sendUtterance(u) : m_qqChannel->sendUtterance(u);
             m_memoryManager->reminderOutcome(id,ok ? "handed_off" : "rejected");
+            if (ok)
+                m_memoryManager->recordProactiveMessage(u.channel,u.sessionId,u.text,
+                                                        QStringLiteral("reminder"),QString::number(id));
             qInfo()<<"[Reminder] dispatch"<<id<<ok;
+        }
+        // 上一次被渠道拒绝的联系：每个周期最多补发一条；claim 保证不会重复发送。
+        if (canContactNow()) {
+            const auto retries = m_memoryManager->retryableReflectionContacts(4);
+            for (const auto &value : retries) {
+                const auto retry = value.toObject();
+                if (!dispatchContact(retry["turn"].toInteger(), retry["version"].toInt()).isEmpty())
+                    break;
+            }
         }
     });
     reminders->start(5000);
-    connect(m_coordinator, &CognitiveCoordinator::contactProposed, this, [this](qlonglong turn,int version) {
-        if (canContactNow()) {
-            auto &cfg = ConfigManager::instance();
-            for (const auto &target : cfg.getProactiveConfig().targets) {
-                const bool pet = target.first==Channel::kPet;
-                if (!pet && !m_qqClient->isConnected()) continue;
-                Utterance u;
-                u.channel=target.first;
-                u.sessionId=target.second;
-                u.text=m_memoryManager->claimReflectionContact(turn,version,u.channel,u.sessionId);
-                if (u.text.isEmpty()) continue;
-                u.deliveryEcho=QString("reflection:%1:%2").arg(turn).arg(version);
-                const bool submitted = pet ? m_petChannel->sendUtterance(u) : m_qqChannel->sendUtterance(u);
-                const QString outcome = submitted ? QStringLiteral("handed_off") : QStringLiteral("rejected");
-                m_memoryManager->recordContactOutcome(turn,version,outcome);
-                qInfo() << "[ReflectionContact]" << turn << version << u.channel << outcome;
-                return;
-            }
-        }
+    connect(m_coordinator, &CognitiveCoordinator::contactProposed, this, [this, dispatchContact](qlonglong turn,int version) {
+        if (canContactNow() && !dispatchContact(turn,version).isEmpty())
+            return;
         m_memoryManager->recordContactOutcome(turn,version,"withheld");
         qInfo() << "[ReflectionContact] withheld" << turn << version;
     });
@@ -256,12 +299,55 @@ AppController::AppController(QObject *parent)
             qInfo()<<"[Reminder] receipt"<<echo<<outcome;
             return;
         }
+        if (echo.startsWith("share:")) {
+            const auto parts=echo.split(':');
+            if (parts.size()!=3) return;
+            // 路由可能在进程重启后丢失：此时仍记录结果，只是不补历史原文/不重发。
+            const auto route=shareRoutes().take(echo);
+            const auto activityId=parts[1].toLongLong();
+            const auto version=parts[2].toInt();
+            if (!m_memoryManager->recordShareOutcome(activityId,version,outcome,route.channel,route.session)) {
+                qWarning()<<"[Share] receipt rejected"<<echo<<outcome;
+                return;
+            }
+            qInfo()<<"[Share] receipt"<<echo<<outcome;
+            if (outcome=="handed_off" || outcome=="protocol_accepted") {
+                if (!route.text.trimmed().isEmpty())
+                    m_memoryManager->recordProactiveMessage(route.channel,route.session,route.text,
+                                                            QStringLiteral("share"),
+                                                            QStringLiteral("%1:%2").arg(activityId).arg(version));
+                return;
+            }
+            // 渠道明确拒绝时把同一份草稿补发一次（canShareThought 用 attempts<2 挡住第二次拒绝）。
+            // 延迟到当前回执处理栈结束之后再发，避免与协议客户端的在途队列冲突。
+            if (outcome=="rejected" && !route.channel.isEmpty() && !route.text.trimmed().isEmpty()
+                && m_memoryManager->canShareThought(activityId, version)) {
+                QTimer::singleShot(4000, this, [this, activityId, version, route, echo] {
+                    if (!m_memoryManager->canShareThought(activityId, version)) return;
+                    Utterance retry;
+                    retry.channel = route.channel;
+                    retry.sessionId = route.session;
+                    retry.text = route.text;
+                    retry.deliveryEcho = echo;
+                    shareRoutes().insert(echo, route);
+                    const bool submitted = route.channel == Channel::kPet
+                        ? m_petChannel->sendUtterance(retry) : m_qqChannel->sendUtterance(retry);
+                    if (!submitted) {
+                        shareRoutes().remove(echo);
+                        m_memoryManager->recordShareOutcome(activityId, version,
+                                                            QStringLiteral("rejected"),
+                                                            route.channel, route.session);
+                    }
+                });
+            }
+            return;
+        }
         if (!echo.startsWith("reflection:")) return;
         const auto parts=echo.split(':');
         if (parts.size()==3 && m_memoryManager->recordContactOutcome(parts[1].toLongLong(),parts[2].toInt(),outcome))
             qInfo() << "[ReflectionContact]" << echo << outcome;
     });
-    connect(m_coordinator, &CognitiveCoordinator::draftReadyToShare, this, [this](const QString &activityRef, int version, const QString &draft) {
+    connect(m_coordinator, &CognitiveCoordinator::draftReadyToShare, this, [this, recordProactive](const QString &activityRef, int version, const QString &draft) {
         if (!canContactNow())
             return;
         const qlonglong activityId = activityRef.startsWith(QStringLiteral("thought/"))
@@ -271,6 +357,7 @@ AppController::AppController(QObject *parent)
             return;
         auto &cfg = ConfigManager::instance();
         const auto targets = cfg.getProactiveConfig().targets;
+        const auto ref = QStringLiteral("%1:%2").arg(activityId).arg(version);
         for (const auto &target : targets) {
             Utterance u;
             u.channel = target.first;
@@ -279,12 +366,25 @@ AppController::AppController(QObject *parent)
             if (cfg.isBlindZone(u.channel,u.sessionId))
                 continue;
             if (u.channel == Channel::kPet && u.sessionId == Channel::kDefaultSession) {
-                m_petChannel->sendUtterance(u);
+                const bool submitted = m_petChannel->sendUtterance(u);
+                m_memoryManager->recordShareOutcome(activityId, version,
+                                                    submitted ? QStringLiteral("handed_off")
+                                                              : QStringLiteral("rejected"),
+                                                    u.channel, u.sessionId);
+                if (submitted)
+                    recordProactive(u.channel,u.sessionId,draft,QStringLiteral("share"),ref);
                 break;
             }
             if (u.channel == Channel::kQQPrivate && cfg.isMasterQQ(u.sessionId)
                 && m_qqClient->isConnected()) {
-                m_qqChannel->sendUtterance(u);
+                // QQ 是"已入队"而非送达：回执在 sendResult 里按 deliveryEcho 回来。
+                u.deliveryEcho = QStringLiteral("share:%1").arg(ref);
+                shareRoutes().insert(u.deliveryEcho, ShareRoute{u.channel,u.sessionId,draft});
+                if (!m_qqChannel->sendUtterance(u)) {
+                    shareRoutes().remove(u.deliveryEcho);
+                    m_memoryManager->recordShareOutcome(activityId, version,
+                                                        QStringLiteral("rejected"), u.channel, u.sessionId);
+                }
                 break;
             }
         }
@@ -457,7 +557,8 @@ void AppController::handleMakoReply(const QList<SentenceText> &sentences, const 
 bool AppController::canContactNow() const
 {
     const auto cfg = ConfigManager::instance().getProactiveConfig();
-    if (!cfg.enabled || !m_coordinator->idleForWriting())
+    // 主动联系与后台写作解耦：只要求"没有在途对话/足够安静"，不看 privateWriting。
+    if (!cfg.enabled || !m_coordinator->idleForAttention())
         return false;
     const auto now = QTime::currentTime();
     const auto start = QTime::fromString(cfg.quietStart, "HH:mm");

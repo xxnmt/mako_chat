@@ -4,7 +4,11 @@
 #include <QScopeGuard>
 #include <QJsonDocument>
 #include <QSqlQuery>
+#include <QSqlError>
+#include <QDebug>
+#include <QHash>
 #include <algorithm>
+#include <cmath>
 #include <QSet>
 
 namespace {
@@ -16,6 +20,27 @@ const QString eligible = QStringLiteral(
     " h.subject='user' AND h.sensitive=0 AND h.channel IN ('pet','qq_private') "
     "AND h.turn_state IN ('handed_off','quiet') AND h.turn_kind='reply' ");
 
+// v23 才有的关注列。迁移失败或旧库回退重放时可能读不到，此时降级为空值而不是整条查询失败。
+bool concernColumnsReady(const QSqlDatabase &db)
+{
+    QSqlQuery q(db);
+    if (!q.exec(QStringLiteral("PRAGMA table_info(private_reflection)"))) return false;
+    while (q.next())
+        if (q.value(1).toString()==QStringLiteral("topic")) return true;
+    return false;
+}
+
+QString isoFromEpoch(qint64 secs)
+{
+    return QDateTime::fromSecsSinceEpoch(secs).toUTC().toString(Qt::ISODateWithMs);
+}
+
+// 关注到期时间：0 表示不按时间再检查（只在新证据或显式唤醒时再看），落库为 0 让到期领取过滤掉。
+qint64 nextCheckAfter(int minutes)
+{
+    return minutes>0 ? minutes*60 : 0;
+}
+
 bool visibleSession(const QString &channel,const QString &session,const QString &viewerChannel,const QString &viewerSession)
 {
     if (channel==viewerChannel && session==viewerSession) return true;
@@ -23,6 +48,32 @@ bool visibleSession(const QString &channel,const QString &session,const QString 
     return cfg.getMemoryPolicyConfig().agent.ownerCrossChannelPrivate &&
            ((channel==Channel::kPet && session==Channel::kDefaultSession) ||
             (channel==Channel::kQQPrivate && cfg.isMasterQQ(session)));
+}
+
+// 统一投递流水（delivery_ledger）的幂等写入：同一 kind+ref 只有一行，
+// 重复回执只累加失败尝试并刷新状态。流水只是可观测性，失败不得阻断主状态机。
+void noteDelivery(const QSqlDatabase &db,const QString &kind,const QString &ref,
+                  const QString &channel,const QString &session,const QString &text,
+                  const QString &state,int attemptsDelta)
+{
+    if (kind.isEmpty() || ref.isEmpty() || state.isEmpty()) return;
+    QSqlQuery q(db);
+    q.prepare("INSERT INTO delivery_ledger(kind,ref,channel,session,text,state,attempts,updated_at) "
+              "VALUES(?,?,?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(kind,ref) DO UPDATE SET "
+              "state=excluded.state,"
+              "channel=coalesce(excluded.channel,delivery_ledger.channel),"
+              "session=coalesce(excluded.session,delivery_ledger.session),"
+              "text=coalesce(excluded.text,delivery_ledger.text),"
+              "attempts=delivery_ledger.attempts+excluded.attempts,"
+              "updated_at=CURRENT_TIMESTAMP");
+    q.addBindValue(kind);
+    q.addBindValue(ref);
+    q.addBindValue(channel.isEmpty() ? QVariant() : QVariant(channel));
+    q.addBindValue(session.isEmpty() ? QVariant() : QVariant(session));
+    q.addBindValue(text.isEmpty() ? QVariant() : QVariant(text));
+    q.addBindValue(state);
+    q.addBindValue(attemptsDelta);
+    if (!q.exec()) qWarning()<<"[Delivery] ledger 写入失败"<<kind<<ref<<state<<q.lastError();
 }
 
 bool basisVisible(const QSqlDatabase &db,qint64 turn,const MemoryReadPolicy &policy,
@@ -40,6 +91,8 @@ bool basisVisible(const QSqlDatabase &db,qint64 turn,const MemoryReadPolicy &pol
 
 // 一条"关注"对模型可见的字段。前台注入与后台 prior 使用同一构造，避免两处形状不一致。
 QJsonObject buildConcernRecord(qlonglong turn,const QString &note,int version,const QString &reportedAt,
+                               const QString &topic,const QString &watch,
+                               const QVariant &rootTurn,const QVariant &nextCheckAt,
                                const QString &sourceChannel,const QString &sourceSession,
                                const QVariant &timing,const QVariant &outcome,const QVariant &message,
                                const QVariant &contactReason,const QVariant &contactChannel,
@@ -52,6 +105,18 @@ QJsonObject buildConcernRecord(qlonglong turn,const QString &note,int version,co
                        {"own_reflection",note},
                        {"version",version},
                        {"reported_at",reportedAt}};
+    if (!topic.isEmpty()) record["topic"]=topic;
+    if (!watch.isEmpty()) record["watch"]=watch;
+    const auto root=rootTurn.toLongLong();
+    if (root>0) {
+        // 关注可能被后续回顾修订：当前行（head）用 reflection/<turn> 精确定位，
+        // 稳定身份 root_ref 另给 "concern/<根轮次>"。前台写回按 head 解析，
+        // 因此 ref 保持旧约定，避免跨层解析出现两种格式。
+        record["root_ref"]=QStringLiteral("concern/%1").arg(root);
+        record["root_turn"]=root;
+    }
+    const auto checkAt=nextCheckAt.toLongLong();
+    if (checkAt>0) record["next_check_at"]=isoFromEpoch(checkAt);
     if (includeSource) {
         record["source_channel"]=sourceChannel;
         record["source_session"]=sourceSession;
@@ -98,12 +163,14 @@ QJsonObject MemoryManager::claimPrivateReflection(int dailyLimit, int cooldownSe
         const auto handoff=q.value(7).toString();
         q.finish();
         if (!chargePrivateReview(id,dailyLimit,cooldownSeconds)) return {};
-        q.prepare("INSERT INTO private_reflection(turn_id,version,state,eligible_at,updated_at) "
-                  "VALUES(?,?,'pending',unixepoch()+1800,unixepoch()) ON CONFLICT(turn_id) DO UPDATE SET "
-                  "version=excluded.version,state='pending',eligible_at=excluded.eligible_at,updated_at=unixepoch() "
+        q.prepare("INSERT INTO private_reflection(turn_id,version,state,eligible_at,updated_at,claimed_by,root_turn) "
+                  "VALUES(?,?,'pending',unixepoch()+1800,unixepoch(),'source',?) ON CONFLICT(turn_id) DO UPDATE SET "
+                  "version=excluded.version,state='pending',eligible_at=excluded.eligible_at,"
+                  "claimed_by=excluded.claimed_by,updated_at=unixepoch() "
                   "WHERE private_reflection.version=excluded.version-1 AND private_reflection.state IN ('deferred','pending')");
         q.addBindValue(id);
         q.addBindValue(version);
+        q.addBindValue(id);
         if (!q.exec() || q.numRowsAffected()!=1 || !m_db.commit()) return {};
         rollback.dismiss();
         QJsonArray actions;
@@ -184,24 +251,24 @@ QJsonArray MemoryManager::matchedConcerns(const RequestMeta &viewer,const QStrin
                                           const QString &queryText,qint64 excludeTurn,int limit,
                                           const QString &beforeReported) const
 {
+    // 旧实现的"抽词 + note 连续片段"会被几乎每条 note 都含有的称呼（如"欧尼酱"）带偏；
+    // 现在只按片段命中的文档频率（DF）打分，terms 不再参与门槛，保留签名兼容既有调用。
+    Q_UNUSED(terms);
     QJsonArray result;
     if (viewer.subject!="user" || viewer.sensitive || !viewer.longTermMemoryEnabled
         || (viewer.channel!=Channel::kPet && viewer.channel!=Channel::kQQPrivate)) return result;
     const MemoryReadPolicy policy;
     if (!policy.allowsSession(viewer.channel,viewer.sessionId)) return result;
-    QStringList clean;
-    for (const auto &term : terms) {
-        const auto value=term.trimmed().toLower();
-        if (value.isEmpty() || value.size()>16 || clean.contains(value)) continue;
-        clean.append(value);
-        if (clean.size()>=12) break;
-    }
-    if (limit<=0 || (queryText.isEmpty() && clean.isEmpty())) return result;
+    if (limit<=0 || queryText.trimmed().isEmpty()) return result;
+    // v23 的结构化描述列；读不到时用 NULL 占位，保持列下标稳定。
+    const QString extra=concernColumnsReady(m_db)
+        ? QStringLiteral("r.topic,r.watch,r.root_turn,r.next_check_at")
+        : QStringLiteral("NULL,NULL,NULL,NULL");
     QSqlQuery q(m_db);
     // beforeReported 只用于"回顾某一轮时，prior 必须早于该轮"；前台注入不需要这个上界。
     // 不能把空串绑成占位参数：空 QString 会被绑成 SQL NULL，`?=''` 恒为假，会把候选全过滤掉。
     QString sql = "SELECT r.turn_id,r.note,r.version,h.channel,h.session_id,s.input,s.reported,"
-                  "c.timing,c.outcome,c.reason,c.message,c.channel,c.session" + sourceRows +
+                  "c.timing,c.outcome,c.reason,c.message,c.channel,c.session," + extra + sourceRows +
                   "JOIN private_reflection r ON r.turn_id=h.id "
                   "LEFT JOIN reflection_contact c ON c.turn_id=r.turn_id WHERE " + eligible +
                   " AND r.state='consider' AND NOT EXISTS (SELECT 1 FROM reflection_change WHERE prior_turn=r.turn_id)"
@@ -212,47 +279,98 @@ QJsonArray MemoryManager::matchedConcerns(const RequestMeta &viewer,const QStrin
     q.addBindValue(excludeTurn);
     if (!beforeReported.isEmpty()) q.addBindValue(beforeReported);
     if (!q.exec()) return result;
+    // 第一遍：只收集通过可见性/敏感/policy/basisVisible/beforeReported 的候选，保留原始行字段。
+    struct Candidate {
+        qlonglong turn; int version;
+        QString note,topic,watch,channel,session,text;
+        QString reportedAt;
+        QVariant timing,outcome,message,contactReason,contactChannel,contactSession;
+        QVariant rootTurn,nextCheckAt;
+    };
+    QList<Candidate> candidates;
+    while (q.next()) {
+        Candidate c;
+        c.turn=q.value(0).toLongLong();
+        c.note=q.value(1).toString();
+        c.version=q.value(2).toInt();
+        c.channel=q.value(3).toString();
+        c.session=q.value(4).toString();
+        c.reportedAt=q.value(6).toString();
+        c.timing=q.value(7);
+        c.outcome=q.value(8);
+        c.contactReason=q.value(9);
+        c.message=q.value(10);
+        c.contactChannel=q.value(11);
+        c.contactSession=q.value(12);
+        c.topic=q.value(13).toString();
+        c.watch=q.value(14).toString();
+        c.rootTurn=q.value(15);
+        c.nextCheckAt=q.value(16);
+        if (!visibleSession(c.channel,c.session,viewer.channel,viewer.sessionId)) continue;
+        if (!basisVisible(m_db,c.turn,policy,viewer.channel,viewer.sessionId)) continue;
+        if (!policy.allows(c.channel,c.session,q.value(5).toString())
+            || !policy.allows(c.channel,c.session,c.note)) continue;
+        // note 几乎都带称呼；结构化描述（topic/watch）也拼进来，让"在意的事"参与匹配。
+        // 用换行分隔，避免把两个字段的边界当作连续片段。
+        c.text=c.note;
+        if (!c.topic.isEmpty()) c.text+='\n'+c.topic;
+        if (!c.watch.isEmpty()) c.text+='\n'+c.watch;
+        candidates.append(c);
+    }
+    const int corpus=candidates.size();
+    if (corpus<=0) return result;
+    // 第二遍：语料内统计每个 2/3 字片段的文档频率（同一文档内去重）。
+    QHash<QString,int> df;
+    QList<QSet<QString>> grams3(corpus),grams2(corpus);
+    for (int i=0;i<corpus;++i) {
+        const auto &text=candidates.at(i).text;
+        QSet<QString> three,two;
+        for (int p=0;p+3<=text.size();++p) three.insert(text.mid(p,3));
+        for (int p=0;p+2<=text.size();++p) two.insert(text.mid(p,2));
+        for (const auto &gram : three) ++df[gram];
+        for (const auto &gram : two) ++df[gram];
+        grams3[i]=three;
+        grams2[i]=two;
+    }
+    // 片段权重：命中 queryText 且不是"语料里过半文档都含"的常见片段才计数。
+    // 返回分数对 DF 取对数：越少见的片段越有区分度；2 字片段权重减半。
+    const auto gramWeight=[&](const QString &gram,bool three) {
+        if (!queryText.contains(gram,Qt::CaseInsensitive)) return 0.0;
+        const int count=df.value(gram);
+        if (corpus>1 && count>1 && count*2>corpus) return 0.0;
+        const double base=std::log((corpus+1.0)/(count+1.0))+0.5;
+        return three ? base : base*0.5;
+    };
     struct Scored { QJsonObject record; double score; };
     QList<Scored> scored;
-    while (q.next()) {
-        const auto concernTurn=q.value(0).toLongLong();
-        const auto note=q.value(1).toString();
-        const auto channel=q.value(3).toString(),session=q.value(4).toString(),input=q.value(5).toString();
-        if (!visibleSession(channel,session,viewer.channel,viewer.sessionId)) continue;
-        if (!basisVisible(m_db,concernTurn,policy,viewer.channel,viewer.sessionId)) continue;
-        if (!policy.allows(channel,session,input) || !policy.allows(channel,session,note)) continue;
-        int hits3=0,hits2=0,noteHits=0,quoteHits=0;
-        // 用关注 note 的连续片段去匹配"整条当前输入"，而不是只依赖旧抽词的尾部 16 个词，
-        // 这样长消息中段的回答（例如"没有荷包蛋呀"）也能命中旧的疑问。
-        // 收紧要则：命中一个 3 字连续片段，或至少两个不同的 2 字片段，避免"你/好/的"这类常见片段误命中。
-        if (!queryText.isEmpty() && note.size()>=2) {
-            QSet<QString> grams3;
-            for (int i=0;i+3<=note.size();++i) grams3.insert(note.mid(i,3));
-            for (const auto &gram : grams3)
-                if (queryText.contains(gram,Qt::CaseInsensitive)) ++hits3;
-            QSet<QString> grams2;
-            for (int i=0;i+2<=note.size();++i) grams2.insert(note.mid(i,2));
-            for (const auto &gram : grams2)
-                if (queryText.contains(gram,Qt::CaseInsensitive)) ++hits2;
-            noteHits=hits3*2+hits2;
+    for (int i=0;i<corpus;++i) {
+        int hits3=0,hits2=0;
+        double score=0.0;
+        QJsonArray matchedTerms;
+        for (const auto &gram : grams3.at(i)) {
+            const double weight=gramWeight(gram,true);
+            if (weight<=0.0) continue;
+            ++hits3;
+            score+=weight;
+            if (matchedTerms.size()<12) matchedTerms.append(gram);
         }
-        for (const auto &term : clean) {
-            if (note.contains(term,Qt::CaseInsensitive)) ++noteHits;
-            if (input.contains(term,Qt::CaseInsensitive)) ++quoteHits;
+        for (const auto &gram : grams2.at(i)) {
+            const double weight=gramWeight(gram,false);
+            if (weight<=0.0) continue;
+            ++hits2;
+            score+=weight;
+            if (matchedTerms.size()<12) matchedTerms.append(gram);
         }
-        // 只接受"关注文本与当前输入有连续重叠"的匹配：一个 3 字片段，或两个不同的 2 字片段。
-        // 不接受"仅抽词里一个常见词多处同时出现"的弱匹配，避免误了结一条真实关注。
-        if (queryText.isEmpty() || (hits3<1 && hits2<2)) continue;
-        const double score=hits3*2.0+hits2*0.5+quoteHits*0.5;
-        auto record=buildConcernRecord(concernTurn,note,q.value(2).toInt(),q.value(6).toString(),
-                                       channel,session,q.value(7),q.value(8),q.value(10),q.value(9),
-                                       q.value(11),q.value(12),viewer.channel,viewer.sessionId,policy,false);
+        // 门槛：一个 3 字片段，或至少两个不同的 2 字片段。避免常见称呼/虚词把无关关注带出来。
+        if (hits3<1 && hits2<2) continue;
+        const auto &c=candidates.at(i);
+        auto record=buildConcernRecord(c.turn,c.note,c.version,c.reportedAt,c.topic,c.watch,
+                                       c.rootTurn,c.nextCheckAt,c.channel,c.session,
+                                       c.timing,c.outcome,c.message,c.contactReason,
+                                       c.contactChannel,c.contactSession,
+                                       viewer.channel,viewer.sessionId,policy,false);
         record["match_score"]=score;
-        QJsonArray hitTerms;
-        for (const auto &term : clean)
-            if (note.contains(term,Qt::CaseInsensitive) || input.contains(term,Qt::CaseInsensitive))
-                hitTerms.append(term);
-        record["matched_terms"]=hitTerms;
+        record["matched_terms"]=matchedTerms;
         scored.append({record,score});
     }
     std::stable_sort(scored.begin(),scored.end(),
@@ -264,9 +382,12 @@ QJsonArray MemoryManager::matchedConcerns(const RequestMeta &viewer,const QStrin
 QJsonObject MemoryManager::concernByHead(qint64 headTurn) const
 {
     if (headTurn<=0) return {};
+    const QString extra=concernColumnsReady(m_db)
+        ? QStringLiteral("r.topic,r.watch,r.root_turn,r.next_check_at")
+        : QStringLiteral("NULL,NULL,NULL,NULL");
     QSqlQuery q(m_db);
     q.prepare("SELECT r.turn_id,r.note,r.version,h.channel,h.session_id,s.input,s.reported,"
-              "c.timing,c.outcome,c.reason,c.message,c.channel,c.session" + sourceRows +
+              "c.timing,c.outcome,c.reason,c.message,c.channel,c.session," + extra + sourceRows +
               "JOIN private_reflection r ON r.turn_id=h.id "
               "LEFT JOIN reflection_contact c ON c.turn_id=r.turn_id WHERE " + eligible +
               " AND h.id=? AND r.state='consider' AND NOT EXISTS (SELECT 1 FROM reflection_change WHERE prior_turn=r.turn_id)");
@@ -275,7 +396,9 @@ QJsonObject MemoryManager::concernByHead(qint64 headTurn) const
     const MemoryReadPolicy policy;
     const auto channel=q.value(3).toString(),session=q.value(4).toString();
     return buildConcernRecord(q.value(0).toLongLong(),q.value(1).toString(),q.value(2).toInt(),
-                              q.value(6).toString(),channel,session,q.value(7),q.value(8),q.value(10),
+                              q.value(6).toString(),q.value(13).toString(),q.value(14).toString(),
+                              q.value(15),q.value(16),
+                              channel,session,q.value(7),q.value(8),q.value(10),
                               q.value(9),q.value(11),q.value(12),channel,session,policy,true);
 }
 
@@ -332,14 +455,279 @@ bool MemoryManager::resolveConcern(qlonglong headTurn,qlonglong byTurn,const QSt
     q.addBindValue(byTurn);
     q.addBindValue(headTurn);
     if (!q.exec()) return false;
-    q.prepare("UPDATE private_reflection SET state='resolved',updated_at=unixepoch() "
+    q.prepare("UPDATE private_reflection SET state='resolved',resolved_by=?,resolved_kind=?,updated_at=unixepoch() "
               "WHERE turn_id=? AND version=? AND state='consider'");
+    q.addBindValue(byTurn);
+    q.addBindValue(kind);
     q.addBindValue(headTurn);
     q.addBindValue(version);
     if (!q.exec() || q.numRowsAffected()!=1) return false;
     if (!m_db.commit()) return false;
     rollback.dismiss();
     return true;
+}
+
+QJsonObject MemoryManager::claimDueConcern(int dailyLimit,int cooldownSeconds)
+{
+    if (dailyLimit<=0 || !m_db.transaction()) return {};
+    auto rollback=qScopeGuard([this]{m_db.rollback();});
+    QSqlQuery q(m_db);
+    // 只领"按时间到期"的开放关注；被回顾链修订过的旧行不再作为 head。
+    q.prepare("SELECT r.turn_id,r.version,r.note,h.channel,h.session_id,s.input" + sourceRows +
+              "JOIN private_reflection r ON r.turn_id=h.id WHERE " + eligible +
+              " AND r.state='consider' AND NOT EXISTS (SELECT 1 FROM reflection_change WHERE prior_turn=r.turn_id)"
+              " AND r.next_check_at>0 AND r.next_check_at<=unixepoch()"
+              " ORDER BY r.next_check_at,r.turn_id LIMIT 24");
+    if (!q.exec()) return {};
+    struct Due {
+        qlonglong turn; int version;
+        QString note,channel,session,input;
+    };
+    QList<Due> due;
+    while (q.next()) {
+        const auto channel=q.value(3).toString();
+        // 到期回顾只处理主人自己的私聊来源；其余渠道的关注不进入私下回顾。
+        if (channel!=Channel::kPet && channel!=Channel::kQQPrivate) continue;
+        due.append({q.value(0).toLongLong(),q.value(1).toInt(),q.value(2).toString(),
+                    channel,q.value(4).toString(),q.value(5).toString()});
+    }
+    q.finish();
+    const MemoryReadPolicy policy;
+    for (const auto &item : due) {
+        if (!policy.allows(item.channel,item.session,item.input)
+            || !policy.allows(item.channel,item.session,item.note)) continue;
+        // 到期回顾与新来源回顾共用同一份每日预算与冷却；预算用尽时本轮不再领取。
+        if (!chargePrivateReview(item.turn,dailyLimit,cooldownSeconds)) return {};
+        const int nextVersion=item.version+1;
+        q.prepare("UPDATE private_reflection SET state='pending',claimed_by='due',version=?,"
+                  "eligible_at=unixepoch()+1800 WHERE turn_id=? AND version=? AND state='consider'");
+        q.addBindValue(nextVersion);
+        q.addBindValue(item.turn);
+        q.addBindValue(item.version);
+        // 必须精确命中一行：并发/迟到的领取不能把已变化的关注再取走。
+        if (!q.exec() || q.numRowsAffected()!=1 || !m_db.commit()) return {};
+        rollback.dismiss();
+        qInfo()<<"[Concern] due claimed turn="<<item.turn<<"version="<<nextVersion;
+        return concernReviewContext(item.turn,nextVersion);
+    }
+    return {};
+}
+
+QJsonObject MemoryManager::concernReviewContext(qint64 turn,int version) const
+{
+    if (turn<=0 || version<=0) return {};
+    QSqlQuery q(m_db);
+    q.prepare("SELECT r.note,r.version,r.topic,r.watch,r.root_turn,r.matter,r.next_check_at,"
+              "h.channel,h.session_id,s.input,s.reported" + sourceRows +
+              "JOIN private_reflection r ON r.turn_id=h.id WHERE " + eligible +
+              " AND h.id=? AND r.version=? AND r.state='pending'");
+    q.addBindValue(turn);
+    q.addBindValue(version);
+    if (!q.exec() || !q.next()) return {};
+    const auto note=q.value(0).toString();
+    const auto topic=q.value(2).toString();
+    const auto watch=q.value(3).toString();
+    const auto root=q.value(4).toLongLong();
+    const auto matterName=q.value(5).toString();
+    const auto nextCheck=q.value(6).toLongLong();
+    const auto channel=q.value(7).toString();
+    const auto session=q.value(8).toString();
+    const auto input=q.value(9).toString();
+    const auto reported=q.value(10).toString();
+    const MemoryReadPolicy policy;
+    if (!policy.allows(channel,session,input) || !policy.allows(channel,session,note)) return {};
+    q.finish();
+    // 之前留下的联系记录：让模型知道已经留过什么话，避免重复打扰。
+    QJsonArray contacts;
+    QSqlQuery contactQuery(m_db);
+    contactQuery.prepare("SELECT timing,outcome,reason,message,channel,session FROM reflection_contact "
+                         "WHERE turn_id=? ORDER BY rowid");
+    contactQuery.addBindValue(turn);
+    if (contactQuery.exec()) while (contactQuery.next()) {
+        const auto contactChannel=contactQuery.value(4).toString();
+        const auto contactSession=contactQuery.value(5).toString();
+        const auto scopeChannel=contactChannel.isEmpty() ? channel : contactChannel;
+        const auto scopeSession=contactSession.isEmpty() ? session : contactSession;
+        QJsonObject contact{{"timing",contactQuery.value(0).toString()},
+                            {"outcome",contactQuery.value(1).toString()},
+                            {"channel",contactChannel},{"session",contactSession}};
+        const auto reason=contactQuery.value(2).toString();
+        if (!reason.isEmpty() && policy.allows(scopeChannel,scopeSession,reason)) contact["reason"]=reason;
+        const auto message=contactQuery.value(3).toString();
+        if (!message.isEmpty() && policy.allows(scopeChannel,scopeSession,message)) contact["message"]=message;
+        contacts.append(contact);
+    }
+    // 关注来源之后主人说过的话：到期回顾不带新消息，必须从这里判断"事情有没有下落"。
+    QJsonArray since;
+    QSqlQuery sinceQuery(m_db);
+    sinceQuery.prepare("SELECT h.id,h.channel,h.session_id,h.user_input,"
+                       "coalesce(s.reported,h.timestamp) FROM chat_history h "
+                       "LEFT JOIN cognitive_source s ON s.event=h.cognitive_event "
+                       "AND s.channel=h.channel AND s.session=h.session_id "
+                       "AND s.subject=h.subject AND s.input=h.user_input "
+                       "WHERE h.subject='user' AND h.sensitive=0 AND h.channel IN ('pet','qq_private') "
+                       "AND h.user_input<>'' AND h.id<>? "
+                       "AND julianday(coalesce(s.reported,h.timestamp))>julianday(?) "
+                       "ORDER BY h.id LIMIT 64");
+    sinceQuery.addBindValue(turn);
+    sinceQuery.addBindValue(reported);
+    if (sinceQuery.exec()) while (sinceQuery.next()) {
+        const auto sinceChannel=sinceQuery.value(1).toString();
+        const auto sinceSession=sinceQuery.value(2).toString();
+        const auto text=sinceQuery.value(3).toString();
+        if (!visibleSession(sinceChannel,sinceSession,channel,session)
+            || !policy.allows(sinceChannel,sinceSession,text)) continue;
+        since.append(QJsonObject{{"turn",sinceQuery.value(0).toLongLong()},
+                                 {"text",text.left(512)},
+                                 {"reported_at",sinceQuery.value(4).toString()}});
+        if (since.size()>=6) break;
+    }
+    // 相关事项的最新认识：只用最新一条 revision，历史版本由 matter 表自己维护。
+    QJsonObject matter;
+    if (!matterName.isEmpty()) {
+        QSqlQuery matterQuery(m_db);
+        matterQuery.prepare("SELECT r.topic,r.status,r.understanding,s.reported FROM matter_revision r "
+                            "JOIN cognitive_source s ON s.id=r.source WHERE r.matter=? "
+                            "ORDER BY r.version DESC LIMIT 1");
+        matterQuery.addBindValue(matterName);
+        if (matterQuery.exec() && matterQuery.next())
+            matter=QJsonObject{{"topic",matterQuery.value(0).toString()},
+                               {"status",matterQuery.value(1).toString()},
+                               {"understanding",matterQuery.value(2).toString()},
+                               {"reported",matterQuery.value(3).toString()}};
+    }
+    QJsonObject concernRecord{{"ref",QStringLiteral("concern/%1").arg(root>0 ? root : turn)},
+                              {"head",QStringLiteral("reflection/%1").arg(turn)},
+                              {"topic",topic},
+                              {"watch",watch},
+                              {"own_reflection",note},
+                              {"reported_at",reported}};
+    if (nextCheck>0) concernRecord["next_check_at"]=isoFromEpoch(nextCheck);
+    if (!matterName.isEmpty()) concernRecord["matter"]=matterName;
+    QJsonObject result{{"id",turn},{"version",version},{"kind","concern"},
+                       {"concern",concernRecord},{"since",since},{"contacts",contacts}};
+    if (!matter.isEmpty()) result["matter"]=matter;
+    return result;
+}
+
+bool MemoryManager::finishConcernReview(qlonglong turn,int version,const QJsonObject &proposal)
+{
+    static const QSet<QString> actions{QStringLiteral("keep"),QStringLiteral("revise"),
+                                       QStringLiteral("resolve"),QStringLiteral("drop"),
+                                       QStringLiteral("contact")};
+    const auto action=proposal["concern_action"].toString();
+    if (!actions.contains(action)) return false;
+    const auto note=proposal["note"].toString().trimmed();
+    if (note.size()>240) return false;
+    const int minutes=qBound(0,proposal["forget"].toObject()["next_check_after_minutes"].toInt(720),10080);
+    if (!m_db.transaction()) return false;
+    auto rollback=qScopeGuard([this]{m_db.rollback();});
+    QSqlQuery q(m_db);
+    // 与领取时一致的来源校验：只有仍处于 pending 且 version 匹配的领取才能落库。
+    q.prepare("SELECT h.channel,h.session_id,s.input" + sourceRows +
+              "JOIN private_reflection r ON r.turn_id=h.id WHERE " + eligible +
+              " AND h.id=? AND r.version=? AND r.state='pending'");
+    q.addBindValue(turn);
+    q.addBindValue(version);
+    if (!q.exec() || !q.next()) return false;
+    const auto channel=q.value(0).toString();
+    const auto session=q.value(1).toString();
+    const MemoryReadPolicy policy;
+    if (!policy.allows(channel,session,q.value(2).toString())) return false;
+    if (!note.isEmpty() && !policy.allows(channel,session,note)) return false;
+    q.finish();
+    QString sql;
+    QList<QVariant> bindings;
+    QString contactTiming,contactReason,contactMessage;
+    if (action=="keep") {
+        const qint64 delay=nextCheckAfter(minutes);
+        sql=QStringLiteral("UPDATE private_reflection SET state='consider',claimed_by=NULL,"
+                           "next_check_at=CASE WHEN ?>0 THEN unixepoch()+? ELSE 0 END,"
+                           "updated_at=unixepoch() WHERE turn_id=? AND version=? AND state='pending'");
+        bindings<<delay<<delay<<turn<<version;
+    } else if (action=="revise") {
+        const auto topic=proposal["topic"].toString().trimmed().left(60);
+        const auto watch=proposal["watch"].toString().trimmed().left(200);
+        if ((!topic.isEmpty() && !policy.allows(channel,session,topic))
+            || (!watch.isEmpty() && !policy.allows(channel,session,watch))) return false;
+        const qint64 delay=nextCheckAfter(minutes);
+        sql=QStringLiteral("UPDATE private_reflection SET state='consider',claimed_by=NULL,"
+                           "next_check_at=CASE WHEN ?>0 THEN unixepoch()+? ELSE 0 END,"
+                           "note=CASE WHEN ?<>'' THEN ? ELSE note END,"
+                           "topic=CASE WHEN ?<>'' THEN ? ELSE topic END,"
+                           "watch=CASE WHEN ?<>'' THEN ? ELSE watch END,"
+                           "updated_at=unixepoch() WHERE turn_id=? AND version=? AND state='pending'");
+        bindings<<delay<<delay<<note<<note<<topic<<topic<<watch<<watch<<turn<<version;
+    } else if (action=="resolve") {
+        const auto kind=proposal["kind"].toString();
+        const bool kindKnown=kind==QStringLiteral("answer")||kind==QStringLiteral("contradiction")
+            ||kind==QStringLiteral("cancelled");
+        // 了结由回顾做出，不指向具体轮次（resolved_by=0）；无 kind 时按 answer 记录。
+        sql=QStringLiteral("UPDATE private_reflection SET state='resolved',resolved_by=0,"
+                           "resolved_kind=coalesce(?,'answer'),updated_at=unixepoch() "
+                           "WHERE turn_id=? AND version=? AND state='pending'");
+        bindings<<(kindKnown ? QVariant(kind) : QVariant())<<turn<<version;
+    } else if (action=="drop") {
+        sql=QStringLiteral("UPDATE private_reflection SET state='resolved',resolved_kind='dropped',"
+                           "updated_at=unixepoch() WHERE turn_id=? AND version=? AND state='pending'");
+        bindings<<turn<<version;
+    } else {
+        const auto contact=proposal["contact"].toObject();
+        contactTiming=contact["timing"].toString();
+        contactReason=contact["reason"].toString().trimmed();
+        contactMessage=contact["message"].toString().trimmed();
+        if (contactTiming!=QStringLiteral("private") && contactTiming!=QStringLiteral("next_chat")
+            && contactTiming!=QStringLiteral("now")) return false;
+        if (contactReason.isEmpty() || contactReason.size()>240
+            || !policy.allows(channel,session,contactReason)) return false;
+        if (contactTiming==QStringLiteral("now")
+            && (contactMessage.isEmpty() || contactMessage.size()>300
+                || !policy.allows(channel,session,contactMessage))) return false;
+        sql=QStringLiteral("UPDATE private_reflection SET state='consider',claimed_by=NULL,"
+                           "next_check_at=unixepoch()+7200,updated_at=unixepoch() "
+                           "WHERE turn_id=? AND version=? AND state='pending'");
+        bindings<<turn<<version;
+    }
+    q.prepare(sql);
+    for (const auto &value : bindings) q.addBindValue(value);
+    if (!q.exec() || q.numRowsAffected()!=1) return false;
+    if (action=="contact") {
+        // 联系意图与关注状态同一事务落库；投递层之后按 outcome='proposed' 取走。
+        q.prepare("INSERT INTO reflection_contact(turn_id,version,timing,reason,message,outcome,channel,session) "
+                  "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(turn_id) DO UPDATE SET "
+                  "version=excluded.version,timing=excluded.timing,reason=excluded.reason,"
+                  "message=excluded.message,outcome=excluded.outcome,"
+                  "channel=excluded.channel,session=excluded.session,"
+                  // 这是一次新的联系意图：重试预算重新计算（旧投递的失败次数不占用新意图）。
+                  "attempts=0,last_outcome=NULL,last_attempt_at=NULL");
+        q.addBindValue(turn);
+        q.addBindValue(version);
+        q.addBindValue(contactTiming);
+        q.addBindValue(contactReason);
+        q.addBindValue(contactTiming==QStringLiteral("now") ? contactMessage : QString());
+        q.addBindValue(contactTiming==QStringLiteral("now") ? QStringLiteral("proposed")
+                                                            : QStringLiteral("retained"));
+        q.addBindValue(channel);
+        q.addBindValue(session);
+        if (!q.exec()) return false;
+    }
+    if (!m_db.commit()) return false;
+    rollback.dismiss();
+    qInfo()<<"[Concern] review committed turn="<<turn<<"version="<<version<<"action="<<action;
+    return true;
+}
+
+bool MemoryManager::deferConcernReview(qlonglong turn,int version,const QString &reason)
+{
+    QSqlQuery q(m_db);
+    q.prepare("UPDATE private_reflection SET state='deferred',eligible_at=unixepoch(),updated_at=unixepoch() "
+              "WHERE turn_id=? AND version=? AND state='pending'");
+    q.addBindValue(turn);
+    q.addBindValue(version);
+    const bool saved=q.exec() && q.numRowsAffected()==1;
+    qInfo()<<"[Concern] review deferred turn="<<turn<<"version="<<version
+           <<"saved="<<saved<<"reason="<<reason;
+    return saved;
 }
 
 bool MemoryManager::consultPrivateReflection(qint64 turn,int version,const QStringList &terms,QJsonArray &results) const
@@ -366,7 +754,8 @@ bool MemoryManager::consultPrivateReflection(qint64 turn,int version,const QStri
 
 bool MemoryManager::finishPrivateReflection(qlonglong turn, int version, const QString &choice, const QString &note,
                                             const QJsonObject &contact,const QJsonArray &consulted,
-                                            const QJsonObject &prior,const QString &priorAction)
+                                            const QJsonObject &prior,const QString &priorAction,
+                                            const QJsonObject &concern)
 {
     if (choice != "rest" && choice != "consider") return false;
     if (choice == "consider" && (note.trimmed().isEmpty() || note.size()>240)) return false;
@@ -385,8 +774,13 @@ bool MemoryManager::finishPrivateReflection(qlonglong turn, int version, const Q
     if (!prior.isEmpty()) {
         const auto previous=prior["source_turn"].toInteger();
         const auto current=concernByHead(previous);
+        // prior 可能来自新格式（ref=concern/<根轮次>）或兜底的旧格式（ref=reflection/<轮次>）；
+        // 两种都要能对上同一个当前关注行，否则回顾模型无法修订经由兜底注入的旧关注。
+        const auto priorRef=prior["ref"].toString();
+        const bool sameRef=priorRef==current["ref"].toString()
+            || priorRef==QStringLiteral("reflection/%1").arg(previous);
         if (previous<=0 || previous==turn || current.isEmpty()
-            || current["ref"].toString()!=prior["ref"].toString()
+            || !sameRef
             || current["version"].toInteger()!=prior["version"].toInteger()
             || !basisVisible(m_db,previous,policy,channel,session)
             || !visibleSession(current["source_channel"].toString(),current["source_session"].toString(),
@@ -421,12 +815,48 @@ bool MemoryManager::finishPrivateReflection(qlonglong turn, int version, const Q
         q.addBindValue(turn); q.addBindValue(row["turn"].toInteger());
         if (!q.exec()) return false;
     }
-    q.prepare("UPDATE private_reflection SET state=?,note=?,updated_at=unixepoch() "
-              "WHERE turn_id=? AND version=? AND state='pending'");
-    q.addBindValue(choice);
-    q.addBindValue(choice=="consider" ? note.trimmed() : QString{});
-    q.addBindValue(turn);
-    q.addBindValue(version);
+    if (choice=="consider") {
+        // 回顾模型可以顺带给出关注的结构化描述（topic/watch/matter/下一次检查时间）。
+        // 空字符串表示这次没给，保留旧值；0 分钟表示只在新证据或显式唤醒时再看，落库为 0。
+        const auto topic=concern["topic"].toString().trimmed().left(60);
+        const auto watch=concern["watch"].toString().trimmed().left(200);
+        const auto matter=concern["matter"].toString().trimmed();
+        if ((!topic.isEmpty() && !policy.allows(channel,session,topic))
+            || (!watch.isEmpty() && !policy.allows(channel,session,watch))
+            || (!matter.isEmpty() && !policy.allows(channel,session,matter))) return false;
+        const int minutes=qBound(0,concern["next_check_after_minutes"].toInt(720),10080);
+        const qint64 delay=nextCheckAfter(minutes);
+        // 修订时新行沿用旧关注的根轮次；否则用本轮次，已有根轮次则保留（同一 head 被重新回顾）。
+        const int revise=priorAction=="revise" ? 1 : 0;
+        qlonglong rootTurn=turn;
+        if (revise) {
+            const auto priorRoot=prior["root_turn"].toInteger();
+            rootTurn=priorRoot>0 ? priorRoot : prior["source_turn"].toInteger();
+            if (rootTurn<=0) rootTurn=turn;
+        }
+        q.prepare("UPDATE private_reflection SET state='consider',note=?,updated_at=unixepoch(),"
+                  "topic=CASE WHEN ?<>'' THEN ? ELSE topic END,"
+                  "watch=CASE WHEN ?<>'' THEN ? ELSE watch END,"
+                  "next_check_at=CASE WHEN ?>0 THEN unixepoch()+? ELSE 0 END,"
+                  "matter=CASE WHEN ?<>'' THEN ? ELSE matter END,"
+                  "root_turn=CASE WHEN ? THEN ? ELSE coalesce(root_turn,?) END "
+                  "WHERE turn_id=? AND version=? AND state='pending'");
+        q.addBindValue(note.trimmed());
+        q.addBindValue(topic); q.addBindValue(topic);
+        q.addBindValue(watch); q.addBindValue(watch);
+        q.addBindValue(delay); q.addBindValue(delay);
+        q.addBindValue(matter); q.addBindValue(matter);
+        q.addBindValue(revise); q.addBindValue(rootTurn); q.addBindValue(turn);
+        q.addBindValue(turn);
+        q.addBindValue(version);
+    } else {
+        q.prepare("UPDATE private_reflection SET state=?,note=?,updated_at=unixepoch() "
+                  "WHERE turn_id=? AND version=? AND state='pending'");
+        q.addBindValue(choice);
+        q.addBindValue(QString{});
+        q.addBindValue(turn);
+        q.addBindValue(version);
+    }
     if (!q.exec() || q.numRowsAffected()!=1) return false;
     if (choice=="consider" && !contact.isEmpty() && ConfigManager::instance().getProactiveConfig().enabled) {
         const auto timing = contact["timing"].toString();
@@ -454,17 +884,22 @@ QString MemoryManager::claimReflectionContact(qlonglong turn, int version, const
     auto &cfg = ConfigManager::instance();
     const auto opts = cfg.getProactiveConfig();
     const auto memory = cfg.getMemoryPolicyConfig();
-    if (!opts.enabled || !opts.privateWriting || !memory.longTermMemoryEnabled
+    // 主动联系与后台写作解耦：只看"主动联系开关 + 长期记忆 + 目标可达"。
+    // 关闭 privateWriting 只是不做私下写作，不应该让"现在联系"永远不可达。
+    if (!opts.enabled || !memory.longTermMemoryEnabled
         || !opts.targets.contains(qMakePair(channel,session))) return {};
     if (!(channel==Channel::kPet && session==Channel::kDefaultSession)
         && !(channel==Channel::kQQPrivate && cfg.isMasterQQ(session))) return {};
     if (!m_db.transaction()) return {};
     auto rollback=qScopeGuard([this]{m_db.rollback();});
     QSqlQuery q(m_db);
+    // 可领取状态：首次 proposed；或上一次被渠道明确拒绝（rejected）且还没用完一次重试。
+    // unknown 表示协议层可能已送达，不重发；handed_off/protocol_accepted/withheld 是终态。
     q.prepare("SELECT c.message,h.channel,h.session_id,s.input" + sourceRows +
               "JOIN private_reflection r ON r.turn_id=h.id JOIN reflection_contact c ON c.turn_id=r.turn_id "
               "WHERE " + eligible + " AND c.turn_id=? AND c.version=? AND r.version=c.version "
-              "AND r.state='consider' AND c.outcome='proposed' AND NOT EXISTS "
+              "AND r.state='consider' AND (c.outcome='proposed' "
+              "OR (c.outcome='rejected' AND c.attempts<2)) AND NOT EXISTS "
               "(SELECT 1 FROM reflection_change WHERE prior_turn=r.turn_id)");
     q.addBindValue(turn);
     q.addBindValue(version);
@@ -476,12 +911,18 @@ QString MemoryManager::claimReflectionContact(qlonglong turn, int version, const
         || !policy.allows(sourceChannel,sourceSession,q.value(3).toString()) || !policy.allows(channel,session,message)) return {};
     q.finish();
     q.prepare("UPDATE reflection_contact SET outcome='dispatching',channel=?,session=? "
-              "WHERE turn_id=? AND version=? AND outcome='proposed'");
+              "WHERE turn_id=? AND version=? AND (outcome='proposed' "
+              "OR (outcome='rejected' AND attempts<2))");
     q.addBindValue(channel);
     q.addBindValue(session);
     q.addBindValue(turn);
     q.addBindValue(version);
-    if (!q.exec() || q.numRowsAffected()!=1 || !m_db.commit()) return {};
+    if (!q.exec() || q.numRowsAffected()!=1) return {};
+    // 领取即写流水：投递结果之后由 recordContactOutcome 回填同一行。
+    noteDelivery(m_db,QStringLiteral("contact"),
+                 QStringLiteral("reflection:%1:%2").arg(turn).arg(version),
+                 channel,session,message,QStringLiteral("claimed"),0);
+    if (!m_db.commit()) return {};
     rollback.dismiss();
     return message;
 }
@@ -490,14 +931,51 @@ bool MemoryManager::recordContactOutcome(qlonglong turn, int version, const QStr
 {
     if (outcome!="handed_off" && outcome!="rejected" && outcome!="withheld"
         && outcome!="unknown" && outcome!="protocol_accepted") return false;
+    // rejected/unknown 才算一次失败尝试：attempts 供 claim 判断"最多再试一次"。
+    // 状态机保持 proposed→dispatching→终态；handed_off 之后协议层还能补一个终态回执。
+    const bool failed = outcome=="rejected" || outcome=="unknown";
     QSqlQuery q(m_db);
-    q.prepare("UPDATE reflection_contact SET outcome=? WHERE turn_id=? AND version=? AND (outcome=? OR (outcome='handed_off' AND ?))");
+    q.prepare("UPDATE reflection_contact SET outcome=?,last_outcome=?,last_attempt_at=unixepoch(),"
+              "attempts=attempts+? "
+              "WHERE turn_id=? AND version=? AND (outcome=? OR (outcome='handed_off' AND ?))");
     q.addBindValue(outcome);
+    q.addBindValue(outcome);
+    q.addBindValue(failed ? 1 : 0);
     q.addBindValue(turn);
     q.addBindValue(version);
     q.addBindValue(outcome=="withheld" ? "proposed" : "dispatching");
     q.addBindValue(outcome=="unknown" || outcome=="rejected" || outcome=="protocol_accepted");
-    return q.exec() && q.numRowsAffected()==1;
+    if (!q.exec() || q.numRowsAffected()!=1) return false;
+    noteDelivery(m_db,QStringLiteral("contact"),
+                 QStringLiteral("reflection:%1:%2").arg(turn).arg(version),
+                 QString{},QString{},QString{},outcome,failed ? 1 : 0);
+    return true;
+}
+
+QJsonArray MemoryManager::retryableReflectionContacts(int limit) const
+{
+    QJsonArray result;
+    if (limit<=0) return result;
+    auto &cfg=ConfigManager::instance();
+    if (!cfg.getProactiveConfig().enabled || !cfg.getMemoryPolicyConfig().longTermMemoryEnabled)
+        return result;
+    QSqlQuery q(m_db);
+    // 与 claimReflectionContact 的可领取条件保持一致：只取仍可重试一次的联系。
+    q.prepare("SELECT c.turn_id,c.version,c.message FROM reflection_contact c "
+              "JOIN private_reflection r ON r.turn_id=c.turn_id "
+              "JOIN chat_history h ON h.id=r.turn_id "
+              "WHERE c.outcome='rejected' AND c.attempts<2 AND r.state='consider' "
+              "AND r.version=c.version "
+              "AND h.subject='user' AND h.sensitive=0 "
+              "AND NOT EXISTS (SELECT 1 FROM reflection_change WHERE prior_turn=r.turn_id) "
+              "ORDER BY coalesce(c.last_attempt_at,0) LIMIT ?");
+    q.addBindValue(limit);
+    if (!q.exec()) return result;
+    while (q.next())
+        result.append(QJsonObject{{"turn",q.value(0).toLongLong()},
+                                  {"version",q.value(1).toInt()},
+                                  {"message",q.value(2).toString()}});
+    return result;
 }
 
 bool MemoryManager::deferPrivateReflection(qlonglong turn, int version)
@@ -615,6 +1093,15 @@ QJsonObject MemoryManager::claimDueReminder(const QString &channel,const QString
     if (!allowedReminder(channel,session) || !m_db.transaction()) return {};
     auto rollback=qScopeGuard([this]{m_db.rollback();});
     QSqlQuery q(m_db);
+    // 到期未发也要在流水里留痕，避免出现"消失的提醒"。
+    {
+        QSqlQuery expiry(m_db);
+        if (!expiry.exec("INSERT INTO delivery_ledger(kind,ref,channel,session,text,state,updated_at) "
+                         "SELECT 'reminder','reminder:'||id,channel,session,message,'expired',CURRENT_TIMESTAMP "
+                         "FROM reminder WHERE state='pending' AND expires<unixepoch() "
+                         "ON CONFLICT(kind,ref) DO UPDATE SET state='expired',updated_at=CURRENT_TIMESTAMP"))
+            qWarning()<<"[Reminder] 过期流水写入失败"<<expiry.lastError();
+    }
     if (!q.exec("UPDATE reminder SET state='expired' WHERE state='pending' AND expires<unixepoch()")) return {};
     q.prepare("SELECT id,message FROM reminder WHERE state='pending' AND channel=? AND session=? AND due<=unixepoch() ORDER BY due,id LIMIT 1");
     q.addBindValue(channel); q.addBindValue(session);
@@ -626,7 +1113,11 @@ QJsonObject MemoryManager::claimDueReminder(const QString &channel,const QString
     const bool allowed=MemoryReadPolicy().allows(channel,session,message);
     q.prepare("UPDATE reminder SET state=? WHERE id=? AND state='pending'");
     q.addBindValue(allowed ? "dispatching" : "withheld"); q.addBindValue(id);
-    if (!q.exec() || q.numRowsAffected()!=1 || !m_db.commit()) return {};
+    if (!q.exec() || q.numRowsAffected()!=1) return {};
+    noteDelivery(m_db,QStringLiteral("reminder"),QStringLiteral("reminder:%1").arg(id),
+                 channel,session,message,
+                 allowed ? QStringLiteral("claimed") : QStringLiteral("withheld"),0);
+    if (!m_db.commit()) return {};
     rollback.dismiss();
     return allowed ? QJsonObject{{"id",id},{"message",message}} : QJsonObject{};
 }
@@ -637,4 +1128,9 @@ void MemoryManager::reminderOutcome(qint64 id,const QString &state)
     q.prepare("UPDATE reminder SET state=? WHERE id=? AND (state='dispatching' OR (state='handed_off' AND ?))");
     q.addBindValue(state); q.addBindValue(id); q.addBindValue(state!="handed_off");
     if (!q.exec()) qWarning()<<"[Reminder] outcome write failed"<<id;
+    // rejected/unknown 记一次失败尝试；handed_off/protocol_accepted 只更新终态。
+    const bool failed=state=="rejected" || state=="unknown";
+    noteDelivery(m_db,QStringLiteral("reminder"),QStringLiteral("reminder:%1").arg(id),
+                 QString{},QString{},QString{},state,failed ? 1 : 0);
 }
+

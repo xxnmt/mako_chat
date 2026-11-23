@@ -263,3 +263,45 @@ ctest --output-on-failure
 - 运行库：`build/Desktop_Qt_6_11_1_MinGW_64_bit_Debug/app_data/memory/QianDaoMoZi_memory.db`（**只读查询用副本**，避免锁）。
 - 日志：`build/.../app_data/logs/logs_*.txt`；关注链路关键字：`[Reflection]`、`[Concern]`、`[Reminder]`、`[ReflectionContact]`。
 - ACL 报告（若再次遇到权限问题）：`D:\QtProject\acl-reports-dsh\`。
+
+---
+
+## 2026-11-23 · B 阶段（B1–B5）开发记录
+
+### 基线
+
+- HEAD `38af0b7`（11/22 P0 版）。本轮按"最后一次日志"`logs_20261122_235021_131_08ba87506fcb.txt` 与目标文档重新推进；11/23 被放弃的改动未沿用。
+- 生产库迁移前已备份（`QianDaoMoZi_memory.db.bak_before_v25_<时间戳>`），迁移后 `user_version=25`。
+
+### Agent 分工
+
+| Agent | 范围 | 交付 |
+|---|---|---|
+| `m1a-memory` | v23 迁移、文档频率匹配、关注持久化、到期回顾记忆层 | 完成（实现保留） |
+| `m1b-cognitive` | `PrivateReview` 三级优先级、concern 提示词、协调器空闲条件 | 完成 |
+| `m2-delivery` | v24、主动联系门控/重试、主动消息历史、分享回执 | 完成 + 5 用例 |
+| `m3-attention` | v25 注意力事件、重启恢复、当前活动、B2 活动字段 | 完成 + 6 用例 |
+| `lead` | 接口定义、集成、构建修复、验收、文档 | 全量 19/20 |
+
+### 关键实现
+
+- 迁移：v23 关注字段（topic/watch/root_turn/next_check_at/resolved_*/claimed_by）；v24 `reflection_contact` 尝试字段 + `delivery_ledger`；v25 `attention_event`/`attention_state`。
+- 匹配：按开放关注语料的文档频率降权（称呼类高频片段不计数），替代硬编码词表。
+- 到期回顾：活动 → 到期关注 → 新来源；`concern_action` = keep/revise/resolve/drop/contact。
+- 主动联系：与写作开关解耦；`rejected` 最多补一次，`unknown/handed_off/protocol_accepted` 不重发；主动消息写 `chat_history(turn_kind='proactive')` + `raw_events(direction='out')`。
+- 注意力：启动扫描 `received` 轮入队 recovery、`due_wake`/`message`/`activity_result` 事件、当前活动与切换原因；B2 活动来源/产物/删除防护。
+
+### 验证
+
+- 构建零错误；`ctest` 19/20（唯一失败 `tst_runtimelog`，宿主进程管道环境问题）。
+- `tst_memorymanager` 77 passed / 1 skipped；`tst_concern`、`tst_memoryagent` 通过。
+- 生产库 v25 迁移验证：`attention_event/attention_state/delivery_ledger/concern_resolution` 存在、`private_reflection` 新列齐全、36 条开放关注回填。
+
+### 事故与教训（必读）
+
+- 用 PowerShell `Get-Content/Set-Content` 改写源码，导致 `tests/tst_concern.cpp` 编码损坏且不可逆；已 `git checkout` 恢复，并把 M1/M3 的验收用例改写入 `tst_memorymanager.cpp`。**后续只允许用编辑工具改文本文件，禁止用 PowerShell 重写源码。**
+- 不面向结果：删除"欧尼酱"词表补丁，改为 DF 机制；测试用多关注语料锁机制并加正向对照，而不是改输入迁就断言。
+
+### 仍未完成
+
+B5 的 7 天实机连续运行、真实 QQ 主动联系到达、多活动并行选择、元数据优先阅读门控。

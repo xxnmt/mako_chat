@@ -161,6 +161,27 @@ bool MemoryManager::saveQATurn(const QString &userInput, const QString &rawReply
 
     if (query.numRowsAffected() != 1) return false;
     const qlonglong indexedTurn = receivedTurn > 0 ? receivedTurn : query.lastInsertId().toLongLong();
+    if (!thought.isEmpty() && indexedTurn > 0) {
+        // B2：念头/活动的持久化档案。source_turn 必须等于所在行 id；新插入时只有拿到
+        // last_insert_rowid 才知道 id，所以插入成功后在同一连接内补写一次（恢复轮次直接
+        // 用 receivedTurn）。这里覆盖该行 thought_result 是安全的：能在本轮创建活动的前
+        // 提是 hasActiveThought()==false，即该行还没有活动档案。
+        const auto nowIso = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+        const QJsonObject result{
+            {QStringLiteral("status"), QStringLiteral("active")},
+            {QStringLiteral("goal_kind"), QStringLiteral("interest")},
+            {QStringLiteral("source_turn"), indexedTurn},
+            {QStringLiteral("created_at"), nowIso},
+            {QStringLiteral("updated_at"), nowIso},
+            {QStringLiteral("artifact_ref"), QString{}}};
+        QSqlQuery init(m_db);
+        init.prepare("UPDATE chat_history SET thought_result=? "
+                     "WHERE id=? AND thought IS NOT NULL AND thought<>''");
+        init.addBindValue(QString::fromUtf8(QJsonDocument(result).toJson(QJsonDocument::Compact)));
+        init.addBindValue(indexedTurn);
+        if (!init.exec() || init.numRowsAffected() != 1)
+            qWarning() << "[MemoryManager]thought_result 初始化失败:" << indexedTurn << init.lastError();
+    }
     if (indexedTurn > 0 && !indexChatTurn(indexedTurn))
         qWarning() << "[MemoryIndex] incremental chat index failed:" << indexedTurn;
     else if (indexedTurn > 0 && !meta.sensitive)
@@ -341,6 +362,12 @@ bool MemoryManager::finishThoughtReview(qlonglong id, int version, const QJsonOb
     }
     if (!result.contains("reflection"))
         return false;
+    // B2：每次回顾提交都刷新 updated_at；产生草稿时记录产物引用。
+    // thought_result 用 json_patch 合并（而不是整行覆盖），用户/调用方已有字段不会被清掉；
+    // artifact_ref 只在确有草稿时写入，纯"继续思考"的回顾不会伪造产物。
+    result[QStringLiteral("updated_at")] = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    if (!result.value(QStringLiteral("draft")).toString().isEmpty())
+        result[QStringLiteral("artifact_ref")] = QStringLiteral("thought/%1").arg(id);
     const int hours = qBound(1, proposal["review_hours"].toInt(24), 168);
     QSqlQuery q(m_db);
     q.prepare("UPDATE chat_history SET thought_result=json_patch(coalesce(thought_result,'{}'),?),thought_version=thought_version+1,"
@@ -410,11 +437,257 @@ bool MemoryManager::hasActiveThought(const QString &subject) const
 bool MemoryManager::canShareThought(qlonglong id, int expectedVersion) const
 {
     QSqlQuery q(m_db);
-    q.prepare("SELECT 1 FROM chat_history WHERE id=? AND thought IS NOT NULL AND sensitive=0 AND thought_version=? "
-              "AND coalesce(json_extract(thought_result,'$.status'),'active') IN ('active','completed')");
+    // B2：没有实际产物（artifact_ref 为空）的活动不可分享——只写着"在思考"的阶段不打扰主人。
+    // 版本/状态校验与 M2 的分享去重规则保持不变。
+    q.prepare("SELECT coalesce(json_extract(thought_result,'$.share_outcome'),''),"
+              "coalesce(json_extract(thought_result,'$.share_version'),-1) "
+              "FROM chat_history WHERE id=? AND thought IS NOT NULL AND sensitive=0 AND thought_version=? "
+              "AND coalesce(json_extract(thought_result,'$.status'),'active') IN ('active','completed') "
+              "AND coalesce(json_extract(thought_result,'$.artifact_ref'),'')<>''");
     q.addBindValue(id);
     q.addBindValue(expectedVersion);
-    return q.exec() && q.next();
+    if (!q.exec() || !q.next()) return false;
+    // 分享去重只针对"同一版本（同一份草稿）"：新一轮回顾会产生新版本，新草稿仍可再分享。
+    // 同一版本内：已送达（handed_off/protocol_accepted）或协议层"未知"不再重发；
+    // 渠道明确拒绝时最多补齐一次，失败次数记在 delivery_ledger.attempts 上。
+    const qlonglong shareVersion = q.value(1).toLongLong();
+    if (shareVersion != expectedVersion) return true;
+    const QString shareOutcome = q.value(0).toString();
+    if (shareOutcome == QStringLiteral("handed_off")
+        || shareOutcome == QStringLiteral("protocol_accepted")
+        || shareOutcome == QStringLiteral("unknown"))
+        return false;
+    if (shareOutcome == QStringLiteral("rejected")) {
+        QSqlQuery ledger(m_db);
+        ledger.prepare("SELECT attempts FROM delivery_ledger WHERE kind='share' AND ref=?");
+        ledger.addBindValue(QStringLiteral("thought:%1:%2").arg(id).arg(expectedVersion));
+        if (!ledger.exec() || !ledger.next() || ledger.value(0).toInt() >= 2) return false;
+    }
+    return true;
+}
+
+bool MemoryManager::recordShareOutcome(qlonglong activityId, int version, const QString &outcome,
+                                       const QString &channel, const QString &session)
+{
+    static const QSet<QString> states{
+        QStringLiteral("handed_off"), QStringLiteral("protocol_accepted"), QStringLiteral("rejected"),
+        QStringLiteral("unknown"), QStringLiteral("withheld"), QStringLiteral("expired")};
+    if (activityId <= 0 || version < 0 || !states.contains(outcome)) return false;
+    const bool retryable = outcome == QStringLiteral("rejected") || outcome == QStringLiteral("unknown");
+    const QString ref = QStringLiteral("thought:%1:%2").arg(activityId).arg(version);
+    const QString at = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
+    if (!m_db.transaction()) return false;
+    QSqlQuery q(m_db);
+    // 先打补丁到 thought_result：分享结果跟随活动存档，重启后仍能判断是否已送达。
+    // 这里不改 thought_version：回执只是投递元数据，不是一次新的活动修订。
+    q.prepare("UPDATE chat_history SET thought_result=json_patch(coalesce(thought_result,'{}'),?) "
+              "WHERE id=? AND thought IS NOT NULL AND sensitive=0");
+    q.addBindValue(QString::fromUtf8(QJsonDocument(QJsonObject{
+        {QStringLiteral("share_outcome"), outcome},
+        {QStringLiteral("share_version"), version},
+        {QStringLiteral("share_channel"), channel},
+        {QStringLiteral("share_at"), at}}).toJson(QJsonDocument::Compact)));
+    q.addBindValue(activityId);
+    if (!q.exec() || q.numRowsAffected() != 1) {
+        qWarning() << "[MemoryManager]分享回执落库失败:" << activityId << version << outcome << q.lastError();
+        m_db.rollback();
+        return false;
+    }
+    // 投递流水：重复回执只累加失败尝试，不产生重复行；channel/session 留空时不覆盖旧值。
+    q.prepare("INSERT INTO delivery_ledger(kind,ref,channel,session,state,attempts,updated_at) "
+              "VALUES('share',?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(kind,ref) DO UPDATE SET "
+              "state=excluded.state,"
+              "channel=coalesce(excluded.channel,delivery_ledger.channel),"
+              "session=coalesce(excluded.session,delivery_ledger.session),"
+              "attempts=delivery_ledger.attempts+excluded.attempts,"
+              "updated_at=CURRENT_TIMESTAMP");
+    q.addBindValue(ref);
+    q.addBindValue(channel.isEmpty() ? QVariant(QMetaType(QMetaType::QString)) : QVariant(channel));
+    q.addBindValue(session.isEmpty() ? QVariant(QMetaType(QMetaType::QString)) : QVariant(session));
+    q.addBindValue(outcome);
+    q.addBindValue(retryable ? 1 : 0);
+    if (!q.exec() || !m_db.commit()) {
+        qWarning() << "[MemoryManager]分享投递流水写入失败:" << ref << q.lastError();
+        m_db.rollback();
+        return false;
+    }
+    qInfo() << "[Share] outcome" << ref << outcome << channel << session;
+    return true;
+}
+
+// ============== B1：统一注意力事件与当前活动状态（v25） ==============
+qlonglong MemoryManager::enqueueAttentionEvent(const QString &kind, const QString &ref,
+                                               const QJsonObject &payload, const QString &reason,
+                                               int priority)
+{
+    if (!m_db.isOpen() || kind.isEmpty() || ref.isEmpty())
+        return 0;
+    const QString payloadJson = QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact));
+    QSqlQuery insert(m_db);
+    // 同一 (kind,ref) 只保留一行：重复入队不重置已有状态，也不覆盖已有 payload/priority。
+    insert.prepare("INSERT INTO attention_event(kind,ref,payload,priority,reason,created_at) "
+                   "VALUES(?,?,?,?,?,unixepoch()) ON CONFLICT(kind,ref) DO NOTHING");
+    insert.addBindValue(kind);
+    insert.addBindValue(ref);
+    insert.addBindValue(payload.isEmpty() ? QStringLiteral("{}") : payloadJson);
+    insert.addBindValue(qBound(0, priority, 100));
+    insert.addBindValue(reason.isEmpty() ? QVariant(QMetaType(QMetaType::QString)) : QVariant(reason));
+    if (!insert.exec()) {
+        qWarning() << "[Attention] enqueue failed" << kind << ref << insert.lastError();
+        return 0;
+    }
+    // 无论本次是插入还是冲突跳过，都回读该行 id：调用方需要它来落终态。
+    QSqlQuery existing(m_db);
+    existing.prepare("SELECT id FROM attention_event WHERE kind=? AND ref=?");
+    existing.addBindValue(kind);
+    existing.addBindValue(ref);
+    if (!existing.exec() || !existing.next())
+        return 0;
+    return existing.value(0).toLongLong();
+}
+
+QJsonObject MemoryManager::claimAttentionEvent()
+{
+    if (!m_db.isOpen() || !m_db.transaction())
+        return {};
+    QJsonObject event;
+    {
+        QSqlQuery select(m_db);
+        if (!select.exec("SELECT id,kind,ref,payload,priority,created_at FROM attention_event "
+                         "WHERE state='pending' ORDER BY priority,id LIMIT 1")
+            || !select.next()) {
+            m_db.rollback();
+            return {};
+        }
+        event = QJsonObject{
+            {QStringLiteral("id"), select.value(0).toLongLong()},
+            {QStringLiteral("kind"), select.value(1).toString()},
+            {QStringLiteral("ref"), select.value(2).toString()},
+            {QStringLiteral("payload"), QJsonDocument::fromJson(select.value(3).toByteArray()).object()},
+            {QStringLiteral("priority"), select.value(4).toInt()},
+            {QStringLiteral("created_at"), select.value(5).toLongLong()}};
+    }
+    QSqlQuery claim(m_db);
+    claim.prepare("UPDATE attention_event SET state='claimed',claimed_at=unixepoch() "
+                  "WHERE id=? AND state='pending'");
+    claim.addBindValue(event.value(QStringLiteral("id")).toInteger());
+    if (!claim.exec() || claim.numRowsAffected() != 1 || !m_db.commit()) {
+        m_db.rollback();
+        return {};
+    }
+    return event;
+}
+
+bool MemoryManager::completeAttentionEvent(qlonglong id, const QString &state, const QString &reason)
+{
+    if (id <= 0 || (state != QStringLiteral("done") && state != QStringLiteral("abandoned")))
+        return false;
+    QSqlQuery q(m_db);
+    // 允许 pending→done：message/due_wake 这类"直接观测"事件没有独占领取者；
+    // claimed→done/abandoned 是 recovery/activity_result 这类独占处理者的正常终态。
+    // 终态不可再次变更（同一事件重复 complete 返回 false）。
+    q.prepare("UPDATE attention_event SET state=?,done_at=unixepoch(),"
+              "reason=coalesce(nullif(?,''),reason) WHERE id=? AND state IN ('pending','claimed')");
+    q.addBindValue(state);
+    q.addBindValue(reason);
+    q.addBindValue(id);
+    return q.exec() && q.numRowsAffected() == 1;
+}
+
+QJsonObject MemoryManager::attentionBacklog() const
+{
+    QJsonObject pendingKinds;
+    QJsonObject byState;
+    qlonglong oldest = 0;
+    if (!m_db.isOpen()) {
+        return {{QStringLiteral("pending"), pendingKinds},
+                {QStringLiteral("by_state"), byState},
+                {QStringLiteral("oldest_age_seconds"), oldest}};
+    }
+    QSqlQuery states(m_db);
+    if (states.exec("SELECT state,count(*) FROM attention_event GROUP BY state")) {
+        while (states.next())
+            byState.insert(states.value(0).toString(), states.value(1).toInt());
+    }
+    QSqlQuery pending(m_db);
+    if (pending.exec("SELECT kind,count(*) FROM attention_event WHERE state='pending' GROUP BY kind")) {
+        while (pending.next())
+            pendingKinds.insert(pending.value(0).toString(), pending.value(1).toInt());
+    }
+    // 没有 pending 时 min(created_at) 为 NULL，整体表达式也是 NULL，此处归 0。
+    QSqlQuery age(m_db);
+    if (age.exec("SELECT unixepoch()-min(created_at) FROM attention_event WHERE state='pending'")
+        && age.next() && !age.value(0).isNull())
+        oldest = qMax<qlonglong>(0, age.value(0).toLongLong());
+    return {{QStringLiteral("pending"), pendingKinds},
+            {QStringLiteral("by_state"), byState},
+            {QStringLiteral("oldest_age_seconds"), oldest}};
+}
+
+void MemoryManager::setAttentionState(const QString &key, const QString &value)
+{
+    if (!m_db.isOpen() || key.isEmpty())
+        return;
+    QSqlQuery q(m_db);
+    q.prepare("INSERT INTO attention_state(key,value,updated_at) VALUES(?,?,unixepoch()) "
+              "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at");
+    q.addBindValue(key);
+    q.addBindValue(value);
+    if (!q.exec())
+        qWarning() << "[Attention] state write failed" << key << q.lastError();
+}
+
+QString MemoryManager::attentionState(const QString &key) const
+{
+    if (!m_db.isOpen() || key.isEmpty())
+        return {};
+    QSqlQuery q(m_db);
+    q.prepare("SELECT value FROM attention_state WHERE key=?");
+    q.addBindValue(key);
+    if (!q.exec() || !q.next())
+        return {};
+    return q.value(0).toString();
+}
+
+int MemoryManager::enqueueRecoveryEvents(int olderThanSeconds)
+{
+    if (!m_db.isOpen())
+        return 0;
+    // timestamp 是本地时区字段（recordInput/saveQATurn 都按本地时间写入），比较时
+    // 先用 'localtime' 转到本地再回退 N 秒，与 decayEpisodicMemory 等既有写法一致。
+    const int age = qMax(0, olderThanSeconds);
+    QSqlQuery received(m_db);
+    received.prepare(QStringLiteral(
+        "SELECT id,channel,session_id FROM chat_history "
+        "WHERE turn_state='received' AND julianday(timestamp)<=julianday('now','localtime','-%1 seconds')")
+        .arg(age));
+    if (!received.exec()) {
+        qWarning() << "[Attention] recovery scan failed" << received.lastError();
+        return 0;
+    }
+    QList<QVariantList> rows;
+    while (received.next())
+        rows.append(QVariantList{received.value(0), received.value(1), received.value(2)});
+    int queued = 0;
+    for (const auto &row : rows) {
+        const qlonglong turn = row.at(0).toLongLong();
+        if (turn <= 0)
+            continue;
+        const QString ref = QStringLiteral("turn:%1").arg(turn);
+        // 幂等：该轮次已有 recovery 记录（无论状态）就不再入队，重复扫描返回 0。
+        QSqlQuery seen(m_db);
+        seen.prepare("SELECT 1 FROM attention_event WHERE kind='recovery' AND ref=?");
+        seen.addBindValue(ref);
+        if (seen.exec() && seen.next())
+            continue;
+        const QJsonObject payload{{QStringLiteral("turn"), turn},
+                                  {QStringLiteral("channel"), row.at(1).toString()},
+                                  {QStringLiteral("session"), row.at(2).toString()}};
+        if (enqueueAttentionEvent(QStringLiteral("recovery"), ref, payload,
+                                  QStringLiteral("interrupted_turn"), 10) > 0)
+            ++queued;
+    }
+    return queued;
 }
 
 QJsonArray MemoryManager::structuredMemoryRows(const QStringList &kinds, const QString &subject,
@@ -1103,7 +1376,7 @@ bool MemoryManager::indexChatTurn(qlonglong id)
     if (id <= 0)
         return false;
     QSqlQuery q(m_db);
-    q.prepare("SELECT channel,session_id,subject,speaker,user_input,raw_reply,timestamp,sensitive "
+    q.prepare("SELECT channel,session_id,subject,speaker,user_input,raw_reply,timestamp,sensitive,turn_kind "
               "FROM chat_history WHERE id=?");
     q.addBindValue(id);
     if (!q.exec() || !q.next() || q.value(7).toInt() != 0)
@@ -1115,6 +1388,9 @@ bool MemoryManager::indexChatTurn(qlonglong id)
     const QString userText = q.value(4).toString();
     const QString rawReply = q.value(5).toString();
     const QString timestamp = q.value(6).toString();
+    // 主动轮次（turn_kind='proactive'）没有用户输入：不造空的 turn_user 块，
+    // 说话内容全部由下面的 assistant 块从 raw_reply.sentences[].zh_text 收录。
+    const bool proactive = q.value(8).toString() == QStringLiteral("proactive");
     const QString privacy = channel == Channel::kQQGroup
         ? QStringLiteral("public") : QStringLiteral("private");
     q.finish();
@@ -1127,27 +1403,29 @@ bool MemoryManager::indexChatTurn(qlonglong id)
     remove.addBindValue(userText.trimmed());
     if (!remove.exec())
         return false;
-    MemoryChunkWrite user;
-    user.sourceType = QStringLiteral("chat");
-    user.sourceRef = QStringLiteral("chat/%1:user").arg(id);
-    user.chunkKind = QStringLiteral("turn_user");
-    user.derived = QStringLiteral("original");
-    user.text = userText;
-    user.channel = channel;
-    user.session = session;
-    user.speakerId = subject.isEmpty()
-        ? QStringLiteral("user")
-        : (subject == QStringLiteral("user") ? QStringLiteral("owner") : subject);
-    user.speakerName = speaker.isEmpty()
-        ? (subject == QStringLiteral("user") ? QStringLiteral("主人") : QStringLiteral("群友"))
-        : speaker;
-    user.speakerRole = QStringLiteral("user");
-    user.speechAt = timestamp;
-    user.privacy = privacy;
-    user.sourceTable = QStringLiteral("chat_history");
-    user.sourceId = QString::number(id);
-    if (!upsertMemoryChunk(user))
-        return false;
+    if (!proactive) {
+        MemoryChunkWrite user;
+        user.sourceType = QStringLiteral("chat");
+        user.sourceRef = QStringLiteral("chat/%1:user").arg(id);
+        user.chunkKind = QStringLiteral("turn_user");
+        user.derived = QStringLiteral("original");
+        user.text = userText;
+        user.channel = channel;
+        user.session = session;
+        user.speakerId = subject.isEmpty()
+            ? QStringLiteral("user")
+            : (subject == QStringLiteral("user") ? QStringLiteral("owner") : subject);
+        user.speakerName = speaker.isEmpty()
+            ? (subject == QStringLiteral("user") ? QStringLiteral("主人") : QStringLiteral("群友"))
+            : speaker;
+        user.speakerRole = QStringLiteral("user");
+        user.speechAt = timestamp;
+        user.privacy = privacy;
+        user.sourceTable = QStringLiteral("chat_history");
+        user.sourceId = QString::number(id);
+        if (!upsertMemoryChunk(user))
+            return false;
+    }
 
     const auto root = QJsonDocument::fromJson(rawReply.toUtf8()).object();
     QStringList replyParts;
@@ -1481,6 +1759,84 @@ bool MemoryManager::clearAllHistory()
     qDebug()<<"[MemoryManager]清空记录成功";
     emit understandingChanged();
     return true;
+}
+
+qlonglong MemoryManager::recordProactiveMessage(const QString &channel, const QString &session, const QString &text,
+                                                const QString &kind, const QString &ref)
+{
+    const QString body = text.trimmed();
+    if (!m_db.isOpen() || body.isEmpty() || channel.isEmpty() || session.isEmpty()) return 0;
+    // 同一投递意图（kind+ref）只写一条历史：渠道拒绝后补发成功时，历史里不会出现
+    // 两条一模一样的"茉子主动说过的话"。
+    if (!kind.isEmpty() && !ref.isEmpty()) {
+        QSqlQuery existing(m_db);
+        existing.prepare("SELECT id FROM chat_history WHERE channel=? AND session_id=? "
+                         "AND turn_kind='proactive' "
+                         "AND json_extract(raw_reply,'$.delivery.kind')=? "
+                         "AND json_extract(raw_reply,'$.delivery.ref')=? ORDER BY id LIMIT 1");
+        existing.addBindValue(channel);
+        existing.addBindValue(session);
+        existing.addBindValue(kind);
+        existing.addBindValue(ref);
+        if (existing.exec() && existing.next()) return existing.value(0).toLongLong();
+    }
+    // 主动消息也按"茉子说过的话"存档：sentences 与正常回复同形，另带 delivery 引用，
+    // 供下次对话把这句话当成 prior_assistant_expression 回认。
+    QJsonObject sentence{{QStringLiteral("zh_text"), body},
+                         {QStringLiteral("ja_text"), QString{}},
+                         {QStringLiteral("tags"), QJsonObject{}}};
+    QJsonObject root{{QStringLiteral("sentences"), QJsonArray{sentence}},
+                     {QStringLiteral("delivery"), QJsonObject{{QStringLiteral("kind"), kind},
+                                                              {QStringLiteral("ref"), ref}}}};
+    const QString rawReply = QString::fromUtf8(QJsonDocument(root).toJson(QJsonDocument::Compact));
+    if (!m_db.transaction()) return 0;
+    QSqlQuery q(m_db);
+    // user_input 用 SQL NULL：主动轮次没有用户发言，不能伪装成用户输入参与回顾/认识更新。
+    // turn_state='handed_off' 与正常轮次一致；turn_kind='proactive' 让回顾领取与认识更新跳过它。
+    q.prepare("INSERT INTO chat_history(user_input,raw_reply,channel,session_id,speaker,sensitive,"
+              "turn_kind,subject,turn_state,cognitive_event,timestamp) "
+              "VALUES(NULL,?,?,?,'mako',0,'proactive','user','handed_off',NULL,?)");
+    q.addBindValue(rawReply);
+    q.addBindValue(channel);
+    q.addBindValue(session);
+    q.addBindValue(QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")));
+    if (!q.exec() || q.numRowsAffected() != 1) {
+        qWarning() << "[MemoryManager]主动消息写历史失败:" << q.lastError();
+        m_db.rollback();
+        return 0;
+    }
+    const qlonglong id = q.lastInsertId().toLongLong();
+    // raw_events：direction='out'；发送者留空，避免给"茉子"造一条 QQ 身份映射。
+    RawEventWrite event;
+    event.platform = channel == Channel::kPet ? QStringLiteral("pet")
+        : (channel == Channel::kQQPrivate || channel == Channel::kQQGroup) ? QStringLiteral("qq")
+        : channel;
+    event.channel = channel;
+    event.sessionId = session;
+    event.eventType = QStringLiteral("message");
+    event.content = body;
+    event.direction = QStringLiteral("out");
+    event.senderName = QStringLiteral("茉子");
+    event.occurredAt = QDateTime::currentDateTime();
+    event.sensitive = false;
+    // 出站流水没有需要再消费的原始事件；标成已处理，避免被群聊切片器当成未读消息。
+    event.processed = true;
+    event.visibility = channel == Channel::kQQGroup ? QStringLiteral("channel")
+                                                    : QStringLiteral("private");
+    event.redactionStatus = QStringLiteral("none");
+    // 原始流水失败时整次回滚，避免只留半条历史。
+    if (!appendRawEvent(event) || !m_db.commit()) {
+        qWarning() << "[MemoryManager]主动消息写原始事件失败:" << m_db.lastError();
+        m_db.rollback();
+        return 0;
+    }
+    // commit 后再建检索块：主动轮次没有用户块，assistant 块收录这里说的 zh_text。
+    if (id > 0 && !indexChatTurn(id))
+        qWarning() << "[MemoryIndex] proactive chat index failed:" << id;
+    else if (id > 0)
+        emit searchChunksChanged();
+    qInfo() << "[Proactive] recorded" << kind << ref << channel << session << "turn=" << id;
+    return id;
 }
 
 QList<HistoryTurn> MemoryManager::getUnsummarizedTurns(qlonglong &outLastEndId, QList<qlonglong> &outSourceIds, const QString &channel, const QString &sessionId, qint64 throughTurn)
@@ -4585,6 +4941,108 @@ void MemoryManager::initDatabase(const QString &dbFilePath, const QString &conne
                                "JOIN chat_history h ON h.id=b.source WHERE h.cognitive_event=OLD.event); END")
                 || !query.exec("PRAGMA user_version=22")) throw query.lastError();
             currentVersion=22;
+        }
+        if (currentVersion<23) {
+            // 关注生命周期字段（v23）。旧版本回退重放（例如把 user_version 调低再启动）时
+            // private_reflection 里可能已经有这些列，故按列名幂等补列；
+            // 新库从 v0 一路迁移时 private_reflection 已在 v18 建好，这里同样只是补列。
+            QSqlQuery columns(m_db);
+            if (!columns.exec("PRAGMA table_info(private_reflection)")) throw columns.lastError();
+            QSet<QString> present;
+            while (columns.next()) present.insert(columns.value(1).toString());
+            const QList<QPair<QString,QString>> alters{
+                {QStringLiteral("topic"),QStringLiteral("TEXT")},
+                {QStringLiteral("watch"),QStringLiteral("TEXT")},
+                {QStringLiteral("root_turn"),QStringLiteral("INTEGER")},
+                {QStringLiteral("next_check_at"),QStringLiteral("INTEGER NOT NULL DEFAULT 0")},
+                {QStringLiteral("resolved_by"),QStringLiteral("INTEGER")},
+                {QStringLiteral("resolved_kind"),QStringLiteral("TEXT")},
+                {QStringLiteral("matter"),QStringLiteral("TEXT")},
+                {QStringLiteral("claimed_by"),QStringLiteral("TEXT")}};
+            for (const auto &alter : alters) {
+                if (present.contains(alter.first)) continue;
+                if (!query.exec(QStringLiteral("ALTER TABLE private_reflection ADD COLUMN ")
+                                + alter.first + QStringLiteral(" ") + alter.second))
+                    throw query.lastError();
+            }
+            // 既有行补根轮次与下一次检查时间：关注身份默认等于来源轮次，12 小时后再看。
+            if (!query.exec("UPDATE private_reflection SET root_turn=turn_id WHERE root_turn IS NULL")
+                || !query.exec("UPDATE private_reflection SET next_check_at=updated_at+43200 WHERE next_check_at=0")
+                || !query.exec("PRAGMA user_version=23")) throw query.lastError();
+            currentVersion=23;
+        }
+        if (currentVersion<24) {
+            // v24：主动联系/分享的"执行反馈"（B4）。
+            // 1) reflection_contact 增加投递状态：attempts 只统计被拒/未知的失败尝试，
+            //    last_outcome 做终态快照（outcome 列仍是当前状态机状态），last_attempt_at 供重试排序。
+            //    旧库回退重放（把 user_version 调低再启动）时这些列可能已存在，先按列名幂等补列。
+            if (!query.exec("CREATE TABLE IF NOT EXISTS reflection_contact(turn_id INTEGER PRIMARY KEY,"
+                            "version INTEGER NOT NULL,timing TEXT NOT NULL,reason TEXT,message TEXT,"
+                            "outcome TEXT NOT NULL,channel TEXT,session TEXT)"))
+                throw query.lastError();
+            QSqlQuery contactColumns(m_db);
+            if (!contactColumns.exec("PRAGMA table_info(reflection_contact)")) throw contactColumns.lastError();
+            QSet<QString> contactPresent;
+            while (contactColumns.next()) contactPresent.insert(contactColumns.value(1).toString());
+            const QList<QPair<QString,QString>> contactAlters{
+                {QStringLiteral("attempts"),QStringLiteral("INTEGER NOT NULL DEFAULT 0")},
+                {QStringLiteral("last_outcome"),QStringLiteral("TEXT")},
+                {QStringLiteral("last_attempt_at"),QStringLiteral("INTEGER")}};
+            for (const auto &alter : contactAlters) {
+                if (contactPresent.contains(alter.first)) continue;
+                if (!query.exec(QStringLiteral("ALTER TABLE reflection_contact ADD COLUMN ")
+                                + alter.first + QStringLiteral(" ") + alter.second))
+                    throw query.lastError();
+            }
+            // 存量行回填：老库的 outcome 就是最近一次结果；没有 attempts 历史，按 0 起算。
+            if (!query.exec("UPDATE reflection_contact SET last_outcome=outcome WHERE last_outcome IS NULL"))
+                throw query.lastError();
+            // 2) 统一投递流水：提醒/主动联系/草稿分享共用一张表，按 (kind,ref) 幂等。
+            //    state 取值：claimed|handed_off|protocol_accepted|rejected|unknown|withheld|expired。
+            if (!query.exec("CREATE TABLE IF NOT EXISTS delivery_ledger("
+                            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                            "kind TEXT NOT NULL,"
+                            "ref TEXT NOT NULL,"
+                            "channel TEXT, session TEXT,"
+                            "text TEXT,"
+                            "state TEXT NOT NULL,"
+                            "attempts INTEGER NOT NULL DEFAULT 0,"
+                            "last_error TEXT,"
+                            "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                            "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                            "UNIQUE(kind,ref))")
+                || !query.exec("CREATE INDEX IF NOT EXISTS delivery_ledger_state "
+                               "ON delivery_ledger(state,kind)")
+                || !query.exec("PRAGMA user_version=24")) throw query.lastError();
+            currentVersion=24;
+        }
+        if (currentVersion<25) {
+            // v25：统一注意力事件（B1）。
+            // attention_event 是通用队列：kind=pending 状态机 + (kind,ref) 幂等键；
+            // attention_state 存"当前活动/切换原因/最近唤醒"等当下状态。
+            // created_at/updated_at 由写入方显式给 unixepoch()，不依赖 DEFAULT 表达式，
+            // 与旧库时区约定一致。旧测试会把 user_version 压回更小值重放迁移，故此块
+            // 全部用 IF NOT EXISTS，保证可重放。
+            if (!query.exec("CREATE TABLE IF NOT EXISTS attention_event("
+                            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                            "kind TEXT NOT NULL,"
+                            "ref TEXT NOT NULL,"
+                            "payload TEXT NOT NULL DEFAULT '{}',"
+                            "state TEXT NOT NULL DEFAULT 'pending',"
+                            "priority INTEGER NOT NULL DEFAULT 50,"
+                            "reason TEXT,"
+                            "created_at INTEGER NOT NULL DEFAULT 0,"
+                            "claimed_at INTEGER,"
+                            "done_at INTEGER,"
+                            "UNIQUE(kind,ref))")
+                || !query.exec("CREATE INDEX IF NOT EXISTS attention_event_pending "
+                               "ON attention_event(state,priority,id)")
+                || !query.exec("CREATE TABLE IF NOT EXISTS attention_state("
+                               "key TEXT PRIMARY KEY,"
+                               "value TEXT,"
+                               "updated_at INTEGER NOT NULL DEFAULT 0)")
+                || !query.exec("PRAGMA user_version=25")) throw query.lastError();
+            currentVersion=25;
         }
         // 关注了结的独立流水（v22 的补充表）。与 reflection_change（回顾链修订）分开：
         // 前者由正常对话写回，后者由私下回顾写，共用 turn 主键会互相覆盖。

@@ -937,6 +937,49 @@ private slots:
         }
     }
 
+    // B1：启动时把崩溃遗留的 received 轮次登记为 recovery；reviewIfDue 先恢复它再考虑回顾。
+    void reviewIfDueRecoversInterruptedTurn()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto dbPath = dir.filePath("coordinator-recovery.db");
+        qint64 turn = 0;
+        {
+            MemoryManager beforeRestart(dbPath);
+            RequestMeta meta;
+            meta.eventId = meta.runId = QStringLiteral("interrupted-before-restart");
+            meta.receivedAtUtc = QDateTime::currentDateTimeUtc().addSecs(-300);
+            turn = beforeRestart.recordInput(QStringLiteral("这一轮在崩溃前没得到回复"), meta, true);
+            QVERIFY(turn > 0);
+            // timestamp 是本地时间；挪到 3 分钟前，模拟上次进程没来得及回写。
+            QSqlQuery clock(QSqlDatabase::database("memory_db_connection"));
+            QVERIFY(clock.exec(QStringLiteral(
+                "UPDATE chat_history SET timestamp=datetime('now','localtime','-180 seconds') WHERE id=%1").arg(turn)));
+        }
+        MemoryManager db(dbPath);
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QByteArray> bodies;
+        serveCompletions(server,bodies,[](int){ return QStringLiteral(R"({"sentences":[]})"); });
+        LLMService model("test",nullptr,QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.serverPort())));
+        model.setMemoryManager(&db);
+        CognitiveCoordinator coordinator(db,model,nullptr);
+        // 构造函数已把遗留轮次入队为 recovery（最高优先级）。
+        QCOMPARE(db.attentionBacklog()["pending"].toObject()["recovery"].toInt(), 1);
+        coordinator.reviewIfDue();
+        QSqlQuery check(QSqlDatabase::database("memory_db_connection"));
+        QVERIFY(check.exec(QStringLiteral(
+            "SELECT turn_state,turn_detail FROM chat_history WHERE id=%1").arg(turn)));
+        QVERIFY(check.next());
+        QCOMPARE(check.value(0).toString(), QStringLiteral("interrupted"));
+        QCOMPARE(check.value(1).toString(), QStringLiteral("restart_recovery"));
+        // recovery 事件已落终态：pending 里不再有它。
+        QCOMPARE(db.attentionBacklog()["pending"].toObject()["recovery"].toInt(), 0);
+        QCOMPARE(db.attentionBacklog()["by_state"].toObject()["done"].toInt(), 1);
+        // 恢复优先于回顾：本轮没有启动新的回顾请求。
+        QCOMPARE(bodies.size(), 0);
+    }
+
     void initTestCase()
     {
         qRegisterMetaType<MemoryAgentResult>("MemoryAgentResult");

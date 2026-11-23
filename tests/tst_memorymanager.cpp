@@ -141,6 +141,75 @@ static void makePetTurn(MemoryManager &mm, const QString &userText, const QStrin
     QVERIFY(mm.saveQATurn(userText, replyText, {}, meta));
 }
 
+// 主动联系/分享的配置在 identity.json 的 proactive 段。测试里临时启用，析构时恢复，
+// 避免单例配置影响其它用例。
+class ProactiveIdentityGuard
+{
+public:
+    ProactiveIdentityGuard()
+    {
+        auto &config = ConfigManager::instance();
+        m_path = QDir(config.getConfigDirPath()).filePath(QStringLiteral("identity.json"));
+        QFile file(m_path);
+        m_existed = file.exists();
+        if (file.open(QIODevice::ReadOnly)) m_original = file.readAll();
+    }
+    ~ProactiveIdentityGuard()
+    {
+        auto &config = ConfigManager::instance();
+        if (m_existed) {
+            config.writeConfigDocument(QStringLiteral("identity.json"),
+                                       m_original.isEmpty() ? QByteArray("{}") : m_original, nullptr);
+        } else {
+            QFile::remove(m_path);
+            config.reloadIdentity();
+        }
+    }
+    // private_writing 明确保持 false：主动联系的可达性不应依赖后台写作开关。
+    bool enableContact()
+    {
+        return ConfigManager::instance().writeConfigDocument(
+            QStringLiteral("identity.json"),
+            R"({"proactive":{"enabled":true,"private_writing":false,"targets":[{"channel":"pet","session_id":"default"}]}})",
+            nullptr);
+    }
+
+private:
+    QString m_path;
+    QByteArray m_original;
+    bool m_existed = false;
+};
+
+// 回顾领取有 60s 冷却：把 thought_review_log 往前挪，模拟冷却已过。
+static bool rewindReviewCooldown(const QString &dbPath, const QString &tag)
+{
+    RawDb clock(dbPath, tag);
+    if (!clock.open()) return false;
+    return clock.exec(QStringLiteral("UPDATE thought_review_log SET started_at=started_at-120"));
+}
+
+static RequestMeta concernTurnMeta(const QString &event)
+{
+    RequestMeta meta;
+    meta.eventId = meta.runId = event;
+    meta.receivedAtUtc = QDateTime::currentDateTimeUtc();
+    return meta;
+}
+
+// 领取并提交一条 consider 回顾，形成一个开放关注；contact 非空时同时产生 proposed 联系。
+static qint64 seedOpenConcern(MemoryManager &mm, const RequestMeta &meta, const QString &input,
+                              const QString &note, const QJsonObject &concern = {},
+                              const QJsonObject &contact = {})
+{
+    const qint64 turn = mm.recordInput(input, meta, true);
+    if (turn <= 0 || !mm.recordQuiet(turn, "close")) return 0;
+    const auto claim = mm.claimPrivateReflection(12, 60);
+    if (claim["id"].toInteger() != turn || claim["version"].toInt() != 1) return 0;
+    if (!mm.finishPrivateReflection(turn, 1, "consider", note, contact, {}, {}, QString{}, concern))
+        return 0;
+    return turn;
+}
+
 class FailingEmbeddingProvider : public MemoryEmbeddingProvider
 {
 public:
@@ -224,7 +293,7 @@ private slots:
         QVERIFY(raw.exec("DROP TABLE matter_revision"));
         for (int reopen=0; reopen<2; ++reopen) {
             MemoryManager db(path);
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),22);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),25);
             QCOMPARE(raw.scalar("SELECT state_updates FROM chat_history").toString(),QString("[]"));
             QVERIFY(db.matterHeads("user").isEmpty());
         }
@@ -585,7 +654,7 @@ private slots:
         }
         RawDb raw(path,"v17-semantics");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),22);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),25);
         QCOMPARE(raw.scalar("SELECT count(*) FROM matter_revision").toInt(),1);
         QVERIFY(raw.scalar("SELECT semantics IS NULL FROM matter_revision").toBool());
     }
@@ -659,7 +728,7 @@ private slots:
         RawDb raw(path,"lifecycle");
         QVERIFY(raw.open());
         QCOMPARE(raw.scalar("SELECT count(*) FROM matter_revision").toInt(),2);
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),22);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),25);
     }
 
     void currentUnderstandingRetainsLatestSelfReport()
@@ -1405,7 +1474,7 @@ private slots:
         }
         RawDb raw(path, "v15-verify");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 22);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 25);
     }
 
     void databaseBackupIsConsistent()
@@ -1425,7 +1494,7 @@ private slots:
         RawDb copy(backup, "backup-copy");
         QVERIFY(copy.open());
         QCOMPARE(copy.scalar("SELECT count(*) FROM chat_history").toInt(), 1);
-        QCOMPARE(copy.scalar("PRAGMA user_version").toInt(), 22);
+        QCOMPARE(copy.scalar("PRAGMA user_version").toInt(), 25);
         QVERIFY(copy.scalar("SELECT count(*) FROM memory_chunks").toInt() > 0);
     }
 
@@ -1662,7 +1731,7 @@ private slots:
             QVERIFY(raw.open());
 
             // 版本推进到 v3
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 22);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 25);
 
             // 列扩展（v2 渠道 + v3 轮次）
             const QStringList historyCols = raw.columns("chat_history");
@@ -1767,7 +1836,7 @@ private slots:
             MemoryManager second(dbPath);
             RawDb raw(dbPath, "verify2");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 22);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 25);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM chat_history").toInt(), 1);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM relationship_state").toInt(), 2);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM long_term_summary").toInt(), 1);
@@ -1784,7 +1853,7 @@ private slots:
             MemoryManager mm(dbPath);
             RawDb raw(dbPath, "fresh");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 22);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 25);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('raw_events')").toInt() > 0);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('memory_cursor')").toInt() > 0);
 
@@ -1991,7 +2060,7 @@ private slots:
         Q_UNUSED(mm);
         RawDb raw(dbPath, "v2verify");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 22);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 25);
         QCOMPARE(raw.scalar("SELECT user_input FROM chat_history").toString(), QStringLiteral("旧输入"));
         QCOMPARE(raw.scalar("SELECT turn_kind FROM chat_history").toString(), QStringLiteral("reply"));
         QCOMPARE(raw.scalar("SELECT subject FROM chat_history").toString(), QStringLiteral("user"));
@@ -2737,6 +2806,552 @@ private slots:
         QVERIFY(mm.updateMemoryCursor(Channel::kPet, Channel::kDefaultSession, 43, 8));
         QCOMPARE(mm.getMemoryCursorEventId(Channel::kPet, Channel::kDefaultSession), qlonglong(43));
         QCOMPARE(mm.getMemoryCursorEventId(Channel::kQQGroup, QStringLiteral("group:123")), qlonglong(0));
+    }
+
+    // B4：主动联系门控解耦后的重试状态机（rejected 补一次；unknown/已送达不重发）。
+    void contactRetriesOnceAfterRejection()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableContact());
+        const QString path = dir.filePath("contact-retry.db");
+        MemoryManager db(path);
+
+        const auto message = QStringLiteral("在忙吗");
+        const auto note = QStringLiteral("荷包蛋好不好吃");
+        const qint64 turn = seedOpenConcern(db, concernTurnMeta(QStringLiteral("contact-retry-a")),
+                                            QStringLiteral("明天想做荷包蛋，不知道好不好吃"), note,
+                                            QJsonObject{},
+                                            QJsonObject{{"timing", "now"},
+                                                        {"reason", QStringLiteral("到了约定时间")},
+                                                        {"message", message}});
+        QVERIFY(turn > 0);
+        // private_writing=false（enableContact 里固定为 false）时仍可领取并投递。
+        QCOMPARE(db.claimReflectionContact(turn, 1, Channel::kPet, Channel::kDefaultSession), message);
+        QVERIFY(db.recordContactOutcome(turn, 1, "rejected"));
+        // 渠道拒绝一次：允许补发一次。
+        QCOMPARE(db.claimReflectionContact(turn, 1, Channel::kPet, Channel::kDefaultSession), message);
+        QVERIFY(db.recordContactOutcome(turn, 1, "rejected"));
+        // 第二次拒绝后不再领取。
+        QVERIFY(db.claimReflectionContact(turn, 1, Channel::kPet, Channel::kDefaultSession).isEmpty());
+
+        // unknown：协议层可能已送达，不重发。
+        QVERIFY(rewindReviewCooldown(path, QStringLiteral("contact-retry-clock")));
+        const qint64 unknownTurn = seedOpenConcern(
+            db, concernTurnMeta(QStringLiteral("contact-retry-b")),
+            QStringLiteral("最近想看海"), QStringLiteral("想看海"),
+            QJsonObject{}, QJsonObject{{"timing", "now"},
+                                       {"reason", QStringLiteral("想问问")},
+                                       {"message", QStringLiteral("最近还好吗")}});
+        QVERIFY(unknownTurn > 0);
+        QVERIFY(!db.claimReflectionContact(unknownTurn, 1, Channel::kPet, Channel::kDefaultSession).isEmpty());
+        QVERIFY(db.recordContactOutcome(unknownTurn, 1, "unknown"));
+        QVERIFY(db.claimReflectionContact(unknownTurn, 1, Channel::kPet, Channel::kDefaultSession).isEmpty());
+
+        // protocol_accepted：已送达，不重发。
+        QVERIFY(rewindReviewCooldown(path, QStringLiteral("contact-retry-clock2")));
+        const qint64 acceptedTurn = seedOpenConcern(
+            db, concernTurnMeta(QStringLiteral("contact-retry-c")),
+            QStringLiteral("昨天的饭很香"), QStringLiteral("饭菜很香"),
+            QJsonObject{}, QJsonObject{{"timing", "now"},
+                                       {"reason", QStringLiteral("想问问")},
+                                       {"message", QStringLiteral("吃饭了吗")}});
+        QVERIFY(acceptedTurn > 0);
+        QVERIFY(!db.claimReflectionContact(acceptedTurn, 1, Channel::kPet, Channel::kDefaultSession).isEmpty());
+        QVERIFY(db.recordContactOutcome(acceptedTurn, 1, "protocol_accepted"));
+        QVERIFY(db.claimReflectionContact(acceptedTurn, 1, Channel::kPet, Channel::kDefaultSession).isEmpty());
+
+        RawDb raw(path, "contact-retry-raw");
+        QVERIFY(raw.open());
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT attempts FROM reflection_contact WHERE turn_id=%1").arg(turn)).toInt(), 2);
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT last_outcome FROM reflection_contact WHERE turn_id=%1").arg(turn)).toString(),
+                 QStringLiteral("rejected"));
+        QVERIFY(raw.scalar(QStringLiteral("SELECT last_attempt_at FROM reflection_contact WHERE turn_id=%1").arg(turn)).toLongLong() > 0);
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT attempts FROM reflection_contact WHERE turn_id=%1").arg(unknownTurn)).toInt(), 1);
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT last_outcome FROM reflection_contact WHERE turn_id=%1").arg(acceptedTurn)).toString(),
+                 QStringLiteral("protocol_accepted"));
+        // 只有仍可重试的联系会进入重试清单。
+        QVERIFY(db.retryableReflectionContacts(4).isEmpty());
+    }
+
+    // B4：主动消息写历史/原始流水，下次对话能回认；且不参与回顾/认识更新。
+    void proactiveMessageRecordedForRecall()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath("proactive-record.db");
+        MemoryManager db(path);
+        const qlonglong id = db.recordProactiveMessage(Channel::kQQPrivate, QStringLiteral("2014366825"),
+                                                       QStringLiteral("晚安呀"), QStringLiteral("contact"),
+                                                       QStringLiteral("reflection/1"));
+        QVERIFY(id > 0);
+        RawDb raw(path, "proactive-record");
+        QVERIFY(raw.open());
+        QCOMPARE(raw.scalar("SELECT turn_kind FROM chat_history").toString(), QStringLiteral("proactive"));
+        QCOMPARE(raw.scalar("SELECT user_input IS NULL FROM chat_history").toInt(), 1);
+        QCOMPARE(raw.scalar("SELECT turn_state FROM chat_history").toString(), QStringLiteral("handed_off"));
+        QCOMPARE(raw.scalar("SELECT speaker FROM chat_history").toString(), QStringLiteral("mako"));
+        QCOMPARE(raw.scalar("SELECT subject FROM chat_history").toString(), QStringLiteral("user"));
+        QCOMPARE(raw.scalar("SELECT sensitive FROM chat_history").toInt(), 0);
+        QVERIFY(raw.scalar("SELECT cognitive_event IS NULL FROM chat_history").toBool());
+        const auto reply = QJsonDocument::fromJson(
+            raw.scalar("SELECT raw_reply FROM chat_history").toString().toUtf8()).object();
+        QCOMPARE(reply["sentences"].toArray().first().toObject()["zh_text"].toString(), QStringLiteral("晚安呀"));
+        QCOMPARE(reply["delivery"].toObject()["kind"].toString(), QStringLiteral("contact"));
+        QCOMPARE(reply["delivery"].toObject()["ref"].toString(), QStringLiteral("reflection/1"));
+        // 原始事件：direction='out'，平台按渠道推导。
+        QCOMPARE(raw.scalar("SELECT count(*) FROM raw_events WHERE direction='out'").toInt(), 1);
+        QCOMPARE(raw.scalar("SELECT content FROM raw_events WHERE direction='out'").toString(), QStringLiteral("晚安呀"));
+        QCOMPARE(raw.scalar("SELECT platform FROM raw_events WHERE direction='out'").toString(), QStringLiteral("qq"));
+        QCOMPARE(raw.scalar("SELECT event_type FROM raw_events WHERE direction='out'").toString(), QStringLiteral("message"));
+        QCOMPARE(raw.scalar("SELECT sensitive FROM raw_events WHERE direction='out'").toInt(), 0);
+        QCOMPARE(raw.scalar("SELECT redaction_status FROM raw_events WHERE direction='out'").toString(), QStringLiteral("none"));
+        // 索引收录主动文本（assistant 块），且没有空的 turn_user 块。
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM memory_chunks WHERE source_type='chat' "
+                                           "AND source_ref LIKE 'chat/%1:%%' AND text LIKE '%%晚安呀%%'").arg(id)).toInt(), 1);
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM memory_chunks WHERE source_type='chat' "
+                                           "AND source_ref LIKE 'chat/%1:%%' AND chunk_kind='turn_user'").arg(id)).toInt(), 0);
+        // 历史回读：getHistoryTurn 能看到这一轮，turnKind='proactive'、没有用户输入。
+        const QList<HistoryTurn> turns = db.getHistoryTurn(5, Channel::kQQPrivate, QStringLiteral("2014366825"));
+        QCOMPARE(turns.size(), 1);
+        QCOMPARE(turns.first().turnKind, QStringLiteral("proactive"));
+        QVERIFY(turns.first().userInput.isEmpty());
+        QCOMPARE(turns.first().speaker, QStringLiteral("mako"));
+        // 不是用户发言：不进入私下回顾（回顾只领 turn_kind='reply' 的轮次）。
+        QVERIFY(db.claimPrivateReflection(12, 60).isEmpty());
+    }
+
+    // B4：分享回执写 thought_result + delivery_ledger；已送达/未知不重发，被拒只补一次。
+    void shareOutcomeBlocksRepeat()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath("share-outcome.db");
+        MemoryManager db(path);
+
+        QVERIFY(db.saveQATurn(QStringLiteral("试试写诗"), R"({"personal_interest":"想写雨声"})", {}));
+        const auto first = db.nextThought(true);
+        const qlonglong firstId = first["id"].toInteger();
+        const int firstVersion = first["version"].toInt();
+        QVERIFY(firstId > 0);
+        QVERIFY(db.finishThoughtReview(firstId, firstVersion,
+            QJsonObject{{"status","completed"},{"reflection","写好了两句"},
+                        {"draft","屋檐轻响，雨在窗上停了一停。"}}));
+        const int sharedVersion = firstVersion + 1;
+        QVERIFY(db.canShareThought(firstId, sharedVersion));
+
+        // 渠道拒绝：允许补发一次；第二次拒绝后不再分享。
+        QVERIFY(db.recordShareOutcome(firstId, sharedVersion, "rejected",
+                                      Channel::kPet, Channel::kDefaultSession));
+        QVERIFY(db.canShareThought(firstId, sharedVersion));
+        QVERIFY(db.recordShareOutcome(firstId, sharedVersion, "rejected",
+                                      Channel::kPet, Channel::kDefaultSession));
+        QVERIFY(!db.canShareThought(firstId, sharedVersion));
+
+        // 已送达（protocol_accepted）不再分享。
+        QVERIFY(db.saveQATurn(QStringLiteral("再写一段"), R"({"personal_interest":"想写风声"})", {}));
+        const auto second = db.nextThought(true);
+        const qlonglong secondId = second["id"].toInteger();
+        const int secondVersion = second["version"].toInt();
+        QVERIFY(secondId > 0 && secondId != firstId);
+        QVERIFY(db.finishThoughtReview(secondId, secondVersion,
+            QJsonObject{{"status","completed"},{"reflection","写好了两句"},
+                        {"draft","风从窗缝里钻进来。"}}));
+        const int secondShared = secondVersion + 1;
+        QVERIFY(db.canShareThought(secondId, secondShared));
+        QVERIFY(db.recordShareOutcome(secondId, secondShared, "protocol_accepted",
+                                      Channel::kQQPrivate, QStringLiteral("2014366825")));
+        QVERIFY(!db.canShareThought(secondId, secondShared));
+
+        RawDb raw(path, "share-outcome");
+        QVERIFY(raw.open());
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT json_extract(thought_result,'$.share_outcome') "
+                                           "FROM chat_history WHERE id=%1").arg(firstId)).toString(),
+                 QStringLiteral("rejected"));
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM delivery_ledger WHERE kind='share'")).toInt(), 2);
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM delivery_ledger WHERE kind='share' AND ref='thought:%1:%2'")
+                                .arg(firstId).arg(sharedVersion)).toString(),
+                 QStringLiteral("rejected"));
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT attempts FROM delivery_ledger WHERE kind='share' AND ref='thought:%1:%2'")
+                                .arg(firstId).arg(sharedVersion)).toInt(), 2);
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM delivery_ledger WHERE kind='share' AND ref='thought:%1:%2'")
+                                .arg(secondId).arg(secondShared)).toString(),
+                 QStringLiteral("protocol_accepted"));
+    }
+
+    // B4：v24 迁移结构 + 领取/回执在 delivery_ledger 上的状态。
+    void deliveryLedgerStates()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath("ledger.db");
+        {
+            MemoryManager db(path);
+        }
+        {
+            RawDb raw(path, "ledger-schema");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 25);
+            const QStringList contact = raw.columns("reflection_contact");
+            for (const auto &column : {QStringLiteral("attempts"), QStringLiteral("last_outcome"),
+                                       QStringLiteral("last_attempt_at")})
+                QVERIFY2(contact.contains(column), qPrintable(column));
+            const QStringList ledger = raw.columns("delivery_ledger");
+            for (const auto &column : {QStringLiteral("kind"), QStringLiteral("ref"), QStringLiteral("channel"),
+                                       QStringLiteral("session"), QStringLiteral("text"), QStringLiteral("state"),
+                                       QStringLiteral("attempts"), QStringLiteral("last_error"),
+                                       QStringLiteral("created_at"), QStringLiteral("updated_at")})
+                QVERIFY2(ledger.contains(column), qPrintable(column));
+        }
+
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableContact());
+        MemoryManager db(path);
+        const qint64 turn = seedOpenConcern(
+            db, concernTurnMeta(QStringLiteral("ledger-a")),
+            QStringLiteral("明天想做荷包蛋，不知道好不好吃"), QStringLiteral("荷包蛋好不好吃"),
+            QJsonObject{}, QJsonObject{{"timing", "now"},
+                                       {"reason", QStringLiteral("到了约定时间")},
+                                       {"message", QStringLiteral("在忙吗")}});
+        QVERIFY(turn > 0);
+        QVERIFY(!db.claimReflectionContact(turn, 1, Channel::kPet, Channel::kDefaultSession).isEmpty());
+        const auto ref = QStringLiteral("reflection:%1:1").arg(turn);
+        {
+            RawDb raw(path, "ledger-claimed");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM delivery_ledger WHERE kind='contact' AND ref='%1'").arg(ref)).toString(),
+                     QStringLiteral("claimed"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT text FROM delivery_ledger WHERE kind='contact' AND ref='%1'").arg(ref)).toString(),
+                     QStringLiteral("在忙吗"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT attempts FROM delivery_ledger WHERE kind='contact' AND ref='%1'").arg(ref)).toInt(), 0);
+        }
+        QVERIFY(db.recordContactOutcome(turn, 1, "rejected"));
+        {
+            RawDb raw(path, "ledger-rejected");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM delivery_ledger WHERE kind='contact' AND ref='%1'").arg(ref)).toString(),
+                     QStringLiteral("rejected"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT attempts FROM delivery_ledger WHERE kind='contact' AND ref='%1'").arg(ref)).toInt(), 1);
+        }
+        // 重试领取后状态回到 claimed，再次终态写 protocol_accepted 时不再累加失败次数。
+        QVERIFY(!db.claimReflectionContact(turn, 1, Channel::kPet, Channel::kDefaultSession).isEmpty());
+        QVERIFY(db.recordContactOutcome(turn, 1, "protocol_accepted"));
+        {
+            RawDb raw(path, "ledger-accepted");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM delivery_ledger WHERE kind='contact' AND ref='%1'").arg(ref)).toString(),
+                     QStringLiteral("protocol_accepted"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT attempts FROM delivery_ledger WHERE kind='contact' AND ref='%1'").arg(ref)).toInt(), 1);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT last_outcome FROM reflection_contact WHERE turn_id=%1").arg(turn)).toString(),
+                     QStringLiteral("protocol_accepted"));
+        }
+    }
+
+    // M1 接线覆盖：到期关注经 PrivateReview 统一唤醒，claim 的上下文带 kind=concern。
+    void dueConcernRoutedThroughPrivateReview()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath("concern-review.db");
+        MemoryManager db(path);
+        const qint64 turn = seedOpenConcern(
+            db, concernTurnMeta(QStringLiteral("concern-review-a")),
+            QStringLiteral("明天想做荷包蛋，不知道好不好吃"), QStringLiteral("荷包蛋好不好吃"),
+            QJsonObject{{"topic", QStringLiteral("荷包蛋")},
+                        {"watch", QStringLiteral("味道如何")},
+                        {"next_check_after_minutes", 60}});
+        QVERIFY(turn > 0);
+        {
+            RawDb raw(path, "concern-review-due");
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral("UPDATE private_reflection SET next_check_at=unixepoch()-1 "
+                                            "WHERE turn_id=%1").arg(turn)));
+        }
+        QVERIFY(rewindReviewCooldown(path, QStringLiteral("concern-review-clock")));
+
+        PrivateReview review(db);
+        QSignalSpy requested(&review, &PrivateReview::requested);
+        review.wake(12, 60);
+        QCOMPARE(requested.size(), 1);
+        const auto context = requested.first()[2].toJsonObject();
+        QCOMPARE(context["kind"].toString(), QStringLiteral("concern"));
+        QCOMPARE(context["concern"].toObject()["topic"].toString(), QStringLiteral("荷包蛋"));
+        review.receive(requested.first()[0].toLongLong(), requested.first()[1].toInt(),
+                       QJsonObject{{"concern_action", "keep"},
+                                   {"forget", QJsonObject{{"next_check_after_minutes", 0}}}}, {});
+        RawDb raw(path, "concern-review-state");
+        QVERIFY(raw.open());
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM private_reflection WHERE turn_id=%1").arg(turn)).toString(),
+                 QStringLiteral("consider"));
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT next_check_at FROM private_reflection WHERE turn_id=%1").arg(turn)).toLongLong(),
+                 qlonglong(0));
+    }
+
+    // B3：到期关注的领取、了结与主动联系意图（不依赖新用户消息）。
+    void dueConcernResolveAndContact()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath("concern-due.db");
+        MemoryManager db(path);
+        const qint64 resolveTurn = seedOpenConcern(
+            db, concernTurnMeta(QStringLiteral("concern-due-a")),
+            QStringLiteral("明天要做一顿早饭"), QStringLiteral("不知道他有没有吃早饭"),
+            QJsonObject{{"topic", QStringLiteral("早饭")},
+                        {"watch", QStringLiteral("他有没有吃、什么时候吃")},
+                        {"next_check_after_minutes", 60}});
+        QVERIFY(resolveTurn > 0);
+        {
+            RawDb raw(path, "concern-due-backfill");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT root_turn FROM private_reflection WHERE turn_id=%1")
+                                    .arg(resolveTurn)).toLongLong(), resolveTurn);
+            QVERIFY(raw.scalar(QStringLiteral("SELECT next_check_at FROM private_reflection WHERE turn_id=%1")
+                                   .arg(resolveTurn)).toLongLong() > 0);
+            QVERIFY(raw.exec(QStringLiteral("UPDATE private_reflection SET next_check_at=unixepoch()-1 "
+                                            "WHERE turn_id=%1").arg(resolveTurn)));
+        }
+        QVERIFY(rewindReviewCooldown(path, QStringLiteral("concern-due-clock")));
+        const auto claimed = db.claimDueConcern(12, 60);
+        QCOMPARE(claimed["id"].toInteger(), resolveTurn);
+        QCOMPARE(claimed["kind"].toString(), QStringLiteral("concern"));
+        QVERIFY(db.finishConcernReview(resolveTurn, claimed["version"].toInt(),
+                                       QJsonObject{{"concern_action", "resolve"},
+                                                   {"kind", "answer"}}));
+        QVERIFY(db.concernByHead(resolveTurn).isEmpty());
+        {
+            RawDb raw(path, "concern-due-state");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM private_reflection WHERE turn_id=%1")
+                                    .arg(resolveTurn)).toString(), QStringLiteral("resolved"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT resolved_kind FROM private_reflection WHERE turn_id=%1")
+                                    .arg(resolveTurn)).toString(), QStringLiteral("answer"));
+        }
+
+        // 第二个关注：到期后决定"现在联系"，应留下 proposed 联系记录并保持开放。
+        QVERIFY(rewindReviewCooldown(path, QStringLiteral("concern-due-clock2")));
+        const qint64 contactTurn = seedOpenConcern(
+            db, concernTurnMeta(QStringLiteral("concern-due-b")),
+            QStringLiteral("他说晚饭随便吃点"), QStringLiteral("晚饭到底吃了什么"),
+            QJsonObject{{"topic", QStringLiteral("晚饭")},
+                        {"watch", QStringLiteral("他最后吃了什么")},
+                        {"next_check_after_minutes", 60}});
+        QVERIFY(contactTurn > 0);
+        {
+            RawDb raw(path, "concern-due-due2");
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral("UPDATE private_reflection SET next_check_at=unixepoch()-1 "
+                                            "WHERE turn_id=%1").arg(contactTurn)));
+        }
+        QVERIFY(rewindReviewCooldown(path, QStringLiteral("concern-due-clock3")));
+        const auto claimed2 = db.claimDueConcern(12, 60);
+        QCOMPARE(claimed2["id"].toInteger(), contactTurn);
+        QVERIFY(db.finishConcernReview(contactTurn, claimed2["version"].toInt(),
+                                       QJsonObject{{"concern_action", "contact"},
+                                                   {"contact", QJsonObject{{"timing", "now"},
+                                                                           {"reason", "到了约定的时间，想问一句"},
+                                                                           {"message", "晚饭吃了吗？"}}}}));
+        {
+            RawDb raw(path, "concern-due-contact");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT timing FROM reflection_contact WHERE turn_id=%1")
+                                    .arg(contactTurn)).toString(), QStringLiteral("now"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT outcome FROM reflection_contact WHERE turn_id=%1")
+                                    .arg(contactTurn)).toString(), QStringLiteral("proposed"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM private_reflection WHERE turn_id=%1")
+                                    .arg(contactTurn)).toString(), QStringLiteral("consider"));
+            QVERIFY(raw.scalar(QStringLiteral("SELECT next_check_at FROM private_reflection WHERE turn_id=%1")
+                                   .arg(contactTurn)).toLongLong() > 0);
+        }
+    }
+
+    // B1：注意力事件状态机（v25）。同 (kind,ref) 幂等；claim 按 priority,id；终态不可回退。
+    void attentionEventLifecycle()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath("attention-events.db");
+        {
+            MemoryManager db(path);
+            RawDb schema(path, "attention-schema");
+            QVERIFY(schema.open());
+            QCOMPARE(schema.scalar("PRAGMA user_version").toInt(), 25);
+            const QStringList eventColumns = schema.columns("attention_event");
+            for (const auto &column : {QStringLiteral("kind"), QStringLiteral("ref"),
+                                       QStringLiteral("payload"), QStringLiteral("state"),
+                                       QStringLiteral("priority"), QStringLiteral("reason"),
+                                       QStringLiteral("created_at"), QStringLiteral("claimed_at"),
+                                       QStringLiteral("done_at")})
+                QVERIFY2(eventColumns.contains(column), qPrintable(column));
+            const QStringList stateColumns = schema.columns("attention_state");
+            QVERIFY(stateColumns.contains("key"));
+            QVERIFY(stateColumns.contains("value"));
+            QVERIFY(stateColumns.contains("updated_at"));
+            QCOMPARE(schema.scalar("SELECT count(*) FROM sqlite_master WHERE type='index' "
+                                   "AND name='attention_event_pending'").toInt(), 1);
+
+            const auto id = db.enqueueAttentionEvent(
+                QStringLiteral("message"), QStringLiteral("evt-1"),
+                QJsonObject{{QStringLiteral("channel"), QStringLiteral("pet")}},
+                QStringLiteral("arrived"), 50);
+            QVERIFY(id > 0);
+            // 同 (kind,ref) 第二次入队返回同一行 id，不产生新行。
+            QCOMPARE(db.enqueueAttentionEvent(QStringLiteral("message"), QStringLiteral("evt-1")), id);
+            const auto initial = db.attentionBacklog();
+            QCOMPARE(initial["pending"].toObject()["message"].toInt(), 1);
+            QCOMPARE(initial["by_state"].toObject()["pending"].toInt(), 1);
+            QVERIFY(initial["oldest_age_seconds"].toInteger() >= 0);
+
+            const auto claimed = db.claimAttentionEvent();
+            QCOMPARE(claimed["id"].toInteger(), id);
+            QCOMPARE(claimed["kind"].toString(), QStringLiteral("message"));
+            QCOMPARE(claimed["ref"].toString(), QStringLiteral("evt-1"));
+            QCOMPARE(claimed["payload"].toObject()["channel"].toString(), QStringLiteral("pet"));
+            QCOMPARE(claimed["priority"].toInt(), 50);
+            QVERIFY(db.claimAttentionEvent().isEmpty()); // 已无 pending
+            QCOMPARE(db.attentionBacklog()["by_state"].toObject()["claimed"].toInt(), 1);
+
+            QVERIFY(db.completeAttentionEvent(id, QStringLiteral("done"), QStringLiteral("ok")));
+            QVERIFY(!db.completeAttentionEvent(id, QStringLiteral("done"))); // 终态不可再次变更
+            const auto finished = db.attentionBacklog();
+            QVERIFY(finished["pending"].toObject().isEmpty());
+            QCOMPARE(finished["by_state"].toObject()["done"].toInt(), 1);
+            QCOMPARE(finished["oldest_age_seconds"].toInteger(), qint64(0));
+
+            // priority 越小越先领取：recovery(10) 先于 message(50)。
+            const auto low = db.enqueueAttentionEvent(QStringLiteral("message"), QStringLiteral("late"), {}, {}, 50);
+            const auto high = db.enqueueAttentionEvent(QStringLiteral("recovery"), QStringLiteral("turn:1"), {}, {}, 10);
+            QVERIFY(low > 0 && high > 0);
+            QCOMPARE(db.claimAttentionEvent()["id"].toInteger(), high);
+            QCOMPARE(db.claimAttentionEvent()["id"].toInteger(), low);
+        }
+        // 重开连接：事件与状态都在库里。
+        MemoryManager reopened(path);
+        const auto persisted = reopened.attentionBacklog();
+        QCOMPARE(persisted["by_state"].toObject()["done"].toInt(), 1);
+        QCOMPARE(persisted["by_state"].toObject()["claimed"].toInt(), 2);
+    }
+
+    // B1：崩溃恢复。received 轮次超时后幂等入队 recovery（最高优先级），可被中断并落终态。
+    void attentionRecoveryEvents()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath("attention-recovery.db");
+        MemoryManager db(path);
+        RequestMeta meta;
+        meta.eventId = meta.runId = QStringLiteral("interrupted-receipt");
+        const qint64 turn = db.recordInput(QStringLiteral("这一轮没有收到回复"), meta, true);
+        QVERIFY(turn > 0);
+        {
+            RawDb clock(path, "recovery-clock");
+            QVERIFY(clock.open());
+            // recordInput 的 timestamp 是本地时间；挪到 2 分钟前模拟进程中断。
+            QVERIFY(clock.exec(QStringLiteral(
+                "UPDATE chat_history SET timestamp=datetime('now','localtime','-120 seconds') WHERE id=%1").arg(turn)));
+        }
+        QCOMPARE(db.enqueueRecoveryEvents(60), 1);
+        QCOMPARE(db.enqueueRecoveryEvents(60), 0); // 幂等：同轮次不再重复入队
+        const auto event = db.claimAttentionEvent();
+        QCOMPARE(event["kind"].toString(), QStringLiteral("recovery"));
+        QCOMPARE(event["payload"].toObject()["turn"].toInteger(), turn);
+        QCOMPARE(event["payload"].toObject()["channel"].toString(), meta.channel);
+        QCOMPARE(event["payload"].toObject()["session"].toString(), meta.sessionId);
+        QCOMPARE(event["priority"].toInt(), 10);
+        QVERIFY(db.interruptTurn(turn, QStringLiteral("restart_recovery")));
+        QVERIFY(db.completeAttentionEvent(event["id"].toInteger(), QStringLiteral("done"),
+                                          QStringLiteral("recovered")));
+        QCOMPARE(db.attentionBacklog()["by_state"].toObject()["done"].toInt(), 1);
+        // 已恢复的轮次不再被扫描到（turn_state 已不是 received）。
+        QCOMPARE(db.enqueueRecoveryEvents(60), 0);
+    }
+
+    // B1：当前活动/切换原因键值存档跨重启保持。
+    void attentionStatePersists()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath("attention-state.db");
+        {
+            MemoryManager db(path);
+            db.setAttentionState(QStringLiteral("current_activity"), QStringLiteral("thought/492"));
+            db.setAttentionState(QStringLiteral("last_switch_reason"), QStringLiteral("incoming_message"));
+            QCOMPARE(db.attentionState(QStringLiteral("current_activity")), QStringLiteral("thought/492"));
+        }
+        MemoryManager reopened(path);
+        QCOMPARE(reopened.attentionState(QStringLiteral("current_activity")), QStringLiteral("thought/492"));
+        QCOMPARE(reopened.attentionState(QStringLiteral("last_switch_reason")), QStringLiteral("incoming_message"));
+        QVERIFY(reopened.attentionState(QStringLiteral("missing")).isEmpty());
+        // 同一 key 只保留最新值（切换离开活动时清空）。
+        reopened.setAttentionState(QStringLiteral("current_activity"), QString());
+        QVERIFY(reopened.attentionState(QStringLiteral("current_activity")).isEmpty());
+        reopened.setAttentionState(QStringLiteral("current_activity"), QStringLiteral("thought/500"));
+        QCOMPARE(reopened.attentionState(QStringLiteral("current_activity")), QStringLiteral("thought/500"));
+    }
+
+    // B2：活动档案补全：来源轮次/目标类型/时间戳/产物引用；无产物不可分享。
+    void activityStoresSourceAndArtifact()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath("activity-source.db");
+        MemoryManager db(path);
+        QVERIFY(db.saveQATurn(QStringLiteral("想写点雨声"), R"({"personal_interest":"写雨声"})", {}));
+        const auto thought = db.nextThought(true);
+        const qlonglong id = thought["id"].toInteger();
+        const int version = thought["version"].toInt();
+        QVERIFY(id > 0);
+
+        RawDb raw(path, "activity-source");
+        QVERIFY(raw.open());
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT json_extract(thought_result,'$.source_turn') "
+                                           "FROM chat_history WHERE id=%1").arg(id)).toLongLong(), id);
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT json_extract(thought_result,'$.goal_kind') "
+                                           "FROM chat_history WHERE id=%1").arg(id)).toString(),
+                 QStringLiteral("interest"));
+        QVERIFY(!raw.scalar(QStringLiteral("SELECT json_extract(thought_result,'$.created_at') "
+                                           "FROM chat_history WHERE id=%1").arg(id)).toString().isEmpty());
+        QVERIFY(raw.scalar(QStringLiteral("SELECT json_extract(thought_result,'$.artifact_ref') "
+                                          "FROM chat_history WHERE id=%1").arg(id)).toString().isEmpty());
+        // 没有实际产物（只写着"在思考"）时不可分享。
+        QVERIFY(!db.canShareThought(id, version));
+
+        const QJsonObject draft{{"status","completed"},{"reflection","写好了两句"},
+                                {"draft","屋檐轻响，雨在窗上停了一停。"}};
+        QVERIFY(db.finishThoughtReview(id, version, draft));
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT json_extract(thought_result,'$.artifact_ref') "
+                                           "FROM chat_history WHERE id=%1").arg(id)).toString(),
+                 QStringLiteral("thought/%1").arg(id));
+        QVERIFY(!raw.scalar(QStringLiteral("SELECT json_extract(thought_result,'$.updated_at') "
+                                           "FROM chat_history WHERE id=%1").arg(id)).toString().isEmpty());
+        // 回顾不能改掉创建时的来源。
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT json_extract(thought_result,'$.source_turn') "
+                                           "FROM chat_history WHERE id=%1").arg(id)).toLongLong(), id);
+        QVERIFY(db.canShareThought(id, version + 1));
+    }
+
+    // B2：来源轮次删除后活动随之消失，迟到回调/分享都不能复活它。
+    void deletedActivitySourceCannotShare()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager db(dir.filePath("activity-deleted.db"));
+        QVERIFY(db.saveQATurn(QStringLiteral("想写点雨声"), R"({"personal_interest":"写雨声"})", {}));
+        const auto thought = db.nextThought(true);
+        const qlonglong id = thought["id"].toInteger();
+        const int version = thought["version"].toInt();
+        QVERIFY(id > 0);
+        QVERIFY(db.finishThoughtReview(id, version,
+            QJsonObject{{"status","active"},{"reflection","继续写"},{"draft","第一句"}}));
+        QVERIFY(db.canShareThought(id, version + 1));
+        QVERIFY(db.deleteTurnByID(id));
+        QVERIFY(db.nextThought(true).isEmpty());
+        QVERIFY(db.nextThought(false).isEmpty());
+        QVERIFY(!db.canShareThought(id, version + 1));
+        // 迟到回调同样被行存在性/版本校验拒绝。
+        QVERIFY(!db.finishThoughtReview(id, version + 1,
+            QJsonObject{{"status","active"},{"reflection","迟到"}}));
     }
 };
 
