@@ -1592,6 +1592,40 @@ QString MemoryManager::conversationPhase(const RequestMeta &audience) const
     return reply["conversation_action"].toString();
 }
 
+QJsonObject MemoryManager::recentConversationClosure(const QString &channel,const QString &session,
+                                                     const QString &subject,int maxAgeSeconds) const
+{
+    if (channel.isEmpty() || session.isEmpty() || subject.isEmpty()) return {};
+    QSqlQuery q(m_db);
+    // timestamp 是本地时区字段（与 recordInput/saveQATurn 的本地时间约定一致）；
+    // 与 enqueueRecoveryEvents 一样先用 'localtime' 归一，再按天差折算秒数。
+    q.prepare("SELECT h.id,coalesce(s.reported,h.timestamp),h.raw_reply,h.turn_state,h.turn_detail,"
+              "(julianday('now','localtime')-julianday(h.timestamp))*86400.0 "
+              "FROM chat_history h LEFT JOIN cognitive_source s ON s.event=h.cognitive_event "
+              "AND s.channel=h.channel AND s.session=h.session_id AND s.subject=h.subject "
+              "AND s.input=h.user_input "
+              "WHERE h.channel=? AND h.session_id=? AND h.subject=? AND h.sensitive=0 "
+              "AND h.turn_kind='reply' AND h.turn_state IN ('quiet','handed_off','legacy') "
+              "ORDER BY h.id DESC LIMIT 1");
+    q.addBindValue(channel);
+    q.addBindValue(session);
+    q.addBindValue(subject);
+    if (!q.exec() || !q.next()) return {};
+    const auto ageSeconds = qRound64(qMax(0.0, q.value(5).toDouble()));
+    if (maxAgeSeconds >= 0 && ageSeconds > maxAgeSeconds) return {};
+    // quiet 轮次用 turn_detail 记录收口动作；其余轮次从 raw_reply.conversation_action 取。
+    QString action;
+    if (q.value(3).toString() == QStringLiteral("quiet"))
+        action = q.value(4).toString();
+    else
+        action = QJsonDocument::fromJson(q.value(2).toByteArray())
+                     .object()["conversation_action"].toString();
+    return {{"action", action},
+            {"turn", q.value(0).toLongLong()},
+            {"age_seconds", ageSeconds},
+            {"reported_at", q.value(1).toString()}};
+}
+
 QJsonArray MemoryManager::currentUnderstanding(const RequestMeta &audience, const QString &input,
                                     QStringList *keys, const QStringList &only,
                                     bool includeAudiencePrivate) const
@@ -5173,6 +5207,27 @@ void MemoryManager::initDatabase(const QString &dbFilePath, const QString &conne
                 || !query.exec("CREATE INDEX IF NOT EXISTS concern_revision_turn ON concern_revision(turn)")
                 || !query.exec("PRAGMA user_version=26")) throw query.lastError();
             currentVersion=26;
+        }
+        if (currentVersion<27) {
+            // v27：主动联系的"可核验行动依据"字段。basis_type/basis_refs 与联系意图同一行落库，
+            // 供投递前审计与事后追溯（例如"是凭哪条提醒/哪次发言/哪个活动结果决定现在联系"）。
+            // 旧测试会把 user_version 压回更小值重放迁移，故先按列名幂等补列再升级版本号。
+            if (!query.exec("CREATE TABLE IF NOT EXISTS reflection_contact(turn_id INTEGER PRIMARY KEY,"
+                            "version INTEGER NOT NULL,timing TEXT NOT NULL,reason TEXT,message TEXT,"
+                            "outcome TEXT NOT NULL,channel TEXT,session TEXT)"))
+                throw query.lastError();
+            QSqlQuery basisColumns(m_db);
+            if (!basisColumns.exec("PRAGMA table_info(reflection_contact)")) throw basisColumns.lastError();
+            QSet<QString> basisPresent;
+            while (basisColumns.next()) basisPresent.insert(basisColumns.value(1).toString());
+            for (const auto &column : {QStringLiteral("basis_type"), QStringLiteral("basis_refs")}) {
+                if (basisPresent.contains(column)) continue;
+                if (!query.exec(QStringLiteral("ALTER TABLE reflection_contact ADD COLUMN ")
+                                + column + QStringLiteral(" TEXT")))
+                    throw query.lastError();
+            }
+            if (!query.exec("PRAGMA user_version=27")) throw query.lastError();
+            currentVersion=27;
         }
         // 关注了结的独立流水（v22 的补充表）。与 reflection_change（回顾链修订）分开：
         // 前者由正常对话写回，后者由私下回顾写，共用 turn 主键会互相覆盖。

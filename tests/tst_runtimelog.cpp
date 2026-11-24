@@ -100,10 +100,18 @@ private slots:
         QDir logs(root.filePath("logs"));
         for (int run = 1; run <= 2; ++run) {
             QProcess child;
+            // 不依赖 QProcess 管道读取子进程 stdout（部分受限环境管道不可用）：
+            // 把输出重定向到文件，断言的属性仍是"子进程启动后写出 ready"。
+            const QString readyFile = root.filePath(QStringLiteral("child-ready-%1.txt").arg(run));
+            child.setStandardOutputFile(readyFile);
             child.start(QCoreApplication::applicationFilePath(), {"--child-log",root.path()});
             QVERIFY(child.waitForStarted());
-            QVERIFY(child.waitForReadyRead(10000));
-            QCOMPARE(child.readAllStandardOutput().trimmed(), QByteArray("ready"));
+            auto childReady = [&readyFile] {
+                QFile file(readyFile);
+                return file.open(QIODevice::ReadOnly)
+                    && file.readAll().trimmed().contains("ready");
+            };
+            QTRY_VERIFY_WITH_TIMEOUT(childReady(), 10000);
             child.kill();
             QVERIFY(child.waitForFinished());
             QCOMPARE(logs.entryList({"*.txt"}).size(),run);

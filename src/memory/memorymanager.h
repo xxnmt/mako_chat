@@ -96,6 +96,11 @@ public:
                                     bool includeAudiencePrivate = false) const;
     QJsonArray matterEvidence(const RequestMeta &audience, const QString &matter) const;
     QString conversationPhase(const RequestMeta &audience) const;
+    // 最近一次前台私下交流的收口状态；超过 maxAgeSeconds 返回 {}。
+    // 返回 {action, turn, age_seconds, reported_at}：action=close/defer 表示这段交流已经收口，
+    // 早于它的发言不能再当成"新的主人证据"。
+    QJsonObject recentConversationClosure(const QString &channel,const QString &session,
+                                          const QString &subject,int maxAgeSeconds=3600) const;
     QJsonArray structuredMemoryRows(const QStringList &kinds, const QString &subject,
                                     bool includeOthers, bool allEpisodic) const;
 
@@ -146,6 +151,11 @@ public:
     QJsonObject claimDueConcern(int dailyLimit, int cooldownSeconds);
     QJsonObject concernReviewContext(qint64 turn, int version) const;
     bool finishConcernReview(qlonglong turn, int version, const QJsonObject &proposal);
+    // 只有 contact.timing=="now" 需要可核验的行动依据；返回空串=通过，否则返回拒绝原因
+    // （missing_basis / invalid_basis_type / invalid_basis_ref / stale_owner_evidence /
+    //   ambiguous_after_closure / reminder_not_pending / artifact_already_shared）。
+    QString validateContactBasis(const QString &channel,const QString &session,
+                                 qlonglong concernTurn,const QJsonObject &contact) const;
     bool deferConcernReview(qlonglong turn, int version, const QString &reason);
     // 从正常对话了结一个关注：答案到达、被否定或计划取消。提交后不再注入、不再重复追问。
     bool resolveConcern(qlonglong headTurn, qlonglong byTurn, const QString &kind,

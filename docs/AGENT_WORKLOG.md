@@ -342,3 +342,30 @@ B5 的 7 天实机连续运行、真实 QQ 主动联系到达、多活动并行�
 - 启动恢复只处理"租约已过期"的 `pending`：到期关注回 `consider`、来源回顾回 `deferred`，避免误抢进行中的回顾。
 
 验证：构建零错误；`tst_memorymanager` 85 passed/1 skipped、`tst_memoryagent` 73、`tst_qqdelivery` 6。`tst_runtimelog` 为宿主间歇性环境失败（3 次重试 2 败 1 过，失败点是既有子进程管道用例）。生产库已备份并迁移 v26。
+
+---
+
+## 2026-11-24 · 报告核对与行动依据核验（R5）
+
+外部研究报告（`D:\Desktop\deep-research-report.md`）针对 11/23 夜间 00:42"半个小时到啦"异常主动消息，提出"后台 concern review 的 contact(now) 缺少可核验行动依据"。用日志 + DB + 源码逐条核对：
+
+**确认的结论**
+- 该消息来自 `concern 493 → due review → contact(now) → reflection_contact`，非 Reminder：日志有 `[Concern] due claimed turn=493 version=2`、`review committed action="contact"`；`reflection_contact(493)` 的 reason 写"约好半小时后…约定的时间已经到了"，而 `reminder` 表只有两条早上的叫醒；发送 echo 为 `reflection:493:2`。
+- 23:35 两轮没有 `reminder_plan`（`raw_reply` 核实）；`conversation_action` 是可从 `raw_reply` 读出的（`conversationPhase()` 已存在），但回顾 context 没有使用它。
+- 前台 00:21:37 已是 `action=close` 的晚安；00:42:33 才发生主动联系，收口语义被忽略。
+- `concernReviewContext` 当时把 `next_check_at`（她自己的再检查时间）暴露给模型；服务端 contact 分支只校验 timing/reason/message 长度与渠道策略。
+- 00:44 前台再次注入 493 时带上了 `contact_outcome=protocol_accepted` 与自己写的那段理由，自增强链真实存在。
+
+**修正/收窄的结论**
+- "前台已把 conversation_action 存成列"不准确：没有独立列，但可从 `raw_reply` 解析（既有 `conversationPhase()`），因此无需新增列即可做收口信号。
+- "stale reflection recovered=1 就是 493"不成立：DB 显示恢复的是 526（deferred），493 是后续正常到期领取。
+
+**修复**（`r5-contact-basis` 实现，lead 集成/补测试/修复 `tst_runtimelog`）
+- `contact.basis{type,refs}` 契约 + `validateContactBasis()`：主人新证据 / 真实 pending reminder / 未分享完成产物三类依据；`close/defer` 后必须引用收口之后的新证据；`next_check_at` 改名 `own_next_review_at` 并声明不是约定。
+- context 增加 `basis{owner_evidence,reminders,artifacts}` 与 `recent_closure`；提示词同步。
+- 拒绝时不发送、按 keep 落库并写 `concern_revision(action='contact_rejected')`；依据通过时 v27 落 `reflection_contact.basis_type/basis_refs`。
+- `tst_runtimelog` 子进程输出改文件重定向，消除宿主管道依赖。
+
+验证：`ctest` **20/20**；`tst_memorymanager` 92 passed/1 skipped、`tst_memoryagent` 73；新增 7 条依据核验用例；生产库备份并迁移 v27（`QianDaoMoZi_memory.db.bak_before_v27_<时间戳>`）。
+
+已知边界：服务端只能证明"依据存在且时序合法"，不能判断语义是否贴切；`recent_closure` 只看最新一条；提醒窗口偏保守；历史 contact 无 basis。

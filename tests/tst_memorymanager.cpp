@@ -48,6 +48,26 @@ public:
         }
         return q.value(0);
     }
+    // 直接插入一条仍 pending 的提醒：作为 contact now 的 explicit_time_delegation 合法依据。
+    // turn 由调用方给唯一负值：既满足 UNIQUE(turn,due) 的幂等键，又不会命中任何真实轮次的删除触发器。
+    bool insertReminder(qlonglong turn, const QString &channel, const QString &session,
+                        int dueOffsetSeconds, const QString &message, qlonglong *id = nullptr)
+    {
+        QSqlQuery q(m_db);
+        q.prepare("INSERT INTO reminder(turn,channel,session,due,expires,message,state) "
+                  "VALUES(?,?,?,unixepoch()+?,unixepoch()+3600,?,'pending')");
+        q.addBindValue(turn);
+        q.addBindValue(channel);
+        q.addBindValue(session);
+        q.addBindValue(dueOffsetSeconds);
+        q.addBindValue(message);
+        if (!q.exec()) {
+            qWarning() << "insert reminder failed:" << q.lastError().text();
+            return false;
+        }
+        if (id) *id = q.lastInsertId().toLongLong();
+        return true;
+    }
     QString lastError() const { return m_db.lastError().text(); }
     QStringList columns(const QString &table)
     {
@@ -225,6 +245,67 @@ static qint64 seedOpenConcern(MemoryManager &mm, const RequestMeta &meta, const 
     return turn;
 }
 
+// 在测试库里插入一条 pending 提醒，返回提醒 id；用于 contact now 的合法"约定"依据。
+static qint64 insertPendingReminder(const QString &dbPath, const QString &tag,
+                                    const QString &channel = Channel::kPet,
+                                    const QString &session = Channel::kDefaultSession,
+                                    int dueOffsetSeconds = 300,
+                                    const QString &message = QStringLiteral("测试提醒"))
+{
+    // 全局递减的负数 turn：同一进程内多次插入同一测试库时也不会撞 UNIQUE(turn,due)。
+    static qlonglong serial = 0;
+    RawDb raw(dbPath, tag);
+    if (!raw.open()) return 0;
+    qlonglong id = 0;
+    if (!raw.insertReminder(--serial, channel, session, dueOffsetSeconds, message, &id)) return 0;
+    return id;
+}
+
+// contact now 的 explicit_time_delegation 依据对象。
+static QJsonObject pendingReminderBasis(qint64 reminderId)
+{
+    return QJsonObject{{"type", QStringLiteral("explicit_time_delegation")},
+                       {"refs", QJsonArray{QStringLiteral("reminder/%1").arg(reminderId)}}};
+}
+
+// contact now 的 new_owner_evidence 依据对象。
+static QJsonObject ownerEvidenceBasis(qlonglong turn)
+{
+    return QJsonObject{{"type", QStringLiteral("new_owner_evidence")},
+                       {"refs", QJsonArray{QStringLiteral("chat/%1").arg(turn)}}};
+}
+
+// contact now 的 activity_result 依据对象。
+static QJsonObject activityResultBasis(qlonglong activityId)
+{
+    return QJsonObject{{"type", QStringLiteral("activity_result")},
+                       {"refs", QJsonArray{QStringLiteral("thought/%1").arg(activityId)}}};
+}
+
+static QJsonObject contactNow(const QString &reason, const QString &message,
+                              const QJsonObject &basis = {})
+{
+    QJsonObject contact{{"timing", QStringLiteral("now")},
+                        {"reason", reason},
+                        {"message", message}};
+    if (!basis.isEmpty()) contact["basis"] = basis;
+    return contact;
+}
+
+// 把关注改回"按时间到期"，并重新领取一次（版本 +1）。用于在同一条关注上尝试不同依据。
+static QJsonObject reclaimDueConcern(MemoryManager &db, const QString &dbPath, qlonglong turn,
+                                     const QString &tag)
+{
+    {
+        RawDb raw(dbPath, tag + QStringLiteral("-due"));
+        if (!raw.open()) return {};
+        if (!raw.exec(QStringLiteral("UPDATE private_reflection SET next_check_at=unixepoch()-1 "
+                                     "WHERE turn_id=%1").arg(turn))) return {};
+    }
+    if (!rewindReviewCooldown(dbPath, tag + QStringLiteral("-clock"))) return {};
+    return db.claimDueConcern(12, 60);
+}
+
 class FailingEmbeddingProvider : public MemoryEmbeddingProvider
 {
 public:
@@ -308,7 +389,7 @@ private slots:
         QVERIFY(raw.exec("DROP TABLE matter_revision"));
         for (int reopen=0; reopen<2; ++reopen) {
             MemoryManager db(path);
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),26);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),27);
             QCOMPARE(raw.scalar("SELECT state_updates FROM chat_history").toString(),QString("[]"));
             QVERIFY(db.matterHeads("user").isEmpty());
         }
@@ -669,7 +750,7 @@ private slots:
         }
         RawDb raw(path,"v17-semantics");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),26);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),27);
         QCOMPARE(raw.scalar("SELECT count(*) FROM matter_revision").toInt(),1);
         QVERIFY(raw.scalar("SELECT semantics IS NULL FROM matter_revision").toBool());
     }
@@ -743,7 +824,7 @@ private slots:
         RawDb raw(path,"lifecycle");
         QVERIFY(raw.open());
         QCOMPARE(raw.scalar("SELECT count(*) FROM matter_revision").toInt(),2);
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),26);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),27);
     }
 
     void currentUnderstandingRetainsLatestSelfReport()
@@ -1489,7 +1570,7 @@ private slots:
         }
         RawDb raw(path, "v15-verify");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 26);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 27);
     }
 
     void databaseBackupIsConsistent()
@@ -1509,7 +1590,7 @@ private slots:
         RawDb copy(backup, "backup-copy");
         QVERIFY(copy.open());
         QCOMPARE(copy.scalar("SELECT count(*) FROM chat_history").toInt(), 1);
-        QCOMPARE(copy.scalar("PRAGMA user_version").toInt(), 26);
+        QCOMPARE(copy.scalar("PRAGMA user_version").toInt(), 27);
         QVERIFY(copy.scalar("SELECT count(*) FROM memory_chunks").toInt() > 0);
     }
 
@@ -1784,7 +1865,7 @@ private slots:
             QVERIFY(raw.open());
 
             // 版本推进到 v3
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 26);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 27);
 
             // 列扩展（v2 渠道 + v3 轮次）
             const QStringList historyCols = raw.columns("chat_history");
@@ -1889,7 +1970,7 @@ private slots:
             MemoryManager second(dbPath);
             RawDb raw(dbPath, "verify2");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 26);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 27);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM chat_history").toInt(), 1);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM relationship_state").toInt(), 2);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM long_term_summary").toInt(), 1);
@@ -1906,7 +1987,7 @@ private slots:
             MemoryManager mm(dbPath);
             RawDb raw(dbPath, "fresh");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 26);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 27);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('raw_events')").toInt() > 0);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('memory_cursor')").toInt() > 0);
 
@@ -2113,7 +2194,7 @@ private slots:
         Q_UNUSED(mm);
         RawDb raw(dbPath, "v2verify");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 26);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 27);
         QCOMPARE(raw.scalar("SELECT user_input FROM chat_history").toString(), QStringLiteral("旧输入"));
         QCOMPARE(raw.scalar("SELECT turn_kind FROM chat_history").toString(), QStringLiteral("reply"));
         QCOMPARE(raw.scalar("SELECT subject FROM chat_history").toString(), QStringLiteral("user"));
@@ -2873,12 +2954,14 @@ private slots:
 
         const auto message = QStringLiteral("在忙吗");
         const auto note = QStringLiteral("荷包蛋好不好吃");
+        // contact now 必须有可核验依据：这里用一条真实 pending、即将到期的提醒（约定）。
+        const auto reminderA = insertPendingReminder(path, QStringLiteral("contact-retry-reminder-a"));
+        QVERIFY(reminderA > 0);
         const qint64 turn = seedOpenConcern(db, concernTurnMeta(QStringLiteral("contact-retry-a")),
                                             QStringLiteral("明天想做荷包蛋，不知道好不好吃"), note,
                                             QJsonObject{},
-                                            QJsonObject{{"timing", "now"},
-                                                        {"reason", QStringLiteral("到了约定时间")},
-                                                        {"message", message}});
+                                            contactNow(QStringLiteral("到了约定时间"), message,
+                                                       pendingReminderBasis(reminderA)));
         QVERIFY(turn > 0);
         // private_writing=false（enableContact 里固定为 false）时仍可领取并投递。
         QCOMPARE(db.claimReflectionContact(turn, 1, Channel::kPet, Channel::kDefaultSession), message);
@@ -2891,12 +2974,13 @@ private slots:
 
         // unknown：协议层可能已送达，不重发。
         QVERIFY(rewindReviewCooldown(path, QStringLiteral("contact-retry-clock")));
+        const auto reminderB = insertPendingReminder(path, QStringLiteral("contact-retry-reminder-b"));
+        QVERIFY(reminderB > 0);
         const qint64 unknownTurn = seedOpenConcern(
             db, concernTurnMeta(QStringLiteral("contact-retry-b")),
             QStringLiteral("最近想看海"), QStringLiteral("想看海"),
-            QJsonObject{}, QJsonObject{{"timing", "now"},
-                                       {"reason", QStringLiteral("想问问")},
-                                       {"message", QStringLiteral("最近还好吗")}});
+            QJsonObject{}, contactNow(QStringLiteral("想问问"), QStringLiteral("最近还好吗"),
+                                      pendingReminderBasis(reminderB)));
         QVERIFY(unknownTurn > 0);
         QVERIFY(!db.claimReflectionContact(unknownTurn, 1, Channel::kPet, Channel::kDefaultSession).isEmpty());
         QVERIFY(db.recordContactOutcome(unknownTurn, 1, "unknown"));
@@ -2904,12 +2988,13 @@ private slots:
 
         // protocol_accepted：已送达，不重发。
         QVERIFY(rewindReviewCooldown(path, QStringLiteral("contact-retry-clock2")));
+        const auto reminderC = insertPendingReminder(path, QStringLiteral("contact-retry-reminder-c"));
+        QVERIFY(reminderC > 0);
         const qint64 acceptedTurn = seedOpenConcern(
             db, concernTurnMeta(QStringLiteral("contact-retry-c")),
             QStringLiteral("昨天的饭很香"), QStringLiteral("饭菜很香"),
-            QJsonObject{}, QJsonObject{{"timing", "now"},
-                                       {"reason", QStringLiteral("想问问")},
-                                       {"message", QStringLiteral("吃饭了吗")}});
+            QJsonObject{}, contactNow(QStringLiteral("想问问"), QStringLiteral("吃饭了吗"),
+                                      pendingReminderBasis(reminderC)));
         QVERIFY(acceptedTurn > 0);
         QVERIFY(!db.claimReflectionContact(acceptedTurn, 1, Channel::kPet, Channel::kDefaultSession).isEmpty());
         QVERIFY(db.recordContactOutcome(acceptedTurn, 1, "protocol_accepted"));
@@ -2924,6 +3009,11 @@ private slots:
         QCOMPARE(raw.scalar(QStringLiteral("SELECT attempts FROM reflection_contact WHERE turn_id=%1").arg(unknownTurn)).toInt(), 1);
         QCOMPARE(raw.scalar(QStringLiteral("SELECT last_outcome FROM reflection_contact WHERE turn_id=%1").arg(acceptedTurn)).toString(),
                  QStringLiteral("protocol_accepted"));
+        // 依据字段与联系意图同一行落库，供事后追溯"凭什么现在联系"。
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT basis_type FROM reflection_contact WHERE turn_id=%1").arg(turn)).toString(),
+                 QStringLiteral("explicit_time_delegation"));
+        QVERIFY(raw.scalar(QStringLiteral("SELECT basis_refs FROM reflection_contact WHERE turn_id=%1").arg(turn)).toString()
+                    .contains(QStringLiteral("reminder/")));
         // 只有仍可重试的联系会进入重试清单。
         QVERIFY(db.retryableReflectionContacts(4).isEmpty());
     }
@@ -3045,10 +3135,11 @@ private slots:
         {
             RawDb raw(path, "ledger-schema");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 26);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 27);
             const QStringList contact = raw.columns("reflection_contact");
             for (const auto &column : {QStringLiteral("attempts"), QStringLiteral("last_outcome"),
-                                       QStringLiteral("last_attempt_at")})
+                                       QStringLiteral("last_attempt_at"),
+                                       QStringLiteral("basis_type"), QStringLiteral("basis_refs")})
                 QVERIFY2(contact.contains(column), qPrintable(column));
             const QStringList ledger = raw.columns("delivery_ledger");
             for (const auto &column : {QStringLiteral("kind"), QStringLiteral("ref"), QStringLiteral("channel"),
@@ -3061,12 +3152,13 @@ private slots:
         ProactiveIdentityGuard identity;
         QVERIFY(identity.enableContact());
         MemoryManager db(path);
+        const auto ledgerReminder = insertPendingReminder(path, QStringLiteral("ledger-reminder"));
+        QVERIFY(ledgerReminder > 0);
         const qint64 turn = seedOpenConcern(
             db, concernTurnMeta(QStringLiteral("ledger-a")),
             QStringLiteral("明天想做荷包蛋，不知道好不好吃"), QStringLiteral("荷包蛋好不好吃"),
-            QJsonObject{}, QJsonObject{{"timing", "now"},
-                                       {"reason", QStringLiteral("到了约定时间")},
-                                       {"message", QStringLiteral("在忙吗")}});
+            QJsonObject{}, contactNow(QStringLiteral("到了约定时间"), QStringLiteral("在忙吗"),
+                                      pendingReminderBasis(ledgerReminder)));
         QVERIFY(turn > 0);
         QVERIFY(!db.claimReflectionContact(turn, 1, Channel::kPet, Channel::kDefaultSession).isEmpty());
         const auto ref = QStringLiteral("reflection:%1:1").arg(turn);
@@ -3314,11 +3406,15 @@ private slots:
         QVERIFY(rewindReviewCooldown(path, QStringLiteral("concern-due-clock3")));
         const auto claimed2 = db.claimDueConcern(12, 60);
         QCOMPARE(claimed2["id"].toInteger(), contactTurn);
+        // contact now 的"约定"必须是库里真实存在、仍 pending 且很快到期的提醒。
+        const auto dueReminder = insertPendingReminder(path, QStringLiteral("concern-due-reminder"));
+        QVERIFY(dueReminder > 0);
         QVERIFY(db.finishConcernReview(contactTurn, claimed2["version"].toInt(),
                                        QJsonObject{{"concern_action", "contact"},
-                                                   {"contact", QJsonObject{{"timing", "now"},
-                                                                           {"reason", "到了约定的时间，想问一句"},
-                                                                           {"message", "晚饭吃了吗？"}}}}));
+                                                   {"contact", contactNow(
+                                                        QStringLiteral("到了约定的时间，想问一句"),
+                                                        QStringLiteral("晚饭吃了吗？"),
+                                                        pendingReminderBasis(dueReminder))}}));
         {
             RawDb raw(path, "concern-due-contact");
             QVERIFY(raw.open());
@@ -3326,11 +3422,348 @@ private slots:
                                     .arg(contactTurn)).toString(), QStringLiteral("now"));
             QCOMPARE(raw.scalar(QStringLiteral("SELECT outcome FROM reflection_contact WHERE turn_id=%1")
                                     .arg(contactTurn)).toString(), QStringLiteral("proposed"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT basis_type FROM reflection_contact WHERE turn_id=%1")
+                                    .arg(contactTurn)).toString(), QStringLiteral("explicit_time_delegation"));
+            QVERIFY(raw.scalar(QStringLiteral("SELECT basis_refs FROM reflection_contact WHERE turn_id=%1")
+                                   .arg(contactTurn)).toString()
+                        .contains(QStringLiteral("reminder/%1").arg(dueReminder)));
             QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM private_reflection WHERE turn_id=%1")
                                     .arg(contactTurn)).toString(), QStringLiteral("consider"));
             QVERIFY(raw.scalar(QStringLiteral("SELECT next_check_at FROM private_reflection WHERE turn_id=%1")
                                    .arg(contactTurn)).toLongLong() > 0);
+            // 到期回顾的决策流水照旧，依据核验通过时记录 contact 与 timing。
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT action FROM concern_revision WHERE turn=%1")
+                                    .arg(contactTurn)).toString(), QStringLiteral("contact"));
         }
+    }
+
+    // v27：contact now 缺少 basis 时服务端拒绝投递，但要把关注按 keep 放回队列，不能无限 defer。
+    void contactNowRequiresBasis()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath("contact-basis-missing.db");
+        MemoryManager db(path);
+        const qint64 turn = seedOpenConcern(
+            db, concernTurnMeta(QStringLiteral("basis-missing-a")),
+            QStringLiteral("明天想做荷包蛋，不知道好不好吃"), QStringLiteral("荷包蛋好不好吃"),
+            QJsonObject{{"topic", QStringLiteral("荷包蛋")},
+                        {"watch", QStringLiteral("味道如何")},
+                        {"next_check_after_minutes", 60}});
+        QVERIFY(turn > 0);
+        const auto claim = reclaimDueConcern(db, path, turn, QStringLiteral("basis-missing"));
+        QCOMPARE(claim["id"].toInteger(), turn);
+        const auto before = QDateTime::currentSecsSinceEpoch();
+        QVERIFY(db.finishConcernReview(turn, claim["version"].toInt(),
+                                       QJsonObject{{"concern_action", "contact"},
+                                                   {"contact", contactNow(QStringLiteral("到点了"),
+                                                                          QStringLiteral("在忙吗"))}}));
+        RawDb raw(path, "basis-missing-verify");
+        QVERIFY(raw.open());
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM reflection_contact WHERE turn_id=%1")
+                                .arg(turn)).toInt(), 0);
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM private_reflection WHERE turn_id=%1")
+                                .arg(turn)).toString(), QStringLiteral("consider"));
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT claimed_by IS NULL FROM private_reflection WHERE turn_id=%1")
+                                .arg(turn)).toInt(), 1);
+        // 按 keep 落库：约 30 分钟后可再检查，而不是卡在 pending。
+        QVERIFY(raw.scalar(QStringLiteral("SELECT next_check_at FROM private_reflection WHERE turn_id=%1")
+                               .arg(turn)).toLongLong() >= before + 1700);
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT action FROM concern_revision WHERE turn=%1 "
+                                           "ORDER BY id DESC LIMIT 1").arg(turn)).toString(),
+                 QStringLiteral("contact_rejected"));
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT contact_timing IS NULL FROM concern_revision WHERE turn=%1 "
+                                           "ORDER BY id DESC LIMIT 1").arg(turn)).toInt(), 1);
+        // 原 note 不被改写。
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT note FROM private_reflection WHERE turn_id=%1")
+                                .arg(turn)).toString(), QStringLiteral("荷包蛋好不好吃"));
+    }
+
+    // v27：编造 reminder/<id> 的"约定"同样被拒绝。
+    void contactNowRejectsFabricatedDelegation()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath("contact-basis-fabricated.db");
+        MemoryManager db(path);
+        const qint64 turn = seedOpenConcern(
+            db, concernTurnMeta(QStringLiteral("basis-fabricated-a")),
+            QStringLiteral("他说晚上会早点睡"), QStringLiteral("有没有真的早睡"),
+            QJsonObject{{"topic", QStringLiteral("作息")},
+                        {"next_check_after_minutes", 60}});
+        QVERIFY(turn > 0);
+        const QJsonObject fabricated{{"type", QStringLiteral("explicit_time_delegation")},
+                                     {"refs", QJsonArray{QStringLiteral("reminder/999999")}}};
+        const auto claim = reclaimDueConcern(db, path, turn, QStringLiteral("basis-fabricated"));
+        QCOMPARE(claim["id"].toInteger(), turn);
+        QVERIFY(db.finishConcernReview(turn, claim["version"].toInt(),
+                                       QJsonObject{{"concern_action", "contact"},
+                                                   {"contact", contactNow(QStringLiteral("到点了"),
+                                                                          QStringLiteral("睡了吗"),
+                                                                          fabricated)}}));
+        RawDb raw(path, "basis-fabricated-verify");
+        QVERIFY(raw.open());
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM reflection_contact WHERE turn_id=%1")
+                                .arg(turn)).toInt(), 0);
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM private_reflection WHERE turn_id=%1")
+                                .arg(turn)).toString(), QStringLiteral("consider"));
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT action FROM concern_revision WHERE turn=%1 "
+                                           "ORDER BY id DESC LIMIT 1").arg(turn)).toString(),
+                 QStringLiteral("contact_rejected"));
+    }
+
+    // v27：真实 pending、即将到期的提醒是合法约定依据，且依据随联系意图落库。
+    void contactNowAcceptsPendingReminderBasis()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath("contact-basis-reminder.db");
+        MemoryManager db(path);
+        const qint64 turn = seedOpenConcern(
+            db, concernTurnMeta(QStringLiteral("basis-ok-a")),
+            QStringLiteral("明天想做荷包蛋，不知道好不好吃"), QStringLiteral("荷包蛋好不好吃"),
+            QJsonObject{{"topic", QStringLiteral("荷包蛋")},
+                        {"next_check_after_minutes", 60}});
+        QVERIFY(turn > 0);
+        const qint64 reminder = insertPendingReminder(path, QStringLiteral("basis-ok-reminder"));
+        QVERIFY(reminder > 0);
+        const auto claim = reclaimDueConcern(db, path, turn, QStringLiteral("basis-ok"));
+        QCOMPARE(claim["id"].toInteger(), turn);
+        QVERIFY(db.finishConcernReview(turn, claim["version"].toInt(),
+                                       QJsonObject{{"concern_action", "contact"},
+                                                   {"contact", contactNow(QStringLiteral("到了约定时间"),
+                                                                          QStringLiteral("在忙吗"),
+                                                                          pendingReminderBasis(reminder))}}));
+        RawDb raw(path, "basis-ok-verify");
+        QVERIFY(raw.open());
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT timing FROM reflection_contact WHERE turn_id=%1")
+                                .arg(turn)).toString(), QStringLiteral("now"));
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT outcome FROM reflection_contact WHERE turn_id=%1")
+                                .arg(turn)).toString(), QStringLiteral("proposed"));
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT basis_type FROM reflection_contact WHERE turn_id=%1")
+                                .arg(turn)).toString(), QStringLiteral("explicit_time_delegation"));
+        QVERIFY(raw.scalar(QStringLiteral("SELECT basis_refs FROM reflection_contact WHERE turn_id=%1")
+                               .arg(turn)).toString()
+                    .contains(QStringLiteral("reminder/%1").arg(reminder)));
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM private_reflection WHERE turn_id=%1")
+                                .arg(turn)).toString(), QStringLiteral("consider"));
+    }
+
+    // v27：收口（close/defer）之前的发言不能当新证据；收口之后的新发言才可以。
+    void contactNowRejectsPreClosureEvidence()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath("contact-basis-closure.db");
+        MemoryManager db(path);
+        RequestMeta metaA = concernTurnMeta(QStringLiteral("closure-a"));
+        metaA.receivedAtUtc = QDateTime::currentDateTimeUtc().addSecs(-300);
+        const qint64 turn = seedOpenConcern(
+            db, metaA, QStringLiteral("周末想去看展览"), QStringLiteral("展览怎么样"),
+            QJsonObject{{"topic", QStringLiteral("展览")},
+                        {"next_check_after_minutes", 60}});
+        QVERIFY(turn > 0);
+        // 先有一段收口的交流：B 是 quiet close，形成 recent_closure(close)。
+        RequestMeta metaB = concernTurnMeta(QStringLiteral("closure-b"));
+        metaB.receivedAtUtc = QDateTime::currentDateTimeUtc().addSecs(-120);
+        const qint64 closed = db.recordInput(QStringLiteral("先聊到这里吧"), metaB, true);
+        QVERIFY(closed > 0);
+        QVERIFY(db.recordQuiet(closed, "close"));
+        const auto closure = db.recentConversationClosure(Channel::kPet, Channel::kDefaultSession,
+                                                          QStringLiteral("user"));
+        QCOMPARE(closure["action"].toString(), QStringLiteral("close"));
+        QCOMPARE(closure["turn"].toInteger(), closed);
+        QVERIFY(closure["age_seconds"].toInteger() >= 0);
+        QVERIFY(!closure["reported_at"].toString().isEmpty());
+        // 关注来源自身不晚于自己，不能算"之后的新证据"。
+        const auto claimA = reclaimDueConcern(db, path, turn, QStringLiteral("closure-claim-a"));
+        QCOMPARE(claimA["id"].toInteger(), turn);
+        QVERIFY(db.finishConcernReview(turn, claimA["version"].toInt(),
+                                       QJsonObject{{"concern_action", "contact"},
+                                                   {"contact", contactNow(QStringLiteral("到点了"),
+                                                                          QStringLiteral("展览怎么样"),
+                                                                          ownerEvidenceBasis(turn))}}));
+        {
+            RawDb raw(path, "closure-a-verify");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM reflection_contact WHERE turn_id=%1")
+                                    .arg(turn)).toInt(), 0);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM private_reflection WHERE turn_id=%1")
+                                    .arg(turn)).toString(), QStringLiteral("consider"));
+        }
+        // 收口那一轮自身也不能算"收口之后"。
+        const auto claimB = reclaimDueConcern(db, path, turn, QStringLiteral("closure-claim-b"));
+        QCOMPARE(claimB["id"].toInteger(), turn);
+        QVERIFY(db.finishConcernReview(turn, claimB["version"].toInt(),
+                                       QJsonObject{{"concern_action", "contact"},
+                                                   {"contact", contactNow(QStringLiteral("到点了"),
+                                                                          QStringLiteral("先聊到这里吧"),
+                                                                          ownerEvidenceBasis(closed))}}));
+        {
+            RawDb raw(path, "closure-b-verify");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM reflection_contact WHERE turn_id=%1")
+                                    .arg(turn)).toInt(), 0);
+        }
+        // 收口之后主人真的又说话了（未收口的新轮次），这才是合法的新证据。
+        RequestMeta metaC = concernTurnMeta(QStringLiteral("closure-c"));
+        metaC.receivedAtUtc = QDateTime::currentDateTimeUtc().addSecs(-10);
+        const qint64 newer = db.recordInput(QStringLiteral("展览我去啦，很好看"), metaC, true);
+        QVERIFY(newer > 0);
+        const auto claimC = reclaimDueConcern(db, path, turn, QStringLiteral("closure-claim-c"));
+        QCOMPARE(claimC["id"].toInteger(), turn);
+        QVERIFY(db.finishConcernReview(turn, claimC["version"].toInt(),
+                                       QJsonObject{{"concern_action", "contact"},
+                                                   {"contact", contactNow(QStringLiteral("展览有了新进展"),
+                                                                          QStringLiteral("展览怎么样"),
+                                                                          ownerEvidenceBasis(newer))}}));
+        RawDb raw(path, "closure-c-verify");
+        QVERIFY(raw.open());
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT timing FROM reflection_contact WHERE turn_id=%1")
+                                .arg(turn)).toString(), QStringLiteral("now"));
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT basis_type FROM reflection_contact WHERE turn_id=%1")
+                                .arg(turn)).toString(), QStringLiteral("new_owner_evidence"));
+        QVERIFY(raw.scalar(QStringLiteral("SELECT basis_refs FROM reflection_contact WHERE turn_id=%1")
+                               .arg(turn)).toString()
+                    .contains(QStringLiteral("chat/%1").arg(newer)));
+    }
+
+    // v27：已分享过的活动结果不能当"有了新结果"；未分享的完成结果可以通过。
+    void contactNowRejectsAlreadySharedArtifact()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath("contact-basis-artifact.db");
+        MemoryManager db(path);
+        // 活动一：完成且有产物，并已作为分享送达。
+        QVERIFY(db.saveQATurn(QStringLiteral("试试写诗"), R"({"personal_interest":"想写雨声"})", {}));
+        const auto first = db.nextThought(true);
+        const qlonglong firstId = first["id"].toInteger();
+        const int firstVersion = first["version"].toInt();
+        QVERIFY(firstId > 0);
+        QVERIFY(db.finishThoughtReview(firstId, firstVersion,
+            QJsonObject{{"status", "completed"}, {"reflection", "写好了两句"},
+                        {"draft", "屋檐轻响，雨在窗上停了一停。"}}));
+        const int sharedVersion = firstVersion + 1;
+        const auto shareRef = QStringLiteral("thought:%1:%2").arg(firstId).arg(sharedVersion);
+        QVERIFY(db.recordDelivery(QStringLiteral("share"), shareRef, Channel::kPet,
+                                  Channel::kDefaultSession, QStringLiteral("屋檐轻响，雨在窗上停了一停。")));
+        QVERIFY(db.recordDeliveryOutcome(QStringLiteral("share"), shareRef,
+                                         QStringLiteral("protocol_accepted")));
+        // 活动二：同样完成且有产物，但还没有分享过。
+        QVERIFY(db.saveQATurn(QStringLiteral("再写一段"), R"({"personal_interest":"想写风声"})", {}));
+        const auto second = db.nextThought(true);
+        const qlonglong secondId = second["id"].toInteger();
+        const int secondVersion = second["version"].toInt();
+        QVERIFY(secondId > 0 && secondId != firstId);
+        QVERIFY(db.finishThoughtReview(secondId, secondVersion,
+            QJsonObject{{"status", "completed"}, {"reflection", "写好了两句"},
+                        {"draft", "风从窗缝里钻进来。"}}));
+        const auto activity = db.activityById(secondId);
+        QCOMPARE(activity["result"].toObject()["status"].toString(), QStringLiteral("completed"));
+        QVERIFY(!activity["result"].toObject()["artifact_ref"].toString().isEmpty());
+
+        const qint64 turn = seedOpenConcern(
+            db, concernTurnMeta(QStringLiteral("basis-artifact-a")),
+            QStringLiteral("最近想写点东西"), QStringLiteral("写出来了吗"),
+            QJsonObject{{"topic", QStringLiteral("写作")},
+                        {"next_check_after_minutes", 60}});
+        QVERIFY(turn > 0);
+        // 已分享的产物不算"还没告诉主人"的新结果。
+        const auto claimShared = reclaimDueConcern(db, path, turn, QStringLiteral("artifact-shared"));
+        QCOMPARE(claimShared["id"].toInteger(), turn);
+        QVERIFY(db.finishConcernReview(turn, claimShared["version"].toInt(),
+                                       QJsonObject{{"concern_action", "contact"},
+                                                   {"contact", contactNow(QStringLiteral("写好了"),
+                                                                          QStringLiteral("写了一段"),
+                                                                          activityResultBasis(firstId))}}));
+        {
+            RawDb raw(path, "artifact-shared-verify");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM reflection_contact WHERE turn_id=%1")
+                                    .arg(turn)).toInt(), 0);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM private_reflection WHERE turn_id=%1")
+                                    .arg(turn)).toString(), QStringLiteral("consider"));
+        }
+        // 未分享的另一份完成产物可以通过。
+        const auto claimFresh = reclaimDueConcern(db, path, turn, QStringLiteral("artifact-fresh"));
+        QCOMPARE(claimFresh["id"].toInteger(), turn);
+        QVERIFY(db.finishConcernReview(turn, claimFresh["version"].toInt(),
+                                       QJsonObject{{"concern_action", "contact"},
+                                                   {"contact", contactNow(QStringLiteral("写好了"),
+                                                                          QStringLiteral("写了一段"),
+                                                                          activityResultBasis(secondId))}}));
+        RawDb raw(path, "artifact-fresh-verify");
+        QVERIFY(raw.open());
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT basis_type FROM reflection_contact WHERE turn_id=%1")
+                                .arg(turn)).toString(), QStringLiteral("activity_result"));
+        QVERIFY(raw.scalar(QStringLiteral("SELECT basis_refs FROM reflection_contact WHERE turn_id=%1")
+                               .arg(turn)).toString()
+                    .contains(QStringLiteral("thought/%1").arg(secondId)));
+    }
+
+    // v27：茉子自己的主动消息（turn_kind='proactive'）不是主人委托，不能当新证据。
+    void contactNowRejectsProactiveEvidence()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath("contact-basis-proactive.db");
+        MemoryManager db(path);
+        const qlonglong proactive = db.recordProactiveMessage(
+            Channel::kPet, Channel::kDefaultSession, QStringLiteral("晚安呀"),
+            QStringLiteral("contact"), QStringLiteral("reflection/1"));
+        QVERIFY(proactive > 0);
+        const qint64 turn = seedOpenConcern(
+            db, concernTurnMeta(QStringLiteral("basis-proactive-a")),
+            QStringLiteral("他说最近睡得晚"), QStringLiteral("有没有早点睡"),
+            QJsonObject{{"topic", QStringLiteral("作息")},
+                        {"next_check_after_minutes", 60}});
+        QVERIFY(turn > 0);
+        const auto claim = reclaimDueConcern(db, path, turn, QStringLiteral("basis-proactive"));
+        QCOMPARE(claim["id"].toInteger(), turn);
+        QVERIFY(db.finishConcernReview(turn, claim["version"].toInt(),
+                                       QJsonObject{{"concern_action", "contact"},
+                                                   {"contact", contactNow(QStringLiteral("想问问"),
+                                                                          QStringLiteral("睡了吗"),
+                                                                          ownerEvidenceBasis(proactive))}}));
+        RawDb raw(path, "basis-proactive-verify");
+        QVERIFY(raw.open());
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM reflection_contact WHERE turn_id=%1")
+                                .arg(turn)).toInt(), 0);
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM private_reflection WHERE turn_id=%1")
+                                .arg(turn)).toString(), QStringLiteral("consider"));
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT action FROM concern_revision WHERE turn=%1 "
+                                           "ORDER BY id DESC LIMIT 1").arg(turn)).toString(),
+                 QStringLiteral("contact_rejected"));
+    }
+
+    // v27：新来源回顾里的 contact now 同样需要依据；被拒时不写 reflection_contact，但保留 consider。
+    void reflectionContactAlsoRequiresBasis()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableContact());
+        const QString path = dir.filePath("reflection-basis.db");
+        MemoryManager db(path);
+        RequestMeta meta = concernTurnMeta(QStringLiteral("reflection-basis-a"));
+        const qint64 turn = db.recordInput(QStringLiteral("今天有点累"), meta, true);
+        QVERIFY(turn > 0);
+        QVERIFY(db.recordQuiet(turn, "close"));
+        const auto claim = db.claimPrivateReflection(12, 60);
+        QCOMPARE(claim["id"].toInteger(), turn);
+        QVERIFY(db.finishPrivateReflection(turn, claim["version"].toInt(), QStringLiteral("consider"),
+                                           QStringLiteral("担心主人休息不够"),
+                                           contactNow(QStringLiteral("想问问"), QStringLiteral("早点睡")),
+                                           {}, {}, QString{}, QJsonObject{}));
+        RawDb raw(path, "reflection-basis-verify");
+        QVERIFY(raw.open());
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM reflection_contact WHERE turn_id=%1")
+                                .arg(turn)).toInt(), 0);
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM private_reflection WHERE turn_id=%1")
+                                .arg(turn)).toString(), QStringLiteral("consider"));
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT note FROM private_reflection WHERE turn_id=%1")
+                                .arg(turn)).toString(), QStringLiteral("担心主人休息不够"));
     }
 
     // 每日"现在联系"上限：达到上限后不再领取，0 表示不限制。
@@ -3344,10 +3777,12 @@ private slots:
         MemoryManager db(path);
         const auto seed = [&](const QString &event, const QString &input, const QString &note,
                               const QString &message) {
+            const auto reminder = insertPendingReminder(
+                path, QStringLiteral("contact-limit-reminder-") + event);
+            if (reminder <= 0) return qint64(0);
             return seedOpenConcern(db, concernTurnMeta(event), input, note, QJsonObject{},
-                                   QJsonObject{{"timing", "now"},
-                                               {"reason", QStringLiteral("到了约定时间")},
-                                               {"message", message}});
+                                   contactNow(QStringLiteral("到了约定时间"), message,
+                                              pendingReminderBasis(reminder)));
         };
 
         const qint64 first = seed(QStringLiteral("contact-limit-a"), QStringLiteral("第一件事"),
@@ -3581,7 +4016,7 @@ private slots:
             MemoryManager db(path);
             RawDb schema(path, "attention-schema");
             QVERIFY(schema.open());
-            QCOMPARE(schema.scalar("PRAGMA user_version").toInt(), 26);
+            QCOMPARE(schema.scalar("PRAGMA user_version").toInt(), 27);
             const QStringList eventColumns = schema.columns("attention_event");
             for (const auto &column : {QStringLiteral("kind"), QStringLiteral("ref"),
                                        QStringLiteral("payload"), QStringLiteral("state"),

@@ -50,6 +50,18 @@ bool visibleSession(const QString &channel,const QString &session,const QString 
             (channel==Channel::kQQPrivate && cfg.isMasterQQ(session)));
 }
 
+// 活动结果是否已经分享过：与 recordShareOutcome 的 ref 约定一致（thought/<id>:<version>）。
+// 已送达（handed_off/protocol_accepted）的活动不能再被当成"还没告诉主人的新结果"。
+bool artifactAlreadyShared(const QSqlDatabase &db,qlonglong id)
+{
+    if (id<=0) return false;
+    QSqlQuery q(db);
+    q.prepare("SELECT 1 FROM delivery_ledger WHERE kind='share' AND ref LIKE ? "
+              "AND state IN ('handed_off','protocol_accepted') LIMIT 1");
+    q.addBindValue(QStringLiteral("thought:%1:%").arg(id));
+    return q.exec() && q.next();
+}
+
 // 统一投递流水（delivery_ledger）的幂等写入：同一 kind+ref 只有一行，
 // 重复回执只累加失败尝试并刷新状态。流水只是可观测性，失败不得阻断主状态机。
 void noteDelivery(const QSqlDatabase &db,const QString &kind,const QString &ref,
@@ -595,7 +607,9 @@ QJsonObject MemoryManager::concernReviewContext(qint64 turn,int version) const
         const auto text=sinceQuery.value(3).toString();
         if (!visibleSession(sinceChannel,sinceSession,channel,session)
             || !policy.allows(sinceChannel,sinceSession,text)) continue;
-        since.append(QJsonObject{{"turn",sinceQuery.value(0).toLongLong()},
+        // ref 与 contact.basis 的 new_owner_evidence 约定一致：模型可以直接引用这一行的发言。
+        since.append(QJsonObject{{"ref",QStringLiteral("chat/%1").arg(sinceQuery.value(0).toLongLong())},
+                                 {"turn",sinceQuery.value(0).toLongLong()},
                                  {"text",text.left(512)},
                                  {"reported_at",sinceQuery.value(4).toString()}});
         if (since.size()>=6) break;
@@ -614,18 +628,187 @@ QJsonObject MemoryManager::concernReviewContext(qint64 turn,int version) const
                                {"understanding",matterQuery.value(2).toString()},
                                {"reported",matterQuery.value(3).toString()}};
     }
+    // 时间概念分离：next_check_at 是茉子自己排的"再检查时间"，不是与主人的约定。
+    // 键名改成 own_next_review_at 并配一句说明，避免模型把它当成"约定时间到了"而现在联系。
     QJsonObject concernRecord{{"ref",QStringLiteral("concern/%1").arg(root>0 ? root : turn)},
                               {"head",QStringLiteral("reflection/%1").arg(turn)},
                               {"topic",topic},
                               {"watch",watch},
                               {"own_reflection",note},
                               {"reported_at",reported}};
-    if (nextCheck>0) concernRecord["next_check_at"]=isoFromEpoch(nextCheck);
+    if (nextCheck>0) {
+        concernRecord["own_next_review_at"]=isoFromEpoch(nextCheck);
+        concernRecord["note"]=QStringLiteral(
+            "你自己决定何时再看一眼的时间，不是与主人的约定；不能作为现在联系的理由。");
+    }
     if (!matterName.isEmpty()) concernRecord["matter"]=matterName;
+    // 候选依据：只给可核验的引用，让模型从中选择并在 contact.basis 写明，服务端再逐条核验。
+    // owner_evidence 复用上面的 since 查询结果（同一行同时保留 turn/text/reported_at 原字段）。
+    QJsonArray ownerEvidence;
+    for (const auto &value : since) {
+        const auto row=value.toObject();
+        ownerEvidence.append(QJsonObject{{"ref",row["ref"]},
+                                         {"reported_at",row["reported_at"]},
+                                         {"text",row["text"].toString().left(160)}});
+    }
+    // 仍为 pending 且未过期的提醒：只有"确实存在、且到期时间很近"的提醒才能作为现在联系的约定依据。
+    QJsonArray reminders;
+    {
+        QSqlQuery reminderQuery(m_db);
+        reminderQuery.prepare("SELECT id,due,message FROM reminder WHERE channel=? AND session=? "
+                              "AND state='pending' AND expires>unixepoch() ORDER BY due LIMIT 8");
+        reminderQuery.addBindValue(channel);
+        reminderQuery.addBindValue(session);
+        if (reminderQuery.exec()) while (reminderQuery.next()) {
+            const auto message=reminderQuery.value(2).toString();
+            if (!policy.allows(channel,session,message)) continue;
+            reminders.append(QJsonObject{{"ref",QStringLiteral("reminder/%1").arg(reminderQuery.value(0).toLongLong())},
+                                         {"state",QStringLiteral("pending")},
+                                         {"due_at",isoFromEpoch(reminderQuery.value(1).toLongLong())},
+                                         {"message",message.left(80)}});
+        }
+    }
+    // 已经完成、有产物、且还没分享给主人的活动结果：可以作为"活动有了结果"的依据。
+    QJsonArray artifacts;
+    {
+        QSqlQuery artifactQuery(m_db);
+        artifactQuery.prepare("SELECT id,thought_version,json_extract(thought_result,'$.artifact_ref') "
+                              "FROM chat_history WHERE thought IS NOT NULL AND thought<>'' "
+                              "AND sensitive=0 AND subject='user' "
+                              "AND json_extract(thought_result,'$.status')='completed' "
+                              "AND coalesce(json_extract(thought_result,'$.artifact_ref'),'')<>'' "
+                              "ORDER BY id DESC LIMIT 8");
+        if (artifactQuery.exec()) while (artifactQuery.next()) {
+            const auto activityId=artifactQuery.value(0).toLongLong();
+            artifacts.append(QJsonObject{
+                {"ref",QStringLiteral("thought/%1").arg(activityId)},
+                {"status",QStringLiteral("completed")},
+                {"version",artifactQuery.value(1).toInt()},
+                {"already_shared",artifactAlreadyShared(m_db,activityId)}});
+        }
+    }
+    const QJsonObject basis{{"owner_evidence",ownerEvidence},
+                            {"reminders",reminders},
+                            {"artifacts",artifacts}};
+    // 最近一次交流是否已经收口：close/defer 之后，之前的发言不再算"新证据"。
+    const QJsonObject recentClosure=recentConversationClosure(channel,session,QStringLiteral("user"),3600);
     QJsonObject result{{"id",turn},{"version",version},{"kind","concern"},
-                       {"concern",concernRecord},{"since",since},{"contacts",contacts}};
+                       {"concern",concernRecord},{"since",since},{"contacts",contacts},
+                       {"basis",basis},{"recent_closure",recentClosure}};
     if (!matter.isEmpty()) result["matter"]=matter;
     return result;
+}
+
+QString MemoryManager::validateContactBasis(const QString &channel,const QString &session,
+                                            qlonglong concernTurn,const QJsonObject &contact) const
+{
+    // 只有"现在联系"需要依据；private/next_chat 只是保留意图，不会真正打扰主人。
+    if (contact.value(QStringLiteral("timing")).toString()!=QStringLiteral("now")) return {};
+    if (!contact.value(QStringLiteral("basis")).isObject()) return QStringLiteral("missing_basis");
+    const QJsonObject basis=contact.value(QStringLiteral("basis")).toObject();
+    const auto typeValue=basis.value(QStringLiteral("type"));
+    if (!typeValue.isString()) return QStringLiteral("invalid_basis_type");
+    const auto type=typeValue.toString();
+    static const QSet<QString> basisTypes{
+        QStringLiteral("new_owner_evidence"),
+        QStringLiteral("explicit_time_delegation"),
+        QStringLiteral("activity_result")};
+    if (!basisTypes.contains(type)) return QStringLiteral("invalid_basis_type");
+    const auto refsValue=basis.value(QStringLiteral("refs"));
+    if (!refsValue.isArray()) return QStringLiteral("missing_basis");
+    const auto refs=refsValue.toArray();
+    if (refs.isEmpty() || refs.size()>4) return QStringLiteral("missing_basis");
+    for (const auto &value : refs) {
+        if (!value.isString() || value.toString().trimmed().isEmpty())
+            return QStringLiteral("invalid_basis_ref");
+    }
+    // 关注来源：决定"之后"的时间下界、可见性范围，以及提醒要匹配的渠道/会话。
+    QSqlQuery origin(m_db);
+    origin.prepare("SELECT h.channel,h.session_id,coalesce(s.reported,h.timestamp),"
+                   "h.subject,h.sensitive,h.turn_kind "
+                   "FROM chat_history h LEFT JOIN cognitive_source s ON s.event=h.cognitive_event "
+                   "AND s.channel=h.channel AND s.session=h.session_id AND s.subject=h.subject "
+                   "AND s.input=h.user_input WHERE h.id=?");
+    origin.addBindValue(concernTurn);
+    if (!origin.exec() || !origin.next()) return QStringLiteral("invalid_basis_ref");
+    const auto originChannel=origin.value(0).toString();
+    const auto originSession=origin.value(1).toString();
+    const auto originReported=origin.value(2).toString();
+    if (origin.value(3).toString()!=QStringLiteral("user") || origin.value(4).toBool()
+        || origin.value(5).toString()!=QStringLiteral("reply"))
+        return QStringLiteral("invalid_basis_ref");
+    origin.finish();
+    // 最近一次交流是否已经收口：close/defer 之后，关闭之前的发言不再算"新证据"。
+    const auto closure=recentConversationClosure(channel,session,QStringLiteral("user"),3600);
+    const auto closureAction=closure.value(QStringLiteral("action")).toString();
+    const bool closedRecently=closureAction==QStringLiteral("close")
+        || closureAction==QStringLiteral("defer");
+    const auto closureReported=closure.value(QStringLiteral("reported_at")).toString();
+    // 用 SQLite 的 julianday 比较混合格式时间（UTC ISO 与本地 datetime 都支持）。
+    const auto after=[this](const QString &later,const QString &earlier) {
+        if (later.isEmpty() || earlier.isEmpty()) return false;
+        QSqlQuery compare(m_db);
+        compare.prepare("SELECT julianday(?)>julianday(?)");
+        compare.addBindValue(later);
+        compare.addBindValue(earlier);
+        return compare.exec() && compare.next() && compare.value(0).toInt()==1;
+    };
+    for (const auto &value : refs) {
+        const auto ref=value.toString();
+        if (type==QStringLiteral("new_owner_evidence")) {
+            // 必须是关注产生之后主人真实说过的话；助手自己的话、主动消息、自己的关注都不算。
+            if (!ref.startsWith(QStringLiteral("chat/"))) return QStringLiteral("invalid_basis_ref");
+            const auto refTurn=ref.mid(5).section(':',0,0).toLongLong();
+            if (refTurn<=0) return QStringLiteral("invalid_basis_ref");
+            QSqlQuery row(m_db);
+            row.prepare("SELECT h.channel,h.session_id,coalesce(s.reported,h.timestamp),"
+                        "h.subject,h.sensitive,h.turn_kind,coalesce(h.user_input,'') "
+                        "FROM chat_history h LEFT JOIN cognitive_source s ON s.event=h.cognitive_event "
+                        "AND s.channel=h.channel AND s.session=h.session_id AND s.subject=h.subject "
+                        "AND s.input=h.user_input WHERE h.id=?");
+            row.addBindValue(refTurn);
+            if (!row.exec() || !row.next()) return QStringLiteral("invalid_basis_ref");
+            // turn_kind='proactive' 的主动消息不是主人委托；'received' 等未落定轮次同样不算。
+            if (row.value(3).toString()!=QStringLiteral("user") || row.value(4).toBool()
+                || row.value(5).toString()!=QStringLiteral("reply")
+                || row.value(6).toString().trimmed().isEmpty())
+                return QStringLiteral("invalid_basis_ref");
+            if (!visibleSession(row.value(0).toString(),row.value(1).toString(),channel,session))
+                return QStringLiteral("invalid_basis_ref");
+            const auto reported=row.value(2).toString();
+            row.finish();
+            if (!after(reported,originReported)) return QStringLiteral("stale_owner_evidence");
+            if (closedRecently && !after(reported,closureReported))
+                return QStringLiteral("ambiguous_after_closure");
+        } else if (type==QStringLiteral("explicit_time_delegation")) {
+            // 必须是真的存在、仍 pending、且马上到期（±15 分钟）的提醒；"约定"不能是模型编的。
+            if (!ref.startsWith(QStringLiteral("reminder/"))) return QStringLiteral("invalid_basis_ref");
+            const auto reminderId=ref.mid(9).section(':',0,0).toLongLong();
+            if (reminderId<=0) return QStringLiteral("invalid_basis_ref");
+            QSqlQuery reminder(m_db);
+            reminder.prepare("SELECT 1 FROM reminder WHERE id=? AND channel=? AND session=? "
+                             "AND state='pending' AND due BETWEEN unixepoch()-120 AND unixepoch()+900 "
+                             "AND expires>unixepoch()");
+            reminder.addBindValue(reminderId);
+            reminder.addBindValue(originChannel);
+            reminder.addBindValue(originSession);
+            if (!reminder.exec() || !reminder.next()) return QStringLiteral("reminder_not_pending");
+        } else {
+            // 活动结果：必须真的完成、有产物、且还没分享过（分享过就不再算"有了新结果"）。
+            if (!ref.startsWith(QStringLiteral("thought/"))) return QStringLiteral("invalid_basis_ref");
+            const auto activityId=ref.mid(8).section(':',0,0).toLongLong();
+            if (activityId<=0) return QStringLiteral("invalid_basis_ref");
+            const auto activity=activityById(activityId);
+            if (activity.isEmpty()) return QStringLiteral("invalid_basis_ref");
+            const auto result=activity.value(QStringLiteral("result")).toObject();
+            if (result.value(QStringLiteral("status")).toString()!=QStringLiteral("completed")
+                || result.value(QStringLiteral("artifact_ref")).toString().trimmed().isEmpty())
+                return QStringLiteral("invalid_basis_ref");
+            if (artifactAlreadyShared(m_db,activityId))
+                return QStringLiteral("artifact_already_shared");
+        }
+    }
+    return {};
 }
 
 bool MemoryManager::finishConcernReview(qlonglong turn,int version,const QJsonObject &proposal)
@@ -664,6 +847,10 @@ bool MemoryManager::finishConcernReview(qlonglong turn,int version,const QJsonOb
     QString sql;
     QList<QVariant> bindings;
     QString contactTiming,contactReason,contactMessage;
+    // contact now 的可核验依据：只有通过核验才落 reflection_contact，并把依据一起存档。
+    QString basisType,basisRefs;
+    bool contactBasisRejected=false;
+    QString revisionAction=action;
     if (action=="keep") {
         const qint64 delay=nextCheckAfter(minutes);
         sql=QStringLiteral("UPDATE private_reflection SET state='consider',claimed_by=NULL,"
@@ -708,21 +895,49 @@ bool MemoryManager::finishConcernReview(qlonglong turn,int version,const QJsonOb
         if (contactTiming==QStringLiteral("now")
             && (contactMessage.isEmpty() || contactMessage.size()>300
                 || !policy.allows(channel,session,contactMessage))) return false;
-        sql=QStringLiteral("UPDATE private_reflection SET state='consider',claimed_by=NULL,"
-                           "next_check_at=unixepoch()+7200,updated_at=unixepoch() "
-                           "WHERE turn_id=? AND version=? AND state='pending'");
-        bindings<<turn<<version;
+        if (contactTiming==QStringLiteral("now")) {
+            const auto rejection=validateContactBasis(channel,session,turn,contact);
+            if (!rejection.isEmpty()) {
+                // 依据核验不过：不要投递，但也不能让关注卡在 pending 里无限 defer。
+                // 按 keep 语义放回关注队列（30 分钟后可再检查），并留一条可审计的修订。
+                const auto declaredType=contact["basis"].toObject()["type"].toString();
+                qInfo()<<"[Concern] contact_rejected turn="<<turn<<"version="<<version
+                       <<"type="<<declaredType<<"reason="<<rejection;
+                sql=QStringLiteral("UPDATE private_reflection SET state='consider',claimed_by=NULL,"
+                                   "next_check_at=unixepoch()+1800,updated_at=unixepoch() "
+                                   "WHERE turn_id=? AND version=? AND state='pending'");
+                bindings<<turn<<version;
+                contactBasisRejected=true;
+                revisionAction=QStringLiteral("contact_rejected");
+            } else {
+                const auto basis=contact["basis"].toObject();
+                basisType=basis["type"].toString();
+                basisRefs=QString::fromUtf8(QJsonDocument(basis["refs"].toArray())
+                                                .toJson(QJsonDocument::Compact));
+                sql=QStringLiteral("UPDATE private_reflection SET state='consider',claimed_by=NULL,"
+                                   "next_check_at=unixepoch()+7200,updated_at=unixepoch() "
+                                   "WHERE turn_id=? AND version=? AND state='pending'");
+                bindings<<turn<<version;
+            }
+        } else {
+            sql=QStringLiteral("UPDATE private_reflection SET state='consider',claimed_by=NULL,"
+                               "next_check_at=unixepoch()+7200,updated_at=unixepoch() "
+                               "WHERE turn_id=? AND version=? AND state='pending'");
+            bindings<<turn<<version;
+        }
     }
     q.prepare(sql);
     for (const auto &value : bindings) q.addBindValue(value);
     if (!q.exec() || q.numRowsAffected()!=1) return false;
-    if (action=="contact") {
+    if (action=="contact" && !contactBasisRejected) {
         // 联系意图与关注状态同一事务落库；投递层之后按 outcome='proposed' 取走。
-        q.prepare("INSERT INTO reflection_contact(turn_id,version,timing,reason,message,outcome,channel,session) "
-                  "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(turn_id) DO UPDATE SET "
+        // basis_type/basis_refs 记录这次"现在联系"凭什么发生，非 now 的联系留 NULL。
+        q.prepare("INSERT INTO reflection_contact(turn_id,version,timing,reason,message,outcome,channel,session,"
+                  "basis_type,basis_refs) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(turn_id) DO UPDATE SET "
                   "version=excluded.version,timing=excluded.timing,reason=excluded.reason,"
                   "message=excluded.message,outcome=excluded.outcome,"
                   "channel=excluded.channel,session=excluded.session,"
+                  "basis_type=excluded.basis_type,basis_refs=excluded.basis_refs,"
                   // 这是一次新的联系意图：重试预算重新计算（旧投递的失败次数不占用新意图）。
                   "attempts=0,last_outcome=NULL,last_attempt_at=NULL");
         q.addBindValue(turn);
@@ -734,25 +949,29 @@ bool MemoryManager::finishConcernReview(qlonglong turn,int version,const QJsonOb
                                                             : QStringLiteral("retained"));
         q.addBindValue(channel);
         q.addBindValue(session);
+        q.addBindValue(basisType.isEmpty() ? QVariant() : QVariant(basisType));
+        q.addBindValue(basisRefs.isEmpty() ? QVariant() : QVariant(basisRefs));
         if (!q.exec()) return false;
     }
     {
         // 到期回顾是原地更新同一行，旧想法会被覆盖；这里把"决策前/后"快照留成流水，
         // 与来源回顾的 reflection_change 链互补，保证可追溯。
+        // 依据被拒时同样留痕（action=contact_rejected），但不写 contact_timing。
+        const bool rejectedContact=contactBasisRejected;
         QSqlQuery rev(m_db);
         rev.prepare("INSERT INTO concern_revision(turn,version,action,note_before,note_after,"
                     "topic,watch,next_check_at,contact_timing) "
                     "SELECT turn_id,version,?,?,note,topic,watch,next_check_at,? "
                     "FROM private_reflection WHERE turn_id=?");
-        rev.addBindValue(action);
+        rev.addBindValue(revisionAction);
         rev.addBindValue(beforeNote);
-        rev.addBindValue(contactTiming.isEmpty() ? QVariant() : QVariant(contactTiming));
+        rev.addBindValue((rejectedContact || contactTiming.isEmpty()) ? QVariant() : QVariant(contactTiming));
         rev.addBindValue(turn);
         if (!rev.exec()) return false;
     }
     if (!m_db.commit()) return false;
     rollback.dismiss();
-    qInfo()<<"[Concern] review committed turn="<<turn<<"version="<<version<<"action="<<action;
+    qInfo()<<"[Concern] review committed turn="<<turn<<"version="<<version<<"action="<<revisionAction;
     return true;
 }
 
@@ -938,14 +1157,38 @@ bool MemoryManager::finishPrivateReflection(qlonglong turn, int version, const Q
         if (timing!="private" && timing!="next_chat" && timing!="now") return false;
         if (reason.isEmpty() || reason.size()>240 || !policy.allows(channel,session,reason)) return false;
         if (timing=="now" && (message.isEmpty() || message.size()>300 || !policy.allows(channel,session,message))) return false;
-        q.prepare("INSERT INTO reflection_contact(turn_id,version,timing,reason,message,outcome) VALUES(?,?,?,?,?,?)");
-        q.addBindValue(turn);
-        q.addBindValue(version);
-        q.addBindValue(timing);
-        q.addBindValue(reason);
-        q.addBindValue(timing=="now" ? message : QString());
-        q.addBindValue(timing=="now" ? "proposed" : "retained");
-        if (!q.exec()) return false;
+        QString basisType,basisRefs;
+        bool writeContact=true;
+        if (timing=="now") {
+            // "现在联系"必须先通过服务端依据核验；不通过只是不写联系意图，
+            // 本次仍按 consider 落库（上面的关注更新已生效），不因依据不足而 defer。
+            const auto rejection=validateContactBasis(channel,session,turn,contact);
+            if (!rejection.isEmpty()) {
+                qInfo()<<"[Reflection] contact_rejected turn="<<turn<<"version="<<version
+                       <<"type="<<contact["basis"].toObject()["type"].toString()
+                       <<"reason="<<rejection;
+                writeContact=false;
+            } else {
+                const auto basis=contact["basis"].toObject();
+                basisType=basis["type"].toString();
+                basisRefs=QString::fromUtf8(QJsonDocument(basis["refs"].toArray())
+                                                .toJson(QJsonDocument::Compact));
+            }
+        }
+        if (writeContact) {
+            // basis_type/basis_refs 与联系意图同一行落库；非 now 的联系留 NULL。
+            q.prepare("INSERT INTO reflection_contact(turn_id,version,timing,reason,message,outcome,"
+                      "basis_type,basis_refs) VALUES(?,?,?,?,?,?,?,?)");
+            q.addBindValue(turn);
+            q.addBindValue(version);
+            q.addBindValue(timing);
+            q.addBindValue(reason);
+            q.addBindValue(timing=="now" ? message : QString());
+            q.addBindValue(timing=="now" ? "proposed" : "retained");
+            q.addBindValue(basisType.isEmpty() ? QVariant() : QVariant(basisType));
+            q.addBindValue(basisRefs.isEmpty() ? QVariant() : QVariant(basisRefs));
+            if (!q.exec()) return false;
+        }
     }
     if (!m_db.commit()) return false;
     rollback.dismiss();

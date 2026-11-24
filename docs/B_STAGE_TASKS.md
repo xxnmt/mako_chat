@@ -131,3 +131,19 @@
 验证：全量构建零错误；`tst_memorymanager` 85 passed / 1 skipped、`tst_memoryagent` 73、`tst_qqdelivery` 6、`tst_concern` 通过。`tst_runtimelog` 在本宿主为**间歇性环境失败**（子进程管道；重试 3 次 2 败 1 过，失败点在既有 `QProcess` 子进程用例，非本次逻辑）。
 
 生产库已备份并迁移 `user_version=26`（`concern_revision` 表就绪；迁移前备份 `QianDaoMoZi_memory.db.bak_before_v26_<时间戳>`）。
+
+## 8. 行动依据核验（R5，2026-11-24）
+
+对 11/23 夜间日志（`logs_20261123_235026_711_4c76a0f1b162.txt`）的 00:42 主动联系事件与外部研究报告逐条核对后修复：
+
+| 问题 | 实现 |
+|---|---|
+| `contact(now)` 只有模型自述理由，无服务端核验 | 新增 `contact.basis{type,refs}` 契约与 `validateContactBasis()`：`new_owner_evidence` 必须引用关注之后（且最近 `close/defer` 之后）的真实主人发言；`explicit_time_delegation` 必须引用**仍 pending 且临近到期**的 `reminder/<id>`；`activity_result` 必须引用已完成、有产物且**尚未分享**的 `thought/<id>` |
+| `next_check_at` 被当成"约定时间" | context 改为 `own_next_review_at` + 明确"不是与主人的约定"；不提供任何可作为 now 依据的旧时间字段；提示词同步 |
+| 前台刚自然收口（`close/defer`）后仍可能被"到点提醒" | 新增 `recentConversationClosure()`，context 带 `recent_closure`；`new_owner_evidence` 必须晚于收口时间；提示词写明 |
+| 依据不可追溯 | v27：`reflection_contact.basis_type/basis_refs`；拒绝时写 `concern_revision(action='contact_rejected')` 并 `[Concern] contact_rejected` 日志，不发送、不让回顾无限 defer |
+| 自增强（主动消息回写后再次作为依据） | 核验只接受 `subject='user'` 的 reply 轮、真实 reminder、未分享 activity；`turn_kind='proactive'` 与其他助手表达一律拒绝 |
+
+验证：全量构建零错误；`ctest` **20/20**（含修复后的 `tst_runtimelog`：改为文件重定向验证子进程输出，不再依赖受限环境的管道）；`tst_memorymanager` 92 passed/1 skipped、`tst_memoryagent` 73；新增 7 条依据核验用例。生产库已备份并迁移 `user_version=27`。
+
+剩余边界（不冒充解决）：核验只能证明"依据真实存在且时序合法"，不能判断语义是否贴切（模型仍可能把不相关的提醒/作品当作理由）；`recent_closure` 只看最新一条交流；提醒窗口 `[-120,+900]s` 偏保守；历史 `reflection_contact` 无 basis（旧数据不追溯）。

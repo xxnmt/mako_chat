@@ -128,6 +128,22 @@
 - **能力清单当前活动**：清单 JSON 中出现 `current_activity{ref,status,progress,next_step}`，与 `attention_state.current_activity` 一致。
 - **日志噪声**：空 `[Attention] backlog` 与 `idle skip reason=no_idle` 只在 DEBUG 出现；INFO 只在有事件/配置问题时出现。
 
+## 5.2 行动依据核验（v27）
+
+- 主动联系 `timing=now` 必须在 `contact.basis` 给出三类依据之一：
+  - `new_owner_evidence`：引用关注之后（以及最近一次 `close/defer` 之后）的真实主人发言 `chat/<id>`；
+  - `explicit_time_delegation`：引用仍 `pending`、临近到期的 `reminder/<id>`（不是"我自己安排的时间"）；
+  - `activity_result`：引用已完成、有产物、尚未分享的 `thought/<id>`。
+- 被拒时的观测：
+  ```sql
+  select turn,version,action,note_before,note_after,contact_timing from concern_revision
+   where action='contact_rejected' order by id desc limit 5;
+  select turn_id,basis_type,basis_refs from reflection_contact order by turn_id desc limit 5;
+  ```
+  日志：`[Concern] contact_rejected turn=.. type=.. reason=..`；不应出现新的 `reflection_contact(timing='now')` 或主动消息。
+- **新增验收场景**：互道晚安（前台 `conversation_action=close`）后 30 分钟内，不应出现"到点提醒/念诗"式主动联系；除非存在真实 pending reminder 或新的主人证据。日志中 `[Concern] review committed ... action=contact` 必须带可核对的 basis。
+- `recent_closure` 在回顾 context 中可见，用于判断"刚收口"；`own_next_review_at` 只是她自己的再检查时间，不得被当作约定。
+
 ## 6. 已知边界（不作为失败）
 
 - 多活动并行选择未实现（沿用单活动，ROADMAP 已列为后续）。

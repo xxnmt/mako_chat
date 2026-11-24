@@ -678,12 +678,33 @@ private slots:
         for (const auto &action : actions) outcomes.append(action.toObject()["state"].toString());
         QVERIFY(outcomes.contains("cancelled"));
         QVERIFY(outcomes.contains("handed_off"));
+        // contact now 必须带可核验依据：插入一条真实 pending、即将到期的提醒作为约定。
+        qlonglong reminderId = 0;
+        {
+            QSqlQuery reminder(QSqlDatabase::database("memory_db_connection"));
+            QVERIFY(reminder.exec(QStringLiteral(
+                "INSERT INTO reminder(turn,channel,session,due,expires,message,state) "
+                "VALUES(-1,'pet','default',unixepoch()+300,unixepoch()+3600,'basis reminder','pending')")));
+            reminderId = reminder.lastInsertId().toLongLong();
+        }
+        QVERIFY(reminderId > 0);
         QVERIFY(db.finishPrivateReflection(turn,1,"consider","own question",
-            {{"timing","now"},{"reason","follow up"},{"message","shall we continue?"}}));
+            {{"timing","now"},{"reason","follow up"},{"message","shall we continue?"},
+             {"basis",QJsonObject{{"type","explicit_time_delegation"},
+                                  {"refs",QJsonArray{QStringLiteral("reminder/%1").arg(reminderId)}}}}}));
         QVERIFY(db.claimReflectionContact(turn,1,"qq_group","other").isEmpty());
         QCOMPARE(db.claimReflectionContact(turn,1,"pet","default"),QString("shall we continue?"));
         QVERIFY(db.claimReflectionContact(turn,1,"pet","default").isEmpty());
         QVERIFY(db.recordContactOutcome(turn,1,"handed_off"));
+        {
+            // 依据字段与联系意图同一行落库，供审计"凭什么现在联系"。
+            QSqlQuery basisQuery(QSqlDatabase::database("memory_db_connection"));
+            basisQuery.prepare("SELECT basis_type,basis_refs FROM reflection_contact WHERE turn_id=?");
+            basisQuery.addBindValue(turn);
+            QVERIFY(basisQuery.exec() && basisQuery.next());
+            QCOMPARE(basisQuery.value(0).toString(),QString("explicit_time_delegation"));
+            QVERIFY(basisQuery.value(1).toString().contains(QStringLiteral("reminder/%1").arg(reminderId)));
+        }
         QCOMPARE(db.recentPrivateReflection(meta)["handed_off_message"].toString(),QString("shall we continue?"));
         QVERIFY(db.recordContactOutcome(turn,1,"unknown"));
         QVERIFY(!db.recordContactOutcome(turn,1,"protocol_accepted"));
@@ -895,6 +916,8 @@ private slots:
             // 回顾提示词末行带一行能力摘要（联系目标/安静时段/写作开关），不是整段 JSON。
             QVERIFY(bodies.first().contains(QStringLiteral("服务端核验的当前授权").toUtf8()));
             QVERIFY(bodies.first().contains(QStringLiteral("私下写作开关").toUtf8()));
+            // v27：回顾提示词写明"现在联系"必须给出可核验依据（contact.basis）。
+            QVERIFY(bodies.first().contains(QStringLiteral("contact.basis").toUtf8()));
             QVERIFY(bodies.at(1).contains("previous street sounds"));
             QVERIFY(db.nextThought(false).isEmpty());
             QVERIFY(cfg.writeConfigDocument("identity.json",
