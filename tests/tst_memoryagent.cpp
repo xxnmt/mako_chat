@@ -678,20 +678,17 @@ private slots:
         for (const auto &action : actions) outcomes.append(action.toObject()["state"].toString());
         QVERIFY(outcomes.contains("cancelled"));
         QVERIFY(outcomes.contains("handed_off"));
-        // contact now 必须带可核验依据：插入一条真实 pending、即将到期的提醒作为约定。
-        qlonglong reminderId = 0;
-        {
-            QSqlQuery reminder(QSqlDatabase::database("memory_db_connection"));
-            QVERIFY(reminder.exec(QStringLiteral(
-                "INSERT INTO reminder(turn,channel,session,due,expires,message,state) "
-                "VALUES(-1,'pet','default',unixepoch()+300,unixepoch()+3600,'basis reminder','pending')")));
-            reminderId = reminder.lastInsertId().toLongLong();
-        }
-        QVERIFY(reminderId > 0);
+        // contact now 必须带可核验依据：v28 起时间委托只由提醒链执行，回顾不能拿提醒当依据；
+        // 这里用"关注之后主人真实说过的一句话"（new_owner_evidence）。
+        RequestMeta evidenceMeta;
+        evidenceMeta.eventId = evidenceMeta.runId = QStringLiteral("owner-evidence-after-contact");
+        evidenceMeta.receivedAtUtc = QDateTime::currentDateTimeUtc().addSecs(3600);
+        const qlonglong evidenceTurn = db.recordInput("later owner words", evidenceMeta, true);
+        QVERIFY(evidenceTurn > 0);
         QVERIFY(db.finishPrivateReflection(turn,1,"consider","own question",
             {{"timing","now"},{"reason","follow up"},{"message","shall we continue?"},
-             {"basis",QJsonObject{{"type","explicit_time_delegation"},
-                                  {"refs",QJsonArray{QStringLiteral("reminder/%1").arg(reminderId)}}}}}));
+             {"basis",QJsonObject{{"type","new_owner_evidence"},
+                                  {"refs",QJsonArray{QStringLiteral("chat/%1").arg(evidenceTurn)}}}}}));
         QVERIFY(db.claimReflectionContact(turn,1,"qq_group","other").isEmpty());
         QCOMPARE(db.claimReflectionContact(turn,1,"pet","default"),QString("shall we continue?"));
         QVERIFY(db.claimReflectionContact(turn,1,"pet","default").isEmpty());
@@ -702,8 +699,8 @@ private slots:
             basisQuery.prepare("SELECT basis_type,basis_refs FROM reflection_contact WHERE turn_id=?");
             basisQuery.addBindValue(turn);
             QVERIFY(basisQuery.exec() && basisQuery.next());
-            QCOMPARE(basisQuery.value(0).toString(),QString("explicit_time_delegation"));
-            QVERIFY(basisQuery.value(1).toString().contains(QStringLiteral("reminder/%1").arg(reminderId)));
+            QCOMPARE(basisQuery.value(0).toString(),QString("new_owner_evidence"));
+            QVERIFY(basisQuery.value(1).toString().contains(QStringLiteral("chat/%1").arg(evidenceTurn)));
         }
         QCOMPARE(db.recentPrivateReflection(meta)["handed_off_message"].toString(),QString("shall we continue?"));
         QVERIFY(db.recordContactOutcome(turn,1,"unknown"));

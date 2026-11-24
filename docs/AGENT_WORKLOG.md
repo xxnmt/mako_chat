@@ -369,3 +369,23 @@ B5 的 7 天实机连续运行、真实 QQ 主动联系到达、多活动并行�
 验证：`ctest` **20/20**；`tst_memorymanager` 92 passed/1 skipped、`tst_memoryagent` 73；新增 7 条依据核验用例；生产库备份并迁移 v27（`QianDaoMoZi_memory.db.bak_before_v27_<时间戳>`）。
 
 已知边界：服务端只能证明"依据存在且时序合法"，不能判断语义是否贴切；`recent_closure` 只看最新一条；提醒窗口偏保守；历史 contact 无 basis。
+
+---
+
+## 2026-11-24 · 执行期授权与状态竞态（R6）
+
+第二轮独立源码验收报告（更新版）确认 v27 的 basis 门禁已落在服务端，但属于 Evidence Gate 而非 Action Authorization，并列出可构造缺口。逐条核对成立后修复：
+
+| 发现 | 处理 |
+|---|---|
+| 高：pending reminder 既授权 contact(now)，之后 Reminder 链又发一次 → 一次委托两次动作 | 取消 `explicit_time_delegation` 作为 contact 授权（时间委托归 Reminder 链），basis 只剩 owner evidence / activity result |
+| 中高：claim/retry 不重验 basis（TOCTOU） | `claimReflectionContact()` 用落库 basis 重验；失效 → `withheld/basis_expired`，不发送 |
+| 中高：v26 旧 now contact 无 basis 可被领取 | v28 迁移 + claim 兜底 → `withheld/missing_basis_at_v28` |
+| 中：unknown share 被当作未分享 | `artifactAlreadyShared()` 把 unknown 视为 possibly_shared |
+| 低中：basis 被拒仍 emit contactProposed → 假 withheld 日志 | 新增 `hasProposedContact()`，PrivateReview 只在真提交时 emit |
+| crash-after-claim 无恢复策略 | `recoverStaleContacts(600)` → `unknown/dispatch_abandoned`（at-most-once） |
+| 收口只看同渠道 | pet/qq_private 按 subject 跨渠道取最近 close/defer |
+
+验证：`ctest` **20/20**；`tst_memorymanager` 101 passed/1 skipped、`tst_memoryagent` 73；新增 9 条用例。生产库备份并迁移 v28（`QianDaoMoZi_memory.db.bak_before_v28_<时间戳>`）。
+
+明确未做：语义相关性（"真实但无关"仍可通过，已用 `semanticallyUnrelatedBasisStillPasses` 固化为基线）；cross-channel 收口可能过度抑制；统一 Action Commit Boundary / exactly-once 恢复仍属后续架构工作。

@@ -51,13 +51,14 @@ bool visibleSession(const QString &channel,const QString &session,const QString 
 }
 
 // 活动结果是否已经分享过：与 recordShareOutcome 的 ref 约定一致（thought/<id>:<version>）。
-// 已送达（handed_off/protocol_accepted）的活动不能再被当成"还没告诉主人的新结果"。
+// handed_off/protocol_accepted 是明确送达；unknown 表示协议层"可能已送达、不重发"，
+// 因此同样视为已分享，避免把同一结果当成"还没告诉主人的新结果"再发一遍。
 bool artifactAlreadyShared(const QSqlDatabase &db,qlonglong id)
 {
     if (id<=0) return false;
     QSqlQuery q(db);
     q.prepare("SELECT 1 FROM delivery_ledger WHERE kind='share' AND ref LIKE ? "
-              "AND state IN ('handed_off','protocol_accepted') LIMIT 1");
+              "AND state IN ('handed_off','protocol_accepted','unknown') LIMIT 1");
     q.addBindValue(QStringLiteral("thought:%1:%").arg(id));
     return q.exec() && q.next();
 }
@@ -644,6 +645,7 @@ QJsonObject MemoryManager::concernReviewContext(qint64 turn,int version) const
     if (!matterName.isEmpty()) concernRecord["matter"]=matterName;
     // 候选依据：只给可核验的引用，让模型从中选择并在 contact.basis 写明，服务端再逐条核验。
     // owner_evidence 复用上面的 since 查询结果（同一行同时保留 turn/text/reported_at 原字段）。
+    // reminders 只是"待发提醒"的信息，服务端会在每项标 usable_for_now=false。
     QJsonArray ownerEvidence;
     for (const auto &value : since) {
         const auto row=value.toObject();
@@ -651,7 +653,8 @@ QJsonObject MemoryManager::concernReviewContext(qint64 turn,int version) const
                                          {"reported_at",row["reported_at"]},
                                          {"text",row["text"].toString().left(160)}});
     }
-    // 仍为 pending 且未过期的提醒：只有"确实存在、且到期时间很近"的提醒才能作为现在联系的约定依据。
+    // 仍为 pending 且未过期的提醒：只让模型"知道有这个提醒"，不能作为现在联系的依据——
+    // 时间委托一律由提醒链在到期时执行，回顾若再代表它联系一次就是同一委托两发。
     QJsonArray reminders;
     {
         QSqlQuery reminderQuery(m_db);
@@ -665,7 +668,9 @@ QJsonObject MemoryManager::concernReviewContext(qint64 turn,int version) const
             reminders.append(QJsonObject{{"ref",QStringLiteral("reminder/%1").arg(reminderQuery.value(0).toLongLong())},
                                          {"state",QStringLiteral("pending")},
                                          {"due_at",isoFromEpoch(reminderQuery.value(1).toLongLong())},
-                                         {"message",message.left(80)}});
+                                         {"message",message.left(80)},
+                                         {"usable_for_now",false},
+                                         {"note",QStringLiteral("时间委托由提醒链执行，不能作为 contact(now) 依据")}});
         }
     }
     // 已经完成、有产物、且还没分享给主人的活动结果：可以作为"活动有了结果"的依据。
@@ -709,9 +714,12 @@ QString MemoryManager::validateContactBasis(const QString &channel,const QString
     const auto typeValue=basis.value(QStringLiteral("type"));
     if (!typeValue.isString()) return QStringLiteral("invalid_basis_type");
     const auto type=typeValue.toString();
+    // v28：真实时间委托一律由提醒链在到期时执行。回顾若也能代表它"现在联系"，
+    // 同一次委托会被发两次（回顾一次 + 5s 后提醒一次），所以这里直接拒绝并给出可审计原因。
+    if (type==QStringLiteral("explicit_time_delegation"))
+        return QStringLiteral("time_delegation_owned_by_reminder");
     static const QSet<QString> basisTypes{
         QStringLiteral("new_owner_evidence"),
-        QStringLiteral("explicit_time_delegation"),
         QStringLiteral("activity_result")};
     if (!basisTypes.contains(type)) return QStringLiteral("invalid_basis_type");
     const auto refsValue=basis.value(QStringLiteral("refs"));
@@ -722,7 +730,7 @@ QString MemoryManager::validateContactBasis(const QString &channel,const QString
         if (!value.isString() || value.toString().trimmed().isEmpty())
             return QStringLiteral("invalid_basis_ref");
     }
-    // 关注来源：决定"之后"的时间下界、可见性范围，以及提醒要匹配的渠道/会话。
+    // 关注来源：决定"之后"的时间下界与可见性范围。
     QSqlQuery origin(m_db);
     origin.prepare("SELECT h.channel,h.session_id,coalesce(s.reported,h.timestamp),"
                    "h.subject,h.sensitive,h.turn_kind "
@@ -733,6 +741,9 @@ QString MemoryManager::validateContactBasis(const QString &channel,const QString
     if (!origin.exec() || !origin.next()) return QStringLiteral("invalid_basis_ref");
     const auto originChannel=origin.value(0).toString();
     const auto originSession=origin.value(1).toString();
+    // 渠道/会话只用于校验来源轮次确实落在主人私聊域；具体依据核验不需要它们。
+    Q_UNUSED(originChannel);
+    Q_UNUSED(originSession);
     const auto originReported=origin.value(2).toString();
     if (origin.value(3).toString()!=QStringLiteral("user") || origin.value(4).toBool()
         || origin.value(5).toString()!=QStringLiteral("reply"))
@@ -780,21 +791,8 @@ QString MemoryManager::validateContactBasis(const QString &channel,const QString
             if (!after(reported,originReported)) return QStringLiteral("stale_owner_evidence");
             if (closedRecently && !after(reported,closureReported))
                 return QStringLiteral("ambiguous_after_closure");
-        } else if (type==QStringLiteral("explicit_time_delegation")) {
-            // 必须是真的存在、仍 pending、且马上到期（±15 分钟）的提醒；"约定"不能是模型编的。
-            if (!ref.startsWith(QStringLiteral("reminder/"))) return QStringLiteral("invalid_basis_ref");
-            const auto reminderId=ref.mid(9).section(':',0,0).toLongLong();
-            if (reminderId<=0) return QStringLiteral("invalid_basis_ref");
-            QSqlQuery reminder(m_db);
-            reminder.prepare("SELECT 1 FROM reminder WHERE id=? AND channel=? AND session=? "
-                             "AND state='pending' AND due BETWEEN unixepoch()-120 AND unixepoch()+900 "
-                             "AND expires>unixepoch()");
-            reminder.addBindValue(reminderId);
-            reminder.addBindValue(originChannel);
-            reminder.addBindValue(originSession);
-            if (!reminder.exec() || !reminder.next()) return QStringLiteral("reminder_not_pending");
         } else {
-            // 活动结果：必须真的完成、有产物、且还没分享过（分享过就不再算"有了新结果"）。
+            // 活动结果：必须真的完成、有产物、且还没分享过（unknown 也可能已送达，按已分享处理）。
             if (!ref.startsWith(QStringLiteral("thought/"))) return QStringLiteral("invalid_basis_ref");
             const auto activityId=ref.mid(8).section(':',0,0).toLongLong();
             if (activityId<=0) return QStringLiteral("invalid_basis_ref");
@@ -1018,6 +1016,23 @@ int MemoryManager::recoverStaleReflections(int staleSeconds)
     return recovered;
 }
 
+int MemoryManager::recoverStaleContacts(int staleSeconds)
+{
+    if (staleSeconds < 0) staleSeconds = 0;
+    // at-most-once：领取后崩溃时无法知道消息是否已经交给渠道，只能按"可能已送达"落 unknown，
+    // 绝不重发（unknown 不在 claim/retryable 的可选状态里）。
+    QSqlQuery q(m_db);
+    q.prepare("UPDATE reflection_contact SET outcome='unknown',last_outcome='dispatch_abandoned',"
+              "updated_at=unixepoch() WHERE outcome='dispatching' "
+              "AND coalesce(last_attempt_at,0)>0 AND last_attempt_at<unixepoch()-?");
+    q.addBindValue(staleSeconds);
+    if (!q.exec()) return 0;
+    const int abandoned=q.numRowsAffected();
+    if (abandoned>0)
+        qInfo()<<"[ReflectionContact] dispatch_abandoned count="<<abandoned;
+    return abandoned;
+}
+
 bool MemoryManager::consultPrivateReflection(qint64 turn,int version,const QStringList &terms,QJsonArray &results) const
 {
     QSqlQuery q(m_db);
@@ -1238,7 +1253,54 @@ QString MemoryManager::claimReflectionContact(qlonglong turn, int version, const
         || !basisVisible(m_db,turn,policy,channel,session)
         || !policy.allows(sourceChannel,sourceSession,q.value(3).toString()) || !policy.allows(channel,session,message)) return {};
     q.finish();
-    q.prepare("UPDATE reflection_contact SET outcome='dispatching',channel=?,session=? "
+    // v28：事务领取前用持久化依据重验。提出联系到真正投递之间可能隔了几秒到几分钟，
+    // 期间提醒可能已被提醒链发送/取消、活动可能已分享、可能发生新的收口或新证据；
+    // 只有"此刻仍站得住"的 now 联系才允许领取，否则落 withheld（basis_expired）不再发送。
+    q.prepare("SELECT c.timing,coalesce(c.basis_type,''),coalesce(c.basis_refs,'') "
+              "FROM reflection_contact c WHERE c.turn_id=? AND c.version=?");
+    q.addBindValue(turn);
+    q.addBindValue(version);
+    if (!q.exec() || !q.next()) return {};
+    const auto contactTiming=q.value(0).toString();
+    const auto basisType=q.value(1).toString();
+    const auto basisRefsText=q.value(2).toString();
+    q.finish();
+    if (contactTiming==QStringLiteral("now")) {
+        // 旧行（v27 之前）没有 basis：新授权模型下不可投递，按 missing_basis 处理。
+        QString rejection;
+        QJsonArray refs;
+        if (basisType.isEmpty() || basisRefsText.isEmpty()) {
+            rejection=QStringLiteral("missing_basis");
+        } else {
+            const auto parsed=QJsonDocument::fromJson(basisRefsText.toUtf8()).array();
+            if (parsed.isEmpty()) rejection=QStringLiteral("missing_basis");
+            else refs=parsed;
+        }
+        if (rejection.isEmpty()) {
+            const QJsonObject contact{
+                {QStringLiteral("timing"),contactTiming},
+                {QStringLiteral("basis"),QJsonObject{{QStringLiteral("type"),basisType},
+                                                     {QStringLiteral("refs"),refs}}}};
+            // 用联系意图落库时的同一来源渠道/会话重验，保证与提出时判定口径一致。
+            rejection=validateContactBasis(sourceChannel,sourceSession,turn,contact);
+        }
+        if (!rejection.isEmpty()) {
+            q.prepare("UPDATE reflection_contact SET outcome='withheld',last_outcome='basis_expired',"
+                      "updated_at=unixepoch() WHERE turn_id=? AND version=? "
+                      "AND outcome IN ('proposed','rejected')");
+            q.addBindValue(turn);
+            q.addBindValue(version);
+            if (!q.exec()) return {};
+            qInfo()<<"[ReflectionContact] basis_expired turn="<<turn<<"version="<<version
+                   <<"reason="<<rejection;
+            if (!m_db.commit()) return {};
+            rollback.dismiss();
+            return {};
+        }
+    }
+    q.prepare("UPDATE reflection_contact SET outcome='dispatching',channel=?,session=?,"
+              // 领取即记一次尝试时刻：崩溃后 recoverStaleContacts 靠它判断是否过期遗留。
+              "last_attempt_at=unixepoch(),updated_at=unixepoch() "
               "WHERE turn_id=? AND version=? AND (outcome='proposed' "
               "OR (outcome='rejected' AND attempts<2))");
     q.addBindValue(channel);
@@ -1253,6 +1315,17 @@ QString MemoryManager::claimReflectionContact(qlonglong turn, int version, const
     if (!m_db.commit()) return {};
     rollback.dismiss();
     return message;
+}
+
+bool MemoryManager::hasProposedContact(qlonglong turn,int version) const
+{
+    if (turn<=0 || version<=0) return false;
+    QSqlQuery q(m_db);
+    q.prepare("SELECT 1 FROM reflection_contact WHERE turn_id=? AND version=? "
+              "AND timing='now' AND outcome='proposed' LIMIT 1");
+    q.addBindValue(turn);
+    q.addBindValue(version);
+    return q.exec() && q.next();
 }
 
 bool MemoryManager::recordContactOutcome(qlonglong turn, int version, const QString &outcome)

@@ -144,6 +144,21 @@
 - **新增验收场景**：互道晚安（前台 `conversation_action=close`）后 30 分钟内，不应出现"到点提醒/念诗"式主动联系；除非存在真实 pending reminder 或新的主人证据。日志中 `[Concern] review committed ... action=contact` 必须带可核对的 basis。
 - `recent_closure` 在回顾 context 中可见，用于判断"刚收口"；`own_next_review_at` 只是她自己的再检查时间，不得被当作约定。
 
+## 5.3 执行期授权（v28）
+
+- **时间委托只走提醒链**：`explicit_time_delegation` 不再能授权 `contact(now)`；若看到 `contact_rejected reason=time_delegation_owned_by_reminder`，属正确拒绝，提醒仍会由 Reminder 链发送一次。
+- **领取/重试时重验**：
+  ```sql
+  select turn_id,version,timing,outcome,last_outcome,basis_type from reflection_contact
+   where timing='now' order by turn_id desc limit 10;
+  ```
+  预期：只能看到 `proposed→dispatching→handed_off/protocol_accepted/unknown`；若 basis 失效会变成 `withheld/basis_expired`。
+- **旧行不可投递**：v28 后旧 `now/proposed` 无 basis 行统一 `withheld/missing_basis_at_v28`。
+- **crashed dispatching**：启动日志 `[ReflectionContact] dispatch_abandoned count=N`；对应行 `outcome='unknown'`，不会重发。
+- **跨渠道收口**：pet 说晚安（close/defer）后 1 小时内，QQ 私聊的 `new_owner_evidence` 必须引用 pet 收口之后的新发言，否则 `ambiguous_after_closure`。
+- **不再有假 withheld**：basis 被拒时不应出现 `[ReflectionContact] withheld`；只有在真正提交了 `contact(proposed)` 后才会进入投递链。
+- **验收场景（双发）**：造一条 pending reminder（如 10 分钟后）并让某 due concern 试图用它 `contact(now)` → 应被拒；到点后只有 Reminder 链发送一次。
+
 ## 6. 已知边界（不作为失败）
 
 - 多活动并行选择未实现（沿用单活动，ROADMAP 已列为后续）。

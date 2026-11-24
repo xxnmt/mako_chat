@@ -79,6 +79,9 @@ CognitiveCoordinator::CognitiveCoordinator(MemoryManager &memory, LLMService &mo
     const int staleReflections = store.recoverStaleReflections(1800);
     if (staleReflections > 0)
         qInfo() << "[Attention] stale_reflections_recovered=" << staleReflections;
+    // 上次运行若在"联系投递"中退出，会留下 dispatching 的 contact 行。领取后无法确认消息
+    // 是否已经交给渠道，只能按 at-most-once 落 unknown（可能已送达），不再重发。
+    store.recoverStaleContacts(600);
     store.setAttentionState(QStringLiteral("last_start_at"),
                             QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
 }

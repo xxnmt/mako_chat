@@ -147,3 +147,23 @@
 验证：全量构建零错误；`ctest` **20/20**（含修复后的 `tst_runtimelog`：改为文件重定向验证子进程输出，不再依赖受限环境的管道）；`tst_memorymanager` 92 passed/1 skipped、`tst_memoryagent` 73；新增 7 条依据核验用例。生产库已备份并迁移 `user_version=27`。
 
 剩余边界（不冒充解决）：核验只能证明"依据真实存在且时序合法"，不能判断语义是否贴切（模型仍可能把不相关的提醒/作品当作理由）；`recent_closure` 只看最新一条交流；提醒窗口 `[-120,+900]s` 偏保守；历史 `reflection_contact` 无 basis（旧数据不追溯）。
+
+## 9. 执行期授权与状态竞态（R6，2026-11-24）
+
+第二轮独立源码验收（报告更新版）确认 v27 是 **Evidence Gate**，还不是 **Action Authorization + Atomic Commit**，并指出四项可构造缺口。本轮按"最小正确修复"落地：
+
+| 发现 | 修复 |
+|---|---|
+| 高：`explicit_time_delegation` 与 Reminder 链双发（一次委托两次外部动作） | **取消它作为 `contact(now)` 授权**：真实时间委托一律由 Reminder 链执行；basis 只保留 `new_owner_evidence` 与 `activity_result`；context 里待发提醒保留但标记 `usable_for_now=false`；拒绝原因 `time_delegation_owned_by_reminder` |
+| 中高：commit 后 basis 失效但 retry/dispatch 不重验（TOCTOU） | `claimReflectionContact()` 每次领取/重试前用**落库的 basis_type/basis_refs** 重跑 `validateContactBasis()`；不通过 → `withheld/last_outcome=basis_expired`，不发送、不写 claimed |
+| 中高：v26 旧 `now/proposed` 无 basis 仍可领取 | v28 迁移把旧 `now` 且无 basis 的 `proposed/rejected` 统一置 `withheld/missing_basis_at_v28`；claim 再兜底拒绝 |
+| 中：`unknown` share 被当成"未分享" | `artifactAlreadyShared()` 把 `unknown` 也视为 possibly_shared，不允许再作为 activity 依据 |
+| 低中：basis 被拒仍 emit `contactProposed` → 误导性 withheld 日志 | `PrivateReview` 只在 `hasProposedContact(turn,version)` 为真时 emit；被拒时不再有假信号 |
+| crash-after-claim：`dispatching` 无恢复策略 | `recoverStaleContacts(600)`：超时 `dispatching` → `unknown/dispatch_abandoned`（at-most-once，可审计，不重发）；协调器启动调用 |
+| 中：`recent_closure` 只看同 channel/session | 对主人私聊面统一：`pet` 与 `qq_private` 按 `subject` 跨渠道取最近收口（其它渠道保持同 session） |
+
+v28 迁移同时幂等补 `reflection_contact.updated_at` 列（历史表没有该列，审计与恢复 SQL 需要）。
+
+验证：全量构建零错误；**`ctest` 20/20**；`tst_memorymanager` **101 passed / 1 skipped**、`tst_memoryagent` 73；新增 9 条执行期用例（含双发拒绝、claim 重验、旧行不可投递、unknown share、误报信号、dispatching 恢复、跨渠道收口、语义无关依据基线）。生产库已备份并迁移 `user_version=28`（`QianDaoMoZi_memory.db.bak_before_v28_<时间戳>`；当前库无遗留可投递 `now` 行）。
+
+仍未做（明确边界）：语义相关性（"真实但无关的依据"仍可通过，已用基线测试固化）；cross-channel 收口可能过度抑制；统一 Action Commit Boundary（crash exactly-once）仍是后续架构工作。

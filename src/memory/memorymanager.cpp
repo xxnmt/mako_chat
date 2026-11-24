@@ -1596,20 +1596,32 @@ QJsonObject MemoryManager::recentConversationClosure(const QString &channel,cons
                                                      const QString &subject,int maxAgeSeconds) const
 {
     if (channel.isEmpty() || session.isEmpty() || subject.isEmpty()) return {};
+    // 主人私聊的 pet 与 qq_private 是同一段关系的两个入口：在 pet 里说过晚安（close/defer）后，
+    // QQ 私聊里的主动触达同样应视为"收口之后的交流"，否则换个渠道就能绕过收口。
+    // 其它渠道（群聊等）仍旧只看同渠道同会话。
+    const bool ownerPrivate=channel==Channel::kPet || channel==Channel::kQQPrivate;
     QSqlQuery q(m_db);
     // timestamp 是本地时区字段（与 recordInput/saveQATurn 的本地时间约定一致）；
     // 与 enqueueRecoveryEvents 一样先用 'localtime' 归一，再按天差折算秒数。
-    q.prepare("SELECT h.id,coalesce(s.reported,h.timestamp),h.raw_reply,h.turn_state,h.turn_detail,"
+    QString sql=QStringLiteral(
+              "SELECT h.id,coalesce(s.reported,h.timestamp),h.raw_reply,h.turn_state,h.turn_detail,"
               "(julianday('now','localtime')-julianday(h.timestamp))*86400.0 "
               "FROM chat_history h LEFT JOIN cognitive_source s ON s.event=h.cognitive_event "
               "AND s.channel=h.channel AND s.session=h.session_id AND s.subject=h.subject "
               "AND s.input=h.user_input "
-              "WHERE h.channel=? AND h.session_id=? AND h.subject=? AND h.sensitive=0 "
-              "AND h.turn_kind='reply' AND h.turn_state IN ('quiet','handed_off','legacy') "
-              "ORDER BY h.id DESC LIMIT 1");
-    q.addBindValue(channel);
-    q.addBindValue(session);
+              "WHERE h.subject=? AND h.sensitive=0 "
+              "AND h.turn_kind='reply' AND h.turn_state IN ('quiet','handed_off','legacy') ");
+    if (ownerPrivate)
+        sql+=QStringLiteral("AND h.channel IN ('pet','qq_private') ");
+    else
+        sql+=QStringLiteral("AND h.channel=? AND h.session_id=? ");
+    sql+=QStringLiteral("ORDER BY h.id DESC LIMIT 1");
+    q.prepare(sql);
     q.addBindValue(subject);
+    if (!ownerPrivate) {
+        q.addBindValue(channel);
+        q.addBindValue(session);
+    }
     if (!q.exec() || !q.next()) return {};
     const auto ageSeconds = qRound64(qMax(0.0, q.value(5).toDouble()));
     if (maxAgeSeconds >= 0 && ageSeconds > maxAgeSeconds) return {};
@@ -5228,6 +5240,36 @@ void MemoryManager::initDatabase(const QString &dbFilePath, const QString &conne
             }
             if (!query.exec("PRAGMA user_version=27")) throw query.lastError();
             currentVersion=27;
+        }
+        if (currentVersion<28) {
+            // v28：contact now 的依据门禁收口。
+            // 1) 时间委托改由提醒链独占执行，回顾不再能以 explicit_time_delegation 依据"现在联系"；
+            //    旧库里的 now 联系若没有可核验依据（basis_type/basis_refs 为空），在新授权模型下
+            //    不可投递：统一置 withheld 并留审计，避免旧行被投递层直接领走。
+            // 2) reflection_contact 原先没有 updated_at；v28 起用它记录状态机最近变更时间
+            //    （basis_expired / dispatch_abandoned 等审计）。旧测试会把 user_version 压回
+            //    更小值重放迁移，故先按列名幂等补列，再执行数据整理并升级版本号。
+            if (!query.exec("CREATE TABLE IF NOT EXISTS reflection_contact(turn_id INTEGER PRIMARY KEY,"
+                            "version INTEGER NOT NULL,timing TEXT NOT NULL,reason TEXT,message TEXT,"
+                            "outcome TEXT NOT NULL,channel TEXT,session TEXT)"))
+                throw query.lastError();
+            QSqlQuery contactColumns28(m_db);
+            if (!contactColumns28.exec("PRAGMA table_info(reflection_contact)"))
+                throw contactColumns28.lastError();
+            QSet<QString> contactPresent28;
+            while (contactColumns28.next()) contactPresent28.insert(contactColumns28.value(1).toString());
+            if (!contactPresent28.contains(QStringLiteral("updated_at"))) {
+                if (!query.exec(QStringLiteral("ALTER TABLE reflection_contact ADD COLUMN updated_at INTEGER")))
+                    throw query.lastError();
+            }
+            if (!query.exec("UPDATE reflection_contact SET outcome='withheld',"
+                            "last_outcome='missing_basis_at_v28',updated_at=unixepoch() "
+                            "WHERE timing='now' AND outcome IN ('proposed','rejected') "
+                            "AND (basis_type IS NULL OR basis_type='' "
+                            "OR basis_refs IS NULL OR basis_refs='')"))
+                throw query.lastError();
+            if (!query.exec("PRAGMA user_version=28")) throw query.lastError();
+            currentVersion=28;
         }
         // 关注了结的独立流水（v22 的补充表）。与 reflection_change（回顾链修订）分开：
         // 前者由正常对话写回，后者由私下回顾写，共用 turn 主键会互相覆盖。

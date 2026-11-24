@@ -99,6 +99,8 @@ public:
     // 最近一次前台私下交流的收口状态；超过 maxAgeSeconds 返回 {}。
     // 返回 {action, turn, age_seconds, reported_at}：action=close/defer 表示这段交流已经收口，
     // 早于它的发言不能再当成"新的主人证据"。
+    // channel 为 pet/qq_private（主人私聊）时按跨渠道看待：pet 里说过晚安也能挡住 QQ 私聊的
+    // 主动触达；其它渠道仍只看同渠道同会话。
     QJsonObject recentConversationClosure(const QString &channel,const QString &session,
                                           const QString &subject,int maxAgeSeconds=3600) const;
     QJsonArray structuredMemoryRows(const QStringList &kinds, const QString &subject,
@@ -131,6 +133,9 @@ public:
     bool consultPrivateReflection(qint64 turn, int version,const QStringList &terms,QJsonArray &results) const;
     QString claimReflectionContact(qlonglong turn, int version, const QString &channel, const QString &session);
     bool recordContactOutcome(qlonglong turn, int version, const QString &outcome);
+    // 只有真正核验通过、落库为 proposed 的"现在联系"才算提出了联系；观察层据此决定是否
+    // 通知投递层，避免依据被拒时仍按模型原始 proposal 触发一次（实际不会发送的）联系。
+    bool hasProposedContact(qlonglong turn,int version) const;
     // 上次投递被拒、且还没用完一次重试机会的联系。投递层（5s 调度）据此再次领取；
     // 领取本身由 claimReflectionContact 原子完成，重复轮询不会重复发送。
     QJsonArray retryableReflectionContacts(int limit = 4) const;
@@ -153,7 +158,8 @@ public:
     bool finishConcernReview(qlonglong turn, int version, const QJsonObject &proposal);
     // 只有 contact.timing=="now" 需要可核验的行动依据；返回空串=通过，否则返回拒绝原因
     // （missing_basis / invalid_basis_type / invalid_basis_ref / stale_owner_evidence /
-    //   ambiguous_after_closure / reminder_not_pending / artifact_already_shared）。
+    //   ambiguous_after_closure / artifact_already_shared / time_delegation_owned_by_reminder）。
+    // 时间委托不再作为 now 的依据：提醒链会在到期时自己发送，回顾不能代表它再发第二次。
     QString validateContactBasis(const QString &channel,const QString &session,
                                  qlonglong concernTurn,const QJsonObject &contact) const;
     bool deferConcernReview(qlonglong turn, int version, const QString &reason);
@@ -211,6 +217,9 @@ public:
     // 启动恢复：把租约已过期仍停在 pending 的关注回顾放回可重领状态。
     // 到期关注回 consider（立即可再领取），新来源回顾回 deferred（交由 claimPrivateReflection 重领）。
     int recoverStaleReflections(int staleSeconds = 1800);
+    // 启动恢复：投递层领取后（dispatching）超过 staleSeconds 仍未回执，视为进程崩溃遗留。
+    // at-most-once：置为 unknown（协议层可能已送达），不重发；返回本次恢复条数。
+    int recoverStaleContacts(int staleSeconds = 600);
     // 读取一条活动念头（thought_result 快照），用于能力清单里的"当前活动"。
     QJsonObject activityById(qlonglong id) const;
     // 写一条"茉子主动说出的话"到历史与 raw_events，供下次对话回认与检索。

@@ -100,7 +100,11 @@ void PrivateReview::receive(qlonglong id, int version, const QJsonObject &propos
                                                              proposal["concern"].toObject())) {
             qInfo() << "[Reflection] committed" << id << version << choice << contact["timing"].toString()
                     << "prior_turn=" << prior["source_turn"].toInteger() << "prior_action=" << action;
-            if (choice=="consider" && contact["timing"].toString()=="now") emit contactProposed(id,version);
+            // 只有服务端确实落库了 proposed 的 now 联系才通知投递层；
+            // 依据被拒时只更新关注，不产生外部动作（也不再出现误导性的 withheld 日志）。
+            if (choice=="consider" && contact["timing"].toString()=="now"
+                && store.hasProposedContact(id,version))
+                emit contactProposed(id,version);
         } else {
             store.deferPrivateReflection(id,version);
             qInfo() << "[Reflection] deferred" << id << version << error;
@@ -114,7 +118,9 @@ void PrivateReview::receive(qlonglong id, int version, const QJsonObject &propos
             qInfo() << "[Concern] committed" << id << version << action << contact["timing"].toString();
             // 投递权限与安静时段由 AppController 的 canContactNow 再核验；这里只把"现在联系"的
             // 决定交给投递层，keep/revise/resolve/drop 只在记忆层落库，不产生外部消息。
-            if (action == "contact" && contact["timing"].toString() == "now")
+            // 依据核验被拒时 finishConcernReview 仍返回 true 但不会写 contact 行，此时不 emit。
+            if (action == "contact" && contact["timing"].toString() == "now"
+                && store.hasProposedContact(id,version))
                 emit contactProposed(id,version);
             return;
         }
