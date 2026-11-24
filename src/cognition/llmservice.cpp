@@ -463,6 +463,29 @@ QJsonObject LLMService::capabilityManifest(const RequestMeta &meta) const
     }
     manifest.insert(QStringLiteral("tts"), ttsCapability);
 
+    // 当前活动：她"正在做什么"也应属于自我感知，而不只是持久化在后台。
+    // 只提供简短事实（状态/进度/下一步），不把它当成本轮任务。
+    if (m_memoryManager) {
+        const auto current = m_memoryManager->attentionState(QStringLiteral("current_activity"));
+        const qlonglong activityId = current.startsWith(QStringLiteral("thought/"))
+            ? current.mid(QStringLiteral("thought/").size()).toLongLong() : 0;
+        if (activityId > 0) {
+            const auto activity = m_memoryManager->activityById(activityId);
+            if (!activity.isEmpty()) {
+                const auto result = activity.value(QStringLiteral("result")).toObject();
+                QJsonObject item{{QStringLiteral("ref"), activity.value(QStringLiteral("ref"))}};
+                for (const auto &key : {QStringLiteral("status"), QStringLiteral("progress"),
+                                        QStringLiteral("next_step"), QStringLiteral("goal")}) {
+                    const auto text = result.value(key).toString().trimmed();
+                    if (!text.isEmpty()) item.insert(key, text.left(120));
+                }
+                if (!item.contains(QStringLiteral("status")))
+                    item.insert(QStringLiteral("status"), QStringLiteral("active"));
+                manifest.insert(QStringLiteral("current_activity"), item);
+            }
+        }
+    }
+
     return manifest;
 }
 

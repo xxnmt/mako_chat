@@ -115,3 +115,19 @@
 验证：全量构建零错误；`ctest` **20/20**；`tst_memorymanager` 81 passed / 1 skipped、`tst_memoryagent` 53 passed、`tst_configmanager` 16、`tst_settingspages` 3。
 
 **M5 仍未做**：能力清单的"当前活动/正在做的事"注入（只持久化未注入）；日志保留期/轮转；同义改写匹配；误了结 reopen；多活动并行。
+
+## 7. 可靠性补丁（R3/R4，2026-11-23）
+
+针对实机日志暴露的问题（QQ 断开时普通回复 3 句被丢弃且无记录、到期 revise 无流水、启动残留 pending 回顾、能力清单缺当前活动、日志噪声）：
+
+| 问题 | 实现 | 验收 |
+|---|---|---|
+| 普通回复无投递记录/断线丢失 | `delivery_ledger` 复用 `kind='reply'`：逐句 `recordDelivery("reply","reply:<turn>:<idx>")`，`sendResult` 落 `protocol_accepted/rejected/unknown`；断连时协议层对在途标 `unknown`、排队标 `rejected`；`rejected` 最多补一次，`unknown` 永不重发 | `tst_memorymanager::replyDeliveryLedgerTracksOutcomes`、`deliveryUpsertPreservesAttempts`；`tst_qqdelivery::queuedSendsReportedOnDisconnect`（1×unknown + 2×rejected） |
+| 到期回顾 revise 覆盖旧想法 | v26 `concern_revision` 表：每次到期决策记录 action/note_before/note_after/topic/watch/next_check/contact_timing | `dueConcernReviewWritesRevision`：note_before=旧、note_after=新 |
+| 启动残留 pending 回顾 | `recoverStaleReflections`：租约过期的到期关注回 `consider`（可再领），来源回顾回 `deferred`；协调器启动调用并打 `[Attention] stale_reflections_recovered=` | `staleReflectionsRecovered` |
+| 能力清单缺"正在做的事" | `activityById` + `attention_state.current_activity` → manifest 增加 `current_activity{ref,status,progress,next_step,goal}`（截断 120 字） | `capabilityManifestIncludesCurrentActivity` |
+| 日志噪声 | 空 backlog 降 DEBUG；`idle skip no_idle` 降 DEBUG，配置类原因保留 INFO | 运行日志观测 |
+
+验证：全量构建零错误；`tst_memorymanager` 85 passed / 1 skipped、`tst_memoryagent` 73、`tst_qqdelivery` 6、`tst_concern` 通过。`tst_runtimelog` 在本宿主为**间歇性环境失败**（子进程管道；重试 3 次 2 败 1 过，失败点在既有 `QProcess` 子进程用例，非本次逻辑）。
+
+生产库已备份并迁移 `user_version=26`（`concern_revision` 表就绪；迁移前备份 `QianDaoMoZi_memory.db.bak_before_v26_<时间戳>`）。

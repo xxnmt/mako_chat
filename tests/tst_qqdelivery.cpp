@@ -112,6 +112,52 @@ private slots:
         QTest::qWait(50);QCOMPARE(sends.size(),4);
         client.stop();
     }
+    // 断连丢弃队列时必须逐条回执：正在发送的那条 unknown（协议端可能已处理，不能重发），
+    // 仍在队列里、确定没发出去的那些 rejected（AppController 据此写 delivery_ledger 并有限补发）。
+    void queuedSendsReportedOnDisconnect() {
+        QWebSocketServer server("disconnect-test",QWebSocketServer::NonSecureMode);
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QJsonObject> sends;
+        QWebSocket *peer=nullptr;
+        connect(&server,&QWebSocketServer::newConnection,&server,[&] {
+            peer=server.nextPendingConnection();peer->setParent(&server);
+            connect(peer,&QWebSocket::textMessageReceived,&server,[&](const QString &text) {
+                const auto obj=QJsonDocument::fromJson(text.toUtf8()).object();
+                if(obj["action"].toString().startsWith("send_")) sends.append(obj);
+            });
+        });
+        QQProtocolClient client;
+        QSignalSpy receipts(&client,&QQProtocolClient::sendResult);
+        QQConfig cfg;cfg.enabled=true;
+        cfg.wsUrl=QString("ws://127.0.0.1:%1").arg(server.serverPort());client.setConfig(cfg);client.start();
+        QTRY_VERIFY(client.isConnected() && peer);
+        QQChannelAdapter adapter;adapter.setClient(&client);
+        Utterance u;u.channel=Channel::kQQPrivate;u.sessionId=QStringLiteral("12345");
+        for(int index=0;index<3;++index) {
+            u.text=QStringLiteral("第%1句").arg(index+1);
+            u.deliveryEcho=QStringLiteral("reply:530:%1").arg(index);
+            QVERIFY(adapter.sendUtterance(u));
+        }
+        // 只有第一句被提交出去；另外两句在协议客户端队列里等回执。
+        QTRY_COMPARE(sends.size(),1);
+        peer->close();
+        QTRY_VERIFY_WITH_TIMEOUT(!client.isConnected(),3000);
+        QTRY_COMPARE_WITH_TIMEOUT(receipts.size(),3,3000);
+        int rejected=0,unknown=0;
+        QStringList echoes;
+        for(const auto &args : receipts) {
+            echoes << args.at(0).toString();
+            const QString outcome=args.at(1).toString();
+            if(outcome==QStringLiteral("rejected")) ++rejected;
+            if(outcome==QStringLiteral("unknown")) ++unknown;
+        }
+        QCOMPARE(unknown,1);  // 已提交的那句：可能已被协议端处理，不能重发
+        QCOMPARE(rejected,2); // 仍在队列的两句：确定未发送，可补发
+        QVERIFY(echoes.contains(QStringLiteral("reply:530:0")));
+        QVERIFY(echoes.contains(QStringLiteral("reply:530:1")));
+        QVERIFY(echoes.contains(QStringLiteral("reply:530:2")));
+        client.stop();
+    }
 };
 QTEST_GUILESS_MAIN(TestQQDelivery)
 #include "tst_qqdelivery.moc"

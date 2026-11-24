@@ -75,6 +75,10 @@ CognitiveCoordinator::CognitiveCoordinator(MemoryManager &memory, LLMService &mo
     // B1：进程启动时把崩溃遗留的 received 轮次登记为 recovery 事件（reference 幂等），
     // 由 reviewIfDue 在启动后的第一轮优先恢复；同时记录本次启动时刻供观测。
     qInfo() << "[Attention] recovery_queued=" << store.enqueueRecoveryEvents(120);
+    // 上次运行若在回顾中退出，会留下 pending 的关注回顾；租约过期后放回可重领状态。
+    const int staleReflections = store.recoverStaleReflections(1800);
+    if (staleReflections > 0)
+        qInfo() << "[Attention] stale_reflections_recovered=" << staleReflections;
     store.setAttentionState(QStringLiteral("last_start_at"),
                             QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
 }
@@ -94,9 +98,15 @@ CognitiveCoordinator::~CognitiveCoordinator()
 void CognitiveCoordinator::reviewIfDue()
 {
     // 每轮打一次 backlog，用于区分"没东西可回顾"和"回顾被事件挡住"。
+    // 空队列只记 DEBUG，避免每 60s 一条 INFO 噪声；有内容时保留 INFO 便于现场观测。
     const auto backlog = store.attentionBacklog();
-    qInfo().noquote() << QStringLiteral("[Attention] backlog=")
+    const bool backlogHasContent =
+        !backlog.value(QStringLiteral("pending")).toObject().isEmpty()
+        || !backlog.value(QStringLiteral("by_state")).toObject().isEmpty();
+    const auto backlogLine = QStringLiteral("[Attention] backlog=")
         + QString::fromUtf8(QJsonDocument(backlog).toJson(QJsonDocument::Compact));
+    if (backlogHasContent) qInfo().noquote() << backlogLine;
+    else qDebug().noquote() << backlogLine;
     // 中断恢复优先于一切新回顾：recovery 是最高优先级事件，处理完本轮已排队的恢复就结束
     // 本轮，避免回顾在"上次没说完的话还没收尾"时抢占注意力。只在确实存在 pending recovery
     // 时才领取，避免把 message/due_wake 这类普通事件错误地置成 claimed。
@@ -138,7 +148,11 @@ void CognitiveCoordinator::reviewIfDue()
     else if (!idleForAttention())
         reason = QStringLiteral("no_idle");
     if (!reason.isEmpty()) {
-        qInfo().noquote() << QStringLiteral("[Attention] idle skip reason=%1").arg(reason);
+        // no_idle 是每分钟都会出现的正常状态，降为 DEBUG；配置/能力类原因保留 INFO。
+        if (reason == QStringLiteral("no_idle"))
+            qDebug().noquote() << QStringLiteral("[Attention] idle skip reason=%1").arg(reason);
+        else
+            qInfo().noquote() << QStringLiteral("[Attention] idle skip reason=%1").arg(reason);
         return;
     }
     // 空闲：登记一次"唤醒请求"事件（同一分钟幂等），按实际是否真的启动了回顾落 done。

@@ -116,6 +116,18 @@
 - **关注默认间隔/保留期**：新关注未指定时间时按 `concern_default_check_minutes`（默认 720）排期；超过 `concern_retention_days`（默认 14）的旧关注不再按时间唤醒，但仍可被新证据命中。
 - **分享/联系重试**：`rejected` 最多补一次；`unknown` 不重发；均以 `delivery_ledger` 为准。
 
+## 5.1 可靠性补丁的观测点
+
+- **普通回复投递**：每句 `delivery_ledger(kind='reply', ref='reply:<turn>:<index>')`；断线时在途为 `unknown`、排队为 `rejected`；`rejected` 最多补一次，`unknown` 永不重发。核对：
+  ```sql
+  select ref,state,attempts,last_error from delivery_ledger where kind='reply' order by id desc limit 10;
+  ```
+  日志关键字：`discard queued sends`、`发送失败 retcode`、`[QQ]回执`。
+- **到期修订流水**：`select turn,action,note_before,note_after,next_check_at from concern_revision order by id desc limit 10;`（旧想法不再被静默覆盖）。
+- **启动残留恢复**：启动日志出现 `[Concern] stale_reflections_recovered=N` 或 `[Attention] stale_reflections_recovered=N`。
+- **能力清单当前活动**：清单 JSON 中出现 `current_activity{ref,status,progress,next_step}`，与 `attention_state.current_activity` 一致。
+- **日志噪声**：空 `[Attention] backlog` 与 `idle skip reason=no_idle` 只在 DEBUG 出现；INFO 只在有事件/配置问题时出现。
+
 ## 6. 已知边界（不作为失败）
 
 - 多活动并行选择未实现（沿用单活动，ROADMAP 已列为后续）。

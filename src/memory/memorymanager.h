@@ -168,6 +168,19 @@ public:
     // 分享回执：把结果补进 thought_result 并存 delivery_ledger（kind='share'）。
     bool recordShareOutcome(qlonglong activityId, int version, const QString &outcome,
                             const QString &channel, const QString &session);
+    // 普通对话回复的投递账本（kind='reply'，与 contact/share 共用 delivery_ledger，无迁移）。
+    // 状态机：claimed --回执--> protocol_accepted | handed_off | rejected | unknown。
+    // rejected 且 attempts<maxAttempts 才允许补发；unknown 表示协议层可能已送达，绝不重发。
+    // recordDelivery 是幂等 upsert：重复 claim 刷新路由/原文但保留 attempts；
+    // 发送方在每次提交（首发送/补发）前用 recordDeliveryAttempt 递增，回执用
+    // recordDeliveryOutcome 落终态。所有写操作失败返回 false，不抛异常。
+    bool recordDelivery(const QString &kind,const QString &ref,const QString &channel,
+                        const QString &session,const QString &text);
+    bool recordDeliveryAttempt(const QString &kind,const QString &ref);
+    bool recordDeliveryOutcome(const QString &kind,const QString &ref,const QString &outcome,
+                               const QString &detail = QString());
+    // 仍可补发的投递：state='rejected' 且 attempts<maxAttempts，按 id 升序。
+    QJsonArray retryableDeliveries(const QString &kind,int maxAttempts = 2,int limit = 20) const;
 
     // B1：统一注意力事件。事件表是通用的"注意力待办"队列，不绑定单一调用方：
     // 消息到达、到期唤醒、活动结果、崩溃恢复都按 (kind,ref) 幂等入队，协调器按
@@ -185,6 +198,11 @@ public:
     QString attentionState(const QString &key) const;
     // 扫描进程中断遗留的 received 轮次，幂等入队 recovery 事件；返回新入队条数。
     int enqueueRecoveryEvents(int olderThanSeconds = 120);
+    // 启动恢复：把租约已过期仍停在 pending 的关注回顾放回可重领状态。
+    // 到期关注回 consider（立即可再领取），新来源回顾回 deferred（交由 claimPrivateReflection 重领）。
+    int recoverStaleReflections(int staleSeconds = 1800);
+    // 读取一条活动念头（thought_result 快照），用于能力清单里的"当前活动"。
+    QJsonObject activityById(qlonglong id) const;
     // 写一条"茉子主动说出的话"到历史与 raw_events，供下次对话回认与检索。
     // 主动轮次 user_input 为 NULL、turn_kind='proactive'，不参与回顾/认识更新。
     qlonglong recordProactiveMessage(const QString &channel, const QString &session, const QString &text,

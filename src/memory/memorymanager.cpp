@@ -302,6 +302,21 @@ QJsonObject MemoryManager::nextThought(bool dueOnly) const
             {"last_review",QJsonDocument::fromJson(q.value(3).toByteArray()).object()}};
 }
 
+QJsonObject MemoryManager::activityById(qlonglong id) const
+{
+    if (id <= 0) return {};
+    QSqlQuery q(m_db);
+    q.prepare("SELECT id,thought,thought_version,thought_result FROM chat_history "
+              "WHERE id=? AND thought IS NOT NULL AND thought<>'' AND sensitive=0");
+    q.addBindValue(id);
+    if (!q.exec() || !q.next()) return {};
+    return {{"ref",QStringLiteral("thought/%1").arg(id)},
+            {"id",q.value(0).toLongLong()},
+            {"interest",q.value(1).toString()},
+            {"version",q.value(2).toInt()},
+            {"result",QJsonDocument::fromJson(q.value(3).toByteArray()).object()}};
+}
+
 bool MemoryManager::chargePrivateReview(qlonglong turn, int dailyLimit, int cooldownSeconds)
 {
     QSqlQuery q(m_db);
@@ -513,6 +528,100 @@ bool MemoryManager::recordShareOutcome(qlonglong activityId, int version, const 
     }
     qInfo() << "[Share] outcome" << ref << outcome << channel << session;
     return true;
+}
+
+// ============== 普通回复的投递账本（kind='reply'，复用 delivery_ledger，无迁移） ==============
+// 与 contact/share 共用同一张表：这里只提供通用的 claim/attempt/outcome/retry 读写，
+// 不绑定具体渠道或场景；投递策略（何时补发、补几次）由调用方决定。
+bool MemoryManager::recordDelivery(const QString &kind, const QString &ref,
+                                   const QString &channel, const QString &session,
+                                   const QString &text)
+{
+    if (!m_db.isOpen() || kind.isEmpty() || ref.isEmpty()) return false;
+    QSqlQuery q(m_db);
+    // 首次投递即 claim。同一 (kind,ref) 重复 claim（例如重启后重发同一句）
+    // 只刷新 channel/session/text，attempts 保留，避免把"已经补发过几次"冲成 0。
+    q.prepare("INSERT INTO delivery_ledger(kind,ref,channel,session,text,state,attempts,updated_at) "
+              "VALUES(?,?,?,?,?,'claimed',0,CURRENT_TIMESTAMP) "
+              "ON CONFLICT(kind,ref) DO UPDATE SET "
+              "channel=excluded.channel,"
+              "session=excluded.session,"
+              "text=excluded.text,"
+              "state='claimed',"
+              "updated_at=CURRENT_TIMESTAMP");
+    q.addBindValue(kind);
+    q.addBindValue(ref);
+    q.addBindValue(channel.isEmpty() ? QVariant(QMetaType(QMetaType::QString)) : QVariant(channel));
+    q.addBindValue(session.isEmpty() ? QVariant(QMetaType(QMetaType::QString)) : QVariant(session));
+    q.addBindValue(text.isEmpty() ? QVariant(QMetaType(QMetaType::QString)) : QVariant(text));
+    if (!q.exec()) {
+        qWarning() << "[Delivery] claim 写入失败" << kind << ref << q.lastError();
+        return false;
+    }
+    return true;
+}
+
+bool MemoryManager::recordDeliveryAttempt(const QString &kind, const QString &ref)
+{
+    if (!m_db.isOpen() || kind.isEmpty() || ref.isEmpty()) return false;
+    QSqlQuery q(m_db);
+    // 发送前先占一次尝试并把状态拉回 claimed：同一行不会被下一个 5s 补发周期
+    // 同时选中；真正的结果仍由 sendResult 回执覆盖。
+    q.prepare("UPDATE delivery_ledger SET attempts=attempts+1,state='claimed',"
+              "updated_at=CURRENT_TIMESTAMP WHERE kind=? AND ref=?");
+    q.addBindValue(kind);
+    q.addBindValue(ref);
+    if (!q.exec() || q.numRowsAffected() != 1) {
+        qWarning() << "[Delivery] attempt 写入失败" << kind << ref << q.lastError();
+        return false;
+    }
+    return true;
+}
+
+bool MemoryManager::recordDeliveryOutcome(const QString &kind, const QString &ref,
+                                          const QString &outcome, const QString &detail)
+{
+    if (!m_db.isOpen() || kind.isEmpty() || ref.isEmpty() || outcome.isEmpty()) return false;
+    QSqlQuery q(m_db);
+    // 只落终态与诊断信息：attempts 只由发送方在发送前递增，回执不重复计数。
+    q.prepare("UPDATE delivery_ledger SET state=?,last_error=?,updated_at=CURRENT_TIMESTAMP "
+              "WHERE kind=? AND ref=?");
+    q.addBindValue(outcome);
+    q.addBindValue(detail.isEmpty() ? QVariant(QMetaType(QMetaType::QString)) : QVariant(detail));
+    q.addBindValue(kind);
+    q.addBindValue(ref);
+    if (!q.exec() || q.numRowsAffected() != 1) {
+        qWarning() << "[Delivery] outcome 写入失败" << kind << ref << outcome << q.lastError();
+        return false;
+    }
+    return true;
+}
+
+QJsonArray MemoryManager::retryableDeliveries(const QString &kind, int maxAttempts, int limit) const
+{
+    QJsonArray result;
+    if (!m_db.isOpen() || kind.isEmpty() || maxAttempts <= 0 || limit <= 0) return result;
+    QSqlQuery q(m_db);
+    // 只取"渠道明确拒绝、且还没用完补发次数"的行；unknown（协议可能已送达）永不入选。
+    q.prepare("SELECT kind,ref,channel,session,text,attempts,state FROM delivery_ledger "
+              "WHERE kind=? AND state='rejected' AND attempts<? ORDER BY id LIMIT ?");
+    q.addBindValue(kind);
+    q.addBindValue(maxAttempts);
+    q.addBindValue(limit);
+    if (!q.exec()) {
+        qWarning() << "[Delivery] retry 查询失败" << kind << q.lastError();
+        return result;
+    }
+    while (q.next()) {
+        result.append(QJsonObject{{QStringLiteral("kind"), q.value(0).toString()},
+                                  {QStringLiteral("ref"), q.value(1).toString()},
+                                  {QStringLiteral("channel"), q.value(2).toString()},
+                                  {QStringLiteral("session"), q.value(3).toString()},
+                                  {QStringLiteral("text"), q.value(4).toString()},
+                                  {QStringLiteral("attempts"), q.value(5).toInt()},
+                                  {QStringLiteral("state"), q.value(6).toString()}});
+    }
+    return result;
 }
 
 // ============== B1：统一注意力事件与当前活动状态（v25） ==============
@@ -5045,6 +5154,25 @@ void MemoryManager::initDatabase(const QString &dbFilePath, const QString &conne
                                "updated_at INTEGER NOT NULL DEFAULT 0)")
                 || !query.exec("PRAGMA user_version=25")) throw query.lastError();
             currentVersion=25;
+        }
+        if (currentVersion<26) {
+            // 到期回顾的决策流水：来源回顾用 reflection_change 新建修订链，
+            // 到期回顾是原地更新同一行，旧想法会被覆盖，因此单独留旧/新快照供审计。
+            if (!query.exec("CREATE TABLE IF NOT EXISTS concern_revision("
+                            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                            "turn INTEGER NOT NULL,"
+                            "version INTEGER NOT NULL,"
+                            "action TEXT NOT NULL,"
+                            "note_before TEXT,"
+                            "note_after TEXT,"
+                            "topic TEXT,"
+                            "watch TEXT,"
+                            "next_check_at INTEGER NOT NULL DEFAULT 0,"
+                            "contact_timing TEXT,"
+                            "recorded TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+                || !query.exec("CREATE INDEX IF NOT EXISTS concern_revision_turn ON concern_revision(turn)")
+                || !query.exec("PRAGMA user_version=26")) throw query.lastError();
+            currentVersion=26;
         }
         // 关注了结的独立流水（v22 的补充表）。与 reflection_change（回顾链修订）分开：
         // 前者由正常对话写回，后者由私下回顾写，共用 turn 主键会互相覆盖。

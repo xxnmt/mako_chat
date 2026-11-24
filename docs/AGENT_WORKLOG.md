@@ -323,3 +323,22 @@ B5 的 7 天实机连续运行、真实 QQ 主动联系到达、多活动并行�
 - 能力清单由配置与服务端状态生成，只列真正可用项；不可用项给 `enabled:false` + reason。
 - 日志不改文件名（毫秒时间戳已够），改为新增会话头与配置指纹；保留期/轮转未做。
 - 能力清单尚未包含 `current_activity`（当前活动只持久化未注入），列为下一步。
+
+---
+
+## 2026-11-23 · 可靠性补丁（R3/R4）
+
+实机日志暴露：QQ 关闭时普通回复 3 句被丢弃且无记录；到期修订覆盖旧想法；启动残留 `pending` 回顾；能力清单缺当前活动；空闲日志噪声。
+
+| Agent | 范围 | 交付 |
+|---|---|---|
+| `r3-reply-delivery` | `delivery_ledger(kind='reply')` 逐句入账、`sendResult` 落状态、`rejected` 最多补一次、`unknown` 不重发；5s 定时器与重连触发补发 | +2 memory 用例 +1 QQ 断连用例（1×unknown + 2×rejected） |
+| `lead` | v26 `concern_revision` 流水；`recoverStaleReflections` 启动恢复；能力清单 `current_activity`；日志降噪 | +3 用例；迁移 v26 |
+
+关键决策：
+- 普通回复的账本 ref 固定为 `reply:<turn>:<index>`，与主动消息 `contact/reminder/share` 共用 `delivery_ledger`。
+- `unknown` 永不重发（协议可能已送达）；`rejected` 最多补一次；补发不受安静时段限制（补的是已决定要说的话）。
+- 到期回顾原地更新，故单独用 `concern_revision` 保存决策前后快照；来源回顾仍用 `reflection_change` 修订链。
+- 启动恢复只处理"租约已过期"的 `pending`：到期关注回 `consider`、来源回顾回 `deferred`，避免误抢进行中的回顾。
+
+验证：构建零错误；`tst_memorymanager` 85 passed/1 skipped、`tst_memoryagent` 73、`tst_qqdelivery` 6。`tst_runtimelog` 为宿主间歇性环境失败（3 次重试 2 败 1 过，失败点是既有子进程管道用例）。生产库已备份并迁移 v26。

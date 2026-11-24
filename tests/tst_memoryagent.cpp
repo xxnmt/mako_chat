@@ -1,5 +1,6 @@
 #include <QtTest>
 #include <QSqlQuery>
+#include <QSqlDatabase>
 #include <QJsonDocument>
 #include <QFile>
 #include <QSignalSpy>
@@ -28,6 +29,36 @@
 #include <QImage>
 
 namespace {
+
+// MemoryManager 之外的独立连接：用于伪造"当前活动"的 thought_result（只测试需要）。
+class RawSqlConnection
+{
+public:
+    RawSqlConnection(const QString &path, const QString &tag)
+        : m_conn(QStringLiteral("tst_agent_raw_") + tag)
+    {
+        m_db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), m_conn);
+        m_db.setDatabaseName(path);
+    }
+    ~RawSqlConnection()
+    {
+        if (m_db.isOpen()) m_db.close();
+        m_db = QSqlDatabase();
+        if (QSqlDatabase::contains(m_conn)) QSqlDatabase::removeDatabase(m_conn);
+    }
+    bool open() { return m_db.open(); }
+    bool exec(const QString &sql, const QString &text = {})
+    {
+        QSqlQuery q(m_db);
+        q.prepare(sql);
+        if (!text.isEmpty()) q.addBindValue(text);
+        return q.exec();
+    }
+
+private:
+    QString m_conn;
+    QSqlDatabase m_db;
+};
 
 void serveCompletions(QTcpServer &server,QList<QByteArray> &bodies,std::function<QString(int)> respond,
                       std::function<QString(int)> finish=[](int){return QString("stop");})
@@ -1082,6 +1113,37 @@ private slots:
         QVERIFY(!manifest.value("private_contact").toObject().value("enabled").toBool());
         QVERIFY(!manifest.value("private_review").toObject().value("enabled").toBool());
         QVERIFY(!manifest.value("reminder").toObject().value("enabled").toBool());
+    }
+
+    // 能力清单应包含"当前正在做的事"：来自 attention_state + 活动快照。
+    void capabilityManifestIncludesCurrentActivity()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath("manifest-activity.db");
+        MemoryManager db(path);
+        LLMService service("test", nullptr, QUrl(QStringLiteral("http://127.0.0.1:1")));
+        service.setMemoryManager(&db);
+        RequestMeta meta;
+        meta.eventId = meta.runId = QStringLiteral("manifest-activity");
+        meta.receivedAtUtc = QDateTime::currentDateTimeUtc();
+        const qint64 turn = db.recordInput(QStringLiteral("我想继续写故事"), meta, true);
+        QVERIFY(turn > 0);
+        {
+            RawSqlConnection raw(path, QStringLiteral("manifest-activity"));
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral(
+                        "UPDATE chat_history SET thought='写故事',thought_result=? WHERE id=%1").arg(turn),
+                    QStringLiteral(R"({"status":"active","progress":"写到第二段","next_step":"继续写下去"})")));
+        }
+        db.setAttentionState(QStringLiteral("current_activity"), QStringLiteral("thought/%1").arg(turn));
+        const auto manifest = service.capabilityManifest(meta);
+        QVERIFY(manifest.contains(QStringLiteral("current_activity")));
+        const auto activity = manifest.value(QStringLiteral("current_activity")).toObject();
+        QCOMPARE(activity.value(QStringLiteral("ref")).toString(),
+                 QStringLiteral("thought/%1").arg(turn));
+        QCOMPARE(activity.value(QStringLiteral("progress")).toString(), QStringLiteral("写到第二段"));
+        QCOMPARE(activity.value(QStringLiteral("next_step")).toString(), QStringLiteral("继续写下去"));
     }
 
     // 前台请求体必须带能力清单，且清单随配置变化；旧断言只做 contains，不依赖顺序。

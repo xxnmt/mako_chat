@@ -646,7 +646,7 @@ bool MemoryManager::finishConcernReview(qlonglong turn,int version,const QJsonOb
     auto rollback=qScopeGuard([this]{m_db.rollback();});
     QSqlQuery q(m_db);
     // 与领取时一致的来源校验：只有仍处于 pending 且 version 匹配的领取才能落库。
-    q.prepare("SELECT h.channel,h.session_id,s.input" + sourceRows +
+    q.prepare("SELECT h.channel,h.session_id,s.input,r.note,r.topic,r.watch" + sourceRows +
               "JOIN private_reflection r ON r.turn_id=h.id WHERE " + eligible +
               " AND h.id=? AND r.version=? AND r.state='pending'");
     q.addBindValue(turn);
@@ -654,6 +654,9 @@ bool MemoryManager::finishConcernReview(qlonglong turn,int version,const QJsonOb
     if (!q.exec() || !q.next()) return false;
     const auto channel=q.value(0).toString();
     const auto session=q.value(1).toString();
+    const auto beforeNote=q.value(3).toString();
+    const auto beforeTopic=q.value(4).toString();
+    const auto beforeWatch=q.value(5).toString();
     const MemoryReadPolicy policy;
     if (!policy.allows(channel,session,q.value(2).toString())) return false;
     if (!note.isEmpty() && !policy.allows(channel,session,note)) return false;
@@ -733,6 +736,20 @@ bool MemoryManager::finishConcernReview(qlonglong turn,int version,const QJsonOb
         q.addBindValue(session);
         if (!q.exec()) return false;
     }
+    {
+        // 到期回顾是原地更新同一行，旧想法会被覆盖；这里把"决策前/后"快照留成流水，
+        // 与来源回顾的 reflection_change 链互补，保证可追溯。
+        QSqlQuery rev(m_db);
+        rev.prepare("INSERT INTO concern_revision(turn,version,action,note_before,note_after,"
+                    "topic,watch,next_check_at,contact_timing) "
+                    "SELECT turn_id,version,?,?,note,topic,watch,next_check_at,? "
+                    "FROM private_reflection WHERE turn_id=?");
+        rev.addBindValue(action);
+        rev.addBindValue(beforeNote);
+        rev.addBindValue(contactTiming.isEmpty() ? QVariant() : QVariant(contactTiming));
+        rev.addBindValue(turn);
+        if (!rev.exec()) return false;
+    }
     if (!m_db.commit()) return false;
     rollback.dismiss();
     qInfo()<<"[Concern] review committed turn="<<turn<<"version="<<version<<"action="<<action;
@@ -750,6 +767,36 @@ bool MemoryManager::deferConcernReview(qlonglong turn,int version,const QString 
     qInfo()<<"[Concern] review deferred turn="<<turn<<"version="<<version
            <<"saved="<<saved<<"reason="<<reason;
     return saved;
+}
+
+int MemoryManager::recoverStaleReflections(int staleSeconds)
+{
+    if (staleSeconds < 0) staleSeconds = 0;
+    if (!m_db.transaction()) return 0;
+    auto rollback = qScopeGuard([this]{ m_db.rollback(); });
+    QSqlQuery q(m_db);
+    int recovered = 0;
+    // 到期关注的租约过期：回到 consider 并立即可再领取（保留关注本身，不丢）。
+    q.prepare("UPDATE private_reflection SET state='consider',claimed_by=NULL,"
+              "next_check_at=unixepoch(),updated_at=unixepoch() "
+              "WHERE state='pending' AND claimed_by='due' AND eligible_at<unixepoch()-?");
+    q.addBindValue(staleSeconds);
+    if (!q.exec()) return 0;
+    recovered += q.numRowsAffected();
+    // 新来源回顾的租约过期：回到 deferred，等待 claimPrivateReflection 重领
+    // （仍受来源 24 小时窗口约束，超窗则不重领）。
+    q.prepare("UPDATE private_reflection SET state='deferred',claimed_by=NULL,"
+              "eligible_at=unixepoch(),updated_at=unixepoch() "
+              "WHERE state='pending' AND (claimed_by IS NULL OR claimed_by<>'due') "
+              "AND eligible_at<unixepoch()-?");
+    q.addBindValue(staleSeconds);
+    if (!q.exec()) return 0;
+    recovered += q.numRowsAffected();
+    if (!m_db.commit()) return 0;
+    rollback.dismiss();
+    if (recovered > 0)
+        qInfo() << "[Concern] stale_reflections_recovered=" << recovered;
+    return recovered;
 }
 
 bool MemoryManager::consultPrivateReflection(qint64 turn,int version,const QStringList &terms,QJsonArray &results) const

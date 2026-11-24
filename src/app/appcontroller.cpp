@@ -255,8 +255,46 @@ AppController::AppController(QObject *parent)
         }
         return {};
     };
+    // 普通回复的有限补发：只补"已经决定要发、且被渠道明确拒绝"的话，
+    // 因此不受主动联系的安静时段/空闲门控限制（不调用 canContactNow），只要求 QQ 连接可用。
+    // 每次最多补 1 条；发送前先 recordDeliveryAttempt 占位（state 回到 claimed），
+    // 保证同一行不会被相邻两个 5s 周期同时领取。unknown 表示协议层可能已送达，不重发。
+    const auto retryReplyDeliveries = [this] {
+        if (!m_qqClient->isConnected()) return;
+        const auto retries = m_memoryManager->retryableDeliveries(QStringLiteral("reply"), 2, 1);
+        for (const auto &value : retries) {
+            const auto job = value.toObject();
+            const auto ref = job["ref"].toString();
+            if (ref.isEmpty()) continue;
+            Utterance retry;
+            retry.channel = job["channel"].toString();
+            retry.sessionId = job["session"].toString();
+            retry.text = job["text"].toString();
+            retry.deliveryEcho = ref;
+            if (retry.channel.isEmpty() || retry.text.trimmed().isEmpty()) {
+                // 账本缺路由/原文（正常流程不会出现）：落"expired"终态（非 rejected，不会再次
+                // 入选补发清单），避免每 5s 空转。
+                m_memoryManager->recordDeliveryOutcome(QStringLiteral("reply"), ref,
+                                                       QStringLiteral("expired"),
+                                                       QStringLiteral("retry_incomplete"));
+                continue;
+            }
+            if (!m_memoryManager->recordDeliveryAttempt(QStringLiteral("reply"), ref)) continue;
+            if (!m_qqChannel->sendUtterance(retry)) {
+                m_memoryManager->recordDeliveryOutcome(QStringLiteral("reply"), ref,
+                                                       QStringLiteral("rejected"),
+                                                       QStringLiteral("channel_unavailable"));
+                qWarning() << "[Reply] retry submission failed" << ref;
+                continue;
+            }
+            qInfo() << "[Reply] retry submitted" << ref;
+        }
+    };
     auto *reminders=new QTimer(this);
-    connect(reminders,&QTimer::timeout,this,[this, dispatchContact] {
+    connect(reminders,&QTimer::timeout,this,[this, dispatchContact, retryReplyDeliveries] {
+        // 普通回复补发与主动联系解耦：只要 QQ 可用就补，不受提醒开关/安静时段影响，
+        // 因此先于下面的主动联系门控执行（不能放在早退之后）。
+        retryReplyDeliveries();
         const auto options=ConfigManager::instance().getProactiveConfig();
         const auto now=QTime::currentTime(), start=QTime::fromString(options.quietStart,"HH:mm"), end=QTime::fromString(options.quietEnd,"HH:mm");
         if (!options.enabled || (start<end ? now>=start && now<end : start>end && (now>=start || now<end))) return;
@@ -287,6 +325,10 @@ AppController::AppController(QObject *parent)
         }
     });
     reminders->start(5000);
+    // 重连成功立即补一次，避免最长等 5s；5s 周期仍会在下一拍轮到。
+    connect(m_qqClient, &QQProtocolClient::connected, this, [retryReplyDeliveries] {
+        retryReplyDeliveries();
+    });
     connect(m_coordinator, &CognitiveCoordinator::contactProposed, this, [this, dispatchContact](qlonglong turn,int version) {
         if (canContactNow() && !dispatchContact(turn,version).isEmpty())
             return;
@@ -297,6 +339,15 @@ AppController::AppController(QObject *parent)
         if (echo.startsWith("reminder:")) {
             m_memoryManager->reminderOutcome(echo.mid(9).toLongLong(),outcome);
             qInfo()<<"[Reminder] receipt"<<echo<<outcome;
+            return;
+        }
+        if (echo.startsWith("reply:")) {
+            // 普通回复回执：只落终态。unknown 表示协议层可能已送达，补发逻辑不会选它；
+            // rejected 才进入有限补发（attempts<2）。
+            if (!m_memoryManager->recordDeliveryOutcome(QStringLiteral("reply"), echo, outcome))
+                qWarning() << "[Reply] receipt not recorded" << echo << outcome;
+            else
+                qInfo() << "[Reply] receipt" << echo << outcome;
             return;
         }
         if (echo.startsWith("share:")) {
@@ -484,10 +535,34 @@ void AppController::handleMakoReply(const QList<SentenceText> &sentences, const 
         utterance.channel = meta.channel;
         utterance.sessionId = meta.sessionId;
         utterance.speaker = meta.speaker;
+        // 投递回执键：优先本轮 chat_history.id；本轮没有持久化轮次（turnId=0）时退回
+        // 事件 id，保证同一轮内每句都有稳定唯一的 (turn,index) 关联，重启后仍可按 ref 补发。
+        const qlonglong replyTurn = m_coordinator->turnId();
+        const QString turnKey = replyTurn > 0
+            ? QString::number(replyTurn)
+            : (meta.eventId.isEmpty() ? meta.runId : meta.eventId);
         int submitted = 0;
-        for (const SentenceText &sentence : sentences) {
+        for (int index = 0; index < sentences.size(); ++index) {
+            const SentenceText &sentence = sentences[index];
             utterance.text = sentence.zhText;
+            utterance.deliveryEcho = QStringLiteral("reply:%1:%2").arg(turnKey).arg(index);
+            // 普通回复也建投递账本：先 claim 再提交，协议层回执按同一 ref 落终态，
+            // 被明确拒绝时才允许 5s 调度补发一次。pet 渠道是本地气泡，不建账本。
+            if (!m_memoryManager->recordDelivery(QStringLiteral("reply"), utterance.deliveryEcho,
+                                                 meta.channel, meta.sessionId, sentence.zhText)) {
+                qWarning() << "[Reply] delivery claim not recorded" << utterance.deliveryEcho;
+            } else {
+                // 首发送前也占一次尝试：attempts 语义="已提交的发送次数"，
+                // 这样补发条件的 attempts<2 恰好等于"被明确拒绝后最多再补一次"。
+                m_memoryManager->recordDeliveryAttempt(QStringLiteral("reply"), utterance.deliveryEcho);
+            }
             if (!m_qqChannel->sendUtterance(utterance)) {
+                // 提交失败=确定未进入协议队列：直接落拒绝，供补发调度处理。
+                if (!m_memoryManager->recordDeliveryOutcome(QStringLiteral("reply"),
+                                                            utterance.deliveryEcho,
+                                                            QStringLiteral("rejected"),
+                                                            QStringLiteral("channel_unavailable")))
+                    qWarning() << "[Reply] rejected outcome not recorded" << utterance.deliveryEcho;
                 qWarning() << "[QQChannel] sentence submission interrupted submitted=" << submitted
                            << "total=" << sentences.size();
                 recordInterruption(submitted ? "channel_partial_submission" : "channel_unavailable");
