@@ -314,11 +314,26 @@ AppController::AppController(QObject *parent)
             viewer.subject=QStringLiteral("user");
             viewer.longTermMemoryEnabled=true;
             const auto pending=m_memoryManager->pendingReminders(viewer);
+            const auto nowTime=QDateTime::currentDateTime();
             for (const auto &value : pending) {
-                const auto id=value.toObject().value(QStringLiteral("id")).toInteger();
+                const auto job=value.toObject();
+                const auto id=job.value(QStringLiteral("id")).toInteger();
                 if (id<=0) continue;
-                // commit 自己再做一次"pending/到期/未过期"的领域校验；未到期返回 error，不写任何行。
+                // 先按到期时间过滤：未到期的提醒不应每 5 秒提交一次再被领域层拒绝，
+                // 否则会刷出大量 "reminder rejected not_due" 日志（纯噪声，非错误）。
+                const auto dueAt=QDateTime::fromString(job.value(QStringLiteral("at")).toString(),
+                                                       Qt::ISODate);
+                if (!dueAt.isValid()) {
+                    qDebug()<<"[Reminder] skip malformed due"<<id
+                            <<job.value(QStringLiteral("at")).toString();
+                    continue;
+                }
+                if (dueAt>nowTime) continue;
+                // commit 自己再做一次"pending/到期/未过期"的领域校验；未到期/已过期不写任何行。
                 const auto committed=m_actionCommitter->commitReminderDelivery(id);
+                if (committed.contains(QStringLiteral("error"))) 
+                    qDebug()<<"[Reminder] not deliverable now"<<id
+                            <<committed.value(QStringLiteral("error")).toString();
                 if (committed.contains(QStringLiteral("error"))) continue;
                 qInfo()<<"[Reminder] dispatch"<<id
                        <<committed.value(QStringLiteral("action_key")).toString();

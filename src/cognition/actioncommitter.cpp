@@ -39,9 +39,11 @@ QJsonObject ActionCommitter::commitReminderDelivery(qlonglong reminderId)
 {
     if (!m_memory) return QJsonObject{{QStringLiteral("error"),QStringLiteral("no_store")}};
     const auto result=m_memory->commitReminderDeliveryAction(reminderId);
+    // 未到期是轮询的正常状态，调用方（5s 定时器）应提前过滤；这里只留 DEBUG，
+    // 避免未来提醒在到期前每 5 秒刷一条 INFO 把日志打爆。
     if (result.contains(QStringLiteral("error")))
-        qInfo()<<"[ActionCommitter] reminder rejected id="<<reminderId
-               <<"error="<<result.value(QStringLiteral("error")).toString();
+        qDebug()<<"[ActionCommitter] reminder rejected id="<<reminderId
+                <<"error="<<result.value(QStringLiteral("error")).toString();
     return result;
 }
 

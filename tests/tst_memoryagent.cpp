@@ -163,7 +163,8 @@ private:
     bool m_identityExisted = false;
 };
 
-// 造一个到期关注（来源轮次 + close 收口 + consider），再清掉收口抑制、把关注重新领取到 pending。
+// 造一个到期关注（来源轮次 + close 收口 + consider），再把关注重新领取到 pending。
+// close 仍作为前台状态记录，但不再抑制主动联系。
 // 返回 turn，*version 为本次到期回顾版本；失败返回 0。
 qlonglong seedDueConcernForSemanticReview(MemoryManager &db, const QString &path,
                                           const QString &tag, int *version)
@@ -186,10 +187,6 @@ qlonglong seedDueConcernForSemanticReview(MemoryManager &db, const QString &path
     {
         RawSqlConnection raw(path, tag);
         if (!raw.open()) return 0;
-        // 清掉 close 收口，否则普通自发联系会被 recent_closure 抑制，走不到语义核验。
-        if (!raw.exec(QStringLiteral(
-                "UPDATE chat_history SET turn_state='handed_off',raw_reply='{}' WHERE turn_state='quiet'")))
-            return 0;
         if (!raw.exec(QStringLiteral("UPDATE private_reflection SET next_check_at=unixepoch()-1 "
                                      "WHERE turn_id=%1").arg(turn)))
             return 0;
@@ -1383,13 +1380,6 @@ private slots:
         evidenceMeta.receivedAtUtc = QDateTime::currentDateTimeUtc().addSecs(3600);
         const auto evidence = db.recordInput(QStringLiteral("后天应该可以去"), evidenceMeta, true);
         QVERIFY(evidence > 0);
-        // 清掉 close 收口，否则普通自发联系会被 recent_closure 抑制，走不到语义核验。
-        {
-            RawSqlConnection raw(path, QStringLiteral("semantic-clear-closure"));
-            QVERIFY(raw.open());
-            QVERIFY(raw.exec(QStringLiteral(
-                "UPDATE chat_history SET turn_state='handed_off',raw_reply='{}' WHERE turn_state='quiet'")));
-        }
 
         // 回顾/核验同一个 mock 端点：按请求体里的固定前缀区分三种请求。
         QTcpServer server;

@@ -78,7 +78,6 @@ struct CognitiveSnapshot
     QList<SelfMotivation> motivations;         // concern / interest / activity 等自发动机
     QList<DelegatedCommitment> commitments;    // 真实 delegation（如 reminder）
     QJsonArray activities;                     // 私人活动状态/产物
-    QJsonObject recentClosure;                 // 最近一次私下交流收口
     QJsonArray internalWakes;                  // own_next_review_at / idle / scheduled，永远不是主人委托
     QJsonObject policyView;                    // 读取边界（渠道/会话/长期记忆/盲区等）
     QString snapshotHash;                      // 可分类内容的 SHA-256 前 16 位

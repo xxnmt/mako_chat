@@ -49,15 +49,13 @@ struct ProactiveConfig {
     int concernRetentionDays = 14;           // 超过多少天的关注不再按时间到期回顾（仍可被新证据命中）
 };
 
-// 语义核验与收口抑制（报告切片 C）。identity.json：
+// 语义核验（报告切片 C）。identity.json：
 //   cognition.semantic_verifier.enabled / max_verifier_calls / max_repairs
-//   proactive.spontaneous_close_suppression_seconds
-// 缺省值即安全默认：核验开启、每 action 最多 1 次核验 + 1 次修复、收口窗口 1 小时。
+// 缺省值即安全默认：核验开启、每 action 最多 1 次核验 + 1 次修复。
 struct SemanticVerifierConfig {
     bool enabled = true;                       // 是否允许调用一次性语义验证器
     int maxVerifierCalls = 1;                  // 每个 action 最多几次 verifier 调用
     int maxRepairs = 1;                        // 每个 action 最多几次 constrained repair
-    int closeSuppressionSeconds = 3600;        // 最近收口后多少秒内普通自发联系被抑制
 };
 
 
@@ -143,7 +141,7 @@ public:
     bool isBlindZone(const QString &channel, const QString &sessionId);
     bool getFollowExternalMood();         // D1：外部渠道情绪是否驱动桌设立绘（默认 true）
     ProactiveConfig getProactiveConfig();
-    // 语义核验/收口抑制配置（identity.json 的 cognition 段 + proactive 段），已夹紧。
+    // 语义核验配置（identity.json 的 cognition 段），已夹紧。
     SemanticVerifierConfig getSemanticVerifierConfig();
     QQConfig getQQConfig() const;
     MemoryPolicyConfig getMemoryPolicyConfig() const;

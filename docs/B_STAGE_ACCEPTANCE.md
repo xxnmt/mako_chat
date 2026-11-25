@@ -142,7 +142,7 @@
   ```
   日志：`[Concern] contact_rejected turn=.. type=.. reason=..`；不应出现新的 `reflection_contact(timing='now')` 或主动消息。
 - **新增验收场景**：互道晚安（前台 `conversation_action=close`）后 30 分钟内，不应出现"到点提醒/念诗"式主动联系；除非存在真实 pending reminder 或新的主人证据。日志中 `[Concern] review committed ... action=contact` 必须带可核对的 basis。
-- `recent_closure` 在回顾 context 中可见，用于判断"刚收口"；`own_next_review_at` 只是她自己的再检查时间，不得被当作约定。
+- `own_next_review_at` 只是她自己的再检查时间，不得被当作约定；**`recent_closure` 已随收口抑制机制整体移除（R11），"刚收口"不再是任何主动联系的门禁**。
 
 ## 5.3 执行期授权（v28）
 
@@ -155,7 +155,8 @@
   预期：只能看到 `proposed→dispatching→handed_off/protocol_accepted/unknown`；若 basis 失效会变成 `withheld/basis_expired`。
 - **旧行不可投递**：v28 后旧 `now/proposed` 无 basis 行统一 `withheld/missing_basis_at_v28`。
 - **crashed dispatching**：启动日志 `[ReflectionContact] dispatch_abandoned count=N`；对应行 `outcome='unknown'`，不会重发。
-- **跨渠道收口**：pet 说晚安（close/defer）后 1 小时内，QQ 私聊的 `new_owner_evidence` 必须引用 pet 收口之后的新发言，否则 `ambiguous_after_closure`。
+- **收口不再是门禁（R11）**：pet/QQ 的 `close/defer` 只作为对话状态记录；晚安后她仍可因新想法或单纯想念主动联系，不再有 `recent_closure`/`ambiguous_after_closure` 拒绝。验收时应检查消息里的事实声称是否有依据，而不是"刚收口所以不该发"。
+- **日志降噪（R11）**：正常等待期不应再出现每 5 秒一条 `reminder rejected not_due`；只有到期时出现一次 `[Reminder] dispatch`。若仍看到 not_due，说明是 DEBUG 级（正常），不应刷屏。
 - **不再有假 withheld**：basis 被拒时不应出现 `[ReflectionContact] withheld`；只有在真正提交了 `contact(proposed)` 后才会进入投递链。
 - **验收场景（双发）**：造一条 pending reminder（如 10 分钟后）并让某 due concern 试图用它 `contact(now)` → 应被拒；到点后只有 Reminder 链发送一次。
 

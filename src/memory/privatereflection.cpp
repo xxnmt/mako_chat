@@ -182,8 +182,8 @@ struct NewContractCheck
     QString semanticStatus;
 };
 
-// 提交前的确定性复核。timing=="now" 走完整的主动联系策略（动机/claims/收口/quiet/冷却/目标）；
-// private/next_chat 只是保留意图，不做打扰类抑制，但仍要保证 claims 不是编造。
+// 提交前的确定性复核。timing=="now" 走完整的主动联系策略（动机/claims/quiet/冷却/目标）；
+// private/next_chat 只是保留意图，但仍要保证 claims 不是编造。
 NewContractCheck checkNewContractContact(const MemoryManager *memory, const QString &channel,
                                          const QString &session, qlonglong turn,
                                          const QJsonObject &contact, const QString &timing)
@@ -786,11 +786,9 @@ QJsonObject MemoryManager::concernReviewContext(qint64 turn,int version) const
     const QJsonObject basis{{"owner_evidence",ownerEvidence},
                             {"reminders",reminders},
                             {"artifacts",artifacts}};
-    // 最近一次交流是否已经收口：close/defer 之后，之前的发言不再算"新证据"。
-    const QJsonObject recentClosure=recentConversationClosure(channel,session,QStringLiteral("user"),3600);
     QJsonObject result{{"id",turn},{"version",version},{"kind","concern"},
                        {"concern",concernRecord},{"since",since},{"contacts",contacts},
-                       {"basis",basis},{"recent_closure",recentClosure},
+                       {"basis",basis},
                        // 服务端内部定位键：切片 C 的策略/验证器需要来源渠道会话做可见性判定，
                        // LLMService 会把它们从模型上下文里剥掉。
                        {"source_channel",channel},{"source_session",session}};
@@ -843,12 +841,6 @@ QString MemoryManager::validateContactBasis(const QString &channel,const QString
         || origin.value(5).toString()!=QStringLiteral("reply"))
         return QStringLiteral("invalid_basis_ref");
     origin.finish();
-    // 最近一次交流是否已经收口：close/defer 之后，关闭之前的发言不再算"新证据"。
-    const auto closure=recentConversationClosure(channel,session,QStringLiteral("user"),3600);
-    const auto closureAction=closure.value(QStringLiteral("action")).toString();
-    const bool closedRecently=closureAction==QStringLiteral("close")
-        || closureAction==QStringLiteral("defer");
-    const auto closureReported=closure.value(QStringLiteral("reported_at")).toString();
     // 用 SQLite 的 julianday 比较混合格式时间（UTC ISO 与本地 datetime 都支持）。
     const auto after=[this](const QString &later,const QString &earlier) {
         if (later.isEmpty() || earlier.isEmpty()) return false;
@@ -883,8 +875,6 @@ QString MemoryManager::validateContactBasis(const QString &channel,const QString
             const auto reported=row.value(2).toString();
             row.finish();
             if (!after(reported,originReported)) return QStringLiteral("stale_owner_evidence");
-            if (closedRecently && !after(reported,closureReported))
-                return QStringLiteral("ambiguous_after_closure");
         } else {
             // 活动结果：必须真的完成、有产物、且还没分享过（unknown 也可能已送达，按已分享处理）。
             if (!ref.startsWith(QStringLiteral("thought/"))) return QStringLiteral("invalid_basis_ref");
@@ -992,7 +982,7 @@ bool MemoryManager::finishConcernReview(qlonglong turn,int version,const QJsonOb
             && (contactMessage.isEmpty() || contactMessage.size()>300
                 || !policy.allows(channel,session,contactMessage))) return false;
         if (contactNewContract) {
-            // 确定性复核（动机合法性 + claims refs/authority/时序 + 收口/quiet/冷却/目标）。
+            // 确定性复核（动机合法性 + claims refs/authority/时序 + quiet/冷却/目标）。
             // 语义核验已由 LLMService 完成并写进 contact.semantic_status；这里不再调用模型。
             newCheck=checkNewContractContact(this,channel,session,turn,contact,contactTiming);
             if (!newCheck.withheld) {
@@ -1440,7 +1430,7 @@ QString MemoryManager::claimReflectionContact(qlonglong turn, int version, const
         || !policy.allows(sourceChannel,sourceSession,q.value(3).toString()) || !policy.allows(channel,session,message)) return {};
     q.finish();
     // v28：事务领取前用持久化依据重验。提出联系到真正投递之间可能隔了几秒到几分钟，
-    // 期间提醒可能已被提醒链发送/取消、活动可能已分享、可能发生新的收口或新证据；
+    // 期间提醒可能已被提醒链发送/取消、活动可能已分享、依据可能已失效或出现新证据；
     // 只有"此刻仍站得住"的 now 联系才允许领取，否则落 withheld（basis_expired）不再发送。
     q.prepare("SELECT c.timing,coalesce(c.basis_type,''),coalesce(c.basis_refs,''),"
               "coalesce(c.claims_json,''),coalesce(c.motivation_json,''),"

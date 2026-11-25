@@ -26,6 +26,18 @@ const QString kSelfDesire = QStringLiteral("self_desire");
 const QString kConcernFollowup = QStringLiteral("concern_followup");
 const QString kActivityShare = QStringLiteral("activity_share");
 
+// 纯时间比较（与收口语义无关）：later 是否严格晚于 earlier。
+// 用于"证据必须晚于关注来源"的来源时序检查。
+bool timeAfter(const QSqlDatabase &db,const QString &later,const QString &earlier)
+{
+    if (later.isEmpty() || earlier.isEmpty()) return false;
+    QSqlQuery compare(db);
+    compare.prepare(QStringLiteral("SELECT julianday(?)>julianday(?)"));
+    compare.addBindValue(later);
+    compare.addBindValue(earlier);
+    return compare.exec() && compare.next() && compare.value(0).toInt()==1;
+}
+
 bool isFactClaimType(const QString &type)
 {
     return type == kReportedFact || type == kUserCommitment || type == kExecutionResult;
@@ -79,27 +91,6 @@ QString replyText(const QString &rawReply)
         if (!texts.isEmpty()) return texts.join(QString());
     }
     return trimmed;
-}
-
-bool timeAfter(const QSqlDatabase &db, const QString &later, const QString &earlier)
-{
-    if (later.isEmpty() || earlier.isEmpty()) return false;
-    QSqlQuery compare(db);
-    compare.prepare("SELECT julianday(?)>julianday(?)");
-    compare.addBindValue(later);
-    compare.addBindValue(earlier);
-    return compare.exec() && compare.next() && compare.value(0).toInt() == 1;
-}
-
-// 最近一次收口（close/defer）的时间；没有则空串。用于"收口之前的发言不能当新证据"。
-QString closureReportedAt(const MemoryManager *memory, const QString &channel, const QString &session)
-{
-    if (!memory) return {};
-    const int window = ConfigManager::instance().getSemanticVerifierConfig().closeSuppressionSeconds;
-    const auto closure = memory->recentConversationClosure(channel, session, QStringLiteral("user"), window);
-    const auto action = closure.value(QStringLiteral("action")).toString();
-    if (action != QStringLiteral("close") && action != QStringLiteral("defer")) return {};
-    return closure.value(QStringLiteral("reported_at")).toString();
 }
 
 struct RefText
@@ -228,20 +219,6 @@ private:
     QString m_originReason;
 };
 
-// 主人发言 ref 的时序/收口统一检查；返回空串=通过。
-QString ownerStatementTimingReason(const MemoryManager *memory, const QSqlDatabase &db,
-                                   const QString &channel, const QString &session,
-                                   const EvidenceReader &reader, const QString &reported)
-{
-    auto reason = reader.checkOwnerStatementTiming(reported);
-    if (!reason.isEmpty()) return reason;
-    const auto closure = closureReportedAt(memory, channel, session);
-    if (!closure.isEmpty() && reported.isEmpty()) return QStringLiteral("stale_ref");
-    if (!closure.isEmpty() && !timeAfter(db, reported, closure))
-        return QStringLiteral("ambiguous_after_closure");
-    return {};
-}
-
 bool quietNow(const ProactiveConfig &options)
 {
     const auto start = QTime::fromString(options.quietStart, QStringLiteral("HH:mm"));
@@ -362,8 +339,7 @@ ClaimValidation ActionPolicy::validateClaimDeterministic(const QString &channel,
                 const auto row = reader.chatRef(turn, 1);
                 reason = row.reason;
                 if (reason.isEmpty())
-                    reason = ownerStatementTimingReason(m_memory, m_memory->m_db, channel, session,
-                                                        reader, row.reported);
+                    reason = reader.checkOwnerStatementTiming(row.reported);
             } else if (ref.startsWith(QStringLiteral("source/"))) {
                 const auto sourceId = ref.mid(QStringLiteral("source/").size()).section(':', 0, 0).toLongLong();
                 QSqlQuery row(m_memory->m_db);
@@ -376,8 +352,7 @@ ClaimValidation ActionPolicy::validateClaimDeterministic(const QString &channel,
                 else if (!channelVisibleFromOwnerPrivate(row.value(1).toString(), row.value(2).toString()))
                     reason = QStringLiteral("invisible_ref");
                 else
-                    reason = ownerStatementTimingReason(m_memory, m_memory->m_db, channel, session,
-                                                        reader, row.value(4).toString());
+                    reason = reader.checkOwnerStatementTiming(row.value(4).toString());
             } else if (ref.startsWith(QStringLiteral("raw_event/"))) {
                 const auto eventId = ref.mid(QStringLiteral("raw_event/").size()).section(':', 0, 0).toLongLong();
                 QSqlQuery row(m_memory->m_db);
@@ -403,8 +378,7 @@ ClaimValidation ActionPolicy::validateClaimDeterministic(const QString &channel,
                 const auto row = reader.chatRef(turn, 1);
                 reason = row.reason;
                 if (reason.isEmpty())
-                    reason = ownerStatementTimingReason(m_memory, m_memory->m_db, channel, session,
-                                                        reader, row.reported);
+                    reason = reader.checkOwnerStatementTiming(row.reported);
             } else if (ref.startsWith(QStringLiteral("source/"))) {
                 const auto sourceId = ref.mid(QStringLiteral("source/").size()).section(':', 0, 0).toLongLong();
                 QSqlQuery row(m_memory->m_db);
@@ -417,8 +391,7 @@ ClaimValidation ActionPolicy::validateClaimDeterministic(const QString &channel,
                 else if (!channelVisibleFromOwnerPrivate(row.value(1).toString(), row.value(2).toString()))
                     reason = QStringLiteral("invisible_ref");
                 else
-                    reason = ownerStatementTimingReason(m_memory, m_memory->m_db, channel, session,
-                                                        reader, row.value(4).toString());
+                    reason = reader.checkOwnerStatementTiming(row.value(4).toString());
             } else if (ref.startsWith(QStringLiteral("reminder/"))) {
                 // 提醒是"已安排的执行"，不是主人此刻的原话；提醒链自己执行，不能拿来支持承诺。
                 reason = QStringLiteral("reminder_not_owner_statement");
@@ -672,15 +645,6 @@ QJsonObject ActionPolicy::evaluateSpontaneousContactDeterministic(const QString 
     if (deterministicFailure) {
         result[QStringLiteral("reason")] = QStringLiteral("deterministic:%1").arg(failureReason);
         return result;
-    }
-    // 收口抑制：最近一次私下交流已经 close/defer，普通自发联系不再开口。
-    // activity_share 是"活动有了结果"，由活动/分享链决定，不在这里按收口压制。
-    if (motivationType != kActivityShare) {
-        const auto closure = closureReportedAt(m_memory, channel, session);
-        if (!closure.isEmpty()) {
-            result[QStringLiteral("reason")] = QStringLiteral("recent_closure");
-            return result;
-        }
     }
     if (quietNow(options)) {
         result[QStringLiteral("reason")] = QStringLiteral("quiet_hours");

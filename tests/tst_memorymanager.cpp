@@ -271,7 +271,7 @@ static QJsonObject pendingReminderBasis(qint64 reminderId)
 }
 
 // 合法的 new_owner_evidence 依据：造一条"关注来源之后主人真实说过的话"。
-// reported 默认给 +1 小时：测试里关注/收口的 reported 都是"当前时刻"，用明显的未来偏移
+// reported 默认给 +1 小时：测试里关注来源的 reported 是"当前时刻"，用明显的未来偏移
 // 保证"之后"的时序断言不会因用例执行慢而抖动；它保持 received 状态，不参与私下回顾/
 // 到期关注的领取（那些查询都要求 reported<=now），避免自己变成需要回顾的新来源。
 static qlonglong insertOwnerEvidenceTurn(MemoryManager &mm, const QString &text,
@@ -3583,8 +3583,9 @@ private slots:
                                 .arg(turn)).toString(), QStringLiteral("consider"));
     }
 
-    // v27：收口（close/defer）之前的发言不能当新证据；收口之后的新发言才可以。
-    void contactNowRejectsPreClosureEvidence()
+    // 收口机制已删除：close/defer 之前的发言不再因"刚收口"被拒绝；
+    // 只要它晚于关注来源，仍可作为 new_owner_evidence。
+    void contactNowAcceptsEvidenceFromBeforeClosure()
     {
         QTemporaryDir dir;
         QVERIFY(dir.isValid());
@@ -3597,18 +3598,13 @@ private slots:
             QJsonObject{{"topic", QStringLiteral("展览")},
                         {"next_check_after_minutes", 60}});
         QVERIFY(turn > 0);
-        // 先有一段收口的交流：B 是 quiet close，形成 recent_closure(close)。
+        // 先有一段收口的交流：B 是 quiet close。close 仍作为前台状态记录，但不再参与门禁。
         RequestMeta metaB = concernTurnMeta(QStringLiteral("closure-b"));
         metaB.receivedAtUtc = QDateTime::currentDateTimeUtc().addSecs(-120);
         const qint64 closed = db.recordInput(QStringLiteral("先聊到这里吧"), metaB, true);
         QVERIFY(closed > 0);
         QVERIFY(db.recordQuiet(closed, "close"));
-        const auto closure = db.recentConversationClosure(Channel::kPet, Channel::kDefaultSession,
-                                                          QStringLiteral("user"));
-        QCOMPARE(closure["action"].toString(), QStringLiteral("close"));
-        QCOMPARE(closure["turn"].toInteger(), closed);
-        QVERIFY(closure["age_seconds"].toInteger() >= 0);
-        QVERIFY(!closure["reported_at"].toString().isEmpty());
+        QCOMPARE(db.conversationPhase(metaB), QStringLiteral("close"));
         // 关注来源自身不晚于自己，不能算"之后的新证据"。
         const auto claimA = reclaimDueConcern(db, path, turn, QStringLiteral("closure-claim-a"));
         QCOMPARE(claimA["id"].toInteger(), turn);
@@ -3625,7 +3621,7 @@ private slots:
             QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM private_reflection WHERE turn_id=%1")
                                     .arg(turn)).toString(), QStringLiteral("consider"));
         }
-        // 收口那一轮自身也不能算"收口之后"。
+        // 收口之前的发言（晚于关注来源）：收口不再拦截，应该被接受。
         const auto claimB = reclaimDueConcern(db, path, turn, QStringLiteral("closure-claim-b"));
         QCOMPARE(claimB["id"].toInteger(), turn);
         QVERIFY(db.finishConcernReview(turn, claimB["version"].toInt(),
@@ -3636,10 +3632,19 @@ private slots:
         {
             RawDb raw(path, "closure-b-verify");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM reflection_contact WHERE turn_id=%1")
-                                    .arg(turn)).toInt(), 0);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT timing FROM reflection_contact WHERE turn_id=%1")
+                                    .arg(turn)).toString(), QStringLiteral("now"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT outcome FROM reflection_contact WHERE turn_id=%1")
+                                    .arg(turn)).toString(), QStringLiteral("proposed"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT basis_type FROM reflection_contact WHERE turn_id=%1")
+                                    .arg(turn)).toString(), QStringLiteral("new_owner_evidence"));
+            QVERIFY(raw.scalar(QStringLiteral("SELECT basis_refs FROM reflection_contact WHERE turn_id=%1")
+                                   .arg(turn)).toString()
+                        .contains(QStringLiteral("chat/%1").arg(closed)));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM private_reflection WHERE turn_id=%1")
+                                    .arg(turn)).toString(), QStringLiteral("consider"));
         }
-        // 收口之后主人真的又说话了（未收口的新轮次），这才是合法的新证据。
+        // 收口之后主人真的又说话了：同样通过（时序仍只按关注来源判断）。
         RequestMeta metaC = concernTurnMeta(QStringLiteral("closure-c"));
         metaC.receivedAtUtc = QDateTime::currentDateTimeUtc().addSecs(-10);
         const qint64 newer = db.recordInput(QStringLiteral("展览我去啦，很好看"), metaC, true);
@@ -4039,8 +4044,9 @@ private slots:
         QVERIFY(!db.hasProposedContact(turn, version2));
     }
 
-    // v28：主人私聊的收口跨渠道生效；pet 里说过晚安能挡住 QQ 私聊的主动触达。
-    void crossChannelClosureBlocksContact()
+    // 收口机制已删除：pet 里刚 close 过也不再挡住 QQ 私聊的主动联系；
+    // 依据仍只要求晚于关注来源（时序检查保留）。
+    void crossChannelClosureNoLongerBlocksContact()
     {
         QTemporaryDir dir;
         QVERIFY(dir.isValid());
@@ -4061,16 +4067,14 @@ private slots:
         const qlonglong beforeClose = insertOwnerEvidenceTurn(
             db, QStringLiteral("今天在家休息"), -300, Channel::kQQPrivate, qqSession);
         QVERIFY(beforeClose > 0);
-        // pet 里收口（晚安）：同一 subject 的 pet 收口也应挡住 QQ 私聊的主动触达。
+        // pet 里收口（晚安）：close 仍作为前台状态记录，但不再挡住 QQ 私聊的主动联系。
         RequestMeta petCloseMeta = concernTurnMeta(QStringLiteral("cross-closure-pet"));
         petCloseMeta.receivedAtUtc = QDateTime::currentDateTimeUtc().addSecs(-10);
         const qlonglong petClose = db.recordInput(QStringLiteral("晚安啦"), petCloseMeta, true);
         QVERIFY(petClose > 0);
         QVERIFY(db.recordQuiet(petClose, "close"));
-        QCOMPARE(db.recentConversationClosure(Channel::kQQPrivate, qqSession,
-                                              QStringLiteral("user"))["action"].toString(),
-                 QStringLiteral("close"));
-        // 收口之前的 QQ 发言不能再当"收口之后的新证据"。
+        QCOMPARE(db.conversationPhase(petCloseMeta), QStringLiteral("close"));
+        // 收口之前的 QQ 发言（晚于关注来源）不再被拦截，可以作为新证据。
         const auto claimA = reclaimDueConcern(db, path, turn, QStringLiteral("cross-closure-claim-a"));
         QCOMPARE(claimA["id"].toInteger(), turn);
         QVERIFY(db.finishConcernReview(turn, claimA["version"].toInt(),
@@ -4082,13 +4086,18 @@ private slots:
         {
             RawDb raw(path, "cross-closure-a-verify");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM reflection_contact WHERE turn_id=%1")
-                                    .arg(turn)).toInt(), 0);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT timing FROM reflection_contact WHERE turn_id=%1")
+                                    .arg(turn)).toString(), QStringLiteral("now"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT basis_type FROM reflection_contact WHERE turn_id=%1")
+                                    .arg(turn)).toString(), QStringLiteral("new_owner_evidence"));
+            QVERIFY(raw.scalar(QStringLiteral("SELECT basis_refs FROM reflection_contact WHERE turn_id=%1")
+                                   .arg(turn)).toString()
+                        .contains(QStringLiteral("chat/%1").arg(beforeClose)));
             QCOMPARE(raw.scalar(QStringLiteral("SELECT action FROM concern_revision WHERE turn=%1 "
                                                "ORDER BY id DESC LIMIT 1").arg(turn)).toString(),
-                     QStringLiteral("contact_rejected"));
+                     QStringLiteral("contact"));
         }
-        // 收口之后 QQ 里又有新发言：这才是合法的新证据。
+        // 收口之后 QQ 里又有新发言：同样通过。
         const qlonglong afterClose = insertOwnerEvidenceTurn(
             db, QStringLiteral("脚好多了"), 5, Channel::kQQPrivate, qqSession);
         QVERIFY(afterClose > 0);
@@ -4106,6 +4115,9 @@ private slots:
                                 .arg(turn)).toString(), QStringLiteral("now"));
         QCOMPARE(raw.scalar(QStringLiteral("SELECT basis_type FROM reflection_contact WHERE turn_id=%1")
                                 .arg(turn)).toString(), QStringLiteral("new_owner_evidence"));
+        QVERIFY(raw.scalar(QStringLiteral("SELECT basis_refs FROM reflection_contact WHERE turn_id=%1")
+                               .arg(turn)).toString()
+                    .contains(QStringLiteral("chat/%1").arg(afterClose)));
     }
 
     // v28：dispatching 崩溃遗留按 at-most-once 落 unknown，不重发。

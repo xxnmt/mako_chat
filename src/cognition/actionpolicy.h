@@ -65,7 +65,7 @@ public:
     QString validateMotivation(const QString &channel, const QString &session,
                                qlonglong concernTurn, const QJsonObject &motivation) const;
 
-    // 主动联系策略：motivation 合法性 + claims 校验 + closure/cooldown/quiet/目标/重复。
+    // 主动联系策略：motivation 合法性 + claims 校验 + cooldown/quiet/目标/重复。
     // 返回 {allowed, reason, needs_verifier, verifier_sources:[{ref,text}], ...}。
     // claims 为空（纯 self_desire/问候）时不调用语义验证器。
     QJsonObject evaluateSpontaneousContact(const QString &channel, const QString &session,

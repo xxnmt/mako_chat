@@ -1594,52 +1594,6 @@ QString MemoryManager::conversationPhase(const RequestMeta &audience) const
     return reply["conversation_action"].toString();
 }
 
-QJsonObject MemoryManager::recentConversationClosure(const QString &channel,const QString &session,
-                                                     const QString &subject,int maxAgeSeconds) const
-{
-    if (channel.isEmpty() || session.isEmpty() || subject.isEmpty()) return {};
-    // 主人私聊的 pet 与 qq_private 是同一段关系的两个入口：在 pet 里说过晚安（close/defer）后，
-    // QQ 私聊里的主动触达同样应视为"收口之后的交流"，否则换个渠道就能绕过收口。
-    // 其它渠道（群聊等）仍旧只看同渠道同会话。
-    const bool ownerPrivate=channel==Channel::kPet || channel==Channel::kQQPrivate;
-    QSqlQuery q(m_db);
-    // timestamp 是本地时区字段（与 recordInput/saveQATurn 的本地时间约定一致）；
-    // 与 enqueueRecoveryEvents 一样先用 'localtime' 归一，再按天差折算秒数。
-    QString sql=QStringLiteral(
-              "SELECT h.id,coalesce(s.reported,h.timestamp),h.raw_reply,h.turn_state,h.turn_detail,"
-              "(julianday('now','localtime')-julianday(h.timestamp))*86400.0 "
-              "FROM chat_history h LEFT JOIN cognitive_source s ON s.event=h.cognitive_event "
-              "AND s.channel=h.channel AND s.session=h.session_id AND s.subject=h.subject "
-              "AND s.input=h.user_input "
-              "WHERE h.subject=? AND h.sensitive=0 "
-              "AND h.turn_kind='reply' AND h.turn_state IN ('quiet','handed_off','legacy') ");
-    if (ownerPrivate)
-        sql+=QStringLiteral("AND h.channel IN ('pet','qq_private') ");
-    else
-        sql+=QStringLiteral("AND h.channel=? AND h.session_id=? ");
-    sql+=QStringLiteral("ORDER BY h.id DESC LIMIT 1");
-    q.prepare(sql);
-    q.addBindValue(subject);
-    if (!ownerPrivate) {
-        q.addBindValue(channel);
-        q.addBindValue(session);
-    }
-    if (!q.exec() || !q.next()) return {};
-    const auto ageSeconds = qRound64(qMax(0.0, q.value(5).toDouble()));
-    if (maxAgeSeconds >= 0 && ageSeconds > maxAgeSeconds) return {};
-    // quiet 轮次用 turn_detail 记录收口动作；其余轮次从 raw_reply.conversation_action 取。
-    QString action;
-    if (q.value(3).toString() == QStringLiteral("quiet"))
-        action = q.value(4).toString();
-    else
-        action = QJsonDocument::fromJson(q.value(2).toByteArray())
-                     .object()["conversation_action"].toString();
-    return {{"action", action},
-            {"turn", q.value(0).toLongLong()},
-            {"age_seconds", ageSeconds},
-            {"reported_at", q.value(1).toString()}};
-}
-
 QJsonArray MemoryManager::currentUnderstanding(const RequestMeta &audience, const QString &input,
                                     QStringList *keys, const QStringList &only,
                                     bool includeAudiencePrivate) const
@@ -5244,7 +5198,7 @@ void MemoryManager::initDatabase(const QString &dbFilePath, const QString &conne
             currentVersion=27;
         }
         if (currentVersion<28) {
-            // v28：contact now 的依据门禁收口。
+            // v28：contact now 的依据门禁定稿。
             // 1) 时间委托改由提醒链独占执行，回顾不再能以 explicit_time_delegation 依据"现在联系"；
             //    旧库里的 now 联系若没有可核验依据（basis_type/basis_refs 为空），在新授权模型下
             //    不可投递：统一置 withheld 并留审计，避免旧行被投递层直接领走。
@@ -6188,7 +6142,7 @@ QJsonObject MemoryManager::commitReflectionContactAction(qlonglong turn,int vers
         }
         if (!rejection.isEmpty()) return actionError(QStringLiteral("basis_invalid"),rejection);
     } else if (contactTiming==QStringLiteral("now")) {
-        // 新契约也走一遍确定性联系策略（motivation/claims/closure/quiet/目标/重复），
+        // 新契约也走一遍确定性联系策略（motivation/claims/quiet/目标/重复），
         // 但不要因为"缺 verifier"在这里二次发起语义请求。
         const auto claims=QJsonDocument::fromJson(claimsText.toUtf8()).array();
         const auto motivation=QJsonDocument::fromJson(motivationText.toUtf8()).object();

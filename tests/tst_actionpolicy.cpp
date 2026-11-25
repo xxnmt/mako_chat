@@ -5,11 +5,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
-#include <QScopeGuard>
-#include <QSqlDatabase>
-#include <QSqlQuery>
 #include <QTemporaryDir>
-#include <QVariant>
 
 #include "actionpolicy.h"
 #include "configmanager.h"
@@ -17,45 +13,6 @@
 #include "utterance.h"
 
 namespace {
-
-// 独立连接：造/改测试库里的原始行（时间戳、收口动作、活动结果），不影响 MemoryManager 事务。
-class RawDb
-{
-public:
-    RawDb(const QString &path, const QString &tag)
-        : m_conn(QStringLiteral("tst_actionpolicy_raw_") + tag)
-    {
-        m_db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), m_conn);
-        m_db.setDatabaseName(path);
-    }
-    ~RawDb() { close(); }
-    bool open() { return m_db.open(); }
-    bool exec(const QString &sql, const QVariantList &binds = {})
-    {
-        QSqlQuery query(m_db);
-        query.prepare(sql);
-        for (const auto &value : binds) query.addBindValue(value);
-        return query.exec();
-    }
-    QVariant scalar(const QString &sql, const QVariantList &binds = {})
-    {
-        QSqlQuery query(m_db);
-        query.prepare(sql);
-        for (const auto &value : binds) query.addBindValue(value);
-        if (!query.exec() || !query.next()) return {};
-        return query.value(0);
-    }
-    void close()
-    {
-        if (m_db.isOpen()) m_db.close();
-        m_db = QSqlDatabase();
-        if (QSqlDatabase::contains(m_conn)) QSqlDatabase::removeDatabase(m_conn);
-    }
-
-private:
-    QString m_conn;
-    QSqlDatabase m_db;
-};
 
 // 主动联系/语义核验配置在 identity.json。测试里临时启用，析构时恢复。
 class PolicyIdentityGuard
@@ -80,7 +37,7 @@ public:
             config.reloadIdentity();
         }
     }
-    bool enable(int closeSuppressionSeconds = 3600)
+    bool enable()
     {
         QJsonObject target{{QStringLiteral("channel"), Channel::kPet},
                            {QStringLiteral("session_id"), Channel::kDefaultSession}};
@@ -90,9 +47,7 @@ public:
                               // start==end 表示不设安静时段，避免用例受执行时刻影响。
                               {QStringLiteral("quiet_hours"), QJsonObject{{QStringLiteral("start"), QStringLiteral("00:00")},
                                                                           {QStringLiteral("end"), QStringLiteral("00:00")}}},
-                              {QStringLiteral("cooldown_seconds"), 0},
-                              {QStringLiteral("spontaneous_close_suppression_seconds"),
-                               closeSuppressionSeconds}};
+                              {QStringLiteral("cooldown_seconds"), 0}};
         QJsonObject cognition{{QStringLiteral("semantic_verifier"),
                                QJsonObject{{QStringLiteral("enabled"), true},
                                            {QStringLiteral("max_verifier_calls"), 1},
@@ -150,25 +105,6 @@ qlonglong insertOwnerEvidenceTurn(MemoryManager &memory, const QString &text, in
     return memory.recordInput(text, meta, true);
 }
 
-// 把最近一次 quiet/close 收口"抹掉"：改成 handed_off 且 raw_reply 为空对象，
-// 这样 recentConversationClosure 读到的 action 为空，不会触发 recent_closure 抑制。
-bool clearClosure(const QString &dbPath, const QString &tag)
-{
-    RawDb raw(dbPath, tag);
-    if (!raw.open()) return false;
-    return raw.exec(QStringLiteral("UPDATE chat_history SET turn_state='handed_off',raw_reply='{}' "
-                                   "WHERE turn_state='quiet'"));
-}
-
-// 把历史时间整体推老，用于验证"收口窗口之外"。
-bool ageHistory(const QString &dbPath, const QString &tag, int seconds)
-{
-    RawDb raw(dbPath, tag);
-    if (!raw.open()) return false;
-    return raw.exec(QStringLiteral("UPDATE chat_history SET timestamp=datetime('now','localtime','-%1 seconds')")
-                        .arg(seconds));
-}
-
 QJsonObject selfDesireContact(const QString &summary = QStringLiteral("想和主人说说话"),
                               const QString &message = QStringLiteral("在忙吗"))
 {
@@ -214,7 +150,6 @@ private slots:
         MemoryManager memory(dir.filePath(QStringLiteral("self-desire.db")));
         const auto turn = seedOpenConcern(memory, QStringLiteral("今天有点安静"), QStringLiteral("安静"));
         QVERIFY(turn > 0);
-        QVERIFY(clearClosure(memory.databasePath(), QStringLiteral("self-desire")));
 
         int verifierCalls = 0;
         ActionPolicy policy(&memory);
@@ -273,7 +208,6 @@ private slots:
         QVERIFY(identity.enable());
         const auto turn = seedOpenConcern(memory, QStringLiteral("又想起一件事"), QStringLiteral("想起"));
         QVERIFY(turn > 0);
-        QVERIFY(clearClosure(memory.databasePath(), QStringLiteral("fabricated")));
         auto contact = selfDesireContact();
         contact[QStringLiteral("claims")] = QJsonArray{assistantRefClaim};
         const auto decision = policy.evaluateSpontaneousContact(
@@ -295,7 +229,6 @@ private slots:
         MemoryManager memory(dir.filePath(QStringLiteral("unrelated.db")));
         const auto turn = seedOpenConcern(memory, QStringLiteral("想聊聊面试"), QStringLiteral("面试"));
         QVERIFY(turn > 0);
-        QVERIFY(clearClosure(memory.databasePath(), QStringLiteral("unrelated")));
         const auto evidence = insertOwnerEvidenceTurn(memory, QStringLiteral("今天天气不错"));
         QVERIFY(evidence > 0);
 
@@ -335,7 +268,6 @@ private slots:
         MemoryManager memory(dir.filePath(QStringLiteral("repair.db")));
         const auto turn = seedOpenConcern(memory, QStringLiteral("想起了上次的约定"), QStringLiteral("约定"));
         QVERIFY(turn > 0);
-        QVERIFY(clearClosure(memory.databasePath(), QStringLiteral("repair")));
         const auto evidence = insertOwnerEvidenceTurn(memory, QStringLiteral("随手拍的照片"));
         QVERIFY(evidence > 0);
 
@@ -386,7 +318,6 @@ private slots:
         MemoryManager memory(dir.filePath(QStringLiteral("unavailable.db")));
         const auto turn = seedOpenConcern(memory, QStringLiteral("想起一件事"), QStringLiteral("事"));
         QVERIFY(turn > 0);
-        QVERIFY(clearClosure(memory.databasePath(), QStringLiteral("unavailable")));
         const auto evidence = insertOwnerEvidenceTurn(memory, QStringLiteral("路上看到一只猫"));
         QVERIFY(evidence > 0);
 
@@ -402,28 +333,26 @@ private slots:
         QVERIFY(allowed.value(QStringLiteral("allowed")).toBool());
     }
 
-    // 6. 收口抑制：配置窗口内 close → recent_closure；窗口外 → 允许。
-    void recentClosureSuppressesSpontaneous()
+    // 6. 收口机制已删除：刚 close/defer 过也不抑制自发联系。
+    void closureDoesNotSuppressSpontaneous()
     {
         QTemporaryDir dir;
         QVERIFY(dir.isValid());
         PolicyIdentityGuard identity;
-        QVERIFY(identity.enable(3600));
+        QVERIFY(identity.enable());
         MemoryManager memory(dir.filePath(QStringLiteral("closure.db")));
+        // seedOpenConcern 会把来源轮次 recordQuiet("close")：收口确实发生过。
         const auto turn = seedOpenConcern(memory, QStringLiteral("说了晚安"), QStringLiteral("晚安"));
         QVERIFY(turn > 0);
-        ActionPolicy policy(&memory);
-        const auto suppressed = policy.evaluateSpontaneousContact(
-            Channel::kPet, Channel::kDefaultSession, turn, selfDesireContact());
-        QCOMPARE(suppressed.value(QStringLiteral("allowed")).toBool(), false);
-        QCOMPARE(suppressed.value(QStringLiteral("reason")).toString(), QStringLiteral("recent_closure"));
+        QCOMPARE(memory.conversationPhase(policyMeta(QStringLiteral("closure-phase"))),
+                 QStringLiteral("close"));
 
-        // 窗口外：把历史整体推老 2 小时，收口不再覆盖当前时刻。
-        QVERIFY(ageHistory(memory.databasePath(), QStringLiteral("closure-old"), 7200));
-        const auto allowed = policy.evaluateSpontaneousContact(
+        ActionPolicy policy(&memory);
+        const auto decision = policy.evaluateSpontaneousContactDeterministic(
             Channel::kPet, Channel::kDefaultSession, turn, selfDesireContact());
-        QVERIFY2(allowed.value(QStringLiteral("allowed")).toBool(),
-                 qPrintable(allowed.value(QStringLiteral("reason")).toString()));
+        QVERIFY2(decision.value(QStringLiteral("allowed")).toBool(),
+                 qPrintable(decision.value(QStringLiteral("reason")).toString()));
+        QCOMPARE(decision.value(QStringLiteral("reason")).toString(), QStringLiteral("ok"));
     }
 
     // 7. activity_share 必须引用 completed 且有产物的活动。

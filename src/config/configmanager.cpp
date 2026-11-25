@@ -917,7 +917,7 @@ void ConfigManager::ensureIdentityLoaded() const
         qBound(0, proObj.value("concern_default_check_minutes").toInt(720), 10080);
     m_proactive.concernRetentionDays =
         qBound(1, proObj.value("concern_retention_days").toInt(14), 365);
-    // 语义核验与收口抑制（切片 C）：缺省开启核验；预算在这里夹紧，运行期不再二次判断。
+    // 语义核验（切片 C）：缺省开启核验；预算在这里夹紧，运行期不再二次判断。
     {
         const QJsonObject cognitionObj = rootObj.value("cognition").toObject();
         const QJsonObject verifierObj = cognitionObj.value("semantic_verifier").toObject();
@@ -926,8 +926,6 @@ void ConfigManager::ensureIdentityLoaded() const
             qBound(0, verifierObj.value("max_verifier_calls").toInt(1), 4);
         m_semanticVerifier.maxRepairs =
             qBound(0, verifierObj.value("max_repairs").toInt(1), 2);
-        m_semanticVerifier.closeSuppressionSeconds =
-            qBound(0, proObj.value("spontaneous_close_suppression_seconds").toInt(3600), 86400);
     }
     QJsonObject quietObj = proObj.value("quiet_hours").toObject();
     m_proactive.quietStart = quietObj.value("start").toString("23:00");

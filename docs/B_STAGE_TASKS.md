@@ -207,3 +207,23 @@ v29/v30 migration：新增两表 + `reflection_contact` 三列（`motivation_jso
 验证：**`ctest` 23/23**（源工作树 + 应用运行中，测试目标可重链；`Windows_AI.exe` 因进程占用待关闭后重链）。P2 的 dispatch-time TOCTOU（commit 后 ~1s 内用户重新开口）按报告列为观察项，不阻塞 B5。
 
 B5 执行方式按报告修正：**不做 48h shadow**（旧直发链已移除，shadow 会重新引入双路径）；改为"完成本次修复 → 固定提交基线 → 2–4 小时受控冒烟（正常聊天 + 一次 self_desire/一次 reminder/一次晚安 close/一次重启）→ 无硬停止事件后直接进入 7 天自然使用验收"。
+
+## 12. 移除收口抑制 + 日志降噪（R11，2026-11-25）
+
+**设计决定（取代 §9 的 cross-channel closure 与 §11 的"收口抑制"）**：自主联系不应被"刚说完晚安/刚收口"抑制。晚安后想起一件事、单纯想主人，都可以主动找；收口只应是对话状态，不是行动门禁。因此**整体删除**该机制，而不是保留旋钮：
+
+- 删除 `proactive.spontaneous_close_suppression_seconds` 配置项及 `SemanticVerifierConfig::closeSuppressionSeconds` 字段；
+- 删除 `ActionPolicy` 的 `recent_closure` 抑制、`closureReportedAt()`、`ambiguous_after_closure`（保留"证据须晚于关注来源"的 `stale_ref`，那是来源时序不是收口）；
+- 删除 `MemoryManager::recentConversationClosure()`、回顾上下文 `recent_closure`、`CognitiveSnapshot.recentClosure`、提示词中的收口说明；
+- 保留 `recordQuiet/turn_state='quiet'/conversation_action=close|defer`：仍记录"这轮自然结束"，但不再阻止任何主动联系；
+- 保留的门禁：动机合法性、claims authority/可见性/来源时序、语义 verifier、quiet hours、cooldown、目标列表、重复 action。
+
+**日志降噪（同日）**：`reminder not_due` 每 5 秒刷屏的根因是定时器对"所有 pending 未过期提醒"逐条提交，未到期被领域层拒绝后又打 INFO。修复：
+
+- `AppController` 5 秒定时器先按 `reminder.at`（到期时间）过滤，只有 `<= now` 才提交；
+- `ActionCommitter::commitReminderDelivery` 的拒绝改 DEBUG（正常未到期不应按错误记录）；
+- 到期后正常打 `[Reminder] dispatch` 一次。
+
+验证：全仓 `recentConversationClosure/recent_closure/closeSuppression/spontaneous_close/ambiguous_after_closure` 在 src/tests 中 0 命中；全量构建零错误；**`ctest` 23/23**；用例改为 `closureDoesNotSuppressSpontaneous`、`contactNowAcceptsEvidenceFromBeforeClosure`、`crossChannelClosureNoLongerBlocksContact`、`ownerPrivateChannelsStaySeparated`。应用已重链（新二进制含本修复）。
+
+预期行为变化：晚安/收口后她可以因新想法或单纯想念发起联系；如果出现主动消息，应检查的是"事实声称是否有依据"，而不是"刚收口所以不该发"。B5 指标中"晚安后主动=失败"这条作废。

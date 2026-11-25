@@ -220,7 +220,7 @@ private slots:
         for (const auto &key : {QStringLiteral("observations"), QStringLiteral("self_expressions"),
                                 QStringLiteral("inferences"), QStringLiteral("motivations"),
                                 QStringLiteral("commitments"), QStringLiteral("activities"),
-                                QStringLiteral("recent_closure"), QStringLiteral("internal_wakes"),
+                                QStringLiteral("internal_wakes"),
                                 QStringLiteral("policy_view")}) {
             QVERIFY2(prompt.contains(key), qPrintable(QStringLiteral("missing domain: ") + key));
         }
@@ -380,30 +380,36 @@ private slots:
         QVERIFY(!anyFactText(ownerSnapshot.observations, QStringLiteral("群里说的话")));
     }
 
-    // 5. pet 与 qq_private 共用 owner-private 收口语义。
-    void ownerPrivateAcrossChannels()
+    // 5. 主人私聊各渠道的快照只投影本渠道事实；各渠道之间不互相串数据。
+    void ownerPrivateChannelsStaySeparated()
     {
         QTemporaryDir dir;
         QVERIFY(dir.isValid());
-        MemoryManager db(dir.filePath(QStringLiteral("closure.db")));
+        MemoryManager db(dir.filePath(QStringLiteral("owner-private.db")));
 
         const qlonglong petTurn = db.recordInput(QStringLiteral("晚安啦"), ownerMeta(1), false);
         QVERIFY(petTurn > 0);
+        // close 仍作为前台状态记录；它不再参与任何主动联系门禁。
         QVERIFY(db.recordQuiet(petTurn, QStringLiteral("close")));
 
         RequestMeta qqMeta = ownerMeta(2, Channel::kQQPrivate, QStringLiteral("2014366825"));
         qqMeta.actorId = QStringLiteral("2014366825");
+        const qlonglong qqTurn = db.recordInput(QStringLiteral("脚好点没"), qqMeta, false);
+        QVERIFY(qqTurn > 0);
+
         CognitiveSnapshotBuilder builder(&db);
-        const CognitiveSnapshot snapshot = builder.build(
+        const CognitiveSnapshot qqSnapshot = builder.build(
             qqMeta, QStringLiteral("run-5"), QStringLiteral("trigger-5"),
             QStringLiteral("foreground_reply"));
+        QVERIFY(anyFactText(qqSnapshot.observations, QStringLiteral("脚好点没")));
+        // pet 里的原文不会因此泄进 qq_private 的 observations。
+        QVERIFY(!anyFactText(qqSnapshot.observations, QStringLiteral("晚安啦")));
 
-        // pet 里说过晚安（close）在 qq_private 的近期收口里同样可见。
-        QCOMPARE(snapshot.recentClosure.value(QStringLiteral("action")).toString(),
-                 QStringLiteral("close"));
-        QCOMPARE(snapshot.recentClosure.value(QStringLiteral("turn")).toInteger(), petTurn);
-        // 其它渠道的原文不会因此泄进 qq_private 的 observations。
-        QVERIFY(!anyFactText(snapshot.observations, QStringLiteral("晚安啦")));
+        const CognitiveSnapshot petSnapshot = builder.build(
+            ownerMeta(1), QStringLiteral("run-5"), QStringLiteral("trigger-5"),
+            QStringLiteral("foreground_reply"));
+        QVERIFY(anyFactText(petSnapshot.observations, QStringLiteral("晚安啦")));
+        QVERIFY(!anyFactText(petSnapshot.observations, QStringLiteral("脚好点没")));
     }
 
     // 6. 同一份内容重复构建 hash 稳定；改一条 observation 后 hash 变化。

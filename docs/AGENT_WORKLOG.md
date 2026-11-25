@@ -427,3 +427,18 @@ B5 的 7 天实机连续运行、真实 QQ 主动联系到达、多活动并行�
 新增 6 个 fixture（coverage 两例、QQ 回执/崩溃、start 不隐式恢复、history eligibility）。验证：**ctest 23/23**；应用运行中，`Windows_AI.exe` 待关闭后重链。P2 的 dispatch-time ~1s TOCTOU 按报告列为观察项。
 
 B5 节奏按报告修正：固定提交基线 → 2–4h 受控冒烟（self_desire / reminder / 晚安 close / 重启各一次）→ 无硬停止事件后直接 7 天自然使用；不再做 48h shadow（旧直发链已删除，shadow 会重新引入双路径）。凭据需在 B5 前轮换。
+
+---
+
+## 2026-11-25 · 移除收口抑制 + 日志降噪（R11）
+
+**设计决定**：自主联系不应被"刚说完晚安/刚收口"抑制——晚安后想起事情、单纯想念都可以主动找。因此整体删除机制，而不是保留可调窗口：
+
+- 删除 `proactive.spontaneous_close_suppression_seconds` 配置、`SemanticVerifierConfig::closeSuppressionSeconds`；
+- 删除 `ActionPolicy` 的 `recent_closure` 抑制、`closureReportedAt()`、`ambiguous_after_closure`（保留"证据晚于关注来源"的 `stale_ref`）；
+- 删除 `MemoryManager::recentConversationClosure()`、回顾上下文 `recent_closure`、`CognitiveSnapshot.recentClosure`、提示词中的收口说明；
+- 保留 `recordQuiet/turn_state='quiet'/conversation_action=close|defer` 作为对话状态，不再作为行动门禁。
+
+**日志降噪**：5 秒提醒定时器先按到期时间过滤再提交；`ActionCommitter::commitReminderDelivery` 的拒绝日志降 DEBUG；正常时只在到期时打一次 `[Reminder] dispatch`。修掉了 1.5 小时 894 条 `reminder rejected not_due` 的刷屏。
+
+验证：src/tests 中收口相关标识 0 命中；构建零错误；**ctest 23/23**；应用已重链。测试改写为 `closureDoesNotSuppressSpontaneous`、`contactNowAcceptsEvidenceFromBeforeClosure`、`crossChannelClosureNoLongerBlocksContact`、`ownerPrivateChannelsStaySeparated`。B5 指标中"晚安后主动=失败"作废。
