@@ -27,6 +27,8 @@ class SessionRouter;
 class QQProtocolClient;
 class RawEventProcessor;
 class GroupMembershipService;
+class ActionCommitter;
+class ActionOutboxDispatcher;
 
 class AppController : public QObject
 {
@@ -55,6 +57,9 @@ private:
     void resumeMoodTimers();
     void recordInterruption(const QString &reason);
     bool canContactNow() const;
+    // 切片 B：当前是否至少有一个可达的主动投递目标（桌宠恒可达；QQ 需已连接且是主人私聊）。
+    // 提交前用它门控，避免把动作提交进一个此刻无论如何发不出去的渠道。
+    bool hasReachableProactiveTarget() const;
 
     CharacterWidget *m_character;
     BubbleWidget *m_bubble;
@@ -74,6 +79,9 @@ private:
     SessionRouter *m_sessionRouter;     // 输入路由（渠道→大脑）
     RawEventProcessor *m_rawEventProcessor; // raw_events → interactions → summary
     GroupMembershipService *m_membershipService; // 群成员关系快照
+    // 切片 B：三条主动外发（contact/reminder/share）统一走 committer 提交、dispatcher 发送。
+    ActionCommitter *m_actionCommitter = nullptr;
+    ActionOutboxDispatcher *m_actionOutbox = nullptr;
 
     quint64 m_lastPlaybackRound = 0;    // 最近一次入队 TTS 的轮次（退火门控用）
 };

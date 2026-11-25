@@ -389,3 +389,24 @@ B5 的 7 天实机连续运行、真实 QQ 主动联系到达、多活动并行�
 验证：`ctest` **20/20**；`tst_memorymanager` 101 passed/1 skipped、`tst_memoryagent` 73；新增 9 条用例。生产库备份并迁移 v28（`QianDaoMoZi_memory.db.bak_before_v28_<时间戳>`）。
 
 明确未做：语义相关性（"真实但无关"仍可通过，已用 `semanticallyUnrelatedBasisStillPasses` 固化为基线）；cross-channel 收口可能过度抑制；统一 Action Commit Boundary / exactly-once 恢复仍属后续架构工作。
+
+---
+
+## 2026-11-25 · 持久认知状态 + 统一行动边界（R7/R8/R9）
+
+依据第三轮研究报告（`deep-research-report_3.md`），按 A/B/C 三切片实施；HEAD=`69c3edace5579d10808dff9def0f91ede2404323`，schema 28 → 30。
+
+| 切片 | Agent | 内容 |
+|---|---|---|
+| A | `r7-snapshot` | `CognitiveSnapshot` + Builder + 六域/authority + 前台/回顾注入 + 新测试套件 |
+| B | `r8-action-boundary` | v29 `cognitive_action`/`action_outbox`、`ActionCommitter`、`ActionOutboxDispatcher`、三条主动链迁移、旧直发删除 |
+| C | `r9-motivation` | v30 动机/claims 列、`ActionPolicy`、确定性校验 + 单次 verifier/repair、LLMService 回顾契约、配置项 |
+
+集成期由 lead 修复：
+- A：测试 fixture 用 `saveQATurn` 时未传 sentences（`raw_reply` 由 sentences 重建）、matter status 非法、`recordInput` 缺 subject/channel/turnKind。
+- B：`tst_actionoutbox` 误用 `QVERIFY(rewindReviewCooldown(...))`（helper 返回 void）；`tst_memorymanager` 的 outbox 状态查询漏 action_key 过滤。
+- C：**发现并修复生产 bug**——`ActionPolicy::EvidenceReader::chatRef()` 在 `QSqlQuery::finish()` 之后继续读 `value()`，导致"主人原话"被误判为 `not_owner_statement`；改为读完全部列再 finish。另修正多个测试 fixture 的 RequestMeta（subject/channel/session/turnKind）。
+
+验证：全量构建零错误；**`ctest` 23/23**；`tst_memorymanager` 105 passed/1 skipped、`tst_memoryagent` 75、`tst_actionoutbox` 9、`tst_actionpolicy` 9、`tst_cognitivesnapshot` 8。生产库备份 `QianDaoMoZi_memory.db.bak_before_v30_20261125_004447` 并迁移 `user_version=30`（action/outbox 表就绪，历史 now contact 中 1 行为旧协议接受审计，不可再投递）。
+
+明确边界：ForegroundReply 未迁；verifier 是单次 entailment 判定不是真值证明；无端到端 exactly-once；B5 的 24–48h shadow / 7 天主动模式未开始；策略值已配置化但未按体验定值。

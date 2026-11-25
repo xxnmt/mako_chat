@@ -424,7 +424,7 @@ private slots:
         QVERIFY(raw.exec("DROP TABLE matter_revision"));
         for (int reopen=0; reopen<2; ++reopen) {
             MemoryManager db(path);
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),28);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),30);
             QCOMPARE(raw.scalar("SELECT state_updates FROM chat_history").toString(),QString("[]"));
             QVERIFY(db.matterHeads("user").isEmpty());
         }
@@ -785,7 +785,7 @@ private slots:
         }
         RawDb raw(path,"v17-semantics");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),28);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),30);
         QCOMPARE(raw.scalar("SELECT count(*) FROM matter_revision").toInt(),1);
         QVERIFY(raw.scalar("SELECT semantics IS NULL FROM matter_revision").toBool());
     }
@@ -859,7 +859,7 @@ private slots:
         RawDb raw(path,"lifecycle");
         QVERIFY(raw.open());
         QCOMPARE(raw.scalar("SELECT count(*) FROM matter_revision").toInt(),2);
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),28);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),30);
     }
 
     void currentUnderstandingRetainsLatestSelfReport()
@@ -1605,7 +1605,7 @@ private slots:
         }
         RawDb raw(path, "v15-verify");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 28);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 30);
     }
 
     void databaseBackupIsConsistent()
@@ -1625,7 +1625,7 @@ private slots:
         RawDb copy(backup, "backup-copy");
         QVERIFY(copy.open());
         QCOMPARE(copy.scalar("SELECT count(*) FROM chat_history").toInt(), 1);
-        QCOMPARE(copy.scalar("PRAGMA user_version").toInt(), 28);
+        QCOMPARE(copy.scalar("PRAGMA user_version").toInt(), 30);
         QVERIFY(copy.scalar("SELECT count(*) FROM memory_chunks").toInt() > 0);
     }
 
@@ -1900,7 +1900,7 @@ private slots:
             QVERIFY(raw.open());
 
             // 版本推进到 v3
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 28);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 30);
 
             // 列扩展（v2 渠道 + v3 轮次）
             const QStringList historyCols = raw.columns("chat_history");
@@ -2005,7 +2005,7 @@ private slots:
             MemoryManager second(dbPath);
             RawDb raw(dbPath, "verify2");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 28);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 30);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM chat_history").toInt(), 1);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM relationship_state").toInt(), 2);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM long_term_summary").toInt(), 1);
@@ -2022,7 +2022,7 @@ private slots:
             MemoryManager mm(dbPath);
             RawDb raw(dbPath, "fresh");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 28);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 30);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('raw_events')").toInt() > 0);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('memory_cursor')").toInt() > 0);
 
@@ -2229,7 +2229,7 @@ private slots:
         Q_UNUSED(mm);
         RawDb raw(dbPath, "v2verify");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 28);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 30);
         QCOMPARE(raw.scalar("SELECT user_input FROM chat_history").toString(), QStringLiteral("旧输入"));
         QCOMPARE(raw.scalar("SELECT turn_kind FROM chat_history").toString(), QStringLiteral("reply"));
         QCOMPARE(raw.scalar("SELECT subject FROM chat_history").toString(), QStringLiteral("user"));
@@ -3166,11 +3166,13 @@ private slots:
         {
             RawDb raw(path, "ledger-schema");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 28);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 30);
             const QStringList contact = raw.columns("reflection_contact");
             for (const auto &column : {QStringLiteral("attempts"), QStringLiteral("last_outcome"),
                                        QStringLiteral("last_attempt_at"),
-                                       QStringLiteral("basis_type"), QStringLiteral("basis_refs")})
+                                       QStringLiteral("basis_type"), QStringLiteral("basis_refs"),
+                                       QStringLiteral("motivation_json"), QStringLiteral("claims_json"),
+                                       QStringLiteral("semantic_status")})
                 QVERIFY2(contact.contains(column), qPrintable(column));
             const QStringList ledger = raw.columns("delivery_ledger");
             for (const auto &column : {QStringLiteral("kind"), QStringLiteral("ref"), QStringLiteral("channel"),
@@ -4199,7 +4201,7 @@ private slots:
         MemoryManager reopened(path);
         RawDb raw(path, "v27-legacy-verify");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 28);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 30);
         QCOMPARE(raw.scalar(QStringLiteral("SELECT outcome FROM reflection_contact WHERE turn_id=99001"))
                      .toString(), QStringLiteral("withheld"));
         QCOMPARE(raw.scalar(QStringLiteral("SELECT last_outcome FROM reflection_contact WHERE turn_id=99001"))
@@ -4414,7 +4416,7 @@ private slots:
             MemoryManager db(path);
             RawDb schema(path, "attention-schema");
             QVERIFY(schema.open());
-            QCOMPARE(schema.scalar("PRAGMA user_version").toInt(), 28);
+            QCOMPARE(schema.scalar("PRAGMA user_version").toInt(), 30);
             const QStringList eventColumns = schema.columns("attention_event");
             for (const auto &column : {QStringLiteral("kind"), QStringLiteral("ref"),
                                        QStringLiteral("payload"), QStringLiteral("state"),
@@ -4590,6 +4592,275 @@ private slots:
         // 迟到回调同样被行存在性/版本校验拒绝。
         QVERIFY(!db.finishThoughtReview(id, version + 1,
             QJsonObject{{"status","active"},{"reflection","迟到"}}));
+    }
+
+    // 切片 B：contact 改为"域 CAS + cognitive_action + action_outbox 同事务提交"后，
+    // 旧直发路径（claimReflectionContact）不再能领到同一意图；唯一状态机是
+    // commit → claimOutbox → settle。重复提交幂等、outbox 只有一行。
+    void outboxContactCommitDisablesDirectClaim()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableContact());
+        const QString path = dir.filePath("outbox-contact.db");
+        MemoryManager db(path);
+        const auto evidence = insertOwnerEvidenceTurn(db, QStringLiteral("明天想去看海"));
+        QVERIFY(evidence > 0);
+        const qint64 turn = seedOpenConcern(db, concernTurnMeta(QStringLiteral("outbox-contact-a")),
+                                            QStringLiteral("想去看海"), QStringLiteral("看海"),
+                                            QJsonObject{},
+                                            contactNow(QStringLiteral("有新消息"), QStringLiteral("在吗"),
+                                                       ownerEvidenceBasis(evidence)));
+        QVERIFY(turn > 0);
+        const auto committed = db.commitReflectionContactAction(turn, 1, QStringLiteral("test"));
+        QVERIFY2(!committed.contains("error"), qPrintable(committed.value("error").toString()));
+        const QString actionKey = QStringLiteral("reflection:%1:1:contact").arg(turn);
+        QCOMPARE(committed.value("action_key").toString(), actionKey);
+        QCOMPARE(committed.value("state").toString(), QStringLiteral("queued"));
+        {
+            RawDb raw(path, "outbox-contact-raw");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar("SELECT count(*) FROM cognitive_action").toInt(), 1);
+            QCOMPARE(raw.scalar("SELECT count(*) FROM action_outbox").toInt(), 1);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT outcome FROM reflection_contact WHERE turn_id=%1")
+                                    .arg(turn)).toString(),
+                     QStringLiteral("dispatching"));
+        }
+        // 硬禁用旧路径：同一意图已经交给 outbox，claimReflectionContact 不能再领取（否则会新旧同时发）。
+        QVERIFY(db.claimReflectionContact(turn, 1, Channel::kPet, Channel::kDefaultSession).isEmpty());
+        // 幂等：重复提交返回既有状态，不产生第二条 outbox。
+        const auto again = db.commitReflectionContactAction(turn, 1);
+        QCOMPARE(again.value("idempotent").toBool(), true);
+        {
+            RawDb raw(path, "outbox-contact-raw2");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar("SELECT count(*) FROM action_outbox").toInt(), 1);
+        }
+        const auto job = db.claimOutbox(QStringLiteral("test-owner"), 60);
+        QCOMPARE(job.value("action_key").toString(), actionKey);
+        QCOMPARE(job.value("kind").toString(), QStringLiteral("SpontaneousContact"));
+        const auto sentences = job.value("payload").toObject().value("sentences").toArray();
+        QCOMPARE(sentences.size(), 1);
+        QCOMPARE(sentences.first().toObject().value("zh_text").toString(), QStringLiteral("在吗"));
+        // 首次领取后不会再被第二个领取者拿到（同一行不会并发领取）。
+        QVERIFY(db.claimOutbox(QStringLiteral("test-owner-2"), 60).isEmpty());
+        QVERIFY(db.settleOutboxAction(actionKey, QStringLiteral("protocol_accepted"), QStringLiteral("ok")));
+        {
+            RawDb raw(path, "outbox-contact-raw3");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT outcome FROM reflection_contact WHERE turn_id=%1")
+                                    .arg(turn)).toString(),
+                     QStringLiteral("protocol_accepted"));
+            QCOMPARE(raw.scalar("SELECT state FROM cognitive_action").toString(),
+                     QStringLiteral("handed_off"));
+            QCOMPARE(raw.scalar("SELECT last_outcome FROM cognitive_action").toString(),
+                     QStringLiteral("protocol_accepted"));
+            QCOMPARE(raw.scalar("SELECT state FROM action_outbox").toString(),
+                     QStringLiteral("dispatched"));
+        }
+    }
+
+    // 切片 B：失败提交（依据被拒/无提醒/未到期）不写任何 action/outbox 行（原子性）。
+    void outboxRejectedCommitWritesNothing()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableContact());
+        const QString path = dir.filePath("outbox-reject.db");
+        MemoryManager db(path);
+        // contact now 没有可核验依据：finishPrivateReflection 不写 reflection_contact，commit 必须失败。
+        QVERIFY(rewindReviewCooldown(path, QStringLiteral("outbox-reject-clock")));
+        const qint64 turn = seedOpenConcern(db, concernTurnMeta(QStringLiteral("outbox-reject-a")),
+                                            QStringLiteral("随便聊聊"), QStringLiteral("聊聊天"),
+                                            QJsonObject{},
+                                            contactNow(QStringLiteral("想问问"), QStringLiteral("在吗")));
+        QVERIFY(turn > 0);
+        const auto rejected = db.commitReflectionContactAction(turn, 1);
+        QVERIFY(rejected.contains("error"));
+        // 不存在的提醒 / 未到期的提醒：同样不写行。
+        QVERIFY(db.commitReminderDeliveryAction(987654).contains("error"));
+        const qint64 notDue = insertPendingReminder(path, QStringLiteral("outbox-not-due"),
+                                                     Channel::kPet, Channel::kDefaultSession,
+                                                     3600, QStringLiteral("一小时后"));
+        QVERIFY(notDue > 0);
+        QVERIFY(db.commitReminderDeliveryAction(notDue).contains("error"));
+        {
+            RawDb raw(path, "outbox-reject-raw");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar("SELECT count(*) FROM cognitive_action").toInt(), 0);
+            QCOMPARE(raw.scalar("SELECT count(*) FROM action_outbox").toInt(), 0);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM reflection_contact WHERE turn_id=%1")
+                                    .arg(turn)).toInt(), 0);
+        }
+    }
+
+    // 切片 B：提醒与分享的提交/领取/回执状态机；提醒提交后旧 claimDueReminder 不可再领取。
+    void outboxReminderAndShareStateMachine()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableContact());
+        const QString path = dir.filePath("outbox-reminder-share.db");
+        MemoryManager db(path);
+        const qint64 reminder = insertPendingReminder(path, QStringLiteral("outbox-due"),
+                                                       Channel::kPet, Channel::kDefaultSession,
+                                                       -10, QStringLiteral("该喝水了"));
+        QVERIFY(reminder > 0);
+        const auto reminderCommit = db.commitReminderDeliveryAction(reminder);
+        QVERIFY2(!reminderCommit.contains("error"),
+                 qPrintable(reminderCommit.value("error").toString()));
+        const QString reminderKey = QStringLiteral("reminder:%1:delivery").arg(reminder);
+        QCOMPARE(reminderCommit.value("action_key").toString(), reminderKey);
+        // 旧直发路径已不可领取（reminder.state 已离开 pending）。
+        QVERIFY(db.claimDueReminder(Channel::kPet, Channel::kDefaultSession).isEmpty());
+        // 重复提交幂等。
+        QCOMPARE(db.commitReminderDeliveryAction(reminder).value("idempotent").toBool(), true);
+        const auto reminderJob = db.claimOutbox(QStringLiteral("test-owner"), 60);
+        QCOMPARE(reminderJob.value("action_key").toString(), reminderKey);
+        QCOMPARE(reminderJob.value("payload").toObject().value("message").toString(),
+                 QStringLiteral("该喝水了"));
+        QVERIFY(db.settleOutboxAction(reminderKey, QStringLiteral("protocol_accepted")));
+        {
+            RawDb raw(path, "outbox-reminder-raw");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar("SELECT count(*) FROM action_outbox").toInt(), 1);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM reminder WHERE id=%1").arg(reminder)).toString(),
+                     QStringLiteral("protocol_accepted"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM cognitive_action WHERE action_key='%1'")
+                                    .arg(reminderKey)).toString(),
+                     QStringLiteral("handed_off"));
+        }
+
+        // 分享：completed + 产物 + 版本匹配才可提交；unknown 冻结后同一版本不能再提交。
+        QVERIFY(db.saveQATurn(QStringLiteral("想写点雨声"), R"({"personal_interest":"写雨声"})", {}));
+        const auto thought = db.nextThought(true);
+        const qlonglong activityId = thought["id"].toInteger();
+        const int version = thought["version"].toInt();
+        QVERIFY(activityId > 0);
+        QVERIFY(db.finishThoughtReview(activityId, version,
+            QJsonObject{{"status","completed"},{"reflection","写好了"},
+                        {"draft","屋檐轻响，雨在窗上停了一停。"}}));
+        const int sharedVersion = version + 1;
+        QVERIFY(db.canShareThought(activityId, sharedVersion));
+        const auto shareCommit = db.commitActivityShareAction(
+            activityId, sharedVersion, QStringLiteral("屋檐轻响，雨在窗上停了一停。"));
+        QVERIFY2(!shareCommit.contains("error"), qPrintable(shareCommit.value("error").toString()));
+        const QString shareKey = QStringLiteral("thought:%1:%2:share").arg(activityId).arg(sharedVersion);
+        QCOMPARE(shareCommit.value("action_key").toString(), shareKey);
+        {
+            RawDb raw(path, "outbox-share-raw");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM delivery_ledger WHERE kind='share' AND ref='thought:%1:%2'")
+                                    .arg(activityId).arg(sharedVersion)).toString(),
+                     QStringLiteral("claimed"));
+        }
+        const auto shareJob = db.claimOutbox(QStringLiteral("test-owner"), 60);
+        QCOMPARE(shareJob.value("action_key").toString(), shareKey);
+        QCOMPARE(shareJob.value("payload").toObject().value("draft").toString(),
+                 QStringLiteral("屋檐轻响，雨在窗上停了一停。"));
+        QVERIFY(db.settleOutboxAction(shareKey, QStringLiteral("unknown"), QStringLiteral("timeout")));
+        {
+            RawDb raw(path, "outbox-share-raw2");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM action_outbox WHERE action_key='%1'")
+                                    .arg(shareKey)).toString(),
+                     QStringLiteral("unknown"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM delivery_ledger WHERE kind='share' AND ref='thought:%1:%2'")
+                                    .arg(activityId).arg(sharedVersion)).toString(),
+                     QStringLiteral("unknown"));
+        }
+        // unknown 冻结：同一版本不再允许再分享；重复提交幂等返回已有动作，不产生第二个 outbox。
+        QVERIFY(!db.canShareThought(activityId, sharedVersion));
+        const auto again = db.commitActivityShareAction(
+            activityId, sharedVersion, QStringLiteral("屋檐轻响，雨在窗上停了一停。"));
+        QCOMPARE(again.value("idempotent").toBool(), true);
+        QCOMPARE(again.value("state").toString(), QStringLiteral("unknown"));
+        QVERIFY(db.claimOutbox(QStringLiteral("test-owner"), 60).isEmpty());
+        {
+            RawDb raw(path, "outbox-share-raw3");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar("SELECT count(*) FROM cognitive_action WHERE kind='ActivityShare'").toInt(), 1);
+            QCOMPARE(raw.scalar("SELECT count(*) FROM action_outbox WHERE action_key LIKE 'thought:%'").toInt(), 1);
+        }
+    }
+
+    // 切片 B：拒绝后受控重试一次；租约过期的 dispatching 残留恢复为 unknown 且不再领取。
+    void outboxRetryAndStaleRecovery()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableContact());
+        const QString path = dir.filePath("outbox-retry.db");
+        MemoryManager db(path);
+        const qint64 reminder = insertPendingReminder(path, QStringLiteral("outbox-retry-due"),
+                                                       Channel::kPet, Channel::kDefaultSession,
+                                                       -10, QStringLiteral("该休息了"));
+        QVERIFY(reminder > 0);
+        const auto committed = db.commitReminderDeliveryAction(reminder);
+        QVERIFY2(!committed.contains("error"), qPrintable(committed.value("error").toString()));
+        const QString actionKey = committed.value("action_key").toString();
+        const auto first = db.claimOutbox(QStringLiteral("owner-1"), 60);
+        QCOMPARE(first.value("action_key").toString(), actionKey);
+        QCOMPARE(first.value("attempts").toInt(), 1);
+        // 第一次被拒：outbox 回 queued，允许受控重试一次。
+        QVERIFY(db.settleOutboxAction(actionKey, QStringLiteral("rejected"), QStringLiteral("submit_failed")));
+        {
+            RawDb raw(path, "outbox-retry-raw");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar("SELECT state FROM action_outbox").toString(), QStringLiteral("queued"));
+            QCOMPARE(raw.scalar("SELECT attempts FROM action_outbox").toInt(), 1);
+        }
+        const auto second = db.claimOutbox(QStringLiteral("owner-1"), 60);
+        QCOMPARE(second.value("action_key").toString(), actionKey);
+        QCOMPARE(second.value("attempts").toInt(), 2);
+        QVERIFY(db.settleOutboxAction(actionKey, QStringLiteral("rejected"), QStringLiteral("submit_failed")));
+        // 第二次被拒后终止：不再领取。
+        QVERIFY(db.claimOutbox(QStringLiteral("owner-1"), 60).isEmpty());
+        // 领取后崩溃：租约过期 → recoverStaleOutbox 冻结为 unknown，绝不重发。
+        const qint64 reminder2 = insertPendingReminder(path, QStringLiteral("outbox-stale-due"),
+                                                        Channel::kPet, Channel::kDefaultSession,
+                                                        -10, QStringLiteral("该睡觉了"));
+        QVERIFY(reminder2 > 0);
+        const auto committed2 = db.commitReminderDeliveryAction(reminder2);
+        QVERIFY2(!committed2.contains("error"), qPrintable(committed2.value("error").toString()));
+        const QString staleKey = committed2.value("action_key").toString();
+        const auto claimed = db.claimOutbox(QStringLiteral("owner-1"), 60);
+        QCOMPARE(claimed.value("action_key").toString(), staleKey);
+        {
+            RawDb raw(path, "outbox-stale-expire");
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral(
+                "UPDATE action_outbox SET lease_until=unixepoch()-7200 WHERE action_key='%1'")
+                .arg(staleKey)));
+        }
+        QCOMPARE(db.recoverStaleOutbox(600), 1);
+        QCOMPARE(db.recoverStaleOutbox(600), 0); // 幂等：终态不再重复恢复
+        {
+            RawDb raw(path, "outbox-stale-raw");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM action_outbox WHERE action_key='%1'")
+                                    .arg(staleKey)).toString(),
+                     QStringLiteral("unknown"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM cognitive_action WHERE action_key='%1'")
+                                    .arg(staleKey)).toString(),
+                     QStringLiteral("unknown"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM reminder WHERE id=%1").arg(reminder2)).toString(),
+                     QStringLiteral("unknown"));
+        }
+        QVERIFY(db.claimOutbox(QStringLiteral("owner-1"), 60).isEmpty());
+        // unknown 的迟到回执不能把它改回已送达：冻结语义。
+        QVERIFY(db.settleOutboxAction(staleKey, QStringLiteral("protocol_accepted")));
+        {
+            RawDb raw(path, "outbox-stale-raw2");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM cognitive_action WHERE action_key='%1'")
+                                    .arg(staleKey)).toString(),
+                     QStringLiteral("unknown"));
+        }
     }
 };
 

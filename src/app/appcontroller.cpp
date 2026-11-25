@@ -26,6 +26,8 @@
 #include "memorypolicy.h"
 #include "debuglog.h"
 #include "raweventprocessor.h"
+#include "actioncommitter.h"
+#include "actionoutboxdispatcher.h"
 
 #include <QDebug>
 #include <QTimer>
@@ -36,21 +38,6 @@
 #include <QJsonDocument>
 
 namespace {
-
-// QQ 的发送结果异步回来时只有 deliveryEcho，这里暂存草稿分享的路由（渠道/会话/原文），
-// 供 sendResult 落分享回执并补写"茉子主动说过的话"。键为 share:<activityId>:<version>。
-// 只在主线程访问，条目在回执到达（或入队失败）时移除；重复分享同一版本时覆盖。
-struct ShareRoute {
-    QString channel;
-    QString session;
-    QString text;
-};
-
-QHash<QString, ShareRoute> &shareRoutes()
-{
-    static QHash<QString, ShareRoute> routes;
-    return routes;
-}
 
 bool isAllowedExtractionSubject(const QString &subject, const RequestMeta &meta)
 {
@@ -232,29 +219,49 @@ AppController::AppController(QObject *parent)
             qWarning() << "[Proactive] history write failed:" << kind << ref;
     };
     // 联系投递：claim 自己保证"proposed 首投 + rejected 最多补一次"，这里只负责发送与回执。
-    // 返回本次投递的 outcome；空串表示没有可投递的目标（调用方据此判 withheld）。
-    const auto dispatchContact = [this, recordProactive](qlonglong turn, int version) -> QString {
-        auto &cfg = ConfigManager::instance();
-        for (const auto &target : cfg.getProactiveConfig().targets) {
-            const bool pet = target.first==Channel::kPet;
-            if (!pet && !m_qqClient->isConnected()) continue;
-            Utterance u;
-            u.channel=target.first;
-            u.sessionId=target.second;
-            u.text=m_memoryManager->claimReflectionContact(turn,version,u.channel,u.sessionId);
-            if (u.text.isEmpty()) continue;
-            const auto ref=QStringLiteral("reflection:%1:%2").arg(turn).arg(version);
-            u.deliveryEcho=ref;
-            const bool submitted = pet ? m_petChannel->sendUtterance(u) : m_qqChannel->sendUtterance(u);
-            const QString outcome = submitted ? QStringLiteral("handed_off") : QStringLiteral("rejected");
-            m_memoryManager->recordContactOutcome(turn,version,outcome);
-            if (submitted)
-                recordProactive(u.channel,u.sessionId,u.text,QStringLiteral("contact"),ref);
-            qInfo() << "[ReflectionContact]" << turn << version << u.channel << outcome;
-            return outcome;
+    // 切片 B 起改为 committer 提交 + OutboxDispatcher 唯一发送：三条主动外发不再有直接发送路径。
+    m_actionCommitter = new ActionCommitter(m_memoryManager);
+    m_actionOutbox = new ActionOutboxDispatcher(m_memoryManager, this);
+    // sender 是唯一的渠道出口：桌宠直接显示气泡；QQ 私聊只在已连接且是主人时发送。
+    // 不确定/被拒的回执由 dispatcher 落库（at-most-once），这里只回答"提交是否进入渠道"。
+    m_actionOutbox->setSender([this](const Utterance &u) {
+        if (u.channel == Channel::kPet && u.sessionId == Channel::kDefaultSession)
+            return m_petChannel->sendUtterance(u);
+        if (u.channel == Channel::kQQPrivate
+            && ConfigManager::instance().isMasterQQ(u.sessionId)
+            && m_qqClient->isConnected())
+            return m_qqChannel->sendUtterance(u);
+        return false;
+    });
+    connect(m_actionOutbox, &ActionOutboxDispatcher::actionSettled, this,
+            [recordProactive](const QString &actionKey,const QString &outcome,
+                              const QJsonObject &payload) {
+        qInfo() << "[Outbox] settled" << actionKey << outcome;
+        // "她说过"只能回写至少已经交给渠道的结果：rejected/withheld 明确未发送，绝不写。
+        // pet 没有协议层回执，handed_off 即气泡已显示；QQ 以 protocol_accepted/unknown 为准。
+        const bool delivered = outcome == QStringLiteral("protocol_accepted")
+            || outcome == QStringLiteral("unknown")
+            || (outcome == QStringLiteral("handed_off")
+                && payload.value(QStringLiteral("channel")).toString() == Channel::kPet);
+        if (!delivered) return;
+        const QString text = payload.value(QStringLiteral("text")).toString();
+        const QString channel = payload.value(QStringLiteral("channel")).toString();
+        const QString session = payload.value(QStringLiteral("session")).toString();
+        if (text.trimmed().isEmpty() || channel.isEmpty()) return;
+        // kind/ref 与旧主动历史约定保持一致，便于既有回认/检索继续命中。
+        if (actionKey.startsWith(QStringLiteral("reflection:"))) {
+            recordProactive(channel, session, text, QStringLiteral("contact"),
+                            actionKey.section(QLatin1Char(':'), 0, 2));
+        } else if (actionKey.startsWith(QStringLiteral("reminder:"))) {
+            recordProactive(channel, session, text, QStringLiteral("reminder"),
+                            actionKey.section(QLatin1Char(':'), 1, 1));
+        } else if (actionKey.startsWith(QStringLiteral("thought:"))) {
+            const auto parts = actionKey.split(QLatin1Char(':'));
+            if (parts.size() >= 3)
+                recordProactive(channel, session, text, QStringLiteral("share"),
+                                QStringLiteral("%1:%2").arg(parts[1]).arg(parts[2]));
         }
-        return {};
-    };
+    });
     // 普通回复的有限补发：只补"已经决定要发、且被渠道明确拒绝"的话，
     // 因此不受主动联系的安静时段/空闲门控限制（不调用 canContactNow），只要求 QQ 连接可用。
     // 每次最多补 1 条；发送前先 recordDeliveryAttempt 占位（state 回到 claimed），
@@ -291,36 +298,31 @@ AppController::AppController(QObject *parent)
         }
     };
     auto *reminders=new QTimer(this);
-    connect(reminders,&QTimer::timeout,this,[this, dispatchContact, retryReplyDeliveries] {
+    connect(reminders,&QTimer::timeout,this,[this, retryReplyDeliveries] {
         // 普通回复补发与主动联系解耦：只要 QQ 可用就补，不受提醒开关/安静时段影响，
         // 因此先于下面的主动联系门控执行（不能放在早退之后）。
         retryReplyDeliveries();
         const auto options=ConfigManager::instance().getProactiveConfig();
         const auto now=QTime::currentTime(), start=QTime::fromString(options.quietStart,"HH:mm"), end=QTime::fromString(options.quietEnd,"HH:mm");
         if (!options.enabled || (start<end ? now>=start && now<end : start>end && (now>=start || now<end))) return;
+        // 切片 B：到期提醒只做"提交"，发送由 OutboxDispatcher 唯一执行。
         for (const auto &target : options.targets) {
             const bool pet=target.first==Channel::kPet;
             if (!pet && !m_qqClient->isConnected()) continue;
-            const auto due=m_memoryManager->claimDueReminder(target.first,target.second);
-            if (due.isEmpty()) continue;
-            Utterance u;
-            u.channel=target.first; u.sessionId=target.second; u.text=due["message"].toString();
-            const auto id=due["id"].toInteger();
-            u.deliveryEcho=QString("reminder:%1").arg(id);
-            const bool ok=pet ? m_petChannel->sendUtterance(u) : m_qqChannel->sendUtterance(u);
-            m_memoryManager->reminderOutcome(id,ok ? "handed_off" : "rejected");
-            if (ok)
-                m_memoryManager->recordProactiveMessage(u.channel,u.sessionId,u.text,
-                                                        QStringLiteral("reminder"),QString::number(id));
-            qInfo()<<"[Reminder] dispatch"<<id<<ok;
-        }
-        // 上一次被渠道拒绝的联系：每个周期最多补发一条；claim 保证不会重复发送。
-        if (canContactNow()) {
-            const auto retries = m_memoryManager->retryableReflectionContacts(4);
-            for (const auto &value : retries) {
-                const auto retry = value.toObject();
-                if (!dispatchContact(retry["turn"].toInteger(), retry["version"].toInt()).isEmpty())
-                    break;
+            RequestMeta viewer;
+            viewer.channel=target.first;
+            viewer.sessionId=target.second;
+            viewer.subject=QStringLiteral("user");
+            viewer.longTermMemoryEnabled=true;
+            const auto pending=m_memoryManager->pendingReminders(viewer);
+            for (const auto &value : pending) {
+                const auto id=value.toObject().value(QStringLiteral("id")).toInteger();
+                if (id<=0) continue;
+                // commit 自己再做一次"pending/到期/未过期"的领域校验；未到期返回 error，不写任何行。
+                const auto committed=m_actionCommitter->commitReminderDelivery(id);
+                if (committed.contains(QStringLiteral("error"))) continue;
+                qInfo()<<"[Reminder] dispatch"<<id
+                       <<committed.value(QStringLiteral("action_key")).toString();
             }
         }
     });
@@ -329,116 +331,55 @@ AppController::AppController(QObject *parent)
     connect(m_qqClient, &QQProtocolClient::connected, this, [retryReplyDeliveries] {
         retryReplyDeliveries();
     });
-    connect(m_coordinator, &CognitiveCoordinator::contactProposed, this, [this, dispatchContact](qlonglong turn,int version) {
-        if (canContactNow() && !dispatchContact(turn,version).isEmpty())
-            return;
-        m_memoryManager->recordContactOutcome(turn,version,"withheld");
-        qInfo() << "[ReflectionContact] withheld" << turn << version;
-    });
-    connect(m_qqClient, &QQProtocolClient::sendResult, this, [this](const QString &echo,const QString &outcome) {
-        if (echo.startsWith("reminder:")) {
-            m_memoryManager->reminderOutcome(echo.mid(9).toLongLong(),outcome);
-            qInfo()<<"[Reminder] receipt"<<echo<<outcome;
+    connect(m_coordinator, &CognitiveCoordinator::contactProposed, this, [this](qlonglong turn,int version) {
+        // 切片 B：不再直接发送。可达目标不存在或提交校验失败时把意图落 withheld（不写动作行），
+        // 成功则等待 OutboxDispatcher 领取发送。
+        if (!canContactNow() || !hasReachableProactiveTarget()) {
+            m_memoryManager->recordContactOutcome(turn,version,QStringLiteral("withheld"));
+            qInfo() << "[ReflectionContact] withheld" << turn << version;
             return;
         }
-        if (echo.startsWith("reply:")) {
-            // 普通回复回执：只落终态。unknown 表示协议层可能已送达，补发逻辑不会选它；
-            // rejected 才进入有限补发（attempts<2）。
+        const auto committed=m_actionCommitter->commitReflectionContact(turn,version);
+        if (committed.contains(QStringLiteral("error"))) {
+            m_memoryManager->recordContactOutcome(turn,version,QStringLiteral("withheld"));
+            qInfo() << "[ReflectionContact] withheld" << turn << version
+                    << committed.value(QStringLiteral("error")).toString();
+            return;
+        }
+        qInfo() << "[ReflectionContact] committed" << turn << version
+                << committed.value(QStringLiteral("action_key")).toString();
+    });
+    connect(m_qqClient, &QQProtocolClient::sendResult, this, [this](const QString &echo,const QString &outcome) {
+        if (echo.startsWith(QStringLiteral("reply:"))) {
+            // 普通回复回执（ForegroundReply 保持现状）：只落终态。unknown 表示协议层可能已送达，
+            // 补发逻辑不会选它；rejected 才进入有限补发（attempts<2）。
             if (!m_memoryManager->recordDeliveryOutcome(QStringLiteral("reply"), echo, outcome))
                 qWarning() << "[Reply] receipt not recorded" << echo << outcome;
             else
                 qInfo() << "[Reply] receipt" << echo << outcome;
             return;
         }
-        if (echo.startsWith("share:")) {
-            const auto parts=echo.split(':');
-            if (parts.size()!=3) return;
-            // 路由可能在进程重启后丢失：此时仍记录结果，只是不补历史原文/不重发。
-            const auto route=shareRoutes().take(echo);
-            const auto activityId=parts[1].toLongLong();
-            const auto version=parts[2].toInt();
-            if (!m_memoryManager->recordShareOutcome(activityId,version,outcome,route.channel,route.session)) {
-                qWarning()<<"[Share] receipt rejected"<<echo<<outcome;
-                return;
-            }
-            qInfo()<<"[Share] receipt"<<echo<<outcome;
-            if (outcome=="handed_off" || outcome=="protocol_accepted") {
-                if (!route.text.trimmed().isEmpty())
-                    m_memoryManager->recordProactiveMessage(route.channel,route.session,route.text,
-                                                            QStringLiteral("share"),
-                                                            QStringLiteral("%1:%2").arg(activityId).arg(version));
-                return;
-            }
-            // 渠道明确拒绝时把同一份草稿补发一次（canShareThought 用 attempts<2 挡住第二次拒绝）。
-            // 延迟到当前回执处理栈结束之后再发，避免与协议客户端的在途队列冲突。
-            if (outcome=="rejected" && !route.channel.isEmpty() && !route.text.trimmed().isEmpty()
-                && m_memoryManager->canShareThought(activityId, version)) {
-                QTimer::singleShot(4000, this, [this, activityId, version, route, echo] {
-                    if (!m_memoryManager->canShareThought(activityId, version)) return;
-                    Utterance retry;
-                    retry.channel = route.channel;
-                    retry.sessionId = route.session;
-                    retry.text = route.text;
-                    retry.deliveryEcho = echo;
-                    shareRoutes().insert(echo, route);
-                    const bool submitted = route.channel == Channel::kPet
-                        ? m_petChannel->sendUtterance(retry) : m_qqChannel->sendUtterance(retry);
-                    if (!submitted) {
-                        shareRoutes().remove(echo);
-                        m_memoryManager->recordShareOutcome(activityId, version,
-                                                            QStringLiteral("rejected"),
-                                                            route.channel, route.session);
-                    }
-                });
-            }
-            return;
-        }
-        if (!echo.startsWith("reflection:")) return;
-        const auto parts=echo.split(':');
-        if (parts.size()==3 && m_memoryManager->recordContactOutcome(parts[1].toLongLong(),parts[2].toInt(),outcome))
-            qInfo() << "[ReflectionContact]" << echo << outcome;
+        // 主动外发（contact/reminder/share）回执：echo 现在就是 action_key，
+        // 统一交给 OutboxDispatcher 在一个事务里更新 action/outbox/领域状态。
+        if (m_actionOutbox)
+            m_actionOutbox->onSendResult(echo,outcome);
     });
-    connect(m_coordinator, &CognitiveCoordinator::draftReadyToShare, this, [this, recordProactive](const QString &activityRef, int version, const QString &draft) {
-        if (!canContactNow())
+    connect(m_coordinator, &CognitiveCoordinator::draftReadyToShare, this,
+            [this](const QString &activityRef, int version, const QString &draft) {
+        if (!canContactNow() || !hasReachableProactiveTarget())
             return;
         const qlonglong activityId = activityRef.startsWith(QStringLiteral("thought/"))
             ? activityRef.mid(QStringLiteral("thought/").size()).toLongLong()
             : 0;
-        if (activityId <= 0 || !m_memoryManager->canShareThought(activityId, version))
-            return;
-        auto &cfg = ConfigManager::instance();
-        const auto targets = cfg.getProactiveConfig().targets;
-        const auto ref = QStringLiteral("%1:%2").arg(activityId).arg(version);
-        for (const auto &target : targets) {
-            Utterance u;
-            u.channel = target.first;
-            u.sessionId = target.second;
-            u.text = draft;
-            if (cfg.isBlindZone(u.channel,u.sessionId))
-                continue;
-            if (u.channel == Channel::kPet && u.sessionId == Channel::kDefaultSession) {
-                const bool submitted = m_petChannel->sendUtterance(u);
-                m_memoryManager->recordShareOutcome(activityId, version,
-                                                    submitted ? QStringLiteral("handed_off")
-                                                              : QStringLiteral("rejected"),
-                                                    u.channel, u.sessionId);
-                if (submitted)
-                    recordProactive(u.channel,u.sessionId,draft,QStringLiteral("share"),ref);
-                break;
-            }
-            if (u.channel == Channel::kQQPrivate && cfg.isMasterQQ(u.sessionId)
-                && m_qqClient->isConnected()) {
-                // QQ 是"已入队"而非送达：回执在 sendResult 里按 deliveryEcho 回来。
-                u.deliveryEcho = QStringLiteral("share:%1").arg(ref);
-                shareRoutes().insert(u.deliveryEcho, ShareRoute{u.channel,u.sessionId,draft});
-                if (!m_qqChannel->sendUtterance(u)) {
-                    shareRoutes().remove(u.deliveryEcho);
-                    m_memoryManager->recordShareOutcome(activityId, version,
-                                                        QStringLiteral("rejected"), u.channel, u.sessionId);
-                }
-                break;
-            }
-        }
+        if (activityId <= 0) return;
+        // 切片 B：不再直接发送。canShareThought/artifact/版本/去重校验都在 commit 内完成；
+        // 历史回写由 actionSettled（protocol_accepted/unknown）驱动，避免"没发就说她说过"。
+        const auto committed=m_actionCommitter->commitActivityShare(activityId,version,draft);
+        if (committed.contains(QStringLiteral("error")))
+            qInfo() << "[Share] commit rejected" << activityId << version
+                    << committed.value(QStringLiteral("error")).toString();
+        else
+            qInfo() << "[Share] committed" << committed.value(QStringLiteral("action_key")).toString();
     });
 
     m_timeManager->start();
@@ -449,6 +390,14 @@ AppController::AppController(QObject *parent)
 
 AppController::~AppController()
 {
+    // 切片 B：先停掉主动外发轮询并释放 committer，避免它们持有已析构的 MemoryManager。
+    if (m_actionOutbox) {
+        m_actionOutbox->stop();
+        delete m_actionOutbox;
+        m_actionOutbox = nullptr;
+    }
+    delete m_actionCommitter;
+    m_actionCommitter = nullptr;
     if (m_qqClient)
         m_qqClient->stop();
     delete m_coordinator;
@@ -503,6 +452,14 @@ AppController::~AppController()
 
 void AppController::startApp()
 {
+    // 切片 B：启动恢复先于轮询。上一进程留在 dispatching 的主动外发无法确认是否已送达，
+    // 按 at-most-once 冻结为 unknown（绝不自动重发）；随后启动 outbox 唯一发送循环。
+    if (m_actionOutbox) {
+        const int recovered = m_actionOutbox->recoverStale(600);
+        if (recovered > 0)
+            qInfo() << "[Outbox] stale actions frozen as unknown:" << recovered;
+        m_actionOutbox->start(1000);
+    }
     m_character->show();
 
     qDebug()<<"[AppController]:我已启动！";
@@ -640,6 +597,22 @@ bool AppController::canContactNow() const
     const auto end = QTime::fromString(cfg.quietEnd, "HH:mm");
     return start < end ? (now < start || now >= end)
                        : (start == end || (now < start && now >= end));
+}
+
+bool AppController::hasReachableProactiveTarget() const
+{
+    // 只做"提交前"的粗门控：桌宠渠道恒可达；QQ 私聊要求已连接且是主人号。
+    // 真正的发送结果仍以 OutboxDispatcher 的 sender 返回值/回执为准（escalate 到 settle）。
+    const auto targets = ConfigManager::instance().getProactiveConfig().targets;
+    for (const auto &target : targets) {
+        if (target.first == Channel::kPet && target.second == Channel::kDefaultSession)
+            return true;
+        if (target.first == Channel::kQQPrivate
+            && ConfigManager::instance().isMasterQQ(target.second)
+            && m_qqClient->isConnected())
+            return true;
+    }
+    return false;
 }
 
 void AppController::resumeMoodTimers()

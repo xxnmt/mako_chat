@@ -1,6 +1,7 @@
 #include "memorymanager.h"
 #include "memoryreadpolicy.h"
 #include "recentcontext.h"
+#include "actionpolicy.h"
 #include <QScopeGuard>
 #include <QJsonDocument>
 #include <QSqlQuery>
@@ -147,7 +148,97 @@ QJsonObject buildConcernRecord(qlonglong turn,const QString &note,int version,co
     }
     return record;
 }
+
+// ===== 切片 C：动机/事实分离后的联系契约 =====
+// 旧契约（contact.basis: new_owner_evidence/activity_result）只证明"有依据"，
+// 新契约（contact.motivation + contact.claims）说明"她为什么想开口"以及"消息里
+// 每条事实/承诺/执行结果声称由哪条资料支持"。两者互斥：新契约优先。
+bool contactUsesNewContract(const QJsonObject &contact)
+{
+    return (contact.contains(QStringLiteral("claims"))
+            && contact.value(QStringLiteral("claims")).isArray())
+        || (contact.contains(QStringLiteral("motivation"))
+            && contact.value(QStringLiteral("motivation")).isObject());
 }
+
+QString compactObject(const QJsonObject &object)
+{
+    if (object.isEmpty()) return {};
+    return QString::fromUtf8(QJsonDocument(object).toJson(QJsonDocument::Compact));
+}
+
+QString compactArray(const QJsonArray &array)
+{
+    return QString::fromUtf8(QJsonDocument(array).toJson(QJsonDocument::Compact));
+}
+
+struct NewContractCheck
+{
+    bool withheld = false;        // 需要压下这条联系（仍可写入 withheld 审计行）
+    bool needsVerifier = false;   // 确定性通过，但还有事实 claim 等语义核验
+    QString reason;               // 非空=被拒原因
+    QString motivationJson;
+    QString claimsJson;
+    QString semanticStatus;
+};
+
+// 提交前的确定性复核。timing=="now" 走完整的主动联系策略（动机/claims/收口/quiet/冷却/目标）；
+// private/next_chat 只是保留意图，不做打扰类抑制，但仍要保证 claims 不是编造。
+NewContractCheck checkNewContractContact(const MemoryManager *memory, const QString &channel,
+                                         const QString &session, qlonglong turn,
+                                         const QJsonObject &contact, const QString &timing)
+{
+    NewContractCheck check;
+    auto *mutableMemory = const_cast<MemoryManager *>(memory);
+    const ActionPolicy policy(mutableMemory);
+    const auto motivation = contact.value(QStringLiteral("motivation")).toObject();
+    check.motivationJson = compactObject(motivation);
+    const auto claims = contact.value(QStringLiteral("claims")).toArray();
+    check.claimsJson = compactArray(claims);
+    QString reason = policy.validateMotivation(channel, session, turn, motivation);
+    if (reason.isEmpty()) {
+        for (const auto &value : claims) {
+            const auto validation = policy.validateClaimDeterministic(channel, session, turn,
+                                                                      value.toObject());
+            if (validation.result != ClaimValidation::Entailed) {
+                reason = validation.reason;
+                break;
+            }
+        }
+    }
+    if (reason.isEmpty() && timing == QStringLiteral("now")) {
+        const auto decision = policy.evaluateSpontaneousContactDeterministic(channel, session, turn,
+                                                                             contact);
+        if (!decision.value(QStringLiteral("allowed")).toBool())
+            reason = decision.value(QStringLiteral("reason")).toString();
+        check.needsVerifier = decision.value(QStringLiteral("needs_verifier")).toBool();
+        check.semanticStatus = contact.value(QStringLiteral("semantic_status")).toString();
+        if (reason.isEmpty() && check.needsVerifier
+            && check.semanticStatus != QStringLiteral("entailed")
+            && check.semanticStatus != QStringLiteral("repaired")) {
+            reason = QStringLiteral("unverified_claims");
+        }
+        if (check.semanticStatus.isEmpty())
+            check.semanticStatus = check.needsVerifier ? QStringLiteral("unverified")
+                                                       : QStringLiteral("not_required");
+    } else if (reason.isEmpty()) {
+        check.semanticStatus = contact.value(QStringLiteral("semantic_status")).toString();
+        if (check.semanticStatus.isEmpty()) check.semanticStatus = QStringLiteral("retained");
+    }
+    if (reason.isEmpty() && check.semanticStatus == QStringLiteral("withheld")) {
+        reason = contact.value(QStringLiteral("withhold_reason")).toString();
+        if (reason.isEmpty()) reason = QStringLiteral("semantic_withheld");
+    }
+    if (!reason.isEmpty()) {
+        check.withheld = true;
+        check.reason = reason;
+        if (check.semanticStatus.isEmpty() || check.semanticStatus == QStringLiteral("retained"))
+            check.semanticStatus = QStringLiteral("withheld");
+    }
+    return check;
+}
+
+} // namespace
 
 QJsonObject MemoryManager::claimPrivateReflection(int dailyLimit, int cooldownSeconds)
 {
@@ -699,7 +790,10 @@ QJsonObject MemoryManager::concernReviewContext(qint64 turn,int version) const
     const QJsonObject recentClosure=recentConversationClosure(channel,session,QStringLiteral("user"),3600);
     QJsonObject result{{"id",turn},{"version",version},{"kind","concern"},
                        {"concern",concernRecord},{"since",since},{"contacts",contacts},
-                       {"basis",basis},{"recent_closure",recentClosure}};
+                       {"basis",basis},{"recent_closure",recentClosure},
+                       // 服务端内部定位键：切片 C 的策略/验证器需要来源渠道会话做可见性判定，
+                       // LLMService 会把它们从模型上下文里剥掉。
+                       {"source_channel",channel},{"source_session",session}};
     if (!matter.isEmpty()) result["matter"]=matter;
     return result;
 }
@@ -848,6 +942,8 @@ bool MemoryManager::finishConcernReview(qlonglong turn,int version,const QJsonOb
     // contact now 的可核验依据：只有通过核验才落 reflection_contact，并把依据一起存档。
     QString basisType,basisRefs;
     bool contactBasisRejected=false;
+    bool contactNewContract=false;
+    NewContractCheck newCheck;
     QString revisionAction=action;
     if (action=="keep") {
         const qint64 delay=nextCheckAfter(minutes);
@@ -886,14 +982,45 @@ bool MemoryManager::finishConcernReview(qlonglong turn,int version,const QJsonOb
         contactTiming=contact["timing"].toString();
         contactReason=contact["reason"].toString().trimmed();
         contactMessage=contact["message"].toString().trimmed();
+        // 切片 C：contact 带 claims 数组或 motivation 对象即走新契约；否则保持 v29 依据路径。
+        contactNewContract=contactUsesNewContract(contact);
         if (contactTiming!=QStringLiteral("private") && contactTiming!=QStringLiteral("next_chat")
             && contactTiming!=QStringLiteral("now")) return false;
         if (contactReason.isEmpty() || contactReason.size()>240
             || !policy.allows(channel,session,contactReason)) return false;
-        if (contactTiming==QStringLiteral("now")
+        if (contactTiming==QStringLiteral("now") && !contactNewContract
             && (contactMessage.isEmpty() || contactMessage.size()>300
                 || !policy.allows(channel,session,contactMessage))) return false;
-        if (contactTiming==QStringLiteral("now")) {
+        if (contactNewContract) {
+            // 确定性复核（动机合法性 + claims refs/authority/时序 + 收口/quiet/冷却/目标）。
+            // 语义核验已由 LLMService 完成并写进 contact.semantic_status；这里不再调用模型。
+            newCheck=checkNewContractContact(this,channel,session,turn,contact,contactTiming);
+            if (!newCheck.withheld) {
+                if (contactTiming==QStringLiteral("now")
+                    && (contactMessage.isEmpty() || contactMessage.size()>300
+                        || !policy.allows(channel,session,contactMessage))) return false;
+            } else if (!contactMessage.isEmpty()
+                       && (contactMessage.size()>300 || !policy.allows(channel,session,contactMessage))) {
+                return false;
+            }
+            if (newCheck.withheld) {
+                // 新契约被拒：不投递，但按 keep 语义把关注放回队列；联系意图与
+                // semantic_status=withheld 一起落库，保证"为什么没开口"可审计。
+                qInfo()<<"[Concern] new_contract_withheld turn="<<turn<<"version="<<version
+                       <<"reason="<<newCheck.reason;
+                sql=QStringLiteral("UPDATE private_reflection SET state='consider',claimed_by=NULL,"
+                                   "next_check_at=unixepoch()+1800,updated_at=unixepoch() "
+                                   "WHERE turn_id=? AND version=? AND state='pending'");
+                bindings<<turn<<version;
+                contactBasisRejected=true;
+                revisionAction=QStringLiteral("contact_rejected");
+            } else {
+                sql=QStringLiteral("UPDATE private_reflection SET state='consider',claimed_by=NULL,"
+                                   "next_check_at=unixepoch()+7200,updated_at=unixepoch() "
+                                   "WHERE turn_id=? AND version=? AND state='pending'");
+                bindings<<turn<<version;
+            }
+        } else if (contactTiming==QStringLiteral("now")) {
             const auto rejection=validateContactBasis(channel,session,turn,contact);
             if (!rejection.isEmpty()) {
                 // 依据核验不过：不要投递，但也不能让关注卡在 pending 里无限 defer。
@@ -927,28 +1054,47 @@ bool MemoryManager::finishConcernReview(qlonglong turn,int version,const QJsonOb
     q.prepare(sql);
     for (const auto &value : bindings) q.addBindValue(value);
     if (!q.exec() || q.numRowsAffected()!=1) return false;
-    if (action=="contact" && !contactBasisRejected) {
+    if (action=="contact" && (contactNewContract || !contactBasisRejected)) {
         // 联系意图与关注状态同一事务落库；投递层之后按 outcome='proposed' 取走。
         // basis_type/basis_refs 记录这次"现在联系"凭什么发生，非 now 的联系留 NULL。
+        // 新契约另存 motivation_json/claims_json/semantic_status。
         q.prepare("INSERT INTO reflection_contact(turn_id,version,timing,reason,message,outcome,channel,session,"
-                  "basis_type,basis_refs) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(turn_id) DO UPDATE SET "
+                  "basis_type,basis_refs,motivation_json,claims_json,semantic_status) "
+                  "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(turn_id) DO UPDATE SET "
                   "version=excluded.version,timing=excluded.timing,reason=excluded.reason,"
                   "message=excluded.message,outcome=excluded.outcome,"
                   "channel=excluded.channel,session=excluded.session,"
                   "basis_type=excluded.basis_type,basis_refs=excluded.basis_refs,"
+                  "motivation_json=excluded.motivation_json,claims_json=excluded.claims_json,"
+                  "semantic_status=excluded.semantic_status,"
                   // 这是一次新的联系意图：重试预算重新计算（旧投递的失败次数不占用新意图）。
-                  "attempts=0,last_outcome=NULL,last_attempt_at=NULL");
+                  "attempts=0,last_attempt_at=NULL,"
+                  "last_outcome=CASE WHEN excluded.outcome='withheld' THEN excluded.semantic_status "
+                  "ELSE NULL END");
         q.addBindValue(turn);
         q.addBindValue(version);
         q.addBindValue(contactTiming);
         q.addBindValue(contactReason);
         q.addBindValue(contactTiming==QStringLiteral("now") ? contactMessage : QString());
-        q.addBindValue(contactTiming==QStringLiteral("now") ? QStringLiteral("proposed")
-                                                            : QStringLiteral("retained"));
+        QString outcome;
+        if (contactNewContract)
+            outcome = newCheck.withheld ? QStringLiteral("withheld")
+                      : contactTiming==QStringLiteral("now") ? QStringLiteral("proposed")
+                                                             : QStringLiteral("retained");
+        else
+            outcome = contactTiming==QStringLiteral("now") ? QStringLiteral("proposed")
+                                                           : QStringLiteral("retained");
+        q.addBindValue(outcome);
         q.addBindValue(channel);
         q.addBindValue(session);
         q.addBindValue(basisType.isEmpty() ? QVariant() : QVariant(basisType));
         q.addBindValue(basisRefs.isEmpty() ? QVariant() : QVariant(basisRefs));
+        q.addBindValue(contactNewContract && !newCheck.motivationJson.isEmpty()
+                           ? QVariant(newCheck.motivationJson) : QVariant());
+        q.addBindValue(contactNewContract && !newCheck.claimsJson.isEmpty()
+                           ? QVariant(newCheck.claimsJson) : QVariant());
+        q.addBindValue(contactNewContract && !newCheck.semanticStatus.isEmpty()
+                           ? QVariant(newCheck.semanticStatus) : QVariant());
         if (!q.exec()) return false;
     }
     {
@@ -1171,10 +1317,30 @@ bool MemoryManager::finishPrivateReflection(qlonglong turn, int version, const Q
         const auto message = contact["message"].toString().trimmed();
         if (timing!="private" && timing!="next_chat" && timing!="now") return false;
         if (reason.isEmpty() || reason.size()>240 || !policy.allows(channel,session,reason)) return false;
-        if (timing=="now" && (message.isEmpty() || message.size()>300 || !policy.allows(channel,session,message))) return false;
-        QString basisType,basisRefs;
+        // 切片 C：带 claims/motivation 的 contact 走新契约；否则保持 v29 依据路径。
+        const bool newContract = contactUsesNewContract(contact);
+        if (!newContract && timing=="now"
+            && (message.isEmpty() || message.size()>300 || !policy.allows(channel,session,message)))
+            return false;
+        QString basisType,basisRefs,motivationJson,claimsJson,semanticStatus;
         bool writeContact=true;
-        if (timing=="now") {
+        bool withheldContact=false;
+        if (newContract) {
+            const auto check=checkNewContractContact(this,channel,session,turn,contact,timing);
+            motivationJson=check.motivationJson;
+            claimsJson=check.claimsJson;
+            semanticStatus=check.semanticStatus;
+            withheldContact=check.withheld;
+            if (!withheldContact && timing=="now"
+                && (message.isEmpty() || message.size()>300
+                    || !policy.allows(channel,session,message))) return false;
+            if (withheldContact) {
+                qInfo()<<"[Reflection] new_contract_withheld turn="<<turn<<"version="<<version
+                       <<"reason="<<check.reason;
+                if (!message.isEmpty()
+                    && (message.size()>300 || !policy.allows(channel,session,message))) return false;
+            }
+        } else if (timing=="now") {
             // "现在联系"必须先通过服务端依据核验；不通过只是不写联系意图，
             // 本次仍按 consider 落库（上面的关注更新已生效），不因依据不足而 defer。
             const auto rejection=validateContactBasis(channel,session,turn,contact);
@@ -1191,17 +1357,37 @@ bool MemoryManager::finishPrivateReflection(qlonglong turn, int version, const Q
             }
         }
         if (writeContact) {
-            // basis_type/basis_refs 与联系意图同一行落库；非 now 的联系留 NULL。
-            q.prepare("INSERT INTO reflection_contact(turn_id,version,timing,reason,message,outcome,"
-                      "basis_type,basis_refs) VALUES(?,?,?,?,?,?,?,?)");
-            q.addBindValue(turn);
-            q.addBindValue(version);
-            q.addBindValue(timing);
-            q.addBindValue(reason);
-            q.addBindValue(timing=="now" ? message : QString());
-            q.addBindValue(timing=="now" ? "proposed" : "retained");
-            q.addBindValue(basisType.isEmpty() ? QVariant() : QVariant(basisType));
-            q.addBindValue(basisRefs.isEmpty() ? QVariant() : QVariant(basisRefs));
+            if (newContract) {
+                // 新契约把动机/claims/语义状态与联系意图同一行落库，供投递前复核与事后审计。
+                q.prepare("INSERT INTO reflection_contact(turn_id,version,timing,reason,message,outcome,"
+                          "channel,session,motivation_json,claims_json,semantic_status) "
+                          "VALUES(?,?,?,?,?,?,?,?,?,?,?)");
+                q.addBindValue(turn);
+                q.addBindValue(version);
+                q.addBindValue(timing);
+                q.addBindValue(reason);
+                q.addBindValue(timing=="now" ? message : QString());
+                q.addBindValue(withheldContact ? QStringLiteral("withheld")
+                                               : timing=="now" ? QStringLiteral("proposed")
+                                                                : QStringLiteral("retained"));
+                q.addBindValue(channel);
+                q.addBindValue(session);
+                q.addBindValue(motivationJson.isEmpty() ? QVariant() : QVariant(motivationJson));
+                q.addBindValue(claimsJson.isEmpty() ? QVariant() : QVariant(claimsJson));
+                q.addBindValue(semanticStatus.isEmpty() ? QVariant() : QVariant(semanticStatus));
+            } else {
+                // basis_type/basis_refs 与联系意图同一行落库；非 now 的联系留 NULL。
+                q.prepare("INSERT INTO reflection_contact(turn_id,version,timing,reason,message,outcome,"
+                          "basis_type,basis_refs) VALUES(?,?,?,?,?,?,?,?)");
+                q.addBindValue(turn);
+                q.addBindValue(version);
+                q.addBindValue(timing);
+                q.addBindValue(reason);
+                q.addBindValue(timing=="now" ? message : QString());
+                q.addBindValue(timing=="now" ? "proposed" : "retained");
+                q.addBindValue(basisType.isEmpty() ? QVariant() : QVariant(basisType));
+                q.addBindValue(basisRefs.isEmpty() ? QVariant() : QVariant(basisRefs));
+            }
             if (!q.exec()) return false;
         }
     }
@@ -1256,7 +1442,9 @@ QString MemoryManager::claimReflectionContact(qlonglong turn, int version, const
     // v28：事务领取前用持久化依据重验。提出联系到真正投递之间可能隔了几秒到几分钟，
     // 期间提醒可能已被提醒链发送/取消、活动可能已分享、可能发生新的收口或新证据；
     // 只有"此刻仍站得住"的 now 联系才允许领取，否则落 withheld（basis_expired）不再发送。
-    q.prepare("SELECT c.timing,coalesce(c.basis_type,''),coalesce(c.basis_refs,'') "
+    q.prepare("SELECT c.timing,coalesce(c.basis_type,''),coalesce(c.basis_refs,''),"
+              "coalesce(c.claims_json,''),coalesce(c.motivation_json,''),"
+              "coalesce(c.semantic_status,'') "
               "FROM reflection_contact c WHERE c.turn_id=? AND c.version=?");
     q.addBindValue(turn);
     q.addBindValue(version);
@@ -1264,8 +1452,45 @@ QString MemoryManager::claimReflectionContact(qlonglong turn, int version, const
     const auto contactTiming=q.value(0).toString();
     const auto basisType=q.value(1).toString();
     const auto basisRefsText=q.value(2).toString();
+    const auto claimsText=q.value(3).toString();
+    const auto motivationText=q.value(4).toString();
+    const auto semanticStatus=q.value(5).toString();
     q.finish();
-    if (contactTiming==QStringLiteral("now")) {
+    const bool newContract=!claimsText.isEmpty() || !motivationText.isEmpty();
+    if (newContract && contactTiming==QStringLiteral("now")) {
+        // 切片 C：领取前用同一套确定性规则复核 claims，并拒绝已标记 withheld 的意图。
+        // 语义结论在提出联系时已写入 semantic_status；这里不发起新的模型请求。
+        QString rejection;
+        if (semanticStatus==QStringLiteral("withheld")
+            || semanticStatus==QStringLiteral("repair_needed")
+            || semanticStatus==QStringLiteral("unverified"))
+            rejection=QStringLiteral("semantic_withheld");
+        if (rejection.isEmpty()) {
+            const ActionPolicy policy(this);
+            const auto claims=QJsonDocument::fromJson(claimsText.toUtf8()).array();
+            for (const auto &value : claims) {
+                const auto validation=policy.validateClaimDeterministic(sourceChannel,sourceSession,
+                                                                        turn,value.toObject());
+                if (validation.result!=ClaimValidation::Entailed) {
+                    rejection=validation.reason;
+                    break;
+                }
+            }
+        }
+        if (!rejection.isEmpty()) {
+            q.prepare("UPDATE reflection_contact SET outcome='withheld',last_outcome='claims_expired',"
+                      "updated_at=unixepoch() WHERE turn_id=? AND version=? "
+                      "AND outcome IN ('proposed','rejected')");
+            q.addBindValue(turn);
+            q.addBindValue(version);
+            if (!q.exec()) return {};
+            qInfo()<<"[ReflectionContact] claims_expired turn="<<turn<<"version="<<version
+                   <<"reason="<<rejection;
+            if (!m_db.commit()) return {};
+            rollback.dismiss();
+            return {};
+        }
+    } else if (contactTiming==QStringLiteral("now")) {
         // 旧行（v27 之前）没有 basis：新授权模型下不可投递，按 missing_basis 处理。
         QString rejection;
         QJsonArray refs;

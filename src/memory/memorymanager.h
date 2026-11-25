@@ -106,6 +106,29 @@ public:
     QJsonArray structuredMemoryRows(const QStringList &kinds, const QString &subject,
                                     bool includeOthers, bool allEpisodic) const;
 
+    // ===== 认知快照只读查询（服务端事实分层；不新增表、不改迁移）=====
+    // 全部按既有 MemoryReadPolicy / sensitive / 盲区过滤，时间统一 UTC ISO。
+    // 主人陈述：chat_history 中当前 subject 的 user_input 行。
+    QJsonArray recentOwnerObservations(const QString &subject,const QString &channel,
+                                       const QString &session,int limit=8) const;
+    // 她自己的表达：assistant reply 与 proactive 行（只证明“说过”）。
+    QJsonArray recentSelfExpressions(const QString &subject,const QString &channel,
+                                     const QString &session,int limit=8) const;
+    // 她自己的理解：matter_revision 最新 understanding + reflection note。
+    QJsonArray recentInferences(const QString &subject,int limit=8) const;
+    // 自发动机：open concern + active thought（ref/kind/summary/version）。
+    QJsonArray currentMotivations(int limit=8) const;
+    // 真实委托：目标 channel/session 匹配的 pending reminder。
+    QJsonArray activeCommitments(const QString &channel,const QString &session,
+                                 int limit=8) const;
+    // 私人活动状态/产物：thought 行（ref/status/version/artifact_ref/progress）。
+    QJsonArray currentActivities(int limit=8) const;
+    // 内部唤醒：attention_state.last_wake_at + 未了结关注的 next_check_at + 已排期的活动回顾。
+    // 这些都不是主人约定，不能作为“现在联系”的依据。
+    QJsonArray internalWakes(int limit=8) const;
+    // canonical subject：主人归一为 'user'，第三方取 actor（没有 actor 时沿用 subject）。
+    QString snapshotSubjectId(const RequestMeta &meta) const;
+
     // 可重建的检索块。原文仍留在原表；这些表只保存检索视图与向量。
     bool rebuildSearchIndex(QString *error = nullptr);
     bool clearSearchIndex(QString *error = nullptr);
@@ -220,6 +243,27 @@ public:
     // 启动恢复：投递层领取后（dispatching）超过 staleSeconds 仍未回执，视为进程崩溃遗留。
     // at-most-once：置为 unknown（协议层可能已送达），不重发；返回本次恢复条数。
     int recoverStaleContacts(int staleSeconds = 600);
+
+    // ===== 切片 B：cognitive_action + action_outbox（v29）=====
+    // 三条主动外发（ReminderDelivery / SpontaneousContact / ActivityShare）统一走
+    // "域状态 CAS + cognitive_action + action_outbox 同一事务"，提交后由 OutboxDispatcher
+    // 唯一发送，拿到回执再 settle。事务内绝不调用 QQ/网络。
+    // 已有同 action_key 时幂等返回其当前状态（不再重复建 outbox）。
+    QJsonObject commitReflectionContactAction(qlonglong turn,int version,
+                                              const QString &policyReason = {});
+    QJsonObject commitReminderDeliveryAction(qlonglong reminderId);
+    QJsonObject commitActivityShareAction(qlonglong activityId,int version,const QString &draft);
+    // outbox 领取：state='queued'（或失败的受控重试）→ dispatching，写租约并 attempts+1；
+    // 同一行不会被第二个领取者拿到。返回 {action_key,kind,channel,session,payload,payload_json,...}。
+    QJsonObject claimOutbox(const QString &owner,int leaseSeconds = 60);
+    // 回执/结果落库：一个事务内同时更新 action/outbox 与对应领域行（contact/reminder/share）。
+    // outcome ∈ protocol_accepted|handed_off|rejected|unknown|withheld。
+    // rejected 且 outbox attempts<2 → 回 queued（受控一次重试）；unknown → 冻结，永不重发。
+    bool settleOutboxAction(const QString &actionKey,const QString &outcome,
+                            const QString &detail = {});
+    // 启动恢复：dispatching 且租约过期超过 staleSeconds → action/outbox 都置 unknown，
+    // at-most-once，绝不自动重发；返回本次恢复条数。
+    int recoverStaleOutbox(int staleSeconds = 600);
     // 读取一条活动念头（thought_result 快照），用于能力清单里的"当前活动"。
     QJsonObject activityById(qlonglong id) const;
     // 写一条"茉子主动说出的话"到历史与 raw_events，供下次对话回认与检索。
@@ -398,6 +442,9 @@ signals:
     void searchChunksChanged();
 
 private:
+    // ActionPolicy 是主动联系策略的确定性校验器：它只读本类的连接做 ref 存在性/
+    // authority/时序校验，不写库。friend 避免把整张库的查询接口暴露到公共 API。
+    friend class ActionPolicy;
     bool chargePrivateReview(qlonglong turn, int dailyLimit, int cooldownSeconds);
     void initDatabase(const QString &dbFilePath, const QString &connectionName = QString());
     bool upsertMemoryChunk(const MemoryChunkWrite &chunk);

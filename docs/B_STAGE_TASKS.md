@@ -167,3 +167,26 @@ v28 迁移同时幂等补 `reflection_contact.updated_at` 列（历史表没有�
 验证：全量构建零错误；**`ctest` 20/20**；`tst_memorymanager` **101 passed / 1 skipped**、`tst_memoryagent` 73；新增 9 条执行期用例（含双发拒绝、claim 重验、旧行不可投递、unknown share、误报信号、dispatching 恢复、跨渠道收口、语义无关依据基线）。生产库已备份并迁移 `user_version=28`（`QianDaoMoZi_memory.db.bak_before_v28_<时间戳>`；当前库无遗留可投递 `now` 行）。
 
 仍未做（明确边界）：语义相关性（"真实但无关的依据"仍可通过，已用基线测试固化）；cross-channel 收口可能过度抑制；统一 Action Commit Boundary（crash exactly-once）仍是后续架构工作。
+
+## 10. 持久认知状态 + 统一行动边界（三切片，2026-11-25）
+
+依据第三轮研究报告，在现有 `CognitiveCoordinator + PrivateReview + LLMService + MemoryManager` 之上落地"持久认知快照 + 统一行动提案/授权/提交边界"。**不重写项目、不实现完整单一注意力、不新增独立人格 Agent、ForegroundReply 不迁。**
+
+| 切片 | 内容 | 交付 |
+|---|---|---|
+| **A：CognitiveSnapshot** | `EvidenceAuthority`（UserStatement / ExternalObservation / ExecutionResult / AssistantExpression / SelfInference / InternalState）+ `CognitiveFactRef/SelfMotivation/DelegatedCommitment/CognitiveSnapshot` + `CognitiveSnapshotBuilder`；六域 + `internal_wakes` + `recent_closure` + `policy_view`；`own_next_review_at` 只归 `internal_wakes`；前台（仅 owner-private）与私下回顾注入同一份只读快照，群聊不注入；快照哈希不存整份 | `src/cognition/cognitivesnapshot.*`；`tst_cognitivesnapshot`（8 例） |
+| **B：统一 Action Commit + Outbox** | v29 `cognitive_action`/`action_outbox`；`ActionCommitter`（contact/reminder/share 原子提交）；`ActionOutboxDispatcher`（唯一外发入口）；三条主动链改为"域 CAS + action + outbox 同事务 → commit 后发送 → 回执 settle"；旧 `dispatchContact`/5s 直发提醒/分享直发删除；rejected 仅一次重试、unknown 冻结、stale dispatching→unknown；`action_key` 全局唯一 | 新增 4 个类；`tst_actionoutbox`（9 例）；`tst_memorymanager` +4 例 |
+| **C：动机与事实 claims 分离** | 新 `ActionPolicy`：motivation（self_desire / concern_followup / activity_share）+ claims（reported_fact / user_commitment / execution_result / inference）确定性校验；**纯 self_desire 不再要求主人新证据**；事实 claim 最多 1 次语义 verifier + 1 次 constrained repair，核心 claim 不支持则整项 withhold；verifier 不可用保守降级；v30 `motivation_json/claims_json/semantic_status`；配置 `cognition.semantic_verifier.*`、`proactive.spontaneous_close_suppression_seconds` | `src/cognition/actionpolicy.*`；`tst_actionpolicy`（9 例）；`tst_memoryagent` 新增语义验证用例 |
+
+关键状态机/不变量：
+- action：`queued → dispatching → handed_off | rejected → (≤1 retry) → failed | unknown | withheld`；`unknown/withheld` 冻结，永不自动重发。
+- outbox：`queued → dispatching → dispatched | failed | unknown`；`attempts` 在 claim 时 +1，最多 2 次（首投 + 受控重试一次）。
+- 事务内**绝不调用 QQ/网络**；外发只发生在 commit 之后。
+- Reminder 时间委托只能由 Reminder 链执行（`explicit_time_delegation` 仍被拒绝）；Concern 不能代表 reminder。
+- `internal_wakes`、assistant 表达、proactive 轮**永远不能**充当 user fact / commitment。
+
+v29/v30 migration：新增两表 + `reflection_contact` 三列（`motivation_json/claims_json/semantic_status`），全部幂等；旧 v26→v27 的 basis 兼容路径保留，新契约优先。
+
+验收方式与指标见 [B5 观测手册 §5.4](B_STAGE_ACCEPTANCE.md)；实施记录见 [AGENT_WORKLOG](AGENT_WORKLOG.md)。
+
+**明确未做/边界**：`ForegroundReply` 未迁入 outbox（报告延后）；语义 verifier 仅覆盖主动联系的事实 claims，且是单次判定不是真值证明；没有端到端 exactly-once；没有实现完整单一注意力；策略值（closure 窗口/quiet/频率）已配置化，未按产品体验最终定值。B5 的 24–48h shadow 与 7 天主动模式尚未开始。

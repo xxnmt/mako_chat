@@ -1,10 +1,12 @@
 #include "mattersemantics.h"
 #include "memorymanager.h"
+#include "actionpolicy.h"
 #include "debuglog.h"
 #include "configmanager.h"
 #include "memoryreadpolicy.h"
 
 #include <QStandardPaths>
+#include <QScopeGuard>
 #include <QDir>
 #include <QCryptographicHash>
 #include <QElapsedTimer>
@@ -5271,6 +5273,75 @@ void MemoryManager::initDatabase(const QString &dbFilePath, const QString &conne
             if (!query.exec("PRAGMA user_version=28")) throw query.lastError();
             currentVersion=28;
         }
+        if (currentVersion<29) {
+            // v29：主动外发的唯一提交入口（切片 B）。
+            // cognitive_action 是"一次主动动作"的本地唯一记录（action_key UNIQUE 幂等）；
+            // action_outbox 是它的发送队列（1:1，action_id/action_key 都 UNIQUE）。
+            // 两者与领域状态在同一个 SQLite 事务里写入；发送只由 OutboxDispatcher 做，
+            // 事务内不碰网络。旧测试会把 user_version 压回更小值重放迁移，故全部 IF NOT EXISTS。
+            if (!query.exec("CREATE TABLE IF NOT EXISTS cognitive_action ("
+                            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                            "action_key TEXT NOT NULL UNIQUE,"
+                            "kind TEXT NOT NULL,"
+                            "run_id TEXT, trigger_ref TEXT,"
+                            "subject TEXT NOT NULL DEFAULT 'user',"
+                            "channel TEXT NOT NULL, session_id TEXT NOT NULL,"
+                            "motivation_type TEXT, motivation_ref TEXT,"
+                            "payload_json TEXT NOT NULL,"
+                            "claims_json TEXT, context_refs_json TEXT, snapshot_hash TEXT, expected_json TEXT,"
+                            "state TEXT NOT NULL,"
+                            "policy_reason TEXT, semantic_status TEXT,"
+                            "attempts INTEGER NOT NULL DEFAULT 0,"
+                            "last_outcome TEXT,"
+                            "created_at INTEGER NOT NULL DEFAULT (unixepoch()),"
+                            "updated_at INTEGER NOT NULL DEFAULT (unixepoch()))")
+                || !query.exec("CREATE TABLE IF NOT EXISTS action_outbox ("
+                               "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                               "action_id INTEGER NOT NULL UNIQUE,"
+                               "action_key TEXT NOT NULL UNIQUE,"
+                               "channel TEXT NOT NULL, session_id TEXT NOT NULL,"
+                               "payload_json TEXT NOT NULL,"
+                               "state TEXT NOT NULL,"
+                               "lease_owner TEXT, lease_until INTEGER,"
+                               "attempts INTEGER NOT NULL DEFAULT 0,"
+                               "dispatched_at INTEGER, completed_at INTEGER,"
+                               "last_error TEXT,"
+                               "FOREIGN KEY(action_id) REFERENCES cognitive_action(id))")
+                || !query.exec("CREATE INDEX IF NOT EXISTS action_outbox_state ON action_outbox(state,id)")
+                || !query.exec("PRAGMA user_version=29")) throw query.lastError();
+            currentVersion=29;
+        }
+        if (currentVersion<30) {
+            // v30（报告切片 C）：动机与事实分离。
+            // reflection_contact 增加三列：
+            //   motivation_json —— motivation{type,ref,summary}，说明"她为什么想开口"；
+            //   claims_json     —— claims[{id,type,text,refs}]，消息里的事实/承诺/执行结果声称；
+            //   semantic_status —— 语义核验结论（entailed/repaired/withheld/not_required/retained），
+            //                      使"最终为什么保留/压下这条联系"可审计。
+            // 旧 basis 路径继续用 basis_type/basis_refs，不受影响；旧测试会把 user_version
+            // 压回更小值重放迁移，故先按列名幂等补列再升级版本号。
+            if (!query.exec("CREATE TABLE IF NOT EXISTS reflection_contact(turn_id INTEGER PRIMARY KEY,"
+                            "version INTEGER NOT NULL,timing TEXT NOT NULL,reason TEXT,message TEXT,"
+                            "outcome TEXT NOT NULL,channel TEXT,session TEXT)"))
+                throw query.lastError();
+            QSqlQuery contactColumns30(m_db);
+            if (!contactColumns30.exec("PRAGMA table_info(reflection_contact)"))
+                throw contactColumns30.lastError();
+            QSet<QString> contactPresent30;
+            while (contactColumns30.next()) contactPresent30.insert(contactColumns30.value(1).toString());
+            const QList<QPair<QString,QString>> contactAlters30{
+                {QStringLiteral("motivation_json"),QStringLiteral("TEXT")},
+                {QStringLiteral("claims_json"),QStringLiteral("TEXT")},
+                {QStringLiteral("semantic_status"),QStringLiteral("TEXT")}};
+            for (const auto &alter : contactAlters30) {
+                if (contactPresent30.contains(alter.first)) continue;
+                if (!query.exec(QStringLiteral("ALTER TABLE reflection_contact ADD COLUMN ")
+                                + alter.first + QStringLiteral(" ") + alter.second))
+                    throw query.lastError();
+            }
+            if (!query.exec("PRAGMA user_version=30")) throw query.lastError();
+            currentVersion=30;
+        }
         // 关注了结的独立流水（v22 的补充表）。与 reflection_change（回顾链修订）分开：
         // 前者由正常对话写回，后者由私下回顾写，共用 turn 主键会互相覆盖。
         // 用 IF NOT EXISTS 幂等补表，不改变结构版本号，旧库升级与新库初始化走同一句。
@@ -5289,4 +5360,1210 @@ void MemoryManager::initDatabase(const QString &dbFilePath, const QString &conne
         m_db.rollback();
         qDebug()<<"[MemoryManager]数据库更新失败:"<<error;
     }
+}
+
+// ============================ 认知快照只读查询 ============================
+// 这一组方法只读：不加表、不改迁移、不写库。所有文本都先过 MemoryReadPolicy
+// （盲区 + 敏感内容规则），敏感行（sensitive=1）直接排除；时间统一输出 UTC ISO。
+namespace {
+
+QString snapshotIsoFromEpoch(qint64 seconds)
+{
+    return QDateTime::fromSecsSinceEpoch(seconds).toUTC().toString(Qt::ISODateWithMs);
+}
+
+// 库里的时间有两种：chat_history.timestamp 是本地 datetime 字符串，
+// cognitive_source.reported / attention_state.value 是 UTC ISO。两种都归一成 UTC。
+QDateTime snapshotStoredTimeUtc(const QString &text)
+{
+    const QString trimmed = text.trimmed();
+    if (trimmed.isEmpty()) return {};
+    QDateTime value = QDateTime::fromString(trimmed, Qt::ISODateWithMs);
+    if (!value.isValid()) value = QDateTime::fromString(trimmed, Qt::ISODate);
+    if (!value.isValid())
+        value = QDateTime::fromString(trimmed, QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+    return value.isValid() ? value.toUTC() : QDateTime{};
+}
+
+QString snapshotIsoText(const QString &stored)
+{
+    const QDateTime value = snapshotStoredTimeUtc(stored);
+    return value.isValid() ? value.toUTC().toString(Qt::ISODateWithMs) : stored.trimmed();
+}
+
+// 她说过的话：raw_reply 是 {sentences:[{zh_text,...}]}；老数据可能是纯文本。
+QString snapshotExpressionText(const QString &rawReply)
+{
+    const QString raw = rawReply.trimmed();
+    if (raw.isEmpty()) return {};
+    const QJsonDocument document = QJsonDocument::fromJson(raw.toUtf8());
+    if (document.isObject()) {
+        QStringList parts;
+        for (const auto &value : document.object().value(QStringLiteral("sentences")).toArray()) {
+            const auto text = value.toObject().value(QStringLiteral("zh_text")).toString().trimmed();
+            if (!text.isEmpty()) parts.append(text);
+        }
+        if (!parts.isEmpty()) return parts.join(QLatin1Char('\n'));
+    }
+    return raw.startsWith(QLatin1Char('{')) ? QString{} : raw;
+}
+
+} // namespace
+
+QJsonArray MemoryManager::recentOwnerObservations(const QString &subject,const QString &channel,
+                                                  const QString &session,int limit) const
+{
+    QJsonArray rows;
+    if (!m_db.isOpen() || subject.isEmpty() || limit<=0) return rows;
+    const MemoryReadPolicy policy;
+    const bool hasChannel=!channel.isEmpty();
+    const bool hasSession=hasChannel && !session.isEmpty();
+    QString sql = QStringLiteral(
+        "SELECT h.id,coalesce(s.reported,h.timestamp),h.user_input,h.subject,h.channel,h.session_id "
+        "FROM chat_history h LEFT JOIN cognitive_source s ON s.event=h.cognitive_event "
+        "AND s.channel=h.channel AND s.session=h.session_id AND s.subject=h.subject AND s.input=h.user_input "
+        "WHERE h.subject=? AND h.sensitive=0 AND h.turn_kind='reply' "
+        "AND h.user_input IS NOT NULL AND h.user_input<>''");
+    if (hasSession)
+        sql += QStringLiteral(" AND h.channel=? AND h.session_id=?");
+    else if (hasChannel)
+        sql += QStringLiteral(" AND h.channel=?");
+    else
+        // 回顾上下文可能只知道“这是主人私聊来源”：按主人私聊域读取，绝不扩到群聊。
+        sql += QStringLiteral(" AND h.channel IN ('pet','qq_private')");
+    sql += QStringLiteral(" ORDER BY h.id DESC LIMIT ?");
+    QSqlQuery q(m_db);
+    q.prepare(sql);
+    q.addBindValue(subject);
+    if (hasChannel) q.addBindValue(channel);
+    if (hasSession) q.addBindValue(session);
+    q.addBindValue(limit);
+    if (!q.exec()) return rows;
+    while (q.next()) {
+        const auto text=q.value(2).toString();
+        const auto rowChannel=q.value(4).toString();
+        const auto rowSession=q.value(5).toString();
+        if (!policy.allows(rowChannel,rowSession,text)) continue;
+        rows.append(QJsonObject{{QStringLiteral("ref"),QStringLiteral("chat/%1").arg(q.value(0).toLongLong())},
+                                {QStringLiteral("subject"),q.value(3).toString()},
+                                {QStringLiteral("channel"),rowChannel},
+                                {QStringLiteral("session"),rowSession},
+                                {QStringLiteral("occurred_at"),snapshotIsoText(q.value(1).toString())},
+                                {QStringLiteral("text"),text.left(512)},
+                                {QStringLiteral("sensitive"),false}});
+    }
+    return rows;
+}
+
+QJsonArray MemoryManager::recentSelfExpressions(const QString &subject,const QString &channel,
+                                                const QString &session,int limit) const
+{
+    QJsonArray rows;
+    if (!m_db.isOpen() || subject.isEmpty() || limit<=0) return rows;
+    const MemoryReadPolicy policy;
+    const bool hasChannel=!channel.isEmpty();
+    const bool hasSession=hasChannel && !session.isEmpty();
+    QString sql = QStringLiteral(
+        "SELECT h.id,h.turn_kind,h.raw_reply,coalesce(s.reported,h.timestamp),h.channel,h.session_id "
+        "FROM chat_history h LEFT JOIN cognitive_source s ON s.event=h.cognitive_event "
+        "AND s.channel=h.channel AND s.session=h.session_id AND s.subject=h.subject AND s.input=h.user_input "
+        "WHERE h.subject=? AND h.sensitive=0 AND h.turn_kind IN ('reply','proactive') "
+        "AND h.raw_reply IS NOT NULL AND h.raw_reply<>''");
+    if (hasSession)
+        sql += QStringLiteral(" AND h.channel=? AND h.session_id=?");
+    else if (hasChannel)
+        sql += QStringLiteral(" AND h.channel=?");
+    else
+        sql += QStringLiteral(" AND h.channel IN ('pet','qq_private')");
+    sql += QStringLiteral(" ORDER BY h.id DESC LIMIT ?");
+    QSqlQuery q(m_db);
+    q.prepare(sql);
+    q.addBindValue(subject);
+    if (hasChannel) q.addBindValue(channel);
+    if (hasSession) q.addBindValue(session);
+    q.addBindValue(limit);
+    if (!q.exec()) return rows;
+    while (q.next()) {
+        const auto rowChannel=q.value(4).toString();
+        const auto rowSession=q.value(5).toString();
+        const auto text=snapshotExpressionText(q.value(2).toString());
+        if (text.isEmpty() || !policy.allows(rowChannel,rowSession,text)) continue;
+        rows.append(QJsonObject{{QStringLiteral("ref"),QStringLiteral("chat/%1").arg(q.value(0).toLongLong())},
+                                {QStringLiteral("kind"),q.value(1).toString()},
+                                {QStringLiteral("channel"),rowChannel},
+                                {QStringLiteral("session"),rowSession},
+                                {QStringLiteral("occurred_at"),snapshotIsoText(q.value(3).toString())},
+                                {QStringLiteral("text"),text.left(512)},
+                                {QStringLiteral("sensitive"),false}});
+    }
+    return rows;
+}
+
+QJsonArray MemoryManager::recentInferences(const QString &subject,int limit) const
+{
+    QJsonArray rows;
+    if (!m_db.isOpen() || subject.isEmpty() || limit<=0) return rows;
+    const MemoryReadPolicy policy;
+    // 1) 她自己留下的回顾/关注想法（note）。
+    QSqlQuery notes(m_db);
+    notes.prepare("SELECT r.turn_id,r.note,coalesce(s.reported,h.timestamp),h.channel,h.session_id "
+                  "FROM private_reflection r JOIN chat_history h ON h.id=r.turn_id "
+                  "LEFT JOIN cognitive_source s ON s.event=h.cognitive_event AND s.channel=h.channel "
+                  "AND s.session=h.session_id AND s.subject=h.subject AND s.input=h.user_input "
+                  "WHERE h.subject=? AND h.sensitive=0 AND coalesce(r.note,'')<>'' "
+                  "ORDER BY r.updated_at DESC,r.turn_id DESC LIMIT ?");
+    notes.addBindValue(subject);
+    notes.addBindValue(limit);
+    if (notes.exec()) while (notes.next()) {
+        const auto channel=notes.value(3).toString();
+        const auto session=notes.value(4).toString();
+        const auto text=notes.value(1).toString();
+        if (!policy.allows(channel,session,text)) continue;
+        rows.append(QJsonObject{{QStringLiteral("ref"),QStringLiteral("reflection/%1").arg(notes.value(0).toLongLong())},
+                                {QStringLiteral("kind"),QStringLiteral("reflection")},
+                                {QStringLiteral("channel"),channel},
+                                {QStringLiteral("session"),session},
+                                {QStringLiteral("occurred_at"),snapshotIsoText(notes.value(2).toString())},
+                                {QStringLiteral("text"),text.left(240)},
+                                {QStringLiteral("sensitive"),false}});
+    }
+    // 2) 每个事项只取最新一版 understanding（她是如何理解这件事的）。
+    if (rows.size()>=limit) return rows;
+    QSqlQuery revisions(m_db);
+    revisions.prepare("SELECT r.matter,r.version,r.understanding,s.reported,s.channel,s.session "
+                      "FROM matter_revision r JOIN cognitive_source s ON s.id=r.source WHERE s.subject=? "
+                      "ORDER BY r.matter,r.version DESC");
+    revisions.addBindValue(subject);
+    if (!revisions.exec()) return rows;
+    QSet<QString> seen;
+    while (revisions.next() && rows.size()<limit) {
+        const auto matter=revisions.value(0).toString();
+        if (seen.contains(matter)) continue;
+        seen.insert(matter);
+        const auto channel=revisions.value(4).toString();
+        const auto session=revisions.value(5).toString();
+        const auto text=revisions.value(2).toString();
+        if (!policy.allows(channel,session,text)) continue;
+        rows.append(QJsonObject{{QStringLiteral("ref"),QStringLiteral("revision/%1/%2")
+                                     .arg(matter).arg(revisions.value(1).toLongLong())},
+                                {QStringLiteral("kind"),QStringLiteral("matter_revision")},
+                                {QStringLiteral("channel"),channel},
+                                {QStringLiteral("session"),session},
+                                {QStringLiteral("occurred_at"),snapshotIsoText(revisions.value(3).toString())},
+                                {QStringLiteral("text"),text.left(240)},
+                                {QStringLiteral("sensitive"),false}});
+    }
+    return rows;
+}
+
+QJsonArray MemoryManager::currentMotivations(int limit) const
+{
+    QJsonArray rows;
+    if (!m_db.isOpen() || limit<=0) return rows;
+    const MemoryReadPolicy policy;
+    // open concern：仍 open 且未被回顾链修订掉的 head。
+    QSqlQuery concerns(m_db);
+    concerns.prepare("SELECT r.turn_id,r.version,coalesce(r.topic,''),coalesce(r.note,''),"
+                     "coalesce(r.root_turn,r.turn_id),h.channel,h.session_id "
+                     "FROM private_reflection r JOIN chat_history h ON h.id=r.turn_id "
+                     "WHERE h.subject='user' AND h.sensitive=0 AND h.channel IN ('pet','qq_private') "
+                     "AND r.state='consider' AND NOT EXISTS "
+                     "(SELECT 1 FROM reflection_change WHERE prior_turn=r.turn_id) "
+                     "AND coalesce(r.note,'')<>'' ORDER BY r.updated_at DESC,r.turn_id DESC LIMIT ?");
+    concerns.addBindValue(limit);
+    if (concerns.exec()) while (concerns.next() && rows.size()<limit) {
+        const auto channel=concerns.value(5).toString();
+        const auto session=concerns.value(6).toString();
+        const auto note=concerns.value(3).toString();
+        if (!policy.allows(channel,session,note)) continue;
+        const auto topic=concerns.value(2).toString();
+        rows.append(QJsonObject{{QStringLiteral("ref"),QStringLiteral("concern/%1").arg(concerns.value(4).toLongLong())},
+                                {QStringLiteral("kind"),QStringLiteral("concern")},
+                                {QStringLiteral("summary"),(topic.isEmpty()?note:topic).left(160)},
+                                {QStringLiteral("version"),concerns.value(1).toInt()}});
+    }
+    if (rows.size()>=limit) return rows;
+    // active thought：她自己想继续的兴趣/写作，属于自发动机。
+    QSqlQuery thoughts(m_db);
+    thoughts.prepare("SELECT id,thought,thought_version,h.channel,h.session_id FROM chat_history h "
+                     "WHERE h.thought IS NOT NULL AND h.thought<>'' AND h.sensitive=0 AND h.subject='user' "
+                     "AND coalesce(json_extract(h.thought_result,'$.status'),'active') IN ('active','paused') "
+                     "ORDER BY h.id DESC LIMIT ?");
+    thoughts.addBindValue(limit);
+    if (thoughts.exec()) while (thoughts.next() && rows.size()<limit) {
+        const auto channel=thoughts.value(3).toString();
+        const auto session=thoughts.value(4).toString();
+        const auto text=thoughts.value(1).toString();
+        if (!policy.allows(channel,session,text)) continue;
+        rows.append(QJsonObject{{QStringLiteral("ref"),QStringLiteral("thought/%1").arg(thoughts.value(0).toLongLong())},
+                                {QStringLiteral("kind"),QStringLiteral("interest")},
+                                {QStringLiteral("summary"),text.left(160)},
+                                {QStringLiteral("version"),thoughts.value(2).toInt()}});
+    }
+    return rows;
+}
+
+QJsonArray MemoryManager::activeCommitments(const QString &channel,const QString &session,
+                                            int limit) const
+{
+    QJsonArray rows;
+    if (!m_db.isOpen() || channel.isEmpty() || session.isEmpty() || limit<=0) return rows;
+    const MemoryReadPolicy policy;
+    // 主人真实委托：只取目标 channel/session 匹配、未过期且仍 pending 的提醒。
+    QSqlQuery q(m_db);
+    q.prepare("SELECT m.id,m.state,m.due,m.expires,m.message FROM reminder m "
+              "JOIN chat_history h ON h.id=m.turn "
+              "WHERE m.state='pending' AND m.channel=? AND m.session=? AND m.expires>unixepoch() "
+              "AND h.subject='user' AND h.sensitive=0 ORDER BY m.due,m.id LIMIT ?");
+    q.addBindValue(channel);
+    q.addBindValue(session);
+    q.addBindValue(limit);
+    if (!q.exec()) return rows;
+    while (q.next()) {
+        const auto message=q.value(4).toString();
+        if (!policy.allows(channel,session,message)) continue;
+        rows.append(QJsonObject{{QStringLiteral("ref"),QStringLiteral("reminder/%1").arg(q.value(0).toLongLong())},
+                                {QStringLiteral("kind"),QStringLiteral("reminder")},
+                                {QStringLiteral("state"),q.value(1).toString()},
+                                {QStringLiteral("due_at"),snapshotIsoFromEpoch(q.value(2).toLongLong())},
+                                {QStringLiteral("expires_at"),snapshotIsoFromEpoch(q.value(3).toLongLong())},
+                                {QStringLiteral("message"),message.left(80)}});
+    }
+    return rows;
+}
+
+QJsonArray MemoryManager::currentActivities(int limit) const
+{
+    QJsonArray rows;
+    if (!m_db.isOpen() || limit<=0) return rows;
+    const MemoryReadPolicy policy;
+    QSqlQuery q(m_db);
+    q.prepare("SELECT id,coalesce(json_extract(thought_result,'$.status'),'active'),thought_version,"
+              "coalesce(json_extract(thought_result,'$.artifact_ref'),''),"
+              "coalesce(json_extract(thought_result,'$.progress'),''),"
+              "coalesce(json_extract(thought_result,'$.goal'),''),"
+              "coalesce(json_extract(thought_result,'$.next_step'),''),h.channel,h.session_id "
+              "FROM chat_history h WHERE h.thought IS NOT NULL AND h.thought<>'' "
+              "AND h.sensitive=0 AND h.subject='user' "
+              "AND coalesce(json_extract(h.thought_result,'$.status'),'active') IN ('active','paused') "
+              "ORDER BY h.id DESC LIMIT ?");
+    q.addBindValue(limit);
+    if (!q.exec()) return rows;
+    while (q.next()) {
+        const auto channel=q.value(7).toString();
+        const auto session=q.value(8).toString();
+        QJsonObject row{{QStringLiteral("ref"),QStringLiteral("thought/%1").arg(q.value(0).toLongLong())},
+                        {QStringLiteral("status"),q.value(1).toString()},
+                        {QStringLiteral("version"),q.value(2).toInt()},
+                        {QStringLiteral("artifact_ref"),QString()},
+                        {QStringLiteral("progress"),QString()}};
+        for (const auto &pair : {qMakePair(QStringLiteral("artifact_ref"),q.value(3).toString()),
+                                 qMakePair(QStringLiteral("progress"),q.value(4).toString()),
+                                 qMakePair(QStringLiteral("goal"),q.value(5).toString()),
+                                 qMakePair(QStringLiteral("next_step"),q.value(6).toString())}) {
+            const auto text=pair.second.trimmed();
+            if (text.isEmpty() || !policy.allows(channel,session,text)) continue;
+            row.insert(pair.first,text.left(120));
+        }
+        rows.append(row);
+    }
+    return rows;
+}
+
+QJsonArray MemoryManager::internalWakes(int limit) const
+{
+    QJsonArray rows;
+    if (!m_db.isOpen() || limit<=0) return rows;
+    // 1) 最近一次空闲唤醒（idle）。
+    {
+        QSqlQuery wake(m_db);
+        if (wake.exec("SELECT value FROM attention_state WHERE key='last_wake_at'") && wake.next()) {
+            const auto value=wake.value(0).toString();
+            if (!value.trimmed().isEmpty())
+                rows.append(QJsonObject{{QStringLiteral("ref"),QStringLiteral("attention/last_wake_at")},
+                                        {QStringLiteral("kind"),QStringLiteral("idle")},
+                                        {QStringLiteral("at"),snapshotIsoText(value)}});
+        }
+    }
+    if (rows.size()>=limit) return rows;
+    // 2) 未了结关注自己排的“再看一眼”时间。它不是主人约定，只能作为内部唤醒。
+    {
+        QSqlQuery concerns(m_db);
+        concerns.prepare("SELECT r.turn_id,coalesce(r.root_turn,r.turn_id),r.next_check_at "
+                         "FROM private_reflection r JOIN chat_history h ON h.id=r.turn_id "
+                         "WHERE h.subject='user' AND h.sensitive=0 AND h.channel IN ('pet','qq_private') "
+                         "AND r.state IN ('consider','pending') AND r.next_check_at>0 "
+                         "ORDER BY r.next_check_at LIMIT ?");
+        concerns.addBindValue(int(limit-rows.size()));
+        if (concerns.exec()) while (concerns.next() && rows.size()<limit) {
+            const auto at=snapshotIsoFromEpoch(concerns.value(2).toLongLong());
+            rows.append(QJsonObject{{QStringLiteral("ref"),QStringLiteral("concern/%1").arg(concerns.value(1).toLongLong())},
+                                    {QStringLiteral("kind"),QStringLiteral("concern_review")},
+                                    {QStringLiteral("at"),at},
+                                    // 与回顾提示词里的 own_next_review_at 同义：她自己的再检查时间。
+                                    {QStringLiteral("own_next_review_at"),at}});
+        }
+    }
+    if (rows.size()>=limit) return rows;
+    // 3) 已排期的活动回顾（scheduled）。
+    {
+        QSqlQuery thoughts(m_db);
+        thoughts.prepare("SELECT id,review_after FROM chat_history "
+                         "WHERE thought IS NOT NULL AND thought<>'' AND sensitive=0 AND subject='user' "
+                         "AND coalesce(json_extract(thought_result,'$.status'),'active')='active' "
+                         "AND coalesce(review_after,0)>0 ORDER BY review_after LIMIT ?");
+        thoughts.addBindValue(int(limit-rows.size()));
+        if (thoughts.exec()) while (thoughts.next() && rows.size()<limit) {
+            rows.append(QJsonObject{{QStringLiteral("ref"),QStringLiteral("thought/%1").arg(thoughts.value(0).toLongLong())},
+                                    {QStringLiteral("kind"),QStringLiteral("scheduled")},
+                                    {QStringLiteral("at"),snapshotIsoFromEpoch(thoughts.value(1).toLongLong())}});
+        }
+    }
+    return rows;
+}
+
+QString MemoryManager::snapshotSubjectId(const RequestMeta &meta) const
+{
+    // 主人（含桌宠/QQ 私聊/群里的主人）统一归一为 'user'；第三方取 actor，
+    // 没有 actor 时沿用既有 subject 约定（qq:<uin> 等），保证与库里的行对得上。
+    if (meta.subject.isEmpty() || meta.subject == QStringLiteral("user"))
+        return QStringLiteral("user");
+    if (!meta.actorId.trimmed().isEmpty()) return meta.actorId.trimmed();
+    return meta.subject;
+}
+
+// ============================ 切片 B：主动动作提交 + Outbox ============================
+// 说明：整条链路的唯一不变式是
+//   1) 领域状态 CAS、cognitive_action、action_outbox 在同一个 SQLite 事务里落库；
+//   2) 事务内只读写数据库，绝不调用 QQ/网络/UI；
+//   3) 真正的发送只发生在 OutboxDispatcher（普通 QTimer 轮询），发送失败/回执再 settle；
+//   4) action_key 是本地唯一键：同一动作重复提交幂等，outbox 永远只有一行。
+// 状态机：
+//   action : queued → dispatching → handed_off(含 protocol_accepted) | rejected | unknown | withheld
+//            rejected(attempts<2) 可被 outbox 重新领取一次；unknown/withheld 冻结。
+//   outbox : queued → dispatching → dispatched | failed(终态) | unknown
+//            领取时 attempts+1（attempts 语义=已提交的发送次数，最多 2 次）；
+//            settle rejected 且 attempts<2 → 回 queued（受控一次重试）。
+namespace {
+
+// 与 claimReflectionContact 完全一致的来源/资格口径（privatereflection.cpp 内是文件静态的，
+// 这里按同一语义复制一份，保证"提交"和旧"领取"对同一个联系意图的判断不会分叉）。
+const QString kActionContactSourceRows = QStringLiteral(
+    " FROM chat_history h JOIN cognitive_source s ON s.event=h.cognitive_event "
+    "AND s.channel=h.channel AND s.session=h.session_id AND s.subject=h.subject AND s.input=h.user_input ");
+const QString kActionContactEligible = QStringLiteral(
+    " h.subject='user' AND h.sensitive=0 AND h.channel IN ('pet','qq_private') "
+    "AND h.turn_state IN ('handed_off','quiet') AND h.turn_kind='reply' ");
+
+QJsonObject actionError(const QString &code,const QString &detail = {})
+{
+    QJsonObject result{{QStringLiteral("error"),code}};
+    if (!detail.isEmpty()) result[QStringLiteral("detail")] = detail;
+    return result;
+}
+
+bool actionVisibleSession(const QString &channel,const QString &session,
+                          const QString &viewerChannel,const QString &viewerSession)
+{
+    if (channel==viewerChannel && session==viewerSession) return true;
+    auto &cfg=ConfigManager::instance();
+    return cfg.getMemoryPolicyConfig().agent.ownerCrossChannelPrivate &&
+           ((channel==Channel::kPet && session==Channel::kDefaultSession) ||
+            (channel==Channel::kQQPrivate && cfg.isMasterQQ(session)));
+}
+
+bool actionBasisVisible(const QSqlDatabase &db,qlonglong turn,const MemoryReadPolicy &policy,
+                        const QString &viewerChannel,const QString &viewerSession)
+{
+    QSqlQuery q(db);
+    q.prepare("SELECT h.channel,h.session_id,h.user_input,h.sensitive FROM reflection_basis b "
+              "LEFT JOIN chat_history h ON h.id=b.source WHERE b.turn=?");
+    q.addBindValue(turn);
+    if (!q.exec()) return false;
+    while(q.next()) {
+        if (q.value(0).isNull() || q.value(3).toBool()
+            || !actionVisibleSession(q.value(0).toString(),q.value(1).toString(),
+                                     viewerChannel,viewerSession)
+            || !policy.allows(q.value(0).toString(),q.value(1).toString(),q.value(2).toString()))
+            return false;
+    }
+    return true;
+}
+
+// 统一投递流水：只做可观测性，失败不阻断主状态机。与 privatereflection.cpp 的 noteDelivery 同义。
+void actionNoteDelivery(const QSqlDatabase &db,const QString &kind,const QString &ref,
+                        const QString &channel,const QString &session,const QString &text,
+                        const QString &state,int attemptsDelta)
+{
+    if (kind.isEmpty() || ref.isEmpty() || state.isEmpty()) return;
+    QSqlQuery q(db);
+    q.prepare("INSERT INTO delivery_ledger(kind,ref,channel,session,text,state,attempts,updated_at) "
+              "VALUES(?,?,?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(kind,ref) DO UPDATE SET "
+              "state=excluded.state,"
+              "channel=coalesce(excluded.channel,delivery_ledger.channel),"
+              "session=coalesce(excluded.session,delivery_ledger.session),"
+              "text=coalesce(excluded.text,delivery_ledger.text),"
+              "attempts=delivery_ledger.attempts+excluded.attempts,"
+              "updated_at=CURRENT_TIMESTAMP");
+    q.addBindValue(kind);
+    q.addBindValue(ref);
+    q.addBindValue(channel.isEmpty() ? QVariant() : QVariant(channel));
+    q.addBindValue(session.isEmpty() ? QVariant() : QVariant(session));
+    q.addBindValue(text.isEmpty() ? QVariant() : QVariant(text));
+    q.addBindValue(state);
+    q.addBindValue(attemptsDelta);
+    if (!q.exec()) qWarning()<<"[Outbox] ledger 写入失败"<<kind<<ref<<state<<q.lastError();
+}
+
+// 幂等查询：动作已存在时返回其当前状态，调用方据此不重复建 outbox。
+QJsonObject existingAction(const QSqlDatabase &db,const QString &actionKey)
+{
+    QSqlQuery q(db);
+    q.prepare("SELECT id,kind,state,channel,session_id,payload_json,attempts,last_outcome "
+              "FROM cognitive_action WHERE action_key=?");
+    q.addBindValue(actionKey);
+    if (!q.exec() || !q.next()) return {};
+    QJsonObject result{{QStringLiteral("action_key"),actionKey},
+                       {QStringLiteral("action_id"),q.value(0).toLongLong()},
+                       {QStringLiteral("kind"),q.value(1).toString()},
+                       {QStringLiteral("state"),q.value(2).toString()},
+                       {QStringLiteral("channel"),q.value(3).toString()},
+                       {QStringLiteral("session"),q.value(4).toString()},
+                       {QStringLiteral("attempts"),q.value(6).toInt()},
+                       {QStringLiteral("idempotent"),true}};
+    if (!q.value(7).isNull()) result[QStringLiteral("last_outcome")] = q.value(7).toString();
+    return result;
+}
+
+// 提醒的可达性与 claimDueReminder 的 allowedReminder 同口径。
+bool actionReminderAllowed(const QString &channel,const QString &session)
+{
+    auto &cfg=ConfigManager::instance();
+    const auto opts=cfg.getProactiveConfig();
+    return opts.enabled && opts.targets.contains(qMakePair(channel,session))
+        && cfg.getMemoryPolicyConfig().longTermMemoryEnabled && !cfg.isBlindZone(channel,session)
+        && ((channel==Channel::kPet && session==Channel::kDefaultSession)
+            || (channel==Channel::kQQPrivate && cfg.isMasterQQ(session)));
+}
+
+// 目标选择：优先 pet/default（本地必定可达），否则第一个可用的 QQ 私聊主人目标。
+// 与旧 dispatchContact/draftReadyToShare 的"按配置顺序、宠物优先"一致；QQ 是否在线
+// 由 AppController 在提交前门控，提交本身不依赖网络状态。
+struct ActionTarget { QString channel; QString session; bool found=false; };
+
+ActionTarget actionChooseTarget(const QList<QPair<QString,QString>> &targets,
+                                const QString &draftLikeText,bool requireShareable)
+{
+    auto &cfg=ConfigManager::instance();
+    ActionTarget target;
+    ActionTarget qqFallback;
+    MemoryReadPolicy policy;
+    for (const auto &pair : targets) {
+        const QString channel=pair.first, session=pair.second;
+        const bool pet=channel==Channel::kPet && session==Channel::kDefaultSession;
+        const bool qq=channel==Channel::kQQPrivate && cfg.isMasterQQ(session);
+        if (!pet && !qq) continue;
+        if (requireShareable && cfg.isBlindZone(channel,session)) continue;
+        if (!policy.allows(channel,session,draftLikeText)) continue;
+        if (pet) { target.channel=channel; target.session=session; target.found=true; return target; }
+        if (!qqFallback.found) { qqFallback.channel=channel; qqFallback.session=session; qqFallback.found=true; }
+    }
+    return qqFallback;
+}
+
+// claimOutbox 的事务内动作：把可重试的领域行从 rejected 拉回 dispatching，
+// 使崩溃恢复（recoverStaleOutbox）与旧 recoverStaleContacts 看到一致的状态。
+bool markOutboxDomainDispatching(const QSqlDatabase &db,const QString &actionKey,
+                                 const QString &kind,const QString &channel,const QString &session)
+{
+    const auto parts=actionKey.split(QLatin1Char(':'));
+    QSqlQuery q(db);
+    if (kind==QStringLiteral("SpontaneousContact")) {
+        if (parts.size()<4) return true;
+        const auto turn=parts[1].toLongLong();
+        const auto version=parts[2].toInt();
+        q.prepare("UPDATE reflection_contact SET outcome='dispatching',last_attempt_at=unixepoch(),"
+                  "updated_at=unixepoch() WHERE turn_id=? AND version=? AND outcome='rejected'");
+        q.addBindValue(turn);
+        q.addBindValue(version);
+        if (!q.exec()) return false;
+        actionNoteDelivery(db,QStringLiteral("contact"),
+                           QStringLiteral("reflection:%1:%2").arg(turn).arg(version),
+                           channel,session,QString{},QStringLiteral("claimed"),0);
+    } else if (kind==QStringLiteral("ReminderDelivery")) {
+        if (parts.size()<2) return true;
+        q.prepare("UPDATE reminder SET state='dispatching' WHERE id=? AND state='rejected'");
+        q.addBindValue(parts[1].toLongLong());
+        if (!q.exec()) return false;
+        actionNoteDelivery(db,QStringLiteral("reminder"),
+                           QStringLiteral("reminder:%1").arg(parts[1].toLongLong()),
+                           channel,session,QString{},QStringLiteral("claimed"),0);
+    } else if (kind==QStringLiteral("ActivityShare")) {
+        if (parts.size()<3) return true;
+        const QString ref=QStringLiteral("thought:%1:%2").arg(parts[1]).arg(parts[2]);
+        q.prepare("UPDATE delivery_ledger SET state='claimed',updated_at=CURRENT_TIMESTAMP "
+                  "WHERE kind='share' AND ref=? AND state='rejected'");
+        q.addBindValue(ref);
+        if (!q.exec()) return false;
+    }
+    return true;
+}
+
+// settle 的事务内动作：把结果同时写回领域行（contact / reminder / share）。
+// 领域行可能已被旧恢复逻辑推成终态，此时"影响 0 行"不算失败，只有 SQL 错误才失败。
+bool settleOutboxDomain(const QSqlDatabase &db,const QString &actionKey,const QString &kind,
+                        const QString &channel,const QString &session,const QString &outcome)
+{
+    const auto parts=actionKey.split(QLatin1Char(':'));
+    const bool failed = outcome==QStringLiteral("rejected") || outcome==QStringLiteral("unknown");
+    const bool terminalReceipt = outcome==QStringLiteral("rejected")
+        || outcome==QStringLiteral("unknown") || outcome==QStringLiteral("protocol_accepted");
+    QSqlQuery q(db);
+    if (kind==QStringLiteral("SpontaneousContact")) {
+        if (parts.size()<4) return true;
+        const auto turn=parts[1].toLongLong();
+        const auto version=parts[2].toInt();
+        q.prepare("UPDATE reflection_contact SET outcome=?,last_outcome=?,attempts=attempts+?,"
+                  "last_attempt_at=unixepoch(),updated_at=unixepoch() "
+                  "WHERE turn_id=? AND version=? AND (outcome IN ('dispatching','rejected') "
+                  "OR (outcome='handed_off' AND ?))");
+        q.addBindValue(outcome);
+        q.addBindValue(outcome);
+        q.addBindValue(failed ? 1 : 0);
+        q.addBindValue(turn);
+        q.addBindValue(version);
+        q.addBindValue(terminalReceipt ? 1 : 0);
+        if (!q.exec()) return false;
+        actionNoteDelivery(db,QStringLiteral("contact"),
+                           QStringLiteral("reflection:%1:%2").arg(turn).arg(version),
+                           QString{},QString{},QString{},outcome,failed ? 1 : 0);
+    } else if (kind==QStringLiteral("ReminderDelivery")) {
+        if (parts.size()<2) return true;
+        const auto id=parts[1].toLongLong();
+        q.prepare("UPDATE reminder SET state=? WHERE id=? AND (state IN ('dispatching','rejected','pending') "
+                  "OR (state='handed_off' AND ?))");
+        q.addBindValue(outcome);
+        q.addBindValue(id);
+        q.addBindValue(terminalReceipt ? 1 : 0);
+        if (!q.exec()) return false;
+        actionNoteDelivery(db,QStringLiteral("reminder"),QStringLiteral("reminder:%1").arg(id),
+                           QString{},QString{},QString{},outcome,failed ? 1 : 0);
+    } else if (kind==QStringLiteral("ActivityShare")) {
+        if (parts.size()<3) return true;
+        const auto activityId=parts[1].toLongLong();
+        const auto version=parts[2].toInt();
+        // 分享结果跟随活动存档（与 recordShareOutcome 的 thought_result 补丁同形），
+        // 重启后仍能判断同一版本是否已送达/未知。
+        q.prepare("UPDATE chat_history SET thought_result=json_patch(coalesce(thought_result,'{}'),?) "
+                  "WHERE id=? AND thought IS NOT NULL AND sensitive=0");
+        q.addBindValue(QString::fromUtf8(QJsonDocument(QJsonObject{
+            {QStringLiteral("share_outcome"),outcome},
+            {QStringLiteral("share_version"),version},
+            {QStringLiteral("share_channel"),channel},
+            {QStringLiteral("share_at"),QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)}})
+            .toJson(QJsonDocument::Compact)));
+        q.addBindValue(activityId);
+        if (!q.exec()) return false;
+        actionNoteDelivery(db,QStringLiteral("share"),
+                           QStringLiteral("thought:%1:%2").arg(activityId).arg(version),
+                           channel,session,QString{},outcome,failed ? 1 : 0);
+    }
+    return true;
+}
+
+// 恢复（进程崩溃遗留）时的领域回写：at-most-once，只标"不确定"，不增加失败尝试计数。
+void recoverOutboxDomain(const QSqlDatabase &db,const QString &actionKey,const QString &kind)
+{
+    const auto parts=actionKey.split(QLatin1Char(':'));
+    QSqlQuery q(db);
+    if (kind==QStringLiteral("SpontaneousContact")) {
+        if (parts.size()<4) return;
+        q.prepare("UPDATE reflection_contact SET outcome='unknown',last_outcome='dispatch_abandoned',"
+                  "updated_at=unixepoch() WHERE turn_id=? AND version=? AND outcome='dispatching'");
+        q.addBindValue(parts[1].toLongLong());
+        q.addBindValue(parts[2].toInt());
+        if (!q.exec()) qWarning()<<"[Outbox] 恢复 contact 失败"<<q.lastError();
+        return;
+    }
+    if (kind==QStringLiteral("ReminderDelivery")) {
+        if (parts.size()<2) return;
+        q.prepare("UPDATE reminder SET state='unknown' WHERE id=? AND state='dispatching'");
+        q.addBindValue(parts[1].toLongLong());
+        if (!q.exec()) qWarning()<<"[Outbox] 恢复 reminder 失败"<<q.lastError();
+        return;
+    }
+    if (kind==QStringLiteral("ActivityShare")) {
+        if (parts.size()<3) return;
+        q.prepare("UPDATE delivery_ledger SET state='unknown',last_error='dispatch_abandoned',"
+                  "updated_at=CURRENT_TIMESTAMP WHERE kind='share' AND ref=? AND state='claimed'");
+        q.addBindValue(QStringLiteral("thought:%1:%2").arg(parts[1]).arg(parts[2]));
+        if (!q.exec()) qWarning()<<"[Outbox] 恢复 share 失败"<<q.lastError();
+    }
+}
+
+QJsonObject actionCommittedResult(const QString &actionKey,qlonglong actionId,
+                                  const QString &kind,const QString &channel,const QString &session)
+{
+    return QJsonObject{{QStringLiteral("action_key"),actionKey},
+                       {QStringLiteral("action_id"),actionId},
+                       {QStringLiteral("kind"),kind},
+                       {QStringLiteral("state"),QStringLiteral("queued")},
+                       {QStringLiteral("channel"),channel},
+                       {QStringLiteral("session"),session}};
+}
+
+// 在事务内插入 action + outbox 两行。payloadJson 由调用方按 kind 构造。
+// 切片 C：主动联系可以把动机/claims 摘要带进 cognitive_action（审计用），
+// outbox 仍只携带真正要发送的文本（outboxPayloadJson 为空时沿用 payloadJson）。
+bool insertActionWithOutbox(const QSqlDatabase &db,const QString &actionKey,const QString &kind,
+                            const QString &triggerRef,const QString &channel,const QString &session,
+                            const QString &payloadJson,const QString &policyReason,
+                            qlonglong *actionId,
+                            const QString &claimsJson = QString(),
+                            const QString &motivationType = QString(),
+                            const QString &motivationRef = QString(),
+                            const QString &semanticStatus = QString(),
+                            const QString &contextRefsJson = QString(),
+                            const QString &outboxPayloadJson = QString())
+{
+    QSqlQuery action(db);
+    action.prepare("INSERT INTO cognitive_action(action_key,kind,trigger_ref,subject,channel,session_id,"
+                   "motivation_type,motivation_ref,payload_json,claims_json,context_refs_json,"
+                   "state,policy_reason,semantic_status,attempts,created_at,updated_at) "
+                   "VALUES(?,?,?,'user',?,?,?,?,?,?,?,'queued',?,?,0,unixepoch(),unixepoch())");
+    action.addBindValue(actionKey);
+    action.addBindValue(kind);
+    action.addBindValue(triggerRef.isEmpty() ? QVariant() : QVariant(triggerRef));
+    action.addBindValue(channel);
+    action.addBindValue(session);
+    action.addBindValue(motivationType.isEmpty() ? QVariant() : QVariant(motivationType));
+    action.addBindValue(motivationRef.isEmpty() ? QVariant() : QVariant(motivationRef));
+    action.addBindValue(payloadJson);
+    action.addBindValue(claimsJson.isEmpty() ? QVariant() : QVariant(claimsJson));
+    action.addBindValue(contextRefsJson.isEmpty() ? QVariant() : QVariant(contextRefsJson));
+    action.addBindValue(policyReason.isEmpty() ? QVariant() : QVariant(policyReason));
+    action.addBindValue(semanticStatus.isEmpty() ? QVariant() : QVariant(semanticStatus));
+    if (!action.exec()) {
+        qWarning()<<"[Outbox] action 写入失败"<<actionKey<<action.lastError();
+        return false;
+    }
+    const qlonglong id=action.lastInsertId().toLongLong();
+    QSqlQuery outbox(db);
+    outbox.prepare("INSERT INTO action_outbox(action_id,action_key,channel,session_id,payload_json,"
+                   "state,attempts) VALUES(?,?,?,?,?,'queued',0)");
+    outbox.addBindValue(id);
+    outbox.addBindValue(actionKey);
+    outbox.addBindValue(channel);
+    outbox.addBindValue(session);
+    outbox.addBindValue(outboxPayloadJson.isEmpty() ? payloadJson : outboxPayloadJson);
+    if (!outbox.exec()) {
+        qWarning()<<"[Outbox] outbox 写入失败"<<actionKey<<outbox.lastError();
+        return false;
+    }
+    if (actionId) *actionId=id;
+    return true;
+}
+
+} // namespace
+
+QJsonObject MemoryManager::commitReflectionContactAction(qlonglong turn,int version,
+                                                         const QString &policyReason)
+{
+    if (!m_db.isOpen() || turn<=0 || version<=0)
+        return actionError(QStringLiteral("invalid_args"));
+    const QString actionKey=QStringLiteral("reflection:%1:%2:contact").arg(turn).arg(version);
+    // 幂等：同一联系意图只允许一次本地提交，重复调用返回已有 state（不重复建 outbox）。
+    const auto existing=existingAction(m_db,actionKey);
+    if (!existing.isEmpty()) return existing;
+
+    auto &cfg=ConfigManager::instance();
+    const auto opts=cfg.getProactiveConfig();
+    const auto memory=cfg.getMemoryPolicyConfig();
+    if (!opts.enabled || !memory.longTermMemoryEnabled)
+        return actionError(QStringLiteral("proactive_disabled"));
+    if (!m_db.transaction()) return actionError(QStringLiteral("transaction_failed"));
+    auto rollback=qScopeGuard([this]{m_db.rollback();});
+
+    // 每日"现在联系"投递上限：与 claimReflectionContact 一致，按 delivery_ledger 的 contact 行计数。
+    if (opts.contactDailyLimit > 0) {
+        QSqlQuery used(m_db);
+        if (used.exec("SELECT count(*) FROM delivery_ledger WHERE kind='contact' "
+                      "AND date(created_at,'localtime')=date('now','localtime') "
+                      "AND state<>'withheld'")
+            && used.next() && used.value(0).toInt() >= opts.contactDailyLimit)
+            return actionError(QStringLiteral("daily_limit"));
+    }
+
+    // 域校验：完全复用 claimReflectionContact 的领取条件（来源轮次/关注状态/版本/重试预算）。
+    QSqlQuery q(m_db);
+    q.prepare("SELECT c.message,h.channel,h.session_id,s.input"+kActionContactSourceRows+
+              "JOIN private_reflection r ON r.turn_id=h.id JOIN reflection_contact c ON c.turn_id=r.turn_id "
+              "WHERE "+kActionContactEligible+" AND c.turn_id=? AND c.version=? AND r.version=c.version "
+              "AND r.state='consider' AND (c.outcome='proposed' "
+              "OR (c.outcome='rejected' AND c.attempts<2)) AND NOT EXISTS "
+              "(SELECT 1 FROM reflection_change WHERE prior_turn=r.turn_id)");
+    q.addBindValue(turn);
+    q.addBindValue(version);
+    if (!q.exec() || !q.next()) return actionError(QStringLiteral("not_claimable"));
+    const auto message=q.value(0).toString();
+    const auto sourceChannel=q.value(1).toString();
+    const auto sourceSession=q.value(2).toString();
+    const auto sourceInput=q.value(3).toString();
+    q.finish();
+
+    // 目标选择 + 可见性/敏感内容校验（与领取时同一套 MemoryReadPolicy 口径）。
+    ActionTarget target;
+    {
+        auto &config=ConfigManager::instance();
+        const auto policy=MemoryReadPolicy();
+        ActionTarget qqFallback;
+        for (const auto &pair : opts.targets) {
+            const QString channel=pair.first, session=pair.second;
+            const bool pet=channel==Channel::kPet && session==Channel::kDefaultSession;
+            const bool qq=channel==Channel::kQQPrivate && config.isMasterQQ(session);
+            if (!pet && !qq) continue;
+            if (!policy.allows(channel,session,message)) continue;
+            if ((!memory.agent.ownerCrossChannelPrivate
+                 && (sourceChannel!=channel || sourceSession!=session))
+                || !actionBasisVisible(m_db,turn,policy,channel,session)
+                || !policy.allows(sourceChannel,sourceSession,sourceInput)) continue;
+            if (pet) { target=ActionTarget{channel,session,true}; break; }
+            if (!qqFallback.found) qqFallback=ActionTarget{channel,session,true};
+        }
+        if (!target.found) target=qqFallback;
+    }
+    if (!target.found) return actionError(QStringLiteral("no_target"));
+
+    // 持久化依据重验：提出联系到真正提交之间可能隔了几分钟，只有"此刻仍站得住"的
+    // now 联系才允许进入 outbox；否则不写任何行，由调用方把该意图落 withheld。
+    // 切片 C：新契约（claims/motivation）以 claims 为主要事实来源，旧 basis 仅作兼容路径。
+    QSqlQuery persisted(m_db);
+    persisted.prepare("SELECT c.timing,coalesce(c.basis_type,''),coalesce(c.basis_refs,''),"
+                      "coalesce(c.claims_json,''),coalesce(c.motivation_json,''),"
+                      "coalesce(c.semantic_status,'') "
+                      "FROM reflection_contact c WHERE c.turn_id=? AND c.version=?");
+    persisted.addBindValue(turn);
+    persisted.addBindValue(version);
+    if (!persisted.exec() || !persisted.next())
+        return actionError(QStringLiteral("missing_contact"));
+    const auto contactTiming=persisted.value(0).toString();
+    const auto basisType=persisted.value(1).toString();
+    const auto basisRefsText=persisted.value(2).toString();
+    const auto claimsText=persisted.value(3).toString();
+    const auto motivationText=persisted.value(4).toString();
+    const auto semanticStatus=persisted.value(5).toString();
+    persisted.finish();
+    const bool newContract=!claimsText.isEmpty() || !motivationText.isEmpty();
+    if (newContract) {
+        // 切片 C：提交前用同一套确定性规则再核验一次 claims（不调用语义验证器；
+        // 语义结论已由 LLMService 写进 reflection_contact.semantic_status）。
+        const ActionPolicy policy(this);
+        const auto claims=QJsonDocument::fromJson(claimsText.toUtf8()).array();
+        for (const auto &value : claims) {
+            const auto validation=policy.validateClaimDeterministic(sourceChannel,sourceSession,
+                                                                    turn,value.toObject());
+            if (validation.result!=ClaimValidation::Entailed)
+                return actionError(QStringLiteral("claims_invalid"),validation.reason);
+        }
+        if (semanticStatus==QStringLiteral("withheld")
+            || semanticStatus==QStringLiteral("repair_needed")
+            || semanticStatus==QStringLiteral("unverified"))
+            return actionError(QStringLiteral("semantic_withheld"),semanticStatus);
+    }
+    if (contactTiming==QStringLiteral("now") && !newContract) {
+        QString rejection;
+        QJsonArray refs;
+        if (basisType.isEmpty() || basisRefsText.isEmpty()) {
+            rejection=QStringLiteral("missing_basis");
+        } else {
+            refs=QJsonDocument::fromJson(basisRefsText.toUtf8()).array();
+            if (refs.isEmpty()) rejection=QStringLiteral("missing_basis");
+        }
+        if (rejection.isEmpty()) {
+            const QJsonObject contact{
+                {QStringLiteral("timing"),contactTiming},
+                {QStringLiteral("basis"),QJsonObject{{QStringLiteral("type"),basisType},
+                                                     {QStringLiteral("refs"),refs}}}};
+            rejection=validateContactBasis(sourceChannel,sourceSession,turn,contact);
+        }
+        if (!rejection.isEmpty()) return actionError(QStringLiteral("basis_invalid"),rejection);
+    } else if (contactTiming==QStringLiteral("now")) {
+        // 新契约也走一遍确定性联系策略（motivation/claims/closure/quiet/目标/重复），
+        // 但不要因为"缺 verifier"在这里二次发起语义请求。
+        const auto claims=QJsonDocument::fromJson(claimsText.toUtf8()).array();
+        const auto motivation=QJsonDocument::fromJson(motivationText.toUtf8()).object();
+        QJsonObject contact{{QStringLiteral("timing"),contactTiming},
+                            {QStringLiteral("motivation"),motivation},
+                            {QStringLiteral("claims"),claims}};
+        const ActionPolicy policy(this);
+        const auto deterministic=policy.evaluateSpontaneousContactDeterministic(
+            sourceChannel,sourceSession,turn,contact);
+        if (!deterministic.value(QStringLiteral("allowed")).toBool())
+            return actionError(QStringLiteral("policy_suppressed"),
+                               deterministic.value(QStringLiteral("reason")).toString());
+    }
+
+    // 域状态 CAS：proposed（或 rejected 且 attempts<2）→ dispatching。与 action/outbox 同事务。
+    QSqlQuery claim(m_db);
+    claim.prepare("UPDATE reflection_contact SET outcome='dispatching',channel=?,session=?,"
+                  "last_attempt_at=unixepoch(),updated_at=unixepoch() "
+                  "WHERE turn_id=? AND version=? AND (outcome='proposed' "
+                  "OR (outcome='rejected' AND attempts<2))");
+    claim.addBindValue(target.channel);
+    claim.addBindValue(target.session);
+    claim.addBindValue(turn);
+    claim.addBindValue(version);
+    if (!claim.exec() || claim.numRowsAffected()!=1)
+        return actionError(QStringLiteral("claim_race"));
+
+    // outbox 只带发送文本；cognitive_action 另带动机/claims 摘要供审计。
+    const QString outboxPayloadJson=QString::fromUtf8(QJsonDocument(QJsonObject{
+        {QStringLiteral("sentences"),QJsonArray{QJsonObject{{QStringLiteral("zh_text"),message}}}},
+        {QStringLiteral("channel"),target.channel},
+        {QStringLiteral("session"),target.session}}).toJson(QJsonDocument::Compact));
+    QJsonObject actionPayload=QJsonDocument::fromJson(outboxPayloadJson.toUtf8()).object();
+    QJsonObject motivation;
+    QJsonArray claims;
+    if (newContract) {
+        motivation=QJsonDocument::fromJson(motivationText.toUtf8()).object();
+        claims=QJsonDocument::fromJson(claimsText.toUtf8()).array();
+        if (!motivation.isEmpty()) actionPayload[QStringLiteral("motivation")]=motivation;
+        if (!claims.isEmpty()) actionPayload[QStringLiteral("claims")]=claims;
+    }
+    const QString payloadJson=QString::fromUtf8(
+        QJsonDocument(actionPayload).toJson(QJsonDocument::Compact));
+    QString contextRefsJson;
+    {
+        QJsonArray refs;
+        for (const auto &claim : claims)
+            for (const auto &ref : claim.toObject().value(QStringLiteral("refs")).toArray())
+                refs.append(ref);
+        const auto motivationRef=motivation.value(QStringLiteral("ref")).toString();
+        if (!motivationRef.isEmpty()) refs.append(motivationRef);
+        if (!refs.isEmpty()) contextRefsJson=QString::fromUtf8(
+            QJsonDocument(refs).toJson(QJsonDocument::Compact));
+    }
+    qlonglong actionId=0;
+    if (!insertActionWithOutbox(m_db,actionKey,QStringLiteral("SpontaneousContact"),
+                                QStringLiteral("reflection:%1:%2").arg(turn).arg(version),
+                                target.channel,target.session,payloadJson,policyReason,&actionId,
+                                claimsText,
+                                motivation.value(QStringLiteral("type")).toString(),
+                                motivation.value(QStringLiteral("ref")).toString(),
+                                semanticStatus,contextRefsJson,outboxPayloadJson))
+        return actionError(QStringLiteral("insert_failed"));
+    actionNoteDelivery(m_db,QStringLiteral("contact"),
+                       QStringLiteral("reflection:%1:%2").arg(turn).arg(version),
+                       target.channel,target.session,message,QStringLiteral("claimed"),0);
+    if (!m_db.commit()) return actionError(QStringLiteral("commit_failed"));
+    rollback.dismiss();
+    qInfo()<<"[Outbox] contact committed turn="<<turn<<"version="<<version
+           <<"channel="<<target.channel<<"key="<<actionKey;
+    return actionCommittedResult(actionKey,actionId,QStringLiteral("SpontaneousContact"),
+                                 target.channel,target.session);
+}
+
+QJsonObject MemoryManager::commitReminderDeliveryAction(qlonglong reminderId)
+{
+    if (!m_db.isOpen() || reminderId<=0) return actionError(QStringLiteral("invalid_args"));
+    const QString actionKey=QStringLiteral("reminder:%1:delivery").arg(reminderId);
+    const auto existing=existingAction(m_db,actionKey);
+    if (!existing.isEmpty()) return existing;
+
+    auto &cfg=ConfigManager::instance();
+    const auto opts=cfg.getProactiveConfig();
+    if (!opts.enabled || !cfg.getMemoryPolicyConfig().longTermMemoryEnabled)
+        return actionError(QStringLiteral("proactive_disabled"));
+    if (!m_db.transaction()) return actionError(QStringLiteral("transaction_failed"));
+    auto rollback=qScopeGuard([this]{m_db.rollback();});
+
+    QSqlQuery q(m_db);
+    q.prepare("SELECT channel,session,message,state,due,expires FROM reminder WHERE id=?");
+    q.addBindValue(reminderId);
+    if (!q.exec() || !q.next()) return actionError(QStringLiteral("reminder_missing"));
+    const auto channel=q.value(0).toString(), session=q.value(1).toString();
+    const auto message=q.value(2).toString(), state=q.value(3).toString();
+    const auto due=q.value(4).toLongLong(), expires=q.value(5).toLongLong();
+    q.finish();
+    // 与 claimDueReminder 等价的领域校验：只有 pending 且已到期、未过期才允许提交。
+    if (state!=QStringLiteral("pending")) return actionError(QStringLiteral("not_pending"));
+    const qint64 now=QDateTime::currentSecsSinceEpoch();
+    if (due>now) return actionError(QStringLiteral("not_due"));
+    if (expires<=now) return actionError(QStringLiteral("expired"));
+    if (!actionReminderAllowed(channel,session)) return actionError(QStringLiteral("target_not_allowed"));
+    if (!MemoryReadPolicy().allows(channel,session,message))
+        return actionError(QStringLiteral("blocked_message"));
+
+    QSqlQuery claim(m_db);
+    claim.prepare("UPDATE reminder SET state='dispatching' WHERE id=? AND state='pending' "
+                  "AND due<=unixepoch() AND expires>unixepoch()");
+    claim.addBindValue(reminderId);
+    if (!claim.exec() || claim.numRowsAffected()!=1)
+        return actionError(QStringLiteral("claim_race"));
+
+    const QString payloadJson=QString::fromUtf8(QJsonDocument(QJsonObject{
+        {QStringLiteral("message"),message},
+        {QStringLiteral("channel"),channel},
+        {QStringLiteral("session"),session},
+        {QStringLiteral("reminder_id"),reminderId}}).toJson(QJsonDocument::Compact));
+    qlonglong actionId=0;
+    if (!insertActionWithOutbox(m_db,actionKey,QStringLiteral("ReminderDelivery"),
+                                QStringLiteral("reminder:%1").arg(reminderId),
+                                channel,session,payloadJson,QString{},&actionId))
+        return actionError(QStringLiteral("insert_failed"));
+    actionNoteDelivery(m_db,QStringLiteral("reminder"),QStringLiteral("reminder:%1").arg(reminderId),
+                       channel,session,message,QStringLiteral("claimed"),0);
+    if (!m_db.commit()) return actionError(QStringLiteral("commit_failed"));
+    rollback.dismiss();
+    qInfo()<<"[Outbox] reminder committed id="<<reminderId<<"channel="<<channel;
+    return actionCommittedResult(actionKey,actionId,QStringLiteral("ReminderDelivery"),channel,session);
+}
+
+QJsonObject MemoryManager::commitActivityShareAction(qlonglong activityId,int version,
+                                                     const QString &draft)
+{
+    if (!m_db.isOpen() || activityId<=0 || version<0)
+        return actionError(QStringLiteral("invalid_args"));
+    if (draft.trimmed().isEmpty()) return actionError(QStringLiteral("empty_draft"));
+    const QString actionKey=QStringLiteral("thought:%1:%2:share").arg(activityId).arg(version);
+    const auto existing=existingAction(m_db,actionKey);
+    if (!existing.isEmpty()) return existing;
+
+    auto &cfg=ConfigManager::instance();
+    const auto opts=cfg.getProactiveConfig();
+    if (!opts.enabled || !cfg.getMemoryPolicyConfig().longTermMemoryEnabled)
+        return actionError(QStringLiteral("proactive_disabled"));
+    if (!m_db.transaction()) return actionError(QStringLiteral("transaction_failed"));
+    auto rollback=qScopeGuard([this]{m_db.rollback();});
+
+    // 分享资格：completed/版本匹配/有产物/同版本未送达（含 unknown 视为可能已送达）。
+    if (!canShareThought(activityId,version))
+        return actionError(QStringLiteral("not_shareable"));
+    const QString ledgerRef=QStringLiteral("thought:%1:%2").arg(activityId).arg(version);
+    {
+        QSqlQuery shared(m_db);
+        shared.prepare("SELECT 1 FROM delivery_ledger WHERE kind='share' AND ref=? "
+                       "AND state IN ('handed_off','protocol_accepted','unknown') LIMIT 1");
+        shared.addBindValue(ledgerRef);
+        if (shared.exec() && shared.next()) return actionError(QStringLiteral("already_shared"));
+    }
+
+    const ActionTarget target=actionChooseTarget(opts.targets,draft,true);
+    if (!target.found) return actionError(QStringLiteral("no_target"));
+
+    QSqlQuery ledger(m_db);
+    ledger.prepare("INSERT INTO delivery_ledger(kind,ref,channel,session,text,state,attempts,updated_at) "
+                   "VALUES('share',?,?,?,?,'claimed',0,CURRENT_TIMESTAMP) "
+                   "ON CONFLICT(kind,ref) DO UPDATE SET state='claimed',"
+                   "channel=excluded.channel,session=excluded.session,text=excluded.text,"
+                   "updated_at=CURRENT_TIMESTAMP");
+    ledger.addBindValue(ledgerRef);
+    ledger.addBindValue(target.channel);
+    ledger.addBindValue(target.session);
+    ledger.addBindValue(draft);
+    if (!ledger.exec()) return actionError(QStringLiteral("ledger_failed"));
+
+    const QString payloadJson=QString::fromUtf8(QJsonDocument(QJsonObject{
+        {QStringLiteral("draft"),draft},
+        {QStringLiteral("channel"),target.channel},
+        {QStringLiteral("session"),target.session}}).toJson(QJsonDocument::Compact));
+    qlonglong actionId=0;
+    if (!insertActionWithOutbox(m_db,actionKey,QStringLiteral("ActivityShare"),ledgerRef,
+                                target.channel,target.session,payloadJson,QString{},&actionId))
+        return actionError(QStringLiteral("insert_failed"));
+    if (!m_db.commit()) return actionError(QStringLiteral("commit_failed"));
+    rollback.dismiss();
+    qInfo()<<"[Outbox] share committed activity="<<activityId<<"version="<<version
+           <<"channel="<<target.channel;
+    return actionCommittedResult(actionKey,actionId,QStringLiteral("ActivityShare"),
+                                 target.channel,target.session);
+}
+
+QJsonObject MemoryManager::claimOutbox(const QString &owner,int leaseSeconds)
+{
+    if (!m_db.isOpen() || owner.isEmpty()) return {};
+    if (leaseSeconds<=0) leaseSeconds=60;
+    if (!m_db.transaction()) return {};
+    auto rollback=qScopeGuard([this]{m_db.rollback();});
+    QSqlQuery pick(m_db);
+    // 只领取 queued，或"被渠道明确拒绝且还有一次重试预算"的失败行；
+    // dispatching（可能已交给网络）永远不在这里重领——它只能由 recoverStaleOutbox 冻结为 unknown。
+    pick.prepare("SELECT o.id,o.action_id,o.action_key,o.channel,o.session_id,o.payload_json,o.attempts,"
+                 "a.kind,a.state FROM action_outbox o JOIN cognitive_action a ON a.id=o.action_id "
+                 "WHERE o.state='queued' OR (o.state='failed' AND o.attempts<2) "
+                 "ORDER BY o.id LIMIT 1");
+    if (!pick.exec() || !pick.next()) { m_db.rollback(); return {}; }
+    const auto outboxId=pick.value(0).toLongLong();
+    const auto actionId=pick.value(1).toLongLong();
+    const auto actionKey=pick.value(2).toString();
+    const auto channel=pick.value(3).toString();
+    const auto session=pick.value(4).toString();
+    const auto payloadJson=pick.value(5).toString();
+    const auto attempts=pick.value(6).toInt();
+    const auto kind=pick.value(7).toString();
+    pick.finish();
+
+    QSqlQuery claim(m_db);
+    claim.prepare("UPDATE action_outbox SET state='dispatching',lease_owner=?,"
+                  "lease_until=unixepoch()+?,dispatched_at=coalesce(dispatched_at,unixepoch()),"
+                  "attempts=attempts+1 WHERE id=? AND (state='queued' "
+                  "OR (state='failed' AND attempts<2))");
+    claim.addBindValue(owner);
+    claim.addBindValue(leaseSeconds);
+    claim.addBindValue(outboxId);
+    if (!claim.exec() || claim.numRowsAffected()!=1) { m_db.rollback(); return {}; }
+
+    QSqlQuery touch(m_db);
+    touch.prepare("UPDATE cognitive_action SET state='dispatching',updated_at=unixepoch() "
+                  "WHERE id=? AND state NOT IN ('unknown','withheld')");
+    touch.addBindValue(actionId);
+    if (!touch.exec()) { m_db.rollback(); return {}; }
+
+    if (!markOutboxDomainDispatching(m_db,actionKey,kind,channel,session)) {
+        m_db.rollback();
+        return {};
+    }
+    if (!m_db.commit()) return {};
+    rollback.dismiss();
+    qInfo()<<"[Outbox] claimed key="<<actionKey<<"kind="<<kind<<"attempt="<<(attempts+1);
+    return QJsonObject{{QStringLiteral("outbox_id"),outboxId},
+                       {QStringLiteral("action_id"),actionId},
+                       {QStringLiteral("action_key"),actionKey},
+                       {QStringLiteral("kind"),kind},
+                       {QStringLiteral("channel"),channel},
+                       {QStringLiteral("session"),session},
+                       {QStringLiteral("payload_json"),payloadJson},
+                       {QStringLiteral("payload"),QJsonDocument::fromJson(payloadJson.toUtf8()).object()},
+                       {QStringLiteral("attempts"),attempts+1}};
+}
+
+bool MemoryManager::settleOutboxAction(const QString &actionKey,const QString &outcome,
+                                       const QString &detail)
+{
+    static const QSet<QString> outcomes{
+        QStringLiteral("protocol_accepted"), QStringLiteral("handed_off"),
+        QStringLiteral("rejected"), QStringLiteral("unknown"), QStringLiteral("withheld")};
+    if (!m_db.isOpen() || actionKey.isEmpty() || !outcomes.contains(outcome)) return false;
+    if (!m_db.transaction()) return false;
+    auto rollback=qScopeGuard([this]{m_db.rollback();});
+
+    QSqlQuery find(m_db);
+    find.prepare("SELECT a.id,a.kind,a.channel,a.session_id,a.state,coalesce(a.last_outcome,''),"
+                 "o.id,o.attempts FROM cognitive_action a "
+                 "JOIN action_outbox o ON o.action_id=a.id WHERE a.action_key=?");
+    find.addBindValue(actionKey);
+    if (!find.exec() || !find.next()) return false;
+    const auto actionId=find.value(0).toLongLong();
+    const auto kind=find.value(1).toString();
+    const auto channel=find.value(2).toString();
+    const auto session=find.value(3).toString();
+    const auto state=find.value(4).toString();
+    const auto lastOutcome=find.value(5).toString();
+    const auto outboxAttempts=find.value(7).toInt();
+    find.finish();
+
+    // 终态保护：unknown/withheld 冻结，绝不因迟到的重复回执再变；已协议接受的只允许同结果重复。
+    if (state==QStringLiteral("unknown") || state==QStringLiteral("withheld")) {
+        m_db.rollback();
+        rollback.dismiss();
+        return true;
+    }
+    if (state==QStringLiteral("handed_off")) {
+        // 已协议接受是终态：重复的 accepted/handed_off 回执不再重复累加，也不再触发订阅方回写历史。
+        if (outcome==QStringLiteral("protocol_accepted")
+            && lastOutcome==QStringLiteral("protocol_accepted")) {
+            m_db.rollback();
+            rollback.dismiss();
+            return true;
+        }
+        if (outcome!=QStringLiteral("protocol_accepted")
+            && (outcome==lastOutcome || lastOutcome==QStringLiteral("protocol_accepted"))) {
+            m_db.rollback();
+            rollback.dismiss();
+            return true;
+        }
+    }
+
+    const bool accepted = outcome==QStringLiteral("protocol_accepted")
+        || outcome==QStringLiteral("handed_off");
+    const bool unknown = outcome==QStringLiteral("unknown");
+    const bool withheld = outcome==QStringLiteral("withheld");
+    const bool failed = outcome==QStringLiteral("rejected") || unknown;
+
+    QString outboxState;
+    if (accepted) outboxState=QStringLiteral("dispatched");
+    else if (unknown) outboxState=QStringLiteral("unknown");
+    else if (withheld) outboxState=QStringLiteral("failed");
+    else outboxState = outboxAttempts<2 ? QStringLiteral("queued") : QStringLiteral("failed");
+    // action.state 只收敛到四个对外语义：handed_off（含协议接受）/rejected/unknown/withheld。
+    const QString actionState = accepted ? QStringLiteral("handed_off") : outcome;
+
+    QSqlQuery action(m_db);
+    action.prepare("UPDATE cognitive_action SET state=?,last_outcome=?,attempts=attempts+1,"
+                   "updated_at=unixepoch() WHERE id=?");
+    action.addBindValue(actionState);
+    action.addBindValue(outcome);
+    action.addBindValue(actionId);
+    if (!action.exec()) return false;
+
+    QSqlQuery outbox(m_db);
+    outbox.prepare("UPDATE action_outbox SET state=?,last_error=?,lease_owner=NULL,lease_until=NULL,"
+                   "completed_at=CASE WHEN ? IN ('dispatched','unknown','failed') "
+                   "THEN unixepoch() ELSE completed_at END WHERE action_id=?");
+    outbox.addBindValue(outboxState);
+    outbox.addBindValue(detail.isEmpty() ? QVariant() : QVariant(detail));
+    outbox.addBindValue(outboxState);
+    outbox.addBindValue(actionId);
+    if (!outbox.exec()) return false;
+
+    if (!settleOutboxDomain(m_db,actionKey,kind,channel,session,outcome)) return false;
+    if (!m_db.commit()) return false;
+    rollback.dismiss();
+    qInfo()<<"[Outbox] settled key="<<actionKey<<"outcome="<<outcome
+           <<"action="<<actionState<<"outbox="<<outboxState;
+    return true;
+}
+
+int MemoryManager::recoverStaleOutbox(int staleSeconds)
+{
+    if (!m_db.isOpen()) return 0;
+    if (staleSeconds<0) staleSeconds=0;
+    if (!m_db.transaction()) return 0;
+    auto rollback=qScopeGuard([this]{m_db.rollback();});
+    QSqlQuery stale(m_db);
+    // 领取租约过期（且已过期 staleSeconds 以上）仍停在 dispatching：进程崩溃遗留，
+    // 无法确认消息是否已经交给渠道 → at-most-once 冻结为 unknown，绝不重发。
+    stale.prepare("SELECT o.id,a.action_key,a.kind FROM action_outbox o "
+                  "JOIN cognitive_action a ON a.id=o.action_id "
+                  "WHERE o.state='dispatching' AND coalesce(o.lease_until,0)<unixepoch()-?");
+    stale.addBindValue(staleSeconds);
+    if (!stale.exec()) return 0;
+    struct StaleRow { qlonglong outboxId; QString actionKey; QString kind; };
+    QList<StaleRow> pending;
+    while (stale.next())
+        pending.append(StaleRow{stale.value(0).toLongLong(),
+                                stale.value(1).toString(),stale.value(2).toString()});
+    stale.finish();
+    int recovered=0;
+    for (const auto &row : pending) {
+        QSqlQuery freeze(m_db);
+        freeze.prepare("UPDATE action_outbox SET state='unknown',completed_at=unixepoch(),"
+                       "lease_owner=NULL,lease_until=NULL,last_error='dispatch_abandoned' "
+                       "WHERE id=? AND state='dispatching'");
+        freeze.addBindValue(row.outboxId);
+        if (!freeze.exec() || freeze.numRowsAffected()!=1) continue;
+        QSqlQuery action(m_db);
+        action.prepare("UPDATE cognitive_action SET state='unknown',last_outcome='unknown',"
+                       "updated_at=unixepoch() WHERE action_key=? AND state NOT IN "
+                       "('handed_off','unknown','withheld')");
+        action.addBindValue(row.actionKey);
+        if (!action.exec()) return 0;
+        // 领域行同步冻结（contact→unknown / reminder→unknown / share ledger→unknown）。
+        recoverOutboxDomain(m_db,row.actionKey,row.kind);
+        ++recovered;
+    }
+    if (!m_db.commit()) return 0;
+    rollback.dismiss();
+    if (recovered>0) qInfo()<<"[Outbox] stale dispatching frozen as unknown count="<<recovered;
+    return recovered;
 }

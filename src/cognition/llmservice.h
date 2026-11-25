@@ -114,6 +114,21 @@ private:
                           bool partial = false);
     quint64 m_reviewGeneration = 0;
     void generatePrivateReview(qlonglong id, int version, const QJsonObject &thread);
+    // 切片 C：私人回顾输出 contact.motivation/claims 后的验证链。
+    // 先做确定性策略复核（ActionPolicy），再按配置做一次语义核验；失败时最多一次
+    // constrained repair，最后才 emit privateReviewFinished。全部在异步回调里完成。
+    void finalizePrivateReview(qlonglong id, int version, const QJsonObject &thread,
+                               const QJsonObject &proposal, const QString &error);
+    void verifyPrivateReviewContact(qlonglong id, int version, const QJsonObject &thread,
+                                    const QJsonObject &proposal);
+    void requestContactRepair(qlonglong id, int version, const QJsonObject &thread,
+                              const QJsonObject &proposal, const QString &reason,
+                              const QJsonArray &sources);
+    void emitPrivateReviewResult(qlonglong id, int version, const QJsonObject &proposal,
+                                 const QString &error);
+    static QJsonObject withholdContactProposal(QJsonObject proposal, QJsonObject contact,
+                                               const QString &reason);
+    QPointer<QNetworkReply> m_contactVerificationReply;
     void retrieveMemory(const RetrievalRequest &request, std::function<void(const RetrievalResult &)> done);
     ImagePerception m_imagePerception;
     void finishRetrieval(const RetrievalResult &result);

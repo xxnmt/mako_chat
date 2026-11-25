@@ -44,10 +44,14 @@ qt_add_executable(Windows_AI
     src/memory/memoryrecalltool.h src/memory/memoryrecalltool.cpp
     src/memory/memoryexecutor.h src/memory/memoryexecutor.cpp
     src/cognition/imageperception.cpp
+    src/cognition/cognitivesnapshot.h src/cognition/cognitivesnapshot.cpp
+    src/cognition/actionpolicy.h src/cognition/actionpolicy.cpp
+    src/cognition/actioncommitter.h src/cognition/actioncommitter.cpp
     src/cognition/llmservice.h src/cognition/llmservice.cpp
     src/cognition/promptassembler.h src/cognition/promptassembler.cpp
     src/benchmark/benchmarkrunner.h src/benchmark/benchmarkrunner.cpp src/benchmark/benchmarksnapshot.h src/benchmark/benchmarksnapshot.cpp
     src/app/appcontroller.h src/app/appcontroller.cpp
+    src/app/actionoutboxdispatcher.h src/app/actionoutboxdispatcher.cpp
     src/app/privatereview.cpp src/app/privatereview.h
     src/app/cognitivecoordinator.h src/app/cognitivecoordinator.cpp
     src/app/sentencedata.h

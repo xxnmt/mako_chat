@@ -159,6 +159,44 @@
 - **不再有假 withheld**：basis 被拒时不应出现 `[ReflectionContact] withheld`；只有在真正提交了 `contact(proposed)` 后才会进入投递链。
 - **验收场景（双发）**：造一条 pending reminder（如 10 分钟后）并让某 due concern 试图用它 `contact(now)` → 应被拒；到点后只有 Reminder 链发送一次。
 
+## 5.4 统一行动边界与语义 grounding（v29/v30）
+
+**观测 SQL**
+```sql
+-- 每个外发都应有 action record，且 action_key 唯一
+select kind,state,count(*) from cognitive_action group by 1,2;
+select count(*) from cognitive_action a join action_outbox o on o.action_id=a.id; -- 应为外发总数
+-- 不应出现同一 action_key 两次外发
+select action_key,count(*) from action_outbox group by action_key having count(*)>1;
+-- unknown 必须冻结
+select action_key,state,attempts,last_error from action_outbox where state='unknown' order by id desc;
+-- 语义判定可追溯
+select id,turn_id,timing,outcome,semantic_status,motivation_json,claims_json
+  from reflection_contact where claims_json is not null order by turn_id desc limit 10;
+```
+**日志关键字**：`[Outbox] settled key=... outcome=...`、`[Outbox] dispatch_abandoned`、`[ReflectionContact] basis_expired/claims_expired`、`[Concern] contact_rejected`。
+- 每条外发必须能追到：`action_key → cognitive_action → action_outbox → QQ 回执 → 领域表`。
+- 纯 self_desire（claims 为空）允许在无新主人证据时主动问候；带 `user_commitment/execution_result` 的 claims 必须有 ref 且经语义核验。
+- verifier 不可用/超时时不得发送不可靠事实；纯问候不受影响。
+- `internal_wake`（`own_next_review_at`/idle）在日志与 DB 中绝不能成为"约定"。
+
+**B5 shadow 硬指标（24–48h）**
+```
+无 action record 的外发 = 0
+同一 action_key 两次自动外发 = 0
+unknown 后自动重发 = 0
+internal wake 被声称成用户约定 = 0
+assistant expression 被用作 user commitment = 0
+private evidence 泄露到不允许听众 = 0
+reminder 与 reflection 同委托双发 = 0
+stale version 仍 commit = 0
+action → protocol outcome 可追溯 = 100%
+semantic verifier 无限循环 = 0
+纯自发表达因无 user evidence 一律被拦 = 不允许成为规则
+```
+软指标：自主联系次数/日、closure 抑制比例、semantic reject/repair 比例、activity share unknown 比例、proactive 延迟、每 episode 模型调用数/token。
+停止条件（任一出现即关闭新 proactive dispatch，保留前台与 shadow 审计）：隐私泄露、同 action_key 重复发送、unknown 自动重发、无 action record 的外部副作用、internal wake 被当成委托。
+
 ## 6. 已知边界（不作为失败）
 
 - 多活动并行选择未实现（沿用单活动，ROADMAP 已列为后续）。

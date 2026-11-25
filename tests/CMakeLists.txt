@@ -7,6 +7,8 @@ set(PHASE0_CORE_SOURCES
     ${PROJECT_SOURCE_DIR}/src/memory/memorymanager.h
     ${PROJECT_SOURCE_DIR}/src/memory/memorymanager.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/matterstore.cpp ${PROJECT_SOURCE_DIR}/src/memory/privatereflection.cpp
+    ${PROJECT_SOURCE_DIR}/src/cognition/actionpolicy.h
+    ${PROJECT_SOURCE_DIR}/src/cognition/actionpolicy.cpp
     ${PROJECT_SOURCE_DIR}/src/config/configmanager.h
     ${PROJECT_SOURCE_DIR}/src/config/configmanager.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/memorypolicy.h
@@ -66,6 +68,8 @@ add_phase0_test(tst_memorymanager
     ${PROJECT_SOURCE_DIR}/src/memory/memoryindexworker.h
     ${PROJECT_SOURCE_DIR}/src/memory/memoryindexworker.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/matterstore.cpp ${PROJECT_SOURCE_DIR}/src/memory/privatereflection.cpp
+    ${PROJECT_SOURCE_DIR}/src/cognition/actionpolicy.h
+    ${PROJECT_SOURCE_DIR}/src/cognition/actionpolicy.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/recentcontext.h
     ${PROJECT_SOURCE_DIR}/src/memory/recentcontext.cpp
     ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.h
@@ -120,6 +124,8 @@ add_phase0_test(tst_groupmembership
     ${PROJECT_SOURCE_DIR}/src/memory/memorymanager.h
     ${PROJECT_SOURCE_DIR}/src/memory/memorymanager.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/matterstore.cpp ${PROJECT_SOURCE_DIR}/src/memory/privatereflection.cpp
+    ${PROJECT_SOURCE_DIR}/src/cognition/actionpolicy.h
+    ${PROJECT_SOURCE_DIR}/src/cognition/actionpolicy.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/recentcontext.h
     ${PROJECT_SOURCE_DIR}/src/memory/recentcontext.cpp
     ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.h
@@ -138,6 +144,8 @@ add_phase0_test(tst_memoryagent
     ${PROJECT_SOURCE_DIR}/src/app/cognitivecoordinator.cpp
     tst_memoryagent.cpp
     ${PROJECT_SOURCE_DIR}/src/cognition/imageperception.cpp
+    ${PROJECT_SOURCE_DIR}/src/cognition/cognitivesnapshot.h
+    ${PROJECT_SOURCE_DIR}/src/cognition/cognitivesnapshot.cpp
     ${PROJECT_SOURCE_DIR}/src/cognition/llmservice.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/memoryoutputguard.cpp
     ${PROJECT_SOURCE_DIR}/src/config/configmanager.cpp
@@ -174,6 +182,8 @@ add_phase0_test(tst_memoryagent
     ${PROJECT_SOURCE_DIR}/src/memory/memorymanager.h
     ${PROJECT_SOURCE_DIR}/src/memory/memorymanager.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/matterstore.cpp ${PROJECT_SOURCE_DIR}/src/memory/privatereflection.cpp
+    ${PROJECT_SOURCE_DIR}/src/cognition/actionpolicy.h
+    ${PROJECT_SOURCE_DIR}/src/cognition/actionpolicy.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/memoryaccesspolicy.h
     ${PROJECT_SOURCE_DIR}/src/memory/memoryaccesspolicy.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/memorytimerange.h
@@ -313,9 +323,39 @@ add_phase0_test(tst_concern
     ${PROJECT_SOURCE_DIR}/src/memory/memoryindexworker.h
     ${PROJECT_SOURCE_DIR}/src/memory/memoryindexworker.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/matterstore.cpp ${PROJECT_SOURCE_DIR}/src/memory/privatereflection.cpp
+    ${PROJECT_SOURCE_DIR}/src/cognition/actionpolicy.h
+    ${PROJECT_SOURCE_DIR}/src/cognition/actionpolicy.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/recentcontext.h
     ${PROJECT_SOURCE_DIR}/src/memory/recentcontext.cpp
     ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.h
     ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.cpp
 )
 target_link_libraries(tst_concern PRIVATE Qt6::Network)
+
+# 认知快照（报告切片 A）：服务端事实分层 + authority 分类 + 提示词 JSON 预算。
+# 复用 tst_sessionrouter 的 MemoryManager 最小依赖集，另加 cognitivesnapshot.cpp。
+add_phase0_test(tst_cognitivesnapshot
+    tst_cognitivesnapshot.cpp
+    ${PROJECT_SOURCE_DIR}/src/cognition/cognitivesnapshot.h
+    ${PROJECT_SOURCE_DIR}/src/cognition/cognitivesnapshot.cpp
+    ${PHASE0_CORE_SOURCES}
+)
+
+# 主动外发统一提交/Outbox（报告切片 B）：域状态 CAS + cognitive_action + action_outbox
+# 同一事务提交，OutboxDispatcher 唯一发送，回执/恢复的状态机回归。
+# 复用 tst_sessionrouter 的 MemoryManager 最小依赖集，另加 actioncommitter/actionoutboxdispatcher。
+add_phase0_test(tst_actionoutbox
+    tst_actionoutbox.cpp
+    ${PROJECT_SOURCE_DIR}/src/cognition/actioncommitter.h
+    ${PROJECT_SOURCE_DIR}/src/cognition/actioncommitter.cpp
+    ${PROJECT_SOURCE_DIR}/src/app/actionoutboxdispatcher.h
+    ${PROJECT_SOURCE_DIR}/src/app/actionoutboxdispatcher.cpp
+    ${PHASE0_CORE_SOURCES}
+)
+
+# 主动联系策略（报告切片 C）：动机/事实分离、确定性 claim 校验 + 可注入语义验证器。
+# 用临时 MemoryManager 造真实数据，验证器用假函数注入，覆盖允许/压下/修复/降级路径。
+add_phase0_test(tst_actionpolicy
+    tst_actionpolicy.cpp
+    ${PHASE0_CORE_SOURCES}
+)
