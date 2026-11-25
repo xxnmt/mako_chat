@@ -24,6 +24,8 @@ public:
 
     // sender 返回 true 表示"已提交给渠道/已本地显示"，false 表示确定未发出（可受控重试一次）。
     void setSender(std::function<bool(const Utterance &)> sender);
+    // 只启动轮询；启动恢复由调用方显式执行（AppController::startApp 用 600s 阈值），
+    // 避免这里的隐式 recover 把启动恢复阈值覆盖掉。
     void start(int intervalMs = 1000);
     void stop();
     // 单次轮询：领取一条 outbox 并发送。测试可直接调用。
@@ -32,6 +34,10 @@ public:
     void onSendResult(const QString &echo,const QString &outcome);
     // 启动恢复：dispatching 且租约过期 → unknown（at-most-once），返回恢复条数。
     int recoverStale(int staleSeconds = 600);
+    // 只有"至少已经交给渠道"的结果才能回写"她说过"的主动历史。
+    // protocol_accepted 是协议确认；pet 没有协议回执，handed_off 即气泡已显示；
+    // unknown（可能已送达但无法确认）、rejected、withheld 一律不写。
+    static bool proactiveHistoryEligible(const QString &outcome, const QString &channel);
 
 signals:
     void actionSettled(const QString &actionKey,const QString &outcome,const QJsonObject &payload);

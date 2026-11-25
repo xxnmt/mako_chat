@@ -106,6 +106,102 @@ QString capabilityPromptText(const QByteArray &body)
     return {};
 }
 
+// 语义核验/主动联系用例的配置守卫：写 setting.json + identity.json，析构时恢复原文件。
+// 与 tst_actionoutbox 的 ProactiveIdentityGuard 同思路，但额外要求长期记忆与语义核验开启。
+class SemanticReviewConfigGuard
+{
+public:
+    SemanticReviewConfigGuard()
+    {
+        auto &cfg = ConfigManager::instance();
+        QFile setting(cfg.getConfigFilePath());
+        m_settingExisted = setting.open(QIODevice::ReadOnly);
+        if (m_settingExisted) m_setting = setting.readAll();
+        setting.close();
+        const QString identityPath = cfg.getConfigDirPath() + "/identity.json";
+        QFile identity(identityPath);
+        m_identityExisted = identity.open(QIODevice::ReadOnly);
+        if (m_identityExisted) m_identity = identity.readAll();
+        identity.close();
+        m_identityPath = identityPath;
+    }
+    ~SemanticReviewConfigGuard()
+    {
+        auto &cfg = ConfigManager::instance();
+        cfg.writeConfigDocument(QStringLiteral("setting.json"),
+                                m_settingExisted ? m_setting : QByteArray("{}"), nullptr);
+        if (m_identityExisted) {
+            cfg.writeConfigDocument(QStringLiteral("identity.json"), m_identity, nullptr);
+        } else {
+            QFile::remove(m_identityPath);
+            cfg.reloadIdentity();
+        }
+    }
+    bool enable()
+    {
+        auto &cfg = ConfigManager::instance();
+        if (!cfg.writeConfigDocument(QStringLiteral("setting.json"),
+                QJsonDocument(QJsonObject{{QStringLiteral("memory"),
+                                           QJsonObject{{QStringLiteral("long_term_memory_enabled"), true}}}})
+                    .toJson(),
+                nullptr))
+            return false;
+        // 主动联系目标可达、安静时段置空、冷却 0、语义核验开启，避免用例受执行时刻影响。
+        return cfg.writeConfigDocument(QStringLiteral("identity.json"), QByteArray(
+            R"({"proactive":{"enabled":true,"private_writing":true,"cooldown_seconds":0,)"
+            R"("quiet_hours":{"start":"00:00","end":"00:00"},)"
+            R"("targets":[{"channel":"pet","session_id":"default"}]},)"
+            R"("cognition":{"semantic_verifier":{"enabled":true,"max_verifier_calls":1,"max_repairs":1}}})"),
+            nullptr);
+    }
+
+private:
+    QString m_identityPath;
+    QByteArray m_setting;
+    QByteArray m_identity;
+    bool m_settingExisted = false;
+    bool m_identityExisted = false;
+};
+
+// 造一个到期关注（来源轮次 + close 收口 + consider），再清掉收口抑制、把关注重新领取到 pending。
+// 返回 turn，*version 为本次到期回顾版本；失败返回 0。
+qlonglong seedDueConcernForSemanticReview(MemoryManager &db, const QString &path,
+                                          const QString &tag, int *version)
+{
+    RequestMeta meta;
+    meta.channel = Channel::kPet;
+    meta.sessionId = Channel::kDefaultSession;
+    meta.subject = QStringLiteral("user");
+    meta.turnKind = QStringLiteral("reply");
+    meta.eventId = meta.runId = QStringLiteral("semantic-coverage-%1").arg(tag);
+    meta.receivedAtUtc = QDateTime::currentDateTimeUtc();
+    const auto turn = db.recordInput(QStringLiteral("明天想去看海"), meta, true);
+    if (turn <= 0 || !db.recordQuiet(turn, QStringLiteral("close"))) return 0;
+    const auto claim = db.claimPrivateReflection(12, 60);
+    if (claim.value(QStringLiteral("id")).toInteger() != turn) return 0;
+    if (!db.finishPrivateReflection(turn, 1, QStringLiteral("consider"),
+                                    QStringLiteral("看海"), QJsonObject{}, QJsonArray{},
+                                    QJsonObject{}, QString{}, QJsonObject{}))
+        return 0;
+    {
+        RawSqlConnection raw(path, tag);
+        if (!raw.open()) return 0;
+        // 清掉 close 收口，否则普通自发联系会被 recent_closure 抑制，走不到语义核验。
+        if (!raw.exec(QStringLiteral(
+                "UPDATE chat_history SET turn_state='handed_off',raw_reply='{}' WHERE turn_state='quiet'")))
+            return 0;
+        if (!raw.exec(QStringLiteral("UPDATE private_reflection SET next_check_at=unixepoch()-1 "
+                                     "WHERE turn_id=%1").arg(turn)))
+            return 0;
+        if (!raw.exec(QStringLiteral("UPDATE thought_review_log SET started_at=started_at-120")))
+            return 0;
+    }
+    const auto context = db.claimDueConcern(12, 60);
+    if (context.value(QStringLiteral("id")).toInteger() != turn) return 0;
+    if (version) *version = context.value(QStringLiteral("version")).toInt();
+    return turn;
+}
+
 MemoryAgentScope ownerGroupScope(const QString &groupId, const QDateTime &now)
 {
     MemoryAgentScope scope;
@@ -1221,8 +1317,8 @@ private slots:
     }
 
     // 切片 C：回顾模型给出新契约 contact 时，LLMService 必须先做确定性策略复核，
-    // 再做一次语义核验；核心事实声称不可修复 → 整项联系标记 withheld；
-    // 纯 self_desire（claims 为空）不调用 verifier，联系保留。
+    // 再做一次语义核验（coverage + entailment）；核心事实声称不可修复 → 整项联系标记 withheld；
+    // 纯 self_desire（claims 为空）也要过 coverage 门禁，完整且 entailed 才保留并写 entailed_coverage。
     void privateReviewVerifiesClaims()
     {
         auto &cfg = ConfigManager::instance();
@@ -1305,7 +1401,25 @@ private slots:
             const QByteArray body = bodies.last();
             if (body.contains("【语义核验】")) {
                 ++verifierCalls;
-                return R"({"result":"insufficient","supporting_refs":[],"reason_code":"unrelated"})";
+                // 新契约：verifier 一次请求同时给出 claim_coverage 与 entailment 结论。
+                // 从请求体里解析出 verifier 输入，按 declared_claims 是否为空区分轮次
+                // （HTTP body 里输入 JSON 是转义字符串，不能直接做子串匹配）。
+                QJsonArray declaredClaims;
+                for (const auto &value : QJsonDocument::fromJson(body).object()
+                                             .value(QStringLiteral("messages")).toArray()) {
+                    const auto message = value.toObject();
+                    if (message.value(QStringLiteral("role")).toString() != QStringLiteral("user"))
+                        continue;
+                    declaredClaims = QJsonDocument::fromJson(
+                        message.value(QStringLiteral("content")).toString().toUtf8()).object()
+                                         .value(QStringLiteral("declared_claims")).toArray();
+                }
+                if (!declaredClaims.isEmpty())
+                    return R"({"claim_coverage":"complete","missing_claims":[],)"
+                           R"("result":"insufficient","supporting_refs":[],"reason_code":"unrelated"})";
+                // 纯 self_desire：claims 为空、无外部事实 → coverage 完整且 entailed。
+                return R"({"claim_coverage":"complete","missing_claims":[],)"
+                       R"("result":"entailed","supporting_refs":[],"reason_code":"pure_self_desire"})";
             }
             if (body.contains("【约束修复】"))
                 return R"({"contact":{"reason":"想问问","message":"后来去成了吗","claims":[]}})";
@@ -1330,7 +1444,7 @@ private slots:
                                R"("text":"主人说后天可以去","refs":["chat/%1"]}],)"
                                R"("core_claim_ids":["c1"]}})").arg(evidence);
             }
-            // 纯 self_desire：claims 为空，不调用 verifier，联系应保留。
+            // 纯 self_desire：claims 为空也要过 coverage 门禁（verifier 返回 complete/entailed）。
             return QString(R"({"choice":"consider","concern_action":"contact","note":"想问候",)"
                            R"("contact":{"timing":"now","reason":"自己想到",)"
                            R"("message":"在忙吗",)"
@@ -1399,7 +1513,8 @@ private slots:
             QCOMPARE(row.value(1).toString(), QStringLiteral("withheld"));
         }
 
-        // 第 3 轮：纯 self_desire 且 claims 为空 → 不调用 verifier，联系保留为 proposed。
+        // 第 3 轮：纯 self_desire 且 claims 为空 → 仍必须走一次 verifier（coverage=complete/entailed），
+        // 联系保留为 proposed，语义结论写新值 entailed_coverage。
         context = nextReview(3);
         QVERIFY(!context.isEmpty());
         const int versionC = context.value(QStringLiteral("version")).toInt();
@@ -1407,9 +1522,9 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 1, 8000);
         proposal = finished.takeFirst().at(2).toJsonObject();
         contact = proposal.value(QStringLiteral("contact")).toObject();
-        QCOMPARE(verifierCalls, 1); // 没有新增 verifier 调用
+        QCOMPARE(verifierCalls, 2); // 第 2 轮（有声明事实）+ 第 3 轮（claims 为空）各一次
         QCOMPARE(contact.value(QStringLiteral("semantic_status")).toString(),
-                 QStringLiteral("not_required"));
+                 QStringLiteral("entailed_coverage"));
         QVERIFY(db.finishConcernReview(turn, versionC, proposal));
         QVERIFY(db.hasProposedContact(turn, versionC));
         {
@@ -1418,9 +1533,166 @@ private slots:
             row.addBindValue(turn);
             QVERIFY(row.exec() && row.next());
             QCOMPARE(row.value(0).toString(), QStringLiteral("proposed"));
-            QCOMPARE(row.value(1).toString(), QStringLiteral("not_required"));
+            QCOMPARE(row.value(1).toString(), QStringLiteral("entailed_coverage"));
         }
         QCOMPARE(reviewRound, 3);
+    }
+
+    // P0-1：模型回顾 claims=[] 却把主人承诺写进 message。单次 verifier 同时做 coverage：
+    // 判 claim_coverage=incomplete → 整项 withhold（claim_coverage_incomplete，不 repair），
+    // 记忆层最终关注仍 consider、没有 proposed contact。
+    void coverageGateWithholdsUndeclaredCommitment()
+    {
+        SemanticReviewConfigGuard config;
+        QVERIFY(config.enable());
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath("coverage-incomplete.db");
+        MemoryManager db(path);
+        int version = 0;
+        const qlonglong turn = seedDueConcernForSemanticReview(
+            db, path, QStringLiteral("coverage-incomplete"), &version);
+        QVERIFY(turn > 0);
+        QVERIFY(version > 0);
+
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QByteArray> bodies;
+        int verifierCalls = 0;
+        serveCompletions(server, bodies, [&](int) -> QString {
+            const QByteArray body = bodies.last();
+            if (body.contains("【语义核验】")) {
+                ++verifierCalls;
+                // 独立判定：message 里的"你答应过我要去睡觉"没有任何 declared_claim 覆盖。
+                return R"({"claim_coverage":"incomplete",)"
+                       R"("missing_claims":[{"type":"user_commitment","text":"主人答应过要去睡觉"}],)"
+                       R"("result":"insufficient","supporting_refs":[],)"
+                       R"("reason_code":"undeclared_commitment"})";
+            }
+            return QString(R"({"choice":"consider","concern_action":"contact","note":"想提醒睡觉",)"
+                           R"("contact":{"timing":"now","reason":"到点了",)"
+                           R"("message":"半个小时到了，你答应过我要去睡觉",)"
+                           R"("motivation":{"type":"self_desire","summary":"想提醒主人休息"},)"
+                           R"("claims":[]}})");
+        });
+        LLMService model(QStringLiteral("test"), nullptr,
+                         QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.serverPort())));
+        model.setMemoryManager(&db);
+        QSignalSpy finished(&model, &LLMService::privateReviewFinished);
+
+        model.requestPrivateReview(turn, version,
+                                   QJsonObject{{QStringLiteral("kind"), QStringLiteral("concern")}});
+        QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 1, 8000);
+        const auto proposal = finished.takeFirst().at(2).toJsonObject();
+        const auto contact = proposal.value(QStringLiteral("contact")).toObject();
+        QCOMPARE(contact.value(QStringLiteral("semantic_status")).toString(),
+                 QStringLiteral("withheld"));
+        QCOMPARE(contact.value(QStringLiteral("withhold_reason")).toString(),
+                 QStringLiteral("claim_coverage_incomplete"));
+        QCOMPARE(verifierCalls, 1); // 单次 verifier，不做 repair
+        // verifier 输入契约：message/reason/declared_claims/sources 同时给到，不能只喂声明。
+        QJsonObject verifierInput;
+        bool sawVerifierInput = false;
+        for (const auto &body : bodies) {
+            if (!body.contains("【语义核验】")) continue;
+            sawVerifierInput = true;
+            for (const auto &value : QJsonDocument::fromJson(body).object()
+                                         .value(QStringLiteral("messages")).toArray()) {
+                const auto message = value.toObject();
+                if (message.value(QStringLiteral("role")).toString() != QStringLiteral("user")) continue;
+                verifierInput = QJsonDocument::fromJson(
+                    message.value(QStringLiteral("content")).toString().toUtf8()).object();
+            }
+        }
+        QVERIFY(sawVerifierInput);
+        QCOMPARE(verifierInput.value(QStringLiteral("message")).toString(),
+                 QStringLiteral("半个小时到了，你答应过我要去睡觉"));
+        QCOMPARE(verifierInput.value(QStringLiteral("reason")).toString(), QStringLiteral("到点了"));
+        QCOMPARE(verifierInput.value(QStringLiteral("declared_claims")).toArray().size(), 0);
+        QCOMPARE(verifierInput.value(QStringLiteral("sources")).toArray().size(), 0);
+        QVERIFY(verifierInput.value(QStringLiteral("rules")).toString()
+                    .contains(QStringLiteral("覆盖")));
+
+        // 记忆层路径：关注放回 consider（不给 proposed），审计行 outcome/semantic_status=withheld。
+        QVERIFY(db.finishConcernReview(turn, version, proposal));
+        QVERIFY(!db.hasProposedContact(turn, version));
+        {
+            QSqlQuery row(QSqlDatabase::database("memory_db_connection"));
+            row.prepare("SELECT state FROM private_reflection WHERE turn_id=?");
+            row.addBindValue(turn);
+            QVERIFY(row.exec() && row.next());
+            QCOMPARE(row.value(0).toString(), QStringLiteral("consider"));
+        }
+        {
+            QSqlQuery row(QSqlDatabase::database("memory_db_connection"));
+            row.prepare("SELECT outcome,semantic_status FROM reflection_contact "
+                        "WHERE turn_id=? AND version=?");
+            row.addBindValue(turn);
+            row.addBindValue(version);
+            QVERIFY(row.exec() && row.next());
+            QCOMPARE(row.value(0).toString(), QStringLiteral("withheld"));
+            QCOMPARE(row.value(1).toString(), QStringLiteral("withheld"));
+        }
+    }
+
+    // P0-2：纯感受/问候（claims=[] 且 message 无外部事实）→ verifier 判
+    // claim_coverage=complete 且 result=entailed；联系保留为 proposed，语义状态=entailed_coverage。
+    void coverageGateAllowsPureGreeting()
+    {
+        SemanticReviewConfigGuard config;
+        QVERIFY(config.enable());
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath("coverage-greeting.db");
+        MemoryManager db(path);
+        int version = 0;
+        const qlonglong turn = seedDueConcernForSemanticReview(
+            db, path, QStringLiteral("coverage-greeting"), &version);
+        QVERIFY(turn > 0);
+        QVERIFY(version > 0);
+
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QByteArray> bodies;
+        int verifierCalls = 0;
+        serveCompletions(server, bodies, [&](int) -> QString {
+            const QByteArray body = bodies.last();
+            if (body.contains("【语义核验】")) {
+                ++verifierCalls;
+                return R"({"claim_coverage":"complete","missing_claims":[],)"
+                       R"("result":"entailed","supporting_refs":[],"reason_code":"pure_greeting"})";
+            }
+            return QString(R"({"choice":"consider","concern_action":"contact","note":"想问问好",)"
+                           R"("contact":{"timing":"now","reason":"突然想到",)"
+                           R"("message":"突然想你了，来看看你",)"
+                           R"("motivation":{"type":"self_desire","summary":"想和主人说说话"},)"
+                           R"("claims":[]}})");
+        });
+        LLMService model(QStringLiteral("test"), nullptr,
+                         QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.serverPort())));
+        model.setMemoryManager(&db);
+        QSignalSpy finished(&model, &LLMService::privateReviewFinished);
+
+        model.requestPrivateReview(turn, version,
+                                   QJsonObject{{QStringLiteral("kind"), QStringLiteral("concern")}});
+        QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 1, 8000);
+        const auto proposal = finished.takeFirst().at(2).toJsonObject();
+        const auto contact = proposal.value(QStringLiteral("contact")).toObject();
+        QCOMPARE(verifierCalls, 1); // claims 为空也必须过一次 coverage 核验
+        QCOMPARE(contact.value(QStringLiteral("semantic_status")).toString(),
+                 QStringLiteral("entailed_coverage"));
+        QVERIFY(db.finishConcernReview(turn, version, proposal));
+        QVERIFY(db.hasProposedContact(turn, version));
+        {
+            QSqlQuery row(QSqlDatabase::database("memory_db_connection"));
+            row.prepare("SELECT outcome,semantic_status FROM reflection_contact "
+                        "WHERE turn_id=? AND version=?");
+            row.addBindValue(turn);
+            row.addBindValue(version);
+            QVERIFY(row.exec() && row.next());
+            QCOMPARE(row.value(0).toString(), QStringLiteral("proposed"));
+            QCOMPARE(row.value(1).toString(), QStringLiteral("entailed_coverage"));
+        }
     }
 
     // 能力清单应包含"当前正在做的事"：来自 attention_state + 活动快照。

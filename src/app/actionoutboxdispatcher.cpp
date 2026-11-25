@@ -26,8 +26,8 @@ void ActionOutboxDispatcher::start(int intervalMs)
         m_timer=new QTimer(this);
         connect(m_timer,&QTimer::timeout,this,&ActionOutboxDispatcher::pollOnce);
     }
-    // 启动即冻结上一进程遗留的 dispatching：按 at-most-once 落 unknown，绝不重发。
-    recoverStale(0);
+    // P2：这里不再隐式 recoverStale(0)。启动恢复只由 AppController::startApp 的
+    // recoverStale(600) 执行一次，避免 600s 阈值被第二次 0s 恢复覆盖。
     if (intervalMs<100) intervalMs=100;
     m_timer->start(intervalMs);
 }
@@ -62,7 +62,9 @@ void ActionOutboxDispatcher::pollOnce()
     m_polling=true;
     auto resetPolling=qScopeGuard([this]{ m_polling=false; });
 
-    const auto job=m_memory->claimOutbox(m_owner,60);
+    // 租约 300s：网络渠道提交后要等协议回执，留足回执窗口（启动恢复阈值仍是 600s，
+    // 保证进程崩溃遗留的 dispatching 行不会被误当成可重领）。
+    const auto job=m_memory->claimOutbox(m_owner,300);
     if (job.isEmpty()) return;
     const auto actionKey=job.value(QStringLiteral("action_key")).toString();
     const auto payload=job.value(QStringLiteral("payload")).toObject();
@@ -96,12 +98,28 @@ void ActionOutboxDispatcher::pollOnce()
         return;
     }
 
-    // 已提交。pet 没有协议层回执，handed_off 即本地送达；QQ 的 handed_off 只是入队，
-    // 真正的终态由 onSendResult(protocol_accepted/rejected/unknown) 再 settle。
-    // 只有 QQ 才需要保留 in-flight payload 等协议回执；pet 不会再有回执。
-    if (utterance.channel!=Channel::kPet) m_inflight.insert(actionKey,settledPayload);
-    if (m_memory->settleOutboxAction(actionKey,QStringLiteral("handed_off")))
-        emit actionSettled(actionKey,QStringLiteral("handed_off"),settledPayload);
+    // pet 没有协议层回执：提交成功即本地送达，直接落 handed_off 并通知订阅方。
+    if (utterance.channel==Channel::kPet) {
+        if (m_memory->settleOutboxAction(actionKey,QStringLiteral("handed_off")))
+            emit actionSettled(actionKey,QStringLiteral("handed_off"),settledPayload);
+        return;
+    }
+
+    // P1：网络渠道（QQ 等）提交成功只代表已进入渠道，不是送达。这里不 settle、
+    // 不 emit handed_off：outbox/action 保持 dispatching，等 onSendResult 的协议回执
+    // （protocol_accepted/rejected/unknown）在一个事务里落终态。
+    // 若进程在回执前崩溃，重启后由 recoverStale(600) 冻结为 unknown，绝不重发。
+    m_inflight.insert(actionKey,settledPayload);
+}
+
+bool ActionOutboxDispatcher::proactiveHistoryEligible(const QString &outcome,
+                                                      const QString &channel)
+{
+    if (outcome==QStringLiteral("protocol_accepted")) return true;
+    // pet 没有协议回执，handed_off 表示气泡已经显示；其它渠道的 handed_off 只是入队。
+    if (outcome==QStringLiteral("handed_off") && channel==Channel::kPet) return true;
+    // unknown 表示"可能已送达但无法确认"，不能写成"茉子说过"；rejected/withheld 明确未发。
+    return false;
 }
 
 void ActionOutboxDispatcher::onSendResult(const QString &echo,const QString &outcome)

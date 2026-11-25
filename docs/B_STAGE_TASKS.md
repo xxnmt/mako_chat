@@ -190,3 +190,20 @@ v29/v30 migration：新增两表 + `reflection_contact` 三列（`motivation_jso
 验收方式与指标见 [B5 观测手册 §5.4](B_STAGE_ACCEPTANCE.md)；实施记录见 [AGENT_WORKLOG](AGENT_WORKLOG.md)。
 
 **明确未做/边界**：`ForegroundReply` 未迁入 outbox（报告延后）；语义 verifier 仅覆盖主动联系的事实 claims，且是单次判定不是真值证明；没有端到端 exactly-once；没有实现完整单一注意力；策略值（closure 窗口/quiet/频率）已配置化，未按产品体验最终定值。B5 的 24–48h shadow 与 7 天主动模式尚未开始。
+
+## 11. B5 blocker 最小修复（R10，2026-11-25）
+
+第四轮独立审计结论：A/B/C 方向正确，但 B5 条件性 NO-GO。按报告只做四个最小修复，不扩展架构：
+
+| 级别 | 问题 | 修复 |
+|---|---|---|
+| **P0** | 服务端只校验模型声明的 claims，message/reason 中未声明的事实可逃过授权（`claims=[] + "半个小时到了，你答应过…"` 仍可发） | `LLMService::finalizePrivateReview` 对新契约 `timing=now` **一律**做一次 coverage+entailment 核验；verifier 输入含 `message/reason/declared_claims/sources`，输出 `claim_coverage: complete/incomplete`；`incomplete` → 直接 `withheld/claim_coverage_incomplete`；纯感受/问候必须 `complete+entailed`（记 `entailed_coverage`）；verifier 不可用 → 保守 withhold |
+| **P1** | QQ 本地入队后立即持久化 `handed_off/dispatched`，enqueue 与 protocol receipt 之间崩溃会永久记成已送达 | dispatcher 对 QQ 成功后**不 settle**，保持 `dispatching` 等待 `protocol_accepted/rejected/unknown`；claim lease 60→300s；崩溃后由 `recoverStale(600)` 冻结为 `unknown`，不重发；pet 仍本地 `handed_off` 即时终态 |
+| **P1** | `unknown` 被写成确定的"茉子说过"（proactive history），形成自增强 | 新增 `ActionOutboxDispatcher::proactiveHistoryEligible(outcome,channel)`：`protocol_accepted` 与 pet `handed_off` 才写；`unknown/rejected/withheld` 不写（执行层仍冻结不重发） |
+| **P2** | `startApp` 的 `recoverStale(600)` 被 `start()` 内 `recoverStale(0)` 覆盖 | 删除 `start()` 的隐式恢复，只保留 `startApp` 一处 600s 阈值 |
+
+新增回归 fixture：`coverageGateWithholdsUndeclaredCommitment`（claims=[] + 未声明承诺 → withheld）、`coverageGateAllowsPureGreeting`（纯问候 → 允许）、`qqEnqueueAwaitsReceipt`、`qqCrashBeforeReceiptBecomesUnknown`、`startDoesNotImplicitlyRecover`、`proactiveHistoryEligibility`。
+
+验证：**`ctest` 23/23**（源工作树 + 应用运行中，测试目标可重链；`Windows_AI.exe` 因进程占用待关闭后重链）。P2 的 dispatch-time TOCTOU（commit 后 ~1s 内用户重新开口）按报告列为观察项，不阻塞 B5。
+
+B5 执行方式按报告修正：**不做 48h shadow**（旧直发链已移除，shadow 会重新引入双路径）；改为"完成本次修复 → 固定提交基线 → 2–4 小时受控冒烟（正常聊天 + 一次 self_desire/一次 reminder/一次晚安 close/一次重启）→ 无硬停止事件后直接进入 7 天自然使用验收"。

@@ -410,3 +410,20 @@ B5 的 7 天实机连续运行、真实 QQ 主动联系到达、多活动并行�
 验证：全量构建零错误；**`ctest` 23/23**；`tst_memorymanager` 105 passed/1 skipped、`tst_memoryagent` 75、`tst_actionoutbox` 9、`tst_actionpolicy` 9、`tst_cognitivesnapshot` 8。生产库备份 `QianDaoMoZi_memory.db.bak_before_v30_20261125_004447` 并迁移 `user_version=30`（action/outbox 表就绪，历史 now contact 中 1 行为旧协议接受审计，不可再投递）。
 
 明确边界：ForegroundReply 未迁；verifier 是单次 entailment 判定不是真值证明；无端到端 exactly-once；B5 的 24–48h shadow / 7 天主动模式未开始；策略值已配置化但未按体验定值。
+
+---
+
+## 2026-11-25 · B5 blocker 最小修复（R10）
+
+第四轮独立审计（`deep-research-report_4`）结论：A/B/C 方向正确、B5 条件性 NO-GO。按报告只修四个 blocker，不扩展架构：
+
+| 级别 | 修复 |
+|---|---|
+| P0 | 主动 contact 的 message/reason ↔ declared claims **覆盖门禁**：新契约 `timing=now` 一律单次 verifier 同时输出 `claim_coverage` + entailment；`incomplete` → withheld（`claim_coverage_incomplete`）；纯问候 `complete+entailed` → `entailed_coverage`；verifier 不可用 → 保守 withhold |
+| P1 | QQ 入队后**不再立即** `handed_off/dispatched`，保持 `dispatching` 等协议回执；lease 60→300s；崩溃后 `recoverStale(600)` → `unknown` 不重发；pet 仍即时 handed_off |
+| P1 | `unknown` 不再写 proactive history：新增 `proactiveHistoryEligible()`，仅 `protocol_accepted` 与 pet `handed_off` 可写 |
+| P2 | 删除 `start()` 内隐式 `recoverStale(0)`，只保留 `startApp` 的 600s 一处 |
+
+新增 6 个 fixture（coverage 两例、QQ 回执/崩溃、start 不隐式恢复、history eligibility）。验证：**ctest 23/23**；应用运行中，`Windows_AI.exe` 待关闭后重链。P2 的 dispatch-time ~1s TOCTOU 按报告列为观察项。
+
+B5 节奏按报告修正：固定提交基线 → 2–4h 受控冒烟（self_desire / reminder / 晚安 close / 重启各一次）→ 无硬停止事件后直接 7 天自然使用；不再做 48h shadow（旧直发链已删除，shadow 会重新引入双路径）。凭据需在 B5 前轮换。

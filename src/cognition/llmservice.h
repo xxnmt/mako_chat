@@ -115,8 +115,13 @@ private:
     quint64 m_reviewGeneration = 0;
     void generatePrivateReview(qlonglong id, int version, const QJsonObject &thread);
     // 切片 C：私人回顾输出 contact.motivation/claims 后的验证链。
-    // 先做确定性策略复核（ActionPolicy），再按配置做一次语义核验；失败时最多一次
-    // constrained repair，最后才 emit privateReviewFinished。全部在异步回调里完成。
+    // 先做确定性策略复核（ActionPolicy），再对 timing=="now" 的新契约联系做一次语义核验；
+    // 该次核验同时完成 claim coverage（message/reason 中的外部事实是否都被 declared_claims
+    // 覆盖）与 entailment（已声明事实是否被 sources 支持）。coverage 不完整直接 withhold
+    // （claim_coverage_incomplete，不 repair）；complete+entailed 在无已声明事实 claim 时记
+    // entailed_coverage（有事实 claim 时沿用记忆层门禁接受的 entailed）；complete+
+    // insufficient/contradicted 走既有 core/repair 逻辑（每 action 最多一次 repair）。
+    // 全部在异步回调里完成，最后才 emit privateReviewFinished。
     void finalizePrivateReview(qlonglong id, int version, const QJsonObject &thread,
                                const QJsonObject &proposal, const QString &error);
     void verifyPrivateReviewContact(qlonglong id, int version, const QJsonObject &thread,

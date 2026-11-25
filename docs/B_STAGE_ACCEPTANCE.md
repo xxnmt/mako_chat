@@ -197,6 +197,24 @@ semantic verifier 无限循环 = 0
 软指标：自主联系次数/日、closure 抑制比例、semantic reject/repair 比例、activity share unknown 比例、proactive 延迟、每 episode 模型调用数/token。
 停止条件（任一出现即关闭新 proactive dispatch，保留前台与 shadow 审计）：隐私泄露、同 action_key 重复发送、unknown 自动重发、无 action record 的外部副作用、internal wake 被当成委托。
 
+## 5.5 B5 blocker 修复后的观测点（R10）
+
+- **coverage 门禁**：主动 contact 的日志/DB 中，凡 `timing=now` 的新契约 contact 都应有 verifier 记录；`claim_coverage=incomplete` 应导致 `semantic_status=withheld` 且无外发。DB：
+  ```sql
+  select turn_id,semantic_status,last_outcome,claims_json,motivation_json
+    from reflection_contact where timing='now' order by turn_id desc limit 20;
+  ```
+- **QQ 回执窗口**：QQ 入队后 outbox 应保持 `dispatching`，直到 `protocol_accepted/rejected/unknown`；不应再看到"入队即 dispatched"。崩溃恢复：
+  ```sql
+  select action_key,state,lease_until,last_error from action_outbox where state='dispatching';
+  ```
+  `[Outbox] dispatch_abandoned` 后必须是 `unknown` 且不重发。
+- **unknown 认知边界**：`delivery_ledger`/`action` 可记录 `unknown`，但**不应**出现对应 `turn_kind='proactive'` 的 chat_history 行（即她不会把不确定送达当成"自己说过"）。
+- **单次恢复**：启动日志只应出现一处 stale 恢复（`startApp` 的 `recoverStale(600)`），不要出现 `start()` 的隐式 0 秒恢复。
+- **B5 节奏（修订）**：2–4 小时受控冒烟（正常交流 + self_desire/reminder/晚安 close/重启各一次）→ 无硬停止事件 → 直接 7 天自然使用；每日记录主观"哪里不像同一个茉子"和异常时间点，由 DSH 从日志/DB 汇总 action/outbox/coverage/verifier 指标。
+
+**凭据**：当前 `setting.json` 内含真实 API Key 与 QQ access token，B5 前必须轮换；新日志不得输出密钥。
+
 ## 6. 已知边界（不作为失败）
 
 - 多活动并行选择未实现（沿用单活动，ROADMAP 已列为后续）。

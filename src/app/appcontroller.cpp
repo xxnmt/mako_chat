@@ -237,12 +237,11 @@ AppController::AppController(QObject *parent)
             [recordProactive](const QString &actionKey,const QString &outcome,
                               const QJsonObject &payload) {
         qInfo() << "[Outbox] settled" << actionKey << outcome;
-        // "她说过"只能回写至少已经交给渠道的结果：rejected/withheld 明确未发送，绝不写。
-        // pet 没有协议层回执，handed_off 即气泡已显示；QQ 以 protocol_accepted/unknown 为准。
-        const bool delivered = outcome == QStringLiteral("protocol_accepted")
-            || outcome == QStringLiteral("unknown")
-            || (outcome == QStringLiteral("handed_off")
-                && payload.value(QStringLiteral("channel")).toString() == Channel::kPet);
+        // "她说过"只能回写至少已经交给渠道的结果：rejected/withheld 明确未发送，绝不写；
+        // unknown 只是"可能已送达但无法确认"，也不能写成她说过（执行层仍冻结不重发）。
+        // pet 没有协议层回执，handed_off 即气泡已显示；QQ 以 protocol_accepted 为准。
+        const bool delivered = ActionOutboxDispatcher::proactiveHistoryEligible(
+            outcome, payload.value(QStringLiteral("channel")).toString());
         if (!delivered) return;
         const QString text = payload.value(QStringLiteral("text")).toString();
         const QString channel = payload.value(QStringLiteral("channel")).toString();
@@ -373,7 +372,8 @@ AppController::AppController(QObject *parent)
             : 0;
         if (activityId <= 0) return;
         // 切片 B：不再直接发送。canShareThought/artifact/版本/去重校验都在 commit 内完成；
-        // 历史回写由 actionSettled（protocol_accepted/unknown）驱动，避免"没发就说她说过"。
+        // 历史回写由 actionSettled（protocol_accepted，或 pet 的 handed_off）驱动，
+        // unknown/rejected/withheld 不写，避免"没确认发出去就说她说过"。
         const auto committed=m_actionCommitter->commitActivityShare(activityId,version,draft);
         if (committed.contains(QStringLiteral("error")))
             qInfo() << "[Share] commit rejected" << activityId << version
@@ -452,8 +452,9 @@ AppController::~AppController()
 
 void AppController::startApp()
 {
-    // 切片 B：启动恢复先于轮询。上一进程留在 dispatching 的主动外发无法确认是否已送达，
-    // 按 at-most-once 冻结为 unknown（绝不自动重发）；随后启动 outbox 唯一发送循环。
+    // 切片 B：启动恢复先于轮询，且这里是唯一的启动恢复点。上一进程留在 dispatching 的
+    // 主动外发无法确认是否已送达，按 at-most-once 冻结为 unknown（绝不自动重发）；
+    // 随后启动 outbox 唯一发送循环（dispatcher.start 不再隐式恢复，避免覆盖 600s 阈值）。
     if (m_actionOutbox) {
         const int recovered = m_actionOutbox->recoverStale(600);
         if (recovered > 0)

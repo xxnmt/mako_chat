@@ -44,6 +44,18 @@ public:
         }
         return q.value(0);
     }
+    // 参数化执行：手工构造"网络渠道待发/已领取"的行时避免 SQL 字符串拼接。
+    bool execPrepared(const QString &sql, const QVariantList &values)
+    {
+        QSqlQuery q(m_db);
+        q.prepare(sql);
+        for (const auto &value : values) q.addBindValue(value);
+        if (!q.exec()) {
+            qWarning() << "prepared exec failed:" << sql << q.lastError().text();
+            return false;
+        }
+        return true;
+    }
     // 插入一条 pending 提醒；turn 用全局递减负数，避免撞 UNIQUE(turn,due) 与删除触发器。
     bool insertReminder(qlonglong turn, const QString &channel, const QString &session,
                         int dueOffsetSeconds, int expiresOffsetSeconds, const QString &message,
@@ -203,6 +215,29 @@ static qlonglong seedCompletedActivity(MemoryManager &mm, const QString &userTex
         return 0;
     if (sharedVersion) *sharedVersion = version + 1;
     return id;
+}
+
+// 手工放一条网络渠道（QQ）的 queued 动作 + outbox 行，绕开 committer 的领域校验，
+// 用于验证"入队成功但未拿到协议回执"的状态机。
+static bool insertQueuedNetworkAction(const QString &dbPath, const QString &tag,
+                                      const QString &actionKey, const QString &kind,
+                                      const QString &channel, const QString &session,
+                                      const QString &payloadJson)
+{
+    RawDb raw(dbPath, tag);
+    if (!raw.open()) return false;
+    if (!raw.execPrepared(
+            QStringLiteral("INSERT INTO cognitive_action(action_key,kind,trigger_ref,subject,"
+                           "channel,session_id,payload_json,state) "
+                           "VALUES(?,?,'manual','user',?,?,?,'queued')"),
+            {actionKey, kind, channel, session, payloadJson}))
+        return false;
+    return raw.execPrepared(
+        QStringLiteral("INSERT INTO action_outbox(action_id,action_key,channel,session_id,"
+                       "payload_json,state,attempts) "
+                       "SELECT id,?,?,?,payload_json,'queued',0 FROM cognitive_action "
+                       "WHERE action_key=?"),
+        {actionKey, channel, session, actionKey});
 }
 
 class TestActionOutbox : public QObject
@@ -616,7 +651,7 @@ private slots:
                      QStringLiteral("dispatched"));
         }
 
-        // QQ 回执：echo=action_key → settle 把 handed_off 升级成 protocol_accepted 终态。
+        // QQ 回执：echo=action_key → 提交后保持 dispatching，收到 protocol_accepted 才落终态。
         {
             RawDb raw(path, "dispatch-qq");
             QVERIFY(raw.open());
@@ -676,6 +711,219 @@ private slots:
         QCOMPARE(sent.size(), 5); // 第二次拒绝后终止，不再发送
         // 启动恢复入口在 dispatcher 上也存在（转发给 MemoryManager）。
         QCOMPARE(dispatcher.recoverStale(600), 0);
+    }
+
+    // 10. P1：QQ 入队成功不等于送达。pollOnce 后 outbox/action 必须仍是 dispatching，
+    //     不 emit handed_off；等到 onSendResult(protocol_accepted) 才落终态。
+    void qqEnqueueAwaitsReceipt()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableProactive());
+        const QString path = dir.filePath("qq-await.db");
+        MemoryManager db(path);
+        const QString key = QStringLiteral("reminder:424242:delivery");
+        QVERIFY(insertQueuedNetworkAction(
+            path, QStringLiteral("qq-await-seed"), key, QStringLiteral("ReminderDelivery"),
+            Channel::kQQPrivate, QStringLiteral("10001"),
+            QStringLiteral(R"({"message":"早点睡","channel":"qq_private","session":"10001"})")));
+
+        struct Sent { Utterance utterance; bool accepted = true; };
+        QList<Sent> sent;
+        QList<QPair<QString, QString>> settled;
+        ActionOutboxDispatcher dispatcher(&db);
+        dispatcher.setSender([&sent](const Utterance &u) {
+            Sent item;
+            item.utterance = u;
+            sent.append(item);
+            return true;
+        });
+        connect(&dispatcher, &ActionOutboxDispatcher::actionSettled,
+                this, [&settled](const QString &actionKey, const QString &outcome,
+                                 const QJsonObject &) {
+            settled.append(qMakePair(actionKey, outcome));
+        });
+
+        dispatcher.pollOnce();
+        QCOMPARE(sent.size(), 1);
+        QCOMPARE(sent.first().utterance.channel, Channel::kQQPrivate);
+        QCOMPARE(sent.first().utterance.sessionId, QStringLiteral("10001"));
+        QCOMPARE(sent.first().utterance.text, QStringLiteral("早点睡"));
+        QCOMPARE(sent.first().utterance.deliveryEcho, key);
+        // 没有协议回执前：既不能 settle handed_off，也不能把 outbox 标成 dispatched。
+        QVERIFY(settled.isEmpty());
+        {
+            RawDb raw(path, "qq-await-raw1");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM action_outbox WHERE action_key='%1'")
+                                    .arg(key)).toString(),
+                     QStringLiteral("dispatching"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM cognitive_action WHERE action_key='%1'")
+                                    .arg(key)).toString(),
+                     QStringLiteral("dispatching"));
+            // 租约从 60s 提到 300s：回执窗口必须足够长（启动恢复阈值仍是 600s）。
+            const int lease = raw.scalar(QStringLiteral(
+                "SELECT lease_until-unixepoch() FROM action_outbox WHERE action_key='%1'").arg(key)).toInt();
+            QVERIFY2(lease >= 290 && lease <= 300, qPrintable(QString::number(lease)));
+        }
+
+        dispatcher.onSendResult(key, QStringLiteral("protocol_accepted"));
+        QCOMPARE(settled.size(), 1);
+        QCOMPARE(settled.first().first, key);
+        QCOMPARE(settled.first().second, QStringLiteral("protocol_accepted"));
+        {
+            RawDb raw(path, "qq-await-raw2");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM action_outbox WHERE action_key='%1'")
+                                    .arg(key)).toString(),
+                     QStringLiteral("dispatched"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM cognitive_action WHERE action_key='%1'")
+                                    .arg(key)).toString(),
+                     QStringLiteral("handed_off"));
+            QCOMPARE(raw.scalar(QStringLiteral(
+                                    "SELECT last_outcome FROM cognitive_action WHERE action_key='%1'").arg(key))
+                         .toString(),
+                     QStringLiteral("protocol_accepted"));
+        }
+    }
+
+    // 11. P1：入队后、回执前崩溃 → 租约过期后 recoverStale(600) 冻结为 unknown，
+    //     绝不重发；迟到的 protocol_accepted 也不能把 unknown 改回已送达。
+    void qqCrashBeforeReceiptBecomesUnknown()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableProactive());
+        const QString path = dir.filePath("qq-crash.db");
+        MemoryManager db(path);
+        const QString key = QStringLiteral("reminder:515151:delivery");
+        QVERIFY(insertQueuedNetworkAction(
+            path, QStringLiteral("qq-crash-seed"), key, QStringLiteral("ReminderDelivery"),
+            Channel::kQQPrivate, QStringLiteral("10001"),
+            QStringLiteral(R"({"message":"别忘了喝水","channel":"qq_private","session":"10001"})")));
+
+        ActionOutboxDispatcher dispatcher(&db);
+        dispatcher.setSender([](const Utterance &) { return true; });
+        dispatcher.pollOnce();
+        {
+            RawDb raw(path, "qq-crash-expire");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM action_outbox WHERE action_key='%1'")
+                                    .arg(key)).toString(),
+                     QStringLiteral("dispatching"));
+            // 模拟"提交后进程崩溃、重启时租约已过期超过 600s 阈值"。
+            QVERIFY(raw.exec(QStringLiteral(
+                "UPDATE action_outbox SET lease_until=unixepoch()-7200,"
+                "dispatched_at=unixepoch()-7200 WHERE action_key='%1'").arg(key)));
+        }
+        QCOMPARE(dispatcher.recoverStale(600), 1);
+        {
+            RawDb raw(path, "qq-crash-raw");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM action_outbox WHERE action_key='%1'")
+                                    .arg(key)).toString(),
+                     QStringLiteral("unknown"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM cognitive_action WHERE action_key='%1'")
+                                    .arg(key)).toString(),
+                     QStringLiteral("unknown"));
+        }
+        // unknown 不可重领；迟到的明确接受也必须被冻结语义忽略。
+        QVERIFY(db.claimOutbox(QStringLiteral("owner-after-crash"), 300).isEmpty());
+        QVERIFY(db.settleOutboxAction(key, QStringLiteral("protocol_accepted")));
+        {
+            RawDb raw(path, "qq-crash-frozen");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM action_outbox WHERE action_key='%1'")
+                                    .arg(key)).toString(),
+                     QStringLiteral("unknown"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM cognitive_action WHERE action_key='%1'")
+                                    .arg(key)).toString(),
+                     QStringLiteral("unknown"));
+        }
+        // unknown 不代表"茉子说过"（历史回写资格由 dispatcher 统一判定）。
+        QVERIFY(!ActionOutboxDispatcher::proactiveHistoryEligible(QStringLiteral("unknown"),
+                                                                  Channel::kQQPrivate));
+    }
+
+    // 12. P2：start() 不再隐式恢复。stale dispatching 行在 start() + 一次轮询后保持原状，
+    //     只有显式 recoverStale(600) 才会冻结为 unknown（恢复点唯一）。
+    void startDoesNotImplicitlyRecover()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableProactive());
+        const QString path = dir.filePath("start-recover.db");
+        MemoryManager db(path);
+        const QString key = QStringLiteral("reminder:616161:delivery");
+        QVERIFY(insertQueuedNetworkAction(
+            path, QStringLiteral("start-recover-seed"), key, QStringLiteral("ReminderDelivery"),
+            Channel::kQQPrivate, QStringLiteral("10001"),
+            QStringLiteral(R"({"message":"该睡了","channel":"qq_private","session":"10001"})")));
+        // 模拟上一进程领取后崩溃：行已是 dispatching，且租约早已过期。
+        QVERIFY(!db.claimOutbox(QStringLiteral("crashed-process"), 60).isEmpty());
+        {
+            RawDb raw(path, "start-recover-expire");
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral(
+                "UPDATE action_outbox SET lease_until=unixepoch()-7200 WHERE action_key='%1'").arg(key)));
+        }
+
+        QList<QPair<QString, QString>> settled;
+        ActionOutboxDispatcher dispatcher(&db);
+        dispatcher.setSender([](const Utterance &) { return true; });
+        connect(&dispatcher, &ActionOutboxDispatcher::actionSettled,
+                this, [&settled](const QString &actionKey, const QString &outcome,
+                                 const QJsonObject &) {
+            settled.append(qMakePair(actionKey, outcome));
+        });
+        dispatcher.start(100);
+        QTest::qWait(250); // 让启动后的轮询跑几拍：不能发生隐式恢复，也不需要发送
+        {
+            RawDb raw(path, "start-recover-still");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM action_outbox WHERE action_key='%1'")
+                                    .arg(key)).toString(),
+                     QStringLiteral("dispatching"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM cognitive_action WHERE action_key='%1'")
+                                    .arg(key)).toString(),
+                     QStringLiteral("dispatching"));
+        }
+        QVERIFY(settled.isEmpty());
+        dispatcher.stop();
+        QCOMPARE(dispatcher.recoverStale(600), 1);
+        {
+            RawDb raw(path, "start-recover-done");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM action_outbox WHERE action_key='%1'")
+                                    .arg(key)).toString(),
+                     QStringLiteral("unknown"));
+        }
+    }
+
+    // 13. P1：主动历史回写资格。"茉子说过"只能写至少已经交给渠道的结果。
+    void proactiveHistoryEligibility()
+    {
+        QVERIFY(ActionOutboxDispatcher::proactiveHistoryEligible(
+            QStringLiteral("protocol_accepted"), Channel::kQQPrivate));
+        QVERIFY(ActionOutboxDispatcher::proactiveHistoryEligible(
+            QStringLiteral("protocol_accepted"), Channel::kPet));
+        QVERIFY(ActionOutboxDispatcher::proactiveHistoryEligible(
+            QStringLiteral("handed_off"), Channel::kPet));
+        // QQ 的 handed_off 只是入队，不是送达。
+        QVERIFY(!ActionOutboxDispatcher::proactiveHistoryEligible(
+            QStringLiteral("handed_off"), Channel::kQQPrivate));
+        // unknown/rejected/withheld 一律不能写成"她说过"。
+        QVERIFY(!ActionOutboxDispatcher::proactiveHistoryEligible(
+            QStringLiteral("unknown"), Channel::kQQPrivate));
+        QVERIFY(!ActionOutboxDispatcher::proactiveHistoryEligible(
+            QStringLiteral("unknown"), Channel::kPet));
+        QVERIFY(!ActionOutboxDispatcher::proactiveHistoryEligible(
+            QStringLiteral("rejected"), Channel::kQQPrivate));
+        QVERIFY(!ActionOutboxDispatcher::proactiveHistoryEligible(
+            QStringLiteral("withheld"), Channel::kPet));
     }
 };
 
