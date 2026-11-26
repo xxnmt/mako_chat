@@ -105,6 +105,13 @@ CognitiveCoordinator::CognitiveCoordinator(MemoryManager &memory, LLMService &mo
     // 置为 interrupted，并把调度推到 now，由 reviewIfDue 重新领取；本片只恢复内部唤醒。
     const int recoveredWakes = store.recoverOpenWakeLeases(1800);
     qInfo() << "[OpenWake] recovered=" << recoveredWakes;
+    // R12-1b：统一活动（legacy thought + internal_activity）的启动恢复只做只读诊断：
+    // 报告跨存储 active/paused 冲突与当前到期列表，不重复创建、不领取、不修改生命周期；
+    // 真正的到期领取仍由 reviewIfDue → PrivateReview::wake 的 nextDueActivity 决定。
+    const auto activityRecovery = store.recoverActivities(QStringLiteral("owner"));
+    qInfo().noquote()
+        << QStringLiteral("[Activity] recovered=")
+               + QString::fromUtf8(QJsonDocument(activityRecovery).toJson(QJsonDocument::Compact));
     // 上次运行若在"联系投递"中退出，会留下 dispatching 的 contact 行。领取后无法确认消息
     // 是否已经交给渠道，只能按 at-most-once 落 unknown（可能已送达），不再重发。
     store.recoverStaleContacts(600);

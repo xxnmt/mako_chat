@@ -43,6 +43,12 @@ public:
         for (const auto &value : binds) query.addBindValue(value);
         return query.exec();
     }
+    QVariant scalar(const QString &sql)
+    {
+        QSqlQuery query(m_db);
+        if (!query.exec(sql) || !query.next()) return {};
+        return query.value(0);
+    }
 
 private:
     QString m_connection;
@@ -113,6 +119,32 @@ QList<SentenceText> singleSentence(const QString &text)
     sentence.zhText = text;
     sentence.jaText = QString();
     return {sentence};
+}
+
+// R12-1b：新 saveQATurn 不再写 chat_history.thought。快照的当前活动域读取统一视图
+// （legacy thought/<id> + internal activity/<id>），需要 legacy 行的快照用例在这里显式补写。
+static qlonglong promoteLatestTurnToThought(MemoryManager &db, const QString &interest)
+{
+    RawDb raw(db.databasePath());
+    if (!raw.open()) return 0;
+    const qlonglong turn = raw.scalar(QStringLiteral("SELECT max(id) FROM chat_history")).toLongLong();
+    if (turn <= 0) return 0;
+    const auto nowIso = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    const QJsonObject stored{
+        {QStringLiteral("status"), QStringLiteral("active")},
+        {QStringLiteral("goal_kind"), QStringLiteral("interest")},
+        {QStringLiteral("source_turn"), turn},
+        {QStringLiteral("created_at"), nowIso},
+        {QStringLiteral("updated_at"), nowIso},
+        {QStringLiteral("artifact_ref"), QString{}}};
+    if (!raw.exec(QStringLiteral(
+                      "UPDATE chat_history SET thought=?,thought_result=?,review_after=0 "
+                      "WHERE id=?"),
+                  {interest,
+                   QString::fromUtf8(QJsonDocument(stored).toJson(QJsonDocument::Compact)),
+                   turn}))
+        return 0;
+    return turn;
 }
 
 // R12-0：快照 stats 的权限过滤用例需要临时写 identity.json（盲区），析构时恢复。
@@ -207,14 +239,17 @@ private slots:
                                           QStringLiteral("茉子主动说出的那句话"),
                                           QStringLiteral("contact"), QStringLiteral("ref/1")) > 0);
 
-        // (e) active thought → Activity（同时是自发动机）
+        // (e) active thought → Activity（同时是自发动机）。R12-1b：新代码不写 thought，
+        // 这里显式补一条 legacy 活动行来验证快照的统一读取（legacy + internal）。
         RequestMeta thoughtMeta = ownerMeta(4);
         QVERIFY(db.saveQATurn(
             QStringLiteral("你想做点什么"),
-            QStringLiteral(R"({"personal_interest":"想写一首关于雨的诗","sentences":[{"zh_text":"好呀","ja_text":"","tags":{}}]})"),
+            QStringLiteral(R"({"sentences":[{"zh_text":"好呀","ja_text":"","tags":{}}]})"),
             singleSentence(QStringLiteral("好呀")), thoughtMeta));
-        const qlonglong activityId = db.nextThought(false).value(QStringLiteral("id")).toInteger();
+        const qlonglong activityId =
+            promoteLatestTurnToThought(db, QStringLiteral("想写一首关于雨的诗"));
         QVERIFY(activityId > 0);
+        QCOMPARE(db.nextThought(false).value(QStringLiteral("id")).toInteger(), activityId);
 
         // (f) pending reminder → Commitment（真实委托）
         {
@@ -335,8 +370,9 @@ private slots:
         // 私人活动 + 真实委托 + 内部唤醒。
         QVERIFY(db.saveQATurn(
             QStringLiteral("你想做点什么"),
-            QStringLiteral(R"({"personal_interest":"整理旧照片","sentences":[{"zh_text":"好呀","ja_text":"","tags":{}}]})"),
+            QStringLiteral(R"({"sentences":[{"zh_text":"好呀","ja_text":"","tags":{}}]})"),
             singleSentence(QStringLiteral("好呀")), ownerMeta(60)));
+        QVERIFY(promoteLatestTurnToThought(db, QStringLiteral("整理旧照片")) > 0);
         {
             RawDb raw(db.databasePath());
             QVERIFY(raw.open());
@@ -675,12 +711,12 @@ private slots:
                                        {QStringLiteral("ja_text"), QString()},
                                        {QStringLiteral("tags"), QJsonObject{}}};
         const QJsonObject replyPayload{
-            {QStringLiteral("personal_interest"), longText.left(120)},
             {QStringLiteral("sentences"), QJsonArray{longSentence}}};
         QVERIFY(db.saveQATurn(QStringLiteral("你想做点什么"),
                               QString::fromUtf8(QJsonDocument(replyPayload)
                                                     .toJson(QJsonDocument::Compact)),
                               singleSentence(longText), ownerMeta(60)));
+        QVERIFY(promoteLatestTurnToThought(db, longText.left(120)) > 0);
         // 真实委托（提醒 message 长，但 manager 会截断到读取上限）。
         {
             RawDb raw(db.databasePath());
@@ -835,6 +871,93 @@ private slots:
         QVERIFY(groupSnapshot.internalWakes.isEmpty());
         QVERIFY(anyNotePrefix(groupBuilder.stats().notes,
                               QStringLiteral("group_projection:")));
+    }
+
+    // 8b. R12-1b：internal 活动进入 owner 私人快照（ref/origin/status/version/goal/progress），
+    //     completed 不进入 current，群聊/第三方投影不读取、不泄漏。
+    void snapshotInternalActivityUnifiedAndIsolated()
+    {
+        IdentityFileGuard identityGuard;
+        QVERIFY(identityGuard.write(QByteArray(
+            R"({"cognition":{"snapshot_budget_bytes":4096}})")));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager db(dir.filePath(QStringLiteral("internal-activity.db")));
+        QString error;
+        const auto created = db.createActivity(
+            QStringLiteral("owner"), Channel::kPet, Channel::kDefaultSession,
+            QStringLiteral("整理旧照片"), QStringLiteral("先按年份分组"),
+            QStringLiteral("foreground"), QStringLiteral("chat/501"),
+            QStringLiteral("run-snapshot-activity"), &error);
+        QVERIFY2(!created.isEmpty(), qPrintable(error));
+        const QString ref = created.value(QStringLiteral("ref")).toString();
+        QVERIFY(ref.startsWith(QStringLiteral("activity/")));
+
+        CognitiveSnapshotBuilder ownerBuilder(&db);
+        const auto ownerSnapshot = ownerBuilder.build(
+            ownerMeta(1), QStringLiteral("run-activity-owner"),
+            QStringLiteral("foreground"), QStringLiteral("foreground_reply"));
+        const auto row = findJsonObjectByRef(ownerSnapshot.activities, ref);
+        QVERIFY(!row.isEmpty());
+        QCOMPARE(row.value(QStringLiteral("origin")).toString(), QStringLiteral("internal"));
+        QCOMPARE(row.value(QStringLiteral("origin_kind")).toString(),
+                 QStringLiteral("foreground"));
+        QCOMPARE(row.value(QStringLiteral("status")).toString(), QStringLiteral("active"));
+        QCOMPARE(row.value(QStringLiteral("version")).toInt(), 1);
+        QCOMPARE(row.value(QStringLiteral("goal")).toString(), QStringLiteral("先按年份分组"));
+        const auto ownerStats = ownerBuilder.stats();
+        QVERIFY(ownerStats.domains.value(QStringLiteral("activities")).eligible >= 1);
+        QVERIFY(ownerStats.domains.value(QStringLiteral("activities")).queried
+                >= ownerStats.domains.value(QStringLiteral("activities")).eligible);
+        const auto ownerPrompt = ownerBuilder.toPromptJson(ownerSnapshot);
+        QVERIFY(QJsonDocument(ownerPrompt.value(QStringLiteral("activities")).toArray())
+                    .toJson(QJsonDocument::Compact).contains(ref.toUtf8()));
+
+        // 群聊投影：不读取 owner 私人活动，prompt 里也不出现该 ref。
+        RequestMeta groupMeta = ownerMeta(2, Channel::kQQGroup, QStringLiteral("30001"));
+        groupMeta.actorId = QStringLiteral("10001");
+        CognitiveSnapshotBuilder groupBuilder(&db);
+        const auto groupSnapshot = groupBuilder.build(
+            groupMeta, QStringLiteral("run-activity-group"),
+            QStringLiteral("foreground"), QStringLiteral("foreground_reply"));
+        QVERIFY(groupSnapshot.activities.isEmpty());
+        QVERIFY(anyNotePrefix(groupBuilder.stats().notes, QStringLiteral("group_projection:")));
+        const auto groupPrompt = groupBuilder.toPromptJson(groupSnapshot);
+        QVERIFY(!QJsonDocument(groupPrompt.value(QStringLiteral("activities")).toArray())
+                     .toJson(QJsonDocument::Compact).contains(ref.toUtf8()));
+
+        // 第三方（subject 非主人）：即使走 qq_private 也不读取私人活动。
+        RequestMeta thirdMeta = ownerMeta(3, Channel::kQQPrivate, QStringLiteral("2014366825"));
+        thirdMeta.subject = QStringLiteral("qq:10001");
+        thirdMeta.actorId = QStringLiteral("10001");
+        CognitiveSnapshotBuilder thirdBuilder(&db);
+        const auto thirdSnapshot = thirdBuilder.build(
+            thirdMeta, QStringLiteral("run-activity-third"),
+            QStringLiteral("foreground"), QStringLiteral("foreground_reply"));
+        QVERIFY(thirdSnapshot.activities.isEmpty());
+        QVERIFY(anyNotePrefix(thirdBuilder.stats().notes,
+                              QStringLiteral("third_party_projection:")));
+        const auto thirdPrompt = thirdBuilder.toPromptJson(thirdSnapshot);
+        QVERIFY(!QJsonDocument(thirdPrompt.value(QStringLiteral("activities")).toArray())
+                     .toJson(QJsonDocument::Compact).contains(ref.toUtf8()));
+
+        // completed 后不再进入 current（即使还留着过时的 next_step）。
+        const auto finished = db.finishActivity(
+            ref, 1,
+            QJsonObject{{QStringLiteral("status"), QStringLiteral("completed")},
+                        {QStringLiteral("reflection"), QStringLiteral("整理完了")},
+                        {QStringLiteral("draft"), QStringLiteral("按年份分好了")},
+                        {QStringLiteral("next_step"), QStringLiteral("过时步骤")}},
+            &error);
+        QVERIFY2(!finished.isEmpty(), qPrintable(error));
+        CognitiveSnapshotBuilder afterBuilder(&db);
+        const auto afterSnapshot = afterBuilder.build(
+            ownerMeta(4), QStringLiteral("run-activity-after"),
+            QStringLiteral("foreground"), QStringLiteral("foreground_reply"));
+        QVERIFY(findJsonObjectByRef(afterSnapshot.activities, ref).isEmpty());
+        QVERIFY(!QJsonDocument(afterBuilder.toPromptJson(afterSnapshot)
+                                   .value(QStringLiteral("activities")).toArray())
+                     .toJson(QJsonDocument::Compact).contains("过时步骤"));
     }
 
     // 8b. R12-1a：OpenWake 内部记录/调度按 scope 隔离：默认只读 owner scope；

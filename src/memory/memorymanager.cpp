@@ -20,6 +20,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QRegularExpression>
+#include <algorithm>
 #include <QDebug>
 #include <QDate>
 #include <QTime>
@@ -108,15 +109,17 @@ bool MemoryManager::saveQATurn(const QString &userInput, const QString &rawReply
         rootObj["conversation_action"] = action;
     QString JsonStr = QJsonDocument(rootObj).toJson(QJsonDocument::Compact);
 
-    QString thought;
+    QString personalInterest;
     QJsonArray updates;
     if (meta.longTermMemoryEnabled && meta.persistTurn && !meta.sensitive
         && meta.turnKind == "reply" && !meta.subject.isEmpty()
         && (meta.channel == Channel::kPet || !meta.actorId.isEmpty())) {
         if (meta.subject == "user" && (meta.channel == Channel::kPet || meta.channel == Channel::kQQPrivate)) {
+            // R12-1b：合法 personal_interest 不再写 chat_history.thought，改为下面在拿到
+            // 本轮 id 后创建统一 internal 活动（私有写入门控 + 幂等 + 单 active）。
             const auto candidate = response["personal_interest"].toString().trimmed();
-            if (!candidate.isEmpty() && candidate.size() <= 120 && !hasActiveThought(meta.subject))
-                thought = candidate;
+            if (!candidate.isEmpty() && candidate.size() <= 120)
+                personalInterest = candidate;
         }
         const auto proposals = meta.eventId.isEmpty() ? response["state_updates"].toArray() : QJsonArray{};
         for (const auto &proposal : proposals) {
@@ -134,14 +137,15 @@ bool MemoryManager::saveQATurn(const QString &userInput, const QString &rawReply
     QSqlQuery query(m_db);
     if (receivedTurn != 0) {
         if (sentences.isEmpty()) return false;
-        query.prepare("UPDATE chat_history SET raw_reply=:raw_reply,thought=:thought,turn_state='handed_off' "
+        // R12-1b：恢复轮次不再覆盖 thought（新代码不写 legacy thought 列）。
+        query.prepare("UPDATE chat_history SET raw_reply=:raw_reply,turn_state='handed_off' "
                       "WHERE id=:id AND cognitive_event=:event AND turn_state='received'");
         query.bindValue(":id", receivedTurn);
         query.bindValue(":event", meta.eventId);
     } else {
         query.prepare("INSERT INTO chat_history "
-                      "(user_input, raw_reply, channel, session_id, speaker, sensitive, turn_kind, trigger_event_ids, subject, state_updates, thought, cognitive_event, timestamp) "
-                      "VALUES (:user_input, :raw_reply, :channel, :session_id, :speaker, :sensitive, :turn_kind, :trigger_event_ids, :subject, :updates, :thought, :event, :timestamp)");
+                      "(user_input, raw_reply, channel, session_id, speaker, sensitive, turn_kind, trigger_event_ids, subject, state_updates, cognitive_event, timestamp) "
+                      "VALUES (:user_input, :raw_reply, :channel, :session_id, :speaker, :sensitive, :turn_kind, :trigger_event_ids, :subject, :updates, :event, :timestamp)");
         query.bindValue(":event", meta.eventId);
         query.bindValue(":updates", updates.isEmpty() ? QVariant(QMetaType(QMetaType::QString))
             : QVariant(QString::fromUtf8(QJsonDocument(updates).toJson(QJsonDocument::Compact))));
@@ -158,7 +162,6 @@ bool MemoryManager::saveQATurn(const QString &userInput, const QString &rawReply
             ? meta.receivedAtUtc.toLocalTime() : QDateTime::currentDateTime();
         query.bindValue(":timestamp", logicalTime.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")));
     }
-    query.bindValue(":thought", thought);
     query.bindValue(":raw_reply", JsonStr);
     if (!query.exec()) {
         qDebug()<<"[MemoryManager]:本轮对话保存失败:"<<query.lastError().text();
@@ -167,46 +170,100 @@ bool MemoryManager::saveQATurn(const QString &userInput, const QString &rawReply
 
     if (query.numRowsAffected() != 1) return false;
     const qlonglong indexedTurn = receivedTurn > 0 ? receivedTurn : query.lastInsertId().toLongLong();
-    if (!thought.isEmpty() && indexedTurn > 0) {
-        // B2：念头/活动的持久化档案。source_turn 必须等于所在行 id；新插入时只有拿到
-        // last_insert_rowid 才知道 id，所以插入成功后在同一连接内补写一次（恢复轮次直接
-        // 用 receivedTurn）。这里覆盖该行 thought_result 是安全的：能在本轮创建活动的前
-        // 提是 hasActiveThought()==false，即该行还没有活动档案。
-        const auto nowIso = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
-        const QJsonObject result{
-            {QStringLiteral("status"), QStringLiteral("active")},
-            {QStringLiteral("goal_kind"), QStringLiteral("interest")},
-            {QStringLiteral("source_turn"), indexedTurn},
-            {QStringLiteral("created_at"), nowIso},
-            {QStringLiteral("updated_at"), nowIso},
-            {QStringLiteral("artifact_ref"), QString{}}};
-        QSqlQuery init(m_db);
-        init.prepare("UPDATE chat_history SET thought_result=? "
-                     "WHERE id=? AND thought IS NOT NULL AND thought<>''");
-        init.addBindValue(QString::fromUtf8(QJsonDocument(result).toJson(QJsonDocument::Compact)));
-        init.addBindValue(indexedTurn);
-        if (!init.exec() || init.numRowsAffected() != 1)
-            qWarning() << "[MemoryManager]thought_result 初始化失败:" << indexedTurn << init.lastError();
-    }
     if (indexedTurn > 0 && !indexChatTurn(indexedTurn))
         qWarning() << "[MemoryIndex] incremental chat index failed:" << indexedTurn;
     else if (indexedTurn > 0 && !meta.sensitive)
         emit searchChunksChanged();
+    // R12-1b：前台 personal_interest 统一创建 internal 活动（不写 thought、不伪造聊天行）。
+    // 创建发生在 chat 行落库之后：失败不会回滚这轮对话，也不会退回 legacy thought。
+    if (!personalInterest.isEmpty() && indexedTurn > 0) {
+        const auto proactive = ConfigManager::instance().getProactiveConfig();
+        if (!proactive.privateWriting) {
+            qInfo().noquote()
+                << QStringLiteral("[Activity] foreground_create_skipped writing_disabled turn=%1")
+                       .arg(indexedTurn);
+        } else {
+            const QString normalizedEvent = meta.eventId.trimmed();
+            const QString runId = normalizedEvent.isEmpty()
+                ? QStringLiteral("chat/%1").arg(indexedTurn) : normalizedEvent;
+            const QString originRef = QStringLiteral("chat/%1").arg(indexedTurn);
+            QString createError;
+            const auto created = createActivity(
+                QStringLiteral("owner"), meta.channel, meta.sessionId, personalInterest,
+                QString(), QStringLiteral("foreground"), originRef, runId, &createError);
+            if (created.isEmpty()) {
+                if (createError == QStringLiteral("already_active")) {
+                    // 单 active：已有活动（legacy/internal）时不重复创建，也绝不退回 legacy。
+                    qInfo().noquote()
+                        << QStringLiteral("[Activity] foreground_create_skipped already_active"
+                                          " run_id=%1 turn=%2")
+                               .arg(runId).arg(indexedTurn);
+                } else {
+                    qWarning().noquote()
+                        << QStringLiteral("[Activity] foreground_create_failed error=%1"
+                                          " run_id=%2 turn=%3")
+                               .arg(createError, runId).arg(indexedTurn);
+                    recordCognitiveAudit(
+                        QStringLiteral("activity_create_failed"), meta.runId, indexedTurn,
+                        QJsonObject{{QStringLiteral("origin_kind"), QStringLiteral("foreground")},
+                                    {QStringLiteral("origin_ref"), originRef},
+                                    {QStringLiteral("run_id"), runId},
+                                    {QStringLiteral("error"), createError},
+                                    {QStringLiteral("turn"), indexedTurn}});
+                }
+            } else {
+                qInfo().noquote()
+                    << QStringLiteral("[Activity] foreground_created ref=%1 version=%2"
+                                      " run_id=%3 turn=%4")
+                           .arg(created.value(QStringLiteral("ref")).toString())
+                           .arg(created.value(QStringLiteral("version")).toInt())
+                           .arg(runId)
+                           .arg(indexedTurn);
+            }
+        }
+    }
+    // R12-1b：activity_action 统一走 ActivityRef（thought/<id> 或 activity/<id>）。
+    // 门控（主体/隐私/长期记忆/渠道/私下写作）与版本校验都在写库前完成；非法引用只留审计，
+    // 不写任何半状态。
     const auto activityAction = response["activity_action"].toObject();
     if (!activityAction.isEmpty()) {
-        const QString ref = activityAction["activity_ref"].toString();
-        const qlonglong activityId = ref.startsWith(QStringLiteral("thought/"))
-            ? ref.mid(QStringLiteral("thought/").size()).toLongLong()
-            : 0;
-        const QString action = activityAction["action"].toString();
+        const QString refText = activityAction["activity_ref"].toString().trimmed();
+        const QString action = activityAction["action"].toString().trimmed();
         const int expectedVersion = activityAction["expected_version"].toInt(-1);
+        const bool writingEnabled = ConfigManager::instance().getProactiveConfig().privateWriting;
+        QString rejectReason;
+        ActivityRef parsed;
+        QString parseError;
         if (meta.subject != "user" || meta.sensitive || !meta.longTermMemoryEnabled
-            || (meta.channel!=Channel::kPet && meta.channel!=Channel::kQQPrivate)
-            || activityId <= 0 || expectedVersion < 0
-            || !applyThoughtAction(activityId, expectedVersion, action,
-                                  activityAction["after_minutes"].toInt(-1), activityAction["reason"].toString())) {
-            recordCognitiveAudit("activity_action_rejected", meta.runId, 0,
-                {{"activity_ref", ref}, {"action", action}, {"expected_version", expectedVersion}});
+            || (meta.channel != Channel::kPet && meta.channel != Channel::kQQPrivate))
+            rejectReason = QStringLiteral("permission_denied");
+        else if (!writingEnabled)
+            rejectReason = QStringLiteral("writing_disabled");
+        else if (!ActivityRef::parse(refText, &parsed, &parseError))
+            rejectReason = QStringLiteral("invalid_ref");
+        else if (expectedVersion < 0)
+            rejectReason = QStringLiteral("invalid_version");
+        if (rejectReason.isEmpty()) {
+            QString actionError;
+            const auto applied = applyActivityAction(
+                refText, expectedVersion, action, activityAction["after_minutes"].toInt(-1),
+                activityAction["reason"].toString(), &actionError);
+            if (applied.isEmpty())
+                rejectReason = actionError.isEmpty() ? QStringLiteral("rejected") : actionError;
+            else
+                qInfo().noquote()
+                    << QStringLiteral("[Activity] action_applied ref=%1 action=%2 version=%3->%4")
+                           .arg(refText, action)
+                           .arg(expectedVersion)
+                           .arg(applied.value(QStringLiteral("version")).toInt());
+        }
+        if (!rejectReason.isEmpty()) {
+            recordCognitiveAudit(
+                QStringLiteral("activity_action_rejected"), meta.runId, 0,
+                QJsonObject{{QStringLiteral("activity_ref"), refText},
+                            {QStringLiteral("action"), action},
+                            {QStringLiteral("expected_version"), expectedVersion},
+                            {QStringLiteral("reason"), rejectReason}});
         }
     }
     qDebug()<<"[MemoryManager]:成功保存本轮对话"<<"channel="<<meta.channel<<"session="<<meta.sessionId;
@@ -5594,6 +5651,7 @@ bool parseReviewSourceRef(const QString &kind, const QString &ref, qlonglong *id
 struct ReviewSourceSnapshot
 {
     bool present = false;
+    bool internalActivity = false;    // R12-1b：activity/<id> 指向 internal_activity（否则 chat_history）
     QString state;                    // 源状态机当前状态
     int version = 0;                  // 与 CAS 相关的行版本
     QString contentHash;              // 用于检测来源实质修订
@@ -5602,10 +5660,13 @@ struct ReviewSourceSnapshot
 };
 
 // 只读来源快照：内容字段按来源定义拼接后取哈希。
-//   reflection/concern = note/topic/watch；activity = thought/status/goal/progress/draft；
+//   reflection/concern = note/topic/watch；
+//   activity = legacy(thought/status/goal/progress/draft) 或
+//              internal(interest/status/result_json 关键字段)；
 //   open_wake = note/intent。
 ReviewSourceSnapshot reviewSourceSnapshot(const QSqlDatabase &db, const QString &kind,
-                                          qlonglong id, int refVersion, QString *error)
+                                          const QString &ref, qlonglong id, int refVersion,
+                                          QString *error)
 {
     ReviewSourceSnapshot snapshot;
     if (error) error->clear();
@@ -5629,6 +5690,34 @@ ReviewSourceSnapshot reviewSourceSnapshot(const QSqlDatabase &db, const QString 
         return snapshot;
     }
     if (kind == kReviewKindActivity) {
+        // R12-1b：失败引用支持新活动 activity/<id>；旧 thought/<id> 行为完全保持。
+        ActivityRef activityRef;
+        if (!ActivityRef::parse(ref, &activityRef, nullptr)) return snapshot;
+        if (activityRef.kind == ActivityRef::InternalActivity) {
+            q.prepare(QStringLiteral(
+                "SELECT interest,coalesce(result_json,'{}'),version,status "
+                "FROM internal_activity WHERE id=?"));
+            q.addBindValue(id);
+            if (!q.exec()) {
+                if (error) *error = QStringLiteral("db_error");
+                return snapshot;
+            }
+            if (!q.next()) return snapshot;
+            snapshot.present = true;
+            snapshot.internalActivity = true;
+            snapshot.version = q.value(2).toInt();
+            snapshot.state = q.value(3).toString();
+            const auto result = QJsonDocument::fromJson(q.value(1).toByteArray()).object();
+            snapshot.contentHash = reviewHash16(
+                q.value(0).toString() + QChar(31)
+                + snapshot.state + QChar(31)
+                + result.value(QStringLiteral("goal")).toString() + QChar(31)
+                + result.value(QStringLiteral("progress")).toString() + QChar(31)
+                + result.value(QStringLiteral("next_step")).toString() + QChar(31)
+                + result.value(QStringLiteral("draft")).toString() + QChar(31)
+                + result.value(QStringLiteral("reflection")).toString());
+            return snapshot;
+        }
         q.prepare(QStringLiteral(
             "SELECT thought,coalesce(thought_result,'{}'),thought_version FROM chat_history "
             "WHERE id=? AND thought IS NOT NULL AND thought<>'' AND sensitive=0"));
@@ -5832,11 +5921,17 @@ bool MemoryManager::recordReviewFailure(const QString &sourceKind, const QString
     int refVersion = 0;
     if (!parseReviewSourceRef(kind, ref, &sourceId, &refVersion))
         return fail(QStringLiteral("invalid_source"));
+    // R12-1b：activity 来源必须能区分 thought/<id> 与 activity/<id>，裸 id/未知前缀一律拒绝。
+    if (kind == kReviewKindActivity) {
+        ActivityRef activityRef;
+        if (!ActivityRef::parse(ref, &activityRef, nullptr))
+            return fail(QStringLiteral("invalid_source"));
+    }
     if (!m_db.transaction()) return fail(QStringLiteral("db_error"));
     auto rollback = qScopeGuard([this] { m_db.rollback(); });
     QString snapshotError;
-    const ReviewSourceSnapshot snapshot = reviewSourceSnapshot(m_db, kind, sourceId, refVersion,
-                                                               &snapshotError);
+    const ReviewSourceSnapshot snapshot = reviewSourceSnapshot(m_db, kind, ref, sourceId,
+                                                               refVersion, &snapshotError);
     if (!snapshotError.isEmpty()) return fail(QStringLiteral("db_error"));
     // 源已删除 / 已 resolved / drop / 已不是可写状态：失败记录不能静默残留，
     // 清掉遗留行并返回明确错误码，由调用方据此写可审计日志。
@@ -5988,16 +6083,31 @@ bool MemoryManager::recordReviewFailure(const QString &sourceKind, const QString
             if (!source.exec()) return fail(QStringLiteral("db_error"));
             affected = source.numRowsAffected();
         } else if (kind == kReviewKindActivity) {
-            source.prepare(QStringLiteral(
-                "UPDATE chat_history SET review_after=?,"
-                "thought_result=json_set(coalesce(thought_result,'{}'),'$.deferred_reason',?),"
-                "thought_version=thought_version+1 "
-                "WHERE id=? AND thought_version=? AND thought IS NOT NULL AND sensitive=0 "
-                "AND coalesce(json_extract(thought_result,'$.status'),'active')='active'"));
-            source.addBindValue(nextRetry);
-            source.addBindValue(reason.trimmed().left(240));
-            source.addBindValue(sourceId);
-            source.addBindValue(snapshot.version);
+            if (snapshot.internalActivity) {
+                // R12-1b：新活动失败退避写回 internal_activity；版本 +1、状态不变，
+                // review_after 与 legacy 共用同一退避序列（不允许新活动绕开）。
+                source.prepare(QStringLiteral(
+                    "UPDATE internal_activity SET review_after=?,"
+                    "result_json=json_set(coalesce(result_json,'{}'),'$.deferred_reason',?),"
+                    "version=version+1,updated_at=? "
+                    "WHERE id=? AND version=? AND status='active'"));
+                source.addBindValue(nextRetry);
+                source.addBindValue(reason.trimmed().left(240));
+                source.addBindValue(now);
+                source.addBindValue(sourceId);
+                source.addBindValue(snapshot.version);
+            } else {
+                source.prepare(QStringLiteral(
+                    "UPDATE chat_history SET review_after=?,"
+                    "thought_result=json_set(coalesce(thought_result,'{}'),'$.deferred_reason',?),"
+                    "thought_version=thought_version+1 "
+                    "WHERE id=? AND thought_version=? AND thought IS NOT NULL AND sensitive=0 "
+                    "AND coalesce(json_extract(thought_result,'$.status'),'active')='active'"));
+                source.addBindValue(nextRetry);
+                source.addBindValue(reason.trimmed().left(240));
+                source.addBindValue(sourceId);
+                source.addBindValue(snapshot.version);
+            }
             if (!source.exec()) return fail(QStringLiteral("db_error"));
             affected = source.numRowsAffected();
         } else {
@@ -6078,7 +6188,16 @@ bool MemoryManager::resetReviewFailure(const QString &sourceKind, const QString 
             "updated_at=unixepoch() WHERE turn_id=?"));
         q.addBindValue(sourceId);
     } else if (kind == kReviewKindActivity) {
-        q.prepare(QStringLiteral("UPDATE chat_history SET review_after=0 WHERE id=?"));
+        // R12-1b：activity 来源可能是 legacy(thought/<id>) 或 internal(activity/<id>)；
+        // 重置都要让源立即可领取，但不能写错存储。
+        ActivityRef activityRef;
+        if (!ActivityRef::parse(ref, &activityRef, nullptr)) return false;
+        if (activityRef.kind == ActivityRef::InternalActivity) {
+            q.prepare(QStringLiteral(
+                "UPDATE internal_activity SET review_after=0,updated_at=unixepoch() WHERE id=?"));
+        } else {
+            q.prepare(QStringLiteral("UPDATE chat_history SET review_after=0 WHERE id=?"));
+        }
         q.addBindValue(sourceId);
     } else {
         q.prepare(QStringLiteral(
@@ -6678,79 +6797,1093 @@ bool MemoryManager::hasActiveInternalActivity() const
     return false;
 }
 
-QJsonArray MemoryManager::currentActivitiesUnified(int limit) const
+// ============================ R12-1b：统一活动接口 ============================
+// 这一片把"活动"从两处存储统一成一条访问/生命周期契约：
+//   * legacy：chat_history 的 thought/thought_result（ref=thought/<id>）是 R12-1b 之前
+//     唯一的活动存储；这里只做读取适配、复用旧 CAS/预算/投递语义，不迁移、不复制聊天行；
+//   * internal：v31 的 internal_activity（ref=activity/<id>）是新运行时使用的存储；
+//     新建活动不写 chat_history/检索索引，不伪造完成状态，不建 Outbox/ledger。
+// 两张表可以有相同的整数 id，必须通过 ActivityRef 带前缀解析，裸 id 不是身份。
+namespace {
+
+// epoch 秒 -> UTC ISO；0 表示"没有时间"（不输出空字符串以外的伪造时间）。
+QString activityIsoFromEpoch(qlonglong seconds)
 {
+    return seconds > 0
+        ? QDateTime::fromSecsSinceEpoch(seconds).toUTC().toString(Qt::ISODateWithMs)
+        : QString{};
+}
+
+// 兼容 thought_result.updated_at（UTC ISO）与 chat_history.timestamp（本地 datetime 文本）。
+qlonglong activityEpochFromText(const QString &text)
+{
+    const QString trimmed = text.trimmed();
+    if (trimmed.isEmpty()) return 0;
+    QDateTime value = QDateTime::fromString(trimmed, Qt::ISODateWithMs);
+    if (!value.isValid()) value = QDateTime::fromString(trimmed, Qt::ISODate);
+    if (!value.isValid())
+        value = QDateTime::fromString(trimmed, QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+    return value.isValid() ? value.toSecsSinceEpoch() : 0;
+}
+
+// 统一视图的文本字段：只保留非空值，并按字段上限截断。
+void insertActivityText(QJsonObject *row, const QString &key, const QJsonValue &value,
+                        int limit = 200)
+{
+    if (!row) return;
+    const QString text = value.toString().trimmed();
+    if (text.isEmpty()) return;
+    row->insert(key, text.left(limit));
+}
+
+// legacy 行（chat_history thought）的统一表示。SELECT 必须包含：
+// id,thought,thought_version,thought_result,coalesce(review_after,0) AS review_after,
+// channel,session_id,subject,timestamp。
+QJsonObject legacyActivityRecord(const QSqlQuery &query)
+{
+    const qlonglong id = query.value(QStringLiteral("id")).toLongLong();
+    const QJsonObject stored = QJsonDocument::fromJson(
+        query.value(QStringLiteral("thought_result")).toString().toUtf8()).object();
+    QJsonObject row{
+        {QStringLiteral("ref"), QStringLiteral("thought/%1").arg(id)},
+        {QStringLiteral("origin"), QStringLiteral("legacy")},
+        {QStringLiteral("kind"), QStringLiteral("legacy")},
+        {QStringLiteral("id"), id},
+        {QStringLiteral("status"),
+         stored.value(QStringLiteral("status")).toString(QStringLiteral("active"))},
+        {QStringLiteral("version"), query.value(QStringLiteral("thought_version")).toInt()},
+        {QStringLiteral("interest"), query.value(QStringLiteral("thought")).toString()},
+        {QStringLiteral("review_after"), query.value(QStringLiteral("review_after")).toLongLong()},
+        {QStringLiteral("channel"), query.value(QStringLiteral("channel")).toString()},
+        {QStringLiteral("session"), query.value(QStringLiteral("session_id")).toString()},
+        {QStringLiteral("subject"), query.value(QStringLiteral("subject")).toString()}};
+    for (const auto &key : {QStringLiteral("goal"), QStringLiteral("progress"),
+                            QStringLiteral("next_step"), QStringLiteral("reflection"),
+                            QStringLiteral("mood"), QStringLiteral("paused_reason"),
+                            QStringLiteral("deferred_reason")})
+        insertActivityText(&row, key, stored.value(key), 240);
+    insertActivityText(&row, QStringLiteral("draft"), stored.value(QStringLiteral("draft")), 800);
+    insertActivityText(&row, QStringLiteral("artifact_ref"),
+                       stored.value(QStringLiteral("artifact_ref")), 200);
+    // 旧分享结果字段 share_outcome/share_version 映射为统一的 share_intent（只读，
+    // 只表示"曾经/想要分享"，不代表已经发送）。
+    QJsonObject shareIntent;
+    const QString shareOutcome = stored.value(QStringLiteral("share_outcome")).toString();
+    const int shareVersion = stored.value(QStringLiteral("share_version")).toInt(-1);
+    if (!shareOutcome.isEmpty() || shareVersion >= 0) {
+        shareIntent.insert(QStringLiteral("requested"), !shareOutcome.isEmpty());
+        if (!shareOutcome.isEmpty())
+            shareIntent.insert(QStringLiteral("outcome"), shareOutcome);
+        if (shareVersion >= 0)
+            shareIntent.insert(QStringLiteral("version"), shareVersion);
+        const QString shareDraft = stored.value(QStringLiteral("draft")).toString().trimmed();
+        if (!shareDraft.isEmpty())
+            shareIntent.insert(QStringLiteral("draft"), shareDraft.left(800));
+        row.insert(QStringLiteral("share_intent"), shareIntent);
+    }
+    const qlonglong updated =
+        activityEpochFromText(stored.value(QStringLiteral("updated_at")).toString());
+    const qlonglong created =
+        activityEpochFromText(stored.value(QStringLiteral("created_at")).toString());
+    const QString timestamp = query.value(QStringLiteral("timestamp")).toString();
+    if (updated > 0) {
+        row.insert(QStringLiteral("updated_at"), activityIsoFromEpoch(updated));
+    } else if (!timestamp.trimmed().isEmpty()) {
+        row.insert(QStringLiteral("updated_at"), timestamp);
+    }
+    if (created > 0) row.insert(QStringLiteral("created_at"), activityIsoFromEpoch(created));
+    return row;
+}
+
+// internal 行（internal_activity）的统一表示。SELECT * 以便按列名取值。
+QJsonObject internalActivityRecord(const QSqlQuery &query)
+{
+    const qlonglong id = query.value(QStringLiteral("id")).toLongLong();
+    const QJsonObject stored = QJsonDocument::fromJson(
+        query.value(QStringLiteral("result_json")).toString().toUtf8()).object();
+    QJsonObject row{
+        {QStringLiteral("ref"), QStringLiteral("activity/%1").arg(id)},
+        {QStringLiteral("origin"), QStringLiteral("internal")},
+        {QStringLiteral("kind"), QStringLiteral("internal")},
+        {QStringLiteral("id"), id},
+        {QStringLiteral("scope_key"), query.value(QStringLiteral("scope_key")).toString()},
+        {QStringLiteral("origin_kind"), query.value(QStringLiteral("origin_kind")).toString()},
+        {QStringLiteral("subject"), query.value(QStringLiteral("subject")).toString()},
+        {QStringLiteral("channel"), query.value(QStringLiteral("channel")).toString()},
+        {QStringLiteral("session"), query.value(QStringLiteral("session_id")).toString()},
+        {QStringLiteral("interest"), query.value(QStringLiteral("interest")).toString()},
+        {QStringLiteral("status"), query.value(QStringLiteral("status")).toString()},
+        {QStringLiteral("version"), query.value(QStringLiteral("version")).toInt()},
+        {QStringLiteral("review_after"), query.value(QStringLiteral("review_after")).toLongLong()}};
+    const QString originRef = query.value(QStringLiteral("origin_ref")).toString();
+    if (!originRef.isEmpty()) row.insert(QStringLiteral("origin_ref"), originRef);
+    const QString runId = query.value(QStringLiteral("run_id")).toString();
+    if (!runId.isEmpty()) row.insert(QStringLiteral("run_id"), runId);
+    for (const auto &key : {QStringLiteral("goal"), QStringLiteral("progress"),
+                            QStringLiteral("next_step"), QStringLiteral("reflection"),
+                            QStringLiteral("mood"), QStringLiteral("paused_reason"),
+                            QStringLiteral("deferred_reason")})
+        insertActivityText(&row, key, stored.value(key), 240);
+    insertActivityText(&row, QStringLiteral("draft"), stored.value(QStringLiteral("draft")), 800);
+    const QString artifactRef = query.value(QStringLiteral("artifact_ref")).toString();
+    if (!artifactRef.trimmed().isEmpty())
+        insertActivityText(&row, QStringLiteral("artifact_ref"), artifactRef, 200);
+    else
+        insertActivityText(&row, QStringLiteral("artifact_ref"),
+                           stored.value(QStringLiteral("artifact_ref")), 200);
+    const QJsonValue shareIntent = stored.value(QStringLiteral("share_intent"));
+    if (shareIntent.isObject())
+        row.insert(QStringLiteral("share_intent"), shareIntent.toObject());
+    if (stored.value(QStringLiteral("share_offered")).toBool())
+        row.insert(QStringLiteral("share_offered"), true);
+    const qlonglong created = query.value(QStringLiteral("created_at")).toLongLong();
+    const qlonglong updated = query.value(QStringLiteral("updated_at")).toLongLong();
+    if (created > 0) row.insert(QStringLiteral("created_at"), activityIsoFromEpoch(created));
+    if (updated > 0) row.insert(QStringLiteral("updated_at"), activityIsoFromEpoch(updated));
+    return row;
+}
+
+// 跨存储的 active/paused 检查。excludeRef 非空时排除自身（resume 用）：
+// legacy 只属于 owner scope，internal 按 scope_key 隔离，不同 scope 互不影响。
+// 排除自身只作用于与 excludeRef 同存储的那一行，另一个存储的活动仍然阻止 resume。
+bool hasActiveActivityInStore(const QSqlDatabase &db, const QString &scopeKey,
+                              const QString &excludeRef, QString *error)
+{
+    if (error) error->clear();
+    if (scopeKey == QStringLiteral("owner")) {
+        QSqlQuery legacy(db);
+        if (excludeRef.startsWith(QStringLiteral("thought/"))) {
+            // legacy resume：排除自身，但仍检查同一存储里是否还有别的 active/paused。
+            legacy.prepare(QStringLiteral(
+                "SELECT 1 FROM chat_history WHERE thought IS NOT NULL AND thought<>'' "
+                "AND subject='user' AND sensitive=0 AND ('thought/'||id)<>? "
+                "AND coalesce(json_extract(thought_result,'$.status'),'active') "
+                "IN ('active','paused') LIMIT 1"));
+            legacy.addBindValue(excludeRef);
+            if (!legacy.exec()) {
+                if (error) *error = QStringLiteral("db_error");
+                return false;
+            }
+        } else if (!legacy.exec(QStringLiteral(
+                       "SELECT 1 FROM chat_history WHERE thought IS NOT NULL AND thought<>'' "
+                       "AND subject='user' AND sensitive=0 "
+                       "AND coalesce(json_extract(thought_result,'$.status'),'active') "
+                       "IN ('active','paused') LIMIT 1"))) {
+            if (error) *error = QStringLiteral("db_error");
+            return false;
+        }
+        if (legacy.next()) return true;
+    }
+    QSqlQuery internal(db);
+    if (excludeRef.isEmpty()) {
+        internal.prepare(QStringLiteral(
+            "SELECT 1 FROM internal_activity WHERE scope_key=? "
+            "AND status IN ('active','paused') LIMIT 1"));
+        internal.addBindValue(scopeKey);
+    } else {
+        internal.prepare(QStringLiteral(
+            "SELECT 1 FROM internal_activity WHERE scope_key=? "
+            "AND status IN ('active','paused') AND ('activity/'||id)<>? LIMIT 1"));
+        internal.addBindValue(scopeKey);
+        internal.addBindValue(excludeRef);
+    }
+    if (!internal.exec()) {
+        if (error) *error = QStringLiteral("db_error");
+        return false;
+    }
+    return internal.next();
+}
+
+// 单行读取 internal_activity（调用方已确保数据库打开且 id>0）。
+bool loadInternalActivity(const QSqlDatabase &db, qlonglong id, QJsonObject *view,
+                          QString *error)
+{
+    if (error) error->clear();
+    if (view) *view = QJsonObject{};
+    QSqlQuery q(db);
+    q.prepare(QStringLiteral("SELECT * FROM internal_activity WHERE id=?"));
+    q.addBindValue(id);
+    if (!q.exec()) {
+        if (error) *error = QStringLiteral("db_error");
+        return false;
+    }
+    if (!q.next()) return false;
+    if (view) *view = internalActivityRecord(q);
+    return true;
+}
+
+QString normalizedActivityScope(const QString &scopeKey)
+{
+    const QString trimmed = scopeKey.trimmed();
+    return trimmed.isEmpty() ? QStringLiteral("owner") : trimmed;
+}
+
+} // namespace
+
+// 统一活动列表：legacy/internal 合并后按 updated/created 倒序。
+// 只返回 active/paused：completed 的过时 next_step 绝不出现在"当前活动"里。
+// R12-1b：queried/eligible 只做快照可观测性（与其它域口径一致，不改变返回内容）。
+QJsonArray MemoryManager::currentActivitiesUnified(int limit,int *queried,int *eligible) const
+{
+    if (queried) *queried = 0;
+    if (eligible) *eligible = 0;
     QJsonArray rows;
     if (!m_db.isOpen() || limit <= 0) return rows;
     const MemoryReadPolicy policy;
+    QList<QPair<qint64, QJsonObject>> combined;
     // legacy：字段与 currentActivities 一致，只额外标 origin=legacy；旧接口保持不变。
     QSqlQuery legacy(m_db);
     legacy.prepare(QStringLiteral(
-        "SELECT id,coalesce(json_extract(thought_result,'$.status'),'active'),thought_version,"
-        "coalesce(json_extract(thought_result,'$.artifact_ref'),''),"
-        "coalesce(json_extract(thought_result,'$.progress'),''),"
-        "coalesce(json_extract(thought_result,'$.goal'),''),"
-        "coalesce(json_extract(thought_result,'$.next_step'),''),h.channel,h.session_id "
-        "FROM chat_history h WHERE h.thought IS NOT NULL AND h.thought<>'' "
-        "AND h.sensitive=0 AND h.subject='user' "
-        "AND coalesce(json_extract(h.thought_result,'$.status'),'active') IN ('active','paused') "
-        "ORDER BY h.id DESC LIMIT ?"));
+        "SELECT id,thought,thought_version,coalesce(review_after,0) AS review_after,"
+        "thought_result,channel,session_id,subject,timestamp "
+        "FROM chat_history WHERE thought IS NOT NULL AND thought<>'' "
+        "AND sensitive=0 AND subject='user' "
+        "AND coalesce(json_extract(thought_result,'$.status'),'active') IN ('active','paused') "
+        "ORDER BY id DESC LIMIT ?"));
     legacy.addBindValue(limit);
     if (legacy.exec()) {
-        while (legacy.next() && rows.size() < limit) {
-            const auto channel = legacy.value(7).toString();
-            const auto session = legacy.value(8).toString();
-            QJsonObject row{
-                {QStringLiteral("ref"), QStringLiteral("thought/%1").arg(legacy.value(0).toLongLong())},
-                {QStringLiteral("origin"), QStringLiteral("legacy")},
-                {QStringLiteral("status"), legacy.value(1).toString()},
-                {QStringLiteral("version"), legacy.value(2).toInt()},
-                {QStringLiteral("artifact_ref"), QString{}},
-                {QStringLiteral("progress"), QString{}}};
-            for (const auto &pair : {qMakePair(QStringLiteral("artifact_ref"), legacy.value(3).toString()),
-                                     qMakePair(QStringLiteral("progress"), legacy.value(4).toString()),
-                                     qMakePair(QStringLiteral("goal"), legacy.value(5).toString()),
-                                     qMakePair(QStringLiteral("next_step"), legacy.value(6).toString())}) {
-                const auto text = pair.second.trimmed();
-                if (text.isEmpty() || !policy.allows(channel, session, text)) continue;
-                row.insert(pair.first, text.left(120));
+        while (legacy.next()) {
+            if (queried) ++*queried;
+            QJsonObject row = legacyActivityRecord(legacy);
+            const QString channel = row.value(QStringLiteral("channel")).toString();
+            const QString session = row.value(QStringLiteral("session")).toString();
+            for (const auto &key : {QStringLiteral("interest"), QStringLiteral("goal"),
+                                    QStringLiteral("progress"), QStringLiteral("next_step"),
+                                    QStringLiteral("reflection"), QStringLiteral("artifact_ref")}) {
+                if (!row.contains(key)) continue;
+                const QString text = row.value(key).toString();
+                if (text.isEmpty() || !policy.allows(channel, session, text)) {
+                    row.remove(key);
+                    continue;
+                }
+                row.insert(key, text.left(key == QStringLiteral("interest") ? 160 : 120));
             }
-            rows.append(row);
+            if (row.contains(QStringLiteral("draft"))) {
+                const QString draft = row.value(QStringLiteral("draft")).toString();
+                if (!policy.allows(channel, session, draft))
+                    row.remove(QStringLiteral("draft"));
+            }
+            combined.append({activityEpochFromText(
+                                 row.value(QStringLiteral("updated_at")).toString()), row});
         }
     }
-    if (rows.size() >= limit) return rows;
-    // internal：本片只读骨架（不创建、不迁移），ref=activity/<id>，origin=internal。
+    // internal：本片起可写，ref=activity/<id>，origin=internal；只读 owner 私聊域，
+    // 其它 scope（群聊/第三方/其它会话）的活动不进入统一列表，避免快照/前台扩权。
     QSqlQuery internal(m_db);
     internal.prepare(QStringLiteral(
-        "SELECT id,scope_key,origin_kind,subject,channel,session_id,interest,status,version,"
-        "artifact_ref,review_after FROM internal_activity "
-        "WHERE status IN ('active','paused') ORDER BY id DESC LIMIT ?"));
-    internal.addBindValue(limit - rows.size());
+        "SELECT * FROM internal_activity WHERE scope_key='owner' "
+        "AND status IN ('active','paused') ORDER BY id DESC LIMIT ?"));
+    internal.addBindValue(limit);
     if (internal.exec()) {
-        while (internal.next() && rows.size() < limit) {
-            const auto channel = internal.value(4).toString();
-            const auto session = internal.value(5).toString();
-            const auto interest = internal.value(6).toString();
-            if (!policy.allows(channel, session, interest)) continue;
-            QJsonObject row{
-                {QStringLiteral("ref"), QStringLiteral("activity/%1").arg(internal.value(0).toLongLong())},
-                {QStringLiteral("origin"), QStringLiteral("internal")},
-                {QStringLiteral("origin_kind"), internal.value(2).toString()},
-                {QStringLiteral("scope_key"), internal.value(1).toString()},
-                {QStringLiteral("subject"), internal.value(3).toString()},
-                {QStringLiteral("channel"), channel},
-                {QStringLiteral("session"), session},
-                {QStringLiteral("interest"), interest.left(160)},
-                {QStringLiteral("status"), internal.value(7).toString()},
-                {QStringLiteral("version"), internal.value(8).toInt()},
-                {QStringLiteral("review_after"), internal.value(10).toLongLong()}};
-            const auto artifact = internal.value(9).toString().trimmed();
-            if (!artifact.isEmpty() && policy.allows(channel, session, artifact))
-                row.insert(QStringLiteral("artifact_ref"), artifact.left(120));
-            rows.append(row);
+        while (internal.next()) {
+            if (queried) ++*queried;
+            QJsonObject row = internalActivityRecord(internal);
+            const QString channel = row.value(QStringLiteral("channel")).toString();
+            const QString session = row.value(QStringLiteral("session")).toString();
+            const QString interest = row.value(QStringLiteral("interest")).toString();
+            if (interest.isEmpty() || !policy.allows(channel, session, interest)) continue;
+            for (const auto &key : {QStringLiteral("goal"), QStringLiteral("progress"),
+                                    QStringLiteral("next_step"), QStringLiteral("reflection"),
+                                    QStringLiteral("artifact_ref")}) {
+                if (!row.contains(key)) continue;
+                const QString text = row.value(key).toString();
+                if (text.isEmpty() || !policy.allows(channel, session, text)) {
+                    row.remove(key);
+                    continue;
+                }
+                row.insert(key, text.left(120));
+            }
+            row.insert(QStringLiteral("interest"), interest.left(160));
+            if (row.contains(QStringLiteral("draft"))) {
+                const QString draft = row.value(QStringLiteral("draft")).toString();
+                if (!policy.allows(channel, session, draft))
+                    row.remove(QStringLiteral("draft"));
+            }
+            combined.append({activityEpochFromText(
+                                 row.value(QStringLiteral("updated_at")).toString()), row});
         }
     }
+    std::sort(combined.begin(), combined.end(),
+              [](const QPair<qint64, QJsonObject> &left,
+                 const QPair<qint64, QJsonObject> &right) {
+                  if (left.first != right.first) return left.first > right.first;
+                  return left.second.value(QStringLiteral("ref")).toString()
+                      > right.second.value(QStringLiteral("ref")).toString();
+              });
+    for (const auto &entry : combined) {
+        if (rows.size() >= limit) break;
+        rows.append(entry.second);
+    }
+    if (eligible) *eligible = int(rows.size());
     return rows;
+}
+
+// 新建 internal 活动（"产生意愿并开始安排"，不代表完成/产物）。
+// 事务内：幂等键 -> 两存储单 active -> 插入；任何一步失败整体回滚，绝不半写。
+QJsonObject MemoryManager::createActivity(const QString &scopeKey, const QString &channel,
+                                          const QString &session, const QString &interest,
+                                          const QString &goal, const QString &originKind,
+                                          const QString &originRef, const QString &runId,
+                                          QString *error)
+{
+    if (error) error->clear();
+    const auto fail = [error](const QString &code) {
+        if (error) *error = code;
+        return QJsonObject{};
+    };
+    if (!m_db.isOpen()) return fail(QStringLiteral("db_error"));
+    const QString scope = normalizedActivityScope(scopeKey);
+    const QString trimmedChannel = channel.trimmed();
+    const QString trimmedSession = session.trimmed();
+    const QString trimmedInterest = interest.trimmed();
+    const QString trimmedGoal = goal.trimmed();
+    const QString trimmedOriginKind = originKind.trimmed();
+    const QString trimmedOriginRef = originRef.trimmed();
+    const QString trimmedRunId = runId.trimmed();
+    // 新建活动只允许主人私聊域的 foreground/open_wake；legacy 迁移/导入不能走新写接口。
+    if (scope != QStringLiteral("owner")) return fail(QStringLiteral("invalid_scope"));
+    if (trimmedChannel.isEmpty() || trimmedSession.isEmpty() || trimmedInterest.isEmpty())
+        return fail(QStringLiteral("invalid_argument"));
+    if (trimmedOriginKind != QStringLiteral("foreground")
+        && trimmedOriginKind != QStringLiteral("open_wake"))
+        return fail(QStringLiteral("invalid_origin_kind"));
+    if (trimmedRunId.isEmpty()) return fail(QStringLiteral("missing_run_id"));
+    if (!m_db.transaction()) return fail(QStringLiteral("db_error"));
+    auto rollback = qScopeGuard([this] { m_db.rollback(); });
+    // 幂等：同一 (origin_kind, run_id) 只对应一个活动（R12-1b：前台同一 meta.eventId
+    // 可能因重复提交产生不同 chat 行，origin_ref 会变，但 runId 不变，仍不得重复建活动）；
+    // 重复调用返回已有行。
+    QSqlQuery existing(m_db);
+    existing.prepare(QStringLiteral(
+        "SELECT * FROM internal_activity WHERE origin_kind=? AND run_id=? ORDER BY id LIMIT 1"));
+    existing.addBindValue(trimmedOriginKind);
+    existing.addBindValue(trimmedRunId);
+    if (!existing.exec()) return fail(QStringLiteral("db_error"));
+    if (existing.next()) {
+        QJsonObject row = internalActivityRecord(existing);
+        existing.finish();
+        if (!m_db.commit()) return fail(QStringLiteral("db_error"));
+        rollback.dismiss();
+        return row;
+    }
+    existing.finish();
+    // 单 active/paused 跨存储统一：任一存储已有当前活动就拒绝，且不写任何行。
+    QString activeError;
+    if (hasActiveActivityInStore(m_db, scope, QString{}, &activeError))
+        return fail(QStringLiteral("already_active"));
+    if (!activeError.isEmpty()) return fail(QStringLiteral("db_error"));
+    const qlonglong now = QDateTime::currentSecsSinceEpoch();
+    QJsonObject result{{QStringLiteral("goal"), trimmedGoal},
+                       {QStringLiteral("next_step"), QString{}}};
+    QSqlQuery insert(m_db);
+    insert.prepare(QStringLiteral(
+        "INSERT INTO internal_activity(scope_key,origin_kind,origin_ref,run_id,subject,channel,"
+        "session_id,interest,status,version,result_json,artifact_ref,review_after,"
+        "created_at,updated_at) "
+        "VALUES(?,?,?,?,'user',?,?,?,'active',1,?,NULL,?,?,?)"));
+    insert.addBindValue(scope);
+    insert.addBindValue(trimmedOriginKind);
+    insert.addBindValue(trimmedOriginRef.isEmpty() ? QVariant() : QVariant(trimmedOriginRef));
+    insert.addBindValue(trimmedRunId);
+    insert.addBindValue(trimmedChannel);
+    insert.addBindValue(trimmedSession);
+    insert.addBindValue(trimmedInterest);
+    insert.addBindValue(QString::fromUtf8(
+        QJsonDocument(result).toJson(QJsonDocument::Compact)));
+    insert.addBindValue(now + 1800);
+    insert.addBindValue(now);
+    insert.addBindValue(now);
+    if (!insert.exec()) return fail(QStringLiteral("db_error"));
+    if (insert.numRowsAffected() != 1) return fail(QStringLiteral("db_error"));
+    const qlonglong id = insert.lastInsertId().toLongLong();
+    if (id <= 0) return fail(QStringLiteral("db_error"));
+    QJsonObject view;
+    QString loadError;
+    if (!loadInternalActivity(m_db, id, &view, &loadError))
+        return fail(loadError.isEmpty() ? QStringLiteral("db_error") : loadError);
+    if (!m_db.commit()) return fail(QStringLiteral("db_error"));
+    rollback.dismiss();
+    return view;
+}
+
+// R12-1b：OpenWake 的 start_activity 提交——同一事务先建 internal 活动，再完成 wake/调度。
+// 任一步失败整体回滚：既不会留下"只有活动、wake 仍 running"，也不会"wake 已完成、活动没建"。
+bool MemoryManager::finishOpenWakeWithActivity(qlonglong id, int version,
+                                               const QString &decision, const QString &note,
+                                               const QJsonObject &intent, int nextWakeMinutes,
+                                               const QJsonObject &activityProposal,
+                                               QJsonObject *result, QString *error)
+{
+    if (result) *result = QJsonObject{};
+    if (error) error->clear();
+    const auto fail = [error](const QString &code) {
+        if (error) *error = code;
+        return false;
+    };
+    if (!m_db.isOpen()) return fail(QStringLiteral("db_error"));
+    if (decision != QStringLiteral("start_activity")) return fail(QStringLiteral("invalid_decision"));
+    // 私下写入门控：OpenWake 仍可 rest/reflect，但只有 private_writing=true 才允许创建活动。
+    if (!ConfigManager::instance().getProactiveConfig().privateWriting)
+        return fail(QStringLiteral("writing_disabled"));
+    const QString trimmedNote = note.trimmed();
+    if (trimmedNote.size() > 240) return fail(QStringLiteral("invalid_note"));
+    // 活动提案：只代表"产生意愿并开始安排"，不写完成状态/产物。
+    const QString interest = activityProposal.value(QStringLiteral("interest")).toString().trimmed();
+    const QString goal = activityProposal.value(QStringLiteral("goal")).toString().trimmed();
+    if (interest.isEmpty() || interest.size() > 120) return fail(QStringLiteral("invalid_interest"));
+    if (goal.size() > 200) return fail(QStringLiteral("invalid_goal"));
+    if (activityProposal.contains(QStringLiteral("contact"))
+        || activityProposal.contains(QStringLiteral("artifact"))
+        || activityProposal.contains(QStringLiteral("status"))
+        || activityProposal.contains(QStringLiteral("draft")))
+        return fail(QStringLiteral("schema"));
+    int reviewMinutes = 30;
+    if (activityProposal.contains(QStringLiteral("initial_review_after_minutes"))) {
+        const auto value = activityProposal.value(QStringLiteral("initial_review_after_minutes"));
+        if (!value.isDouble()) return fail(QStringLiteral("invalid_initial_review"));
+        reviewMinutes = value.toInt();
+        if (reviewMinutes < 5 || reviewMinutes > 1440)
+            return fail(QStringLiteral("invalid_initial_review"));
+    }
+    QString channel = activityProposal.value(QStringLiteral("channel")).toString().trimmed();
+    QString session = activityProposal.value(QStringLiteral("session")).toString().trimmed();
+    if (channel.isEmpty()) channel = QString(Channel::kPet);
+    if (session.isEmpty()) session = QString(Channel::kDefaultSession);
+    if (channel != Channel::kPet && channel != Channel::kQQPrivate)
+        return fail(QStringLiteral("invalid_channel"));
+    if (!m_db.transaction()) return fail(QStringLiteral("db_error"));
+    auto rollback = qScopeGuard([this] { m_db.rollback(); });
+    const qlonglong now = QDateTime::currentSecsSinceEpoch();
+    // 1) 读取并 CAS 校验 open_wake 仍处于本次领取的 running/version。
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral(
+        "SELECT scope_key,run_id,state,version FROM open_wake WHERE id=?"));
+    q.addBindValue(id);
+    if (!q.exec()) return fail(QStringLiteral("db_error"));
+    if (!q.next()) return fail(QStringLiteral("cas_conflict"));
+    const QString scope = normalizedActivityScope(q.value(0).toString());
+    const QString runId = q.value(1).toString().trimmed();
+    const QString state = q.value(2).toString();
+    const int currentVersion = q.value(3).toInt();
+    q.finish();
+    if (currentVersion != version || state != QStringLiteral("running"))
+        return fail(QStringLiteral("cas_conflict"));
+    // 新建 internal 活动只允许主人私聊域；scope/run_id 必须自洽。
+    if (scope != QStringLiteral("owner")) return fail(QStringLiteral("invalid_scope"));
+    if (runId.isEmpty()) return fail(QStringLiteral("missing_run_id"));
+    // 2) 单 active 跨存储：legacy/internal 任一当前活动都让整次提交失败（wake 不半写）。
+    QString activeError;
+    if (hasActiveActivityInStore(m_db, scope, QString{}, &activeError))
+        return fail(QStringLiteral("already_active"));
+    if (!activeError.isEmpty()) return fail(QStringLiteral("db_error"));
+    // 3) 创建 internal 活动（origin_ref=wake/<id>，run_id 复用 open_wake.run_id）。
+    const qlonglong reviewAfter = now + qlonglong(reviewMinutes) * 60;
+    const QString initialJson = QString::fromUtf8(QJsonDocument(QJsonObject{
+        {QStringLiteral("goal"), goal},
+        {QStringLiteral("next_step"), QString{}}}).toJson(QJsonDocument::Compact));
+    QSqlQuery insert(m_db);
+    insert.prepare(QStringLiteral(
+        "INSERT INTO internal_activity(scope_key,origin_kind,origin_ref,run_id,subject,channel,"
+        "session_id,interest,status,version,result_json,artifact_ref,review_after,"
+        "created_at,updated_at) "
+        "VALUES('owner','open_wake',?,?,'user',?,?,?,'active',1,?,NULL,?,?,?)"));
+    insert.addBindValue(QStringLiteral("wake/%1").arg(id));
+    insert.addBindValue(runId);
+    insert.addBindValue(channel);
+    insert.addBindValue(session);
+    insert.addBindValue(interest);
+    insert.addBindValue(initialJson);
+    insert.addBindValue(reviewAfter);
+    insert.addBindValue(now);
+    insert.addBindValue(now);
+    if (!insert.exec()) return fail(QStringLiteral("db_error"));
+    if (insert.numRowsAffected() != 1) return fail(QStringLiteral("db_error"));
+    const qlonglong activityId = insert.lastInsertId().toLongLong();
+    if (activityId <= 0) return fail(QStringLiteral("db_error"));
+    // 4) CAS 完成 open_wake：decision=start_activity，note 可空，安排下一次唤醒。
+    const int minutes = qBound(5, nextWakeMinutes, 1440);
+    const qlonglong nextDue = now + qlonglong(minutes) * 60;
+    const QString intentJson =
+        QString::fromUtf8(QJsonDocument(intent).toJson(QJsonDocument::Compact));
+    q.prepare(QStringLiteral(
+        "UPDATE open_wake SET state='committed',decision=?,note=?,intent_json=?,"
+        "finished_at=?,lease_until=NULL,next_due_at=? "
+        "WHERE id=? AND version=? AND state='running'"));
+    q.addBindValue(decision);
+    q.addBindValue(trimmedNote);
+    q.addBindValue(intentJson);
+    q.addBindValue(now);
+    q.addBindValue(nextDue);
+    q.addBindValue(id);
+    q.addBindValue(version);
+    if (!q.exec()) return fail(QStringLiteral("db_error"));
+    if (q.numRowsAffected() != 1) return fail(QStringLiteral("cas_conflict"));
+    // 5) 调度状态同事务推进；start_activity 与 rest/reflect 一样算成功。
+    q.prepare(QStringLiteral(
+        "UPDATE open_wake_state SET next_due_at=?,last_finished_at=?,last_outcome=?,"
+        "version=version+1,updated_at=?,suspended_until=NULL,consecutive_failures=0 "
+        "WHERE scope_key=?"));
+    q.addBindValue(nextDue);
+    q.addBindValue(now);
+    q.addBindValue(decision);
+    q.addBindValue(now);
+    q.addBindValue(scope);
+    if (!q.exec()) return fail(QStringLiteral("db_error"));
+    if (q.numRowsAffected() != 1) return fail(QStringLiteral("cas_conflict"));
+    q.prepare(QStringLiteral(
+        "DELETE FROM review_failure WHERE source_kind='open_wake' AND source_ref IN (?,?)"));
+    q.addBindValue(QStringLiteral("wake/%1:%2").arg(id).arg(version));
+    q.addBindValue(QStringLiteral("wake/%1").arg(id));
+    if (!q.exec()) return fail(QStringLiteral("db_error"));
+    QJsonObject view;
+    QString loadError;
+    if (!loadInternalActivity(m_db, activityId, &view, &loadError))
+        return fail(loadError.isEmpty() ? QStringLiteral("db_error") : loadError);
+    if (!m_db.commit()) return fail(QStringLiteral("db_error"));
+    rollback.dismiss();
+    if (result) {
+        *result = view;
+        result->insert(QStringLiteral("decision"), decision);
+        result->insert(QStringLiteral("next_due_at"), nextDue);
+        result->insert(QStringLiteral("initial_review_after_minutes"), reviewMinutes);
+    }
+    qInfo().noquote()
+        << QStringLiteral("[OpenWake] activity_created wake=%1 activity=%2 review_after=%3")
+               .arg(id)
+               .arg(view.value(QStringLiteral("ref")).toString(),
+                    reviewIsoFromEpoch(reviewAfter));
+    return true;
+}
+
+// 统一读取：legacy 适配 thought_result，internal 读 internal_activity；不存在返回 {}。
+QJsonObject MemoryManager::activityByRef(const QString &ref) const
+{
+    if (!m_db.isOpen()) return {};
+    ActivityRef parsed;
+    if (!ActivityRef::parse(ref, &parsed)) return {};
+    QSqlQuery q(m_db);
+    if (parsed.kind == ActivityRef::LegacyThought) {
+        q.prepare(QStringLiteral(
+            "SELECT id,thought,thought_version,coalesce(review_after,0) AS review_after,"
+            "thought_result,channel,session_id,subject,timestamp FROM chat_history "
+            "WHERE id=? AND thought IS NOT NULL AND thought<>'' AND sensitive=0 "
+            "AND subject='user'"));
+        q.addBindValue(parsed.id);
+        if (!q.exec() || !q.next()) return {};
+        return legacyActivityRecord(q);
+    }
+    QJsonObject view;
+    QString error;
+    if (!loadInternalActivity(m_db, parsed.id, &view, &error)) return {};
+    return view;
+}
+
+bool MemoryManager::hasActiveActivity(const QString &scopeKey) const
+{
+    if (!m_db.isOpen()) return false;
+    QString error;
+    const bool active = hasActiveActivityInStore(m_db, normalizedActivityScope(scopeKey),
+                                                 QString{}, &error);
+    if (!error.isEmpty()) qWarning() << "[Activity] active query failed" << error;
+    return active;
+}
+
+// 两存储中最早到期（active + review_after<=now）的候选。legacy 只属于 owner；
+// internal 要求 scope 匹配且 channel 是 pet/qq_private（与私人回顾一致）。
+QJsonObject MemoryManager::nextDueActivity(const QString &scopeKey) const
+{
+    if (!m_db.isOpen()) return {};
+    const QString scope = normalizedActivityScope(scopeKey);
+    const qlonglong now = QDateTime::currentSecsSinceEpoch();
+    QString bestRef;
+    qlonglong bestDue = -1;
+    qlonglong bestId = 0;
+    if (scope == QStringLiteral("owner")) {
+        QSqlQuery legacy(m_db);
+        legacy.prepare(QStringLiteral(
+            "SELECT id,coalesce(review_after,0) FROM chat_history "
+            "WHERE thought IS NOT NULL AND thought<>'' AND subject='user' AND sensitive=0 "
+            "AND coalesce(json_extract(thought_result,'$.status'),'active')='active' "
+            "AND coalesce(review_after,0)<=? ORDER BY coalesce(review_after,0),id LIMIT 1"));
+        legacy.addBindValue(now);
+        if (legacy.exec() && legacy.next()) {
+            bestRef = QStringLiteral("thought/%1").arg(legacy.value(0).toLongLong());
+            bestDue = legacy.value(1).toLongLong();
+            bestId = legacy.value(0).toLongLong();
+        }
+    }
+    QSqlQuery internal(m_db);
+    internal.prepare(QStringLiteral(
+        "SELECT id,review_after FROM internal_activity WHERE scope_key=? AND status='active' "
+        "AND channel IN ('pet','qq_private') AND review_after<=? "
+        "ORDER BY review_after,id LIMIT 1"));
+    internal.addBindValue(scope);
+    internal.addBindValue(now);
+    if (internal.exec() && internal.next()) {
+        const qlonglong id = internal.value(0).toLongLong();
+        const qlonglong due = internal.value(1).toLongLong();
+        const bool earlier = bestRef.isEmpty() || due < bestDue
+            || (due == bestDue && id < bestId);
+        if (earlier) {
+            bestRef = QStringLiteral("activity/%1").arg(id);
+            bestDue = due;
+        }
+    }
+    if (bestRef.isEmpty()) return {};
+    ActivityRef parsed;
+    if (!ActivityRef::parse(bestRef, &parsed)) return {};
+    const QJsonObject view = activityByRef(bestRef);
+    if (view.isEmpty()) return {};
+    return QJsonObject{{QStringLiteral("ref"), bestRef},
+                       {QStringLiteral("kind"), parsed.originKind()},
+                       {QStringLiteral("origin"), parsed.originKind()},
+                       {QStringLiteral("version"), view.value(QStringLiteral("version")).toInt()},
+                       {QStringLiteral("review_after"), bestDue},
+                       {QStringLiteral("activity"), view}};
+}
+
+// 统一领取。legacy 复用 claimThoughtReview（预算/冷却/失败恢复都在原实现里）；
+// internal 在单事务内 version CAS + 同一份共享预算/冷却 + 公平计数，失败整体回滚。
+QJsonObject MemoryManager::claimActivity(const QString &ref, int expectedVersion, int dailyLimit,
+                                         int cooldownSeconds, QString *reason)
+{
+    if (reason) reason->clear();
+    const auto fail = [reason](const QString &code) {
+        if (reason) *reason = code;
+        return QJsonObject{};
+    };
+    ActivityRef parsed;
+    if (!ActivityRef::parse(ref, &parsed)) return fail(QStringLiteral("invalid_ref"));
+    if (!m_db.isOpen()) return fail(QStringLiteral("db_error"));
+    if (parsed.kind == ActivityRef::LegacyThought) {
+        QString claimReason;
+        QDateTime next;
+        if (!claimThoughtReview(parsed.id, expectedVersion, dailyLimit, cooldownSeconds,
+                                &claimReason, &next))
+            return fail(claimReason.isEmpty() ? QStringLiteral("db_error") : claimReason);
+        const QJsonObject view = activityByRef(parsed.ref());
+        return QJsonObject{{QStringLiteral("ref"), parsed.ref()},
+                           {QStringLiteral("kind"), QStringLiteral("legacy")},
+                           {QStringLiteral("origin_kind"), QStringLiteral("legacy")},
+                           {QStringLiteral("id"), parsed.id},
+                           {QStringLiteral("version"), expectedVersion + 1},
+                           {QStringLiteral("activity"), view}};
+    }
+    const qlonglong now = QDateTime::currentSecsSinceEpoch();
+    if (!m_db.transaction()) return fail(QStringLiteral("db_error"));
+    auto rollback = qScopeGuard([this] { m_db.rollback(); });
+    QSqlQuery current(m_db);
+    current.prepare(QStringLiteral("SELECT * FROM internal_activity WHERE id=?"));
+    current.addBindValue(parsed.id);
+    if (!current.exec()) return fail(QStringLiteral("db_error"));
+    if (!current.next()) return fail(QStringLiteral("cas_conflict"));
+    const int currentVersion = current.value(QStringLiteral("version")).toInt();
+    const QString currentStatus = current.value(QStringLiteral("status")).toString();
+    const qlonglong currentDue = current.value(QStringLiteral("review_after")).toLongLong();
+    const QString runId = current.value(QStringLiteral("run_id")).toString();
+    const QString scopeKey = current.value(QStringLiteral("scope_key")).toString();
+    current.finish();
+    if (currentVersion != expectedVersion || currentStatus != QStringLiteral("active"))
+        return fail(QStringLiteral("cas_conflict"));
+    if (currentDue > now) return fail(QStringLiteral("not_due"));
+    QSqlQuery update(m_db);
+    update.prepare(QStringLiteral(
+        "UPDATE internal_activity SET review_after=unixepoch()+1800,version=version+1,"
+        "updated_at=unixepoch() WHERE id=? AND version=? AND status='active' "
+        "AND review_after<=unixepoch()"));
+    update.addBindValue(parsed.id);
+    update.addBindValue(expectedVersion);
+    if (!update.exec()) return fail(QStringLiteral("db_error"));
+    if (update.numRowsAffected() != 1) return fail(QStringLiteral("cas_conflict"));
+    // R12-1a 失败暂停到期后的恢复（与 legacy 领取同一套 review_failure 语义）。
+    if (!recoverSuspendedFailure(QStringLiteral("activity"), parsed.ref()))
+        return fail(QStringLiteral("db_error"));
+    QString chargeReason;
+    QDateTime nextEligibleAt;
+    if (!chargePrivateReview(parsed.id, dailyLimit, cooldownSeconds, &chargeReason,
+                             &nextEligibleAt, QStringLiteral("activity"), parsed.ref(), runId, 0))
+        return fail(chargeReason.isEmpty() ? QStringLiteral("db_error") : chargeReason);
+    if (!bumpOpenWakeFairness()) return fail(QStringLiteral("db_error"));
+    QJsonObject view;
+    QString loadError;
+    if (!loadInternalActivity(m_db, parsed.id, &view, &loadError))
+        return fail(QStringLiteral("db_error"));
+    if (!m_db.commit()) return fail(QStringLiteral("db_error"));
+    rollback.dismiss();
+    return QJsonObject{{QStringLiteral("ref"), parsed.ref()},
+                       {QStringLiteral("kind"), QStringLiteral("internal")},
+                       {QStringLiteral("origin_kind"), view.value(QStringLiteral("origin_kind"))},
+                       {QStringLiteral("id"), parsed.id},
+                       {QStringLiteral("version"), view.value(QStringLiteral("version"))},
+                       {QStringLiteral("scope_key"), scopeKey},
+                       {QStringLiteral("run_id"), runId},
+                       {QStringLiteral("activity"), view}};
+}
+
+// 统一提交。internal 单事务 CAS：状态、正文 patch、artifact_ref、review_after、version
+// 一次性写入；失败（并发/版本过期/缺产物）整体拒绝。
+QJsonObject MemoryManager::finishActivity(const QString &ref, int version,
+                                          const QJsonObject &proposal, QString *error)
+{
+    if (error) error->clear();
+    const auto fail = [error](const QString &code) {
+        if (error) *error = code;
+        return QJsonObject{};
+    };
+    ActivityRef parsed;
+    if (!ActivityRef::parse(ref, &parsed)) return fail(QStringLiteral("invalid_ref"));
+    if (!m_db.isOpen()) return fail(QStringLiteral("db_error"));
+    if (parsed.kind == ActivityRef::LegacyThought) {
+        if (!finishThoughtReview(parsed.id, version, proposal))
+            return fail(QStringLiteral("invalid_or_stale_proposal"));
+        const QJsonObject view = activityByRef(parsed.ref());
+        QJsonObject result{{QStringLiteral("ref"), parsed.ref()},
+                           {QStringLiteral("status"), view.value(QStringLiteral("status"))},
+                           {QStringLiteral("version"), version + 1}};
+        const QString artifact = view.value(QStringLiteral("artifact_ref")).toString();
+        if (!artifact.isEmpty()) result.insert(QStringLiteral("artifact_ref"), artifact);
+        return result;
+    }
+    const QString status = proposal.value(QStringLiteral("status")).toString();
+    if (status != QStringLiteral("active") && status != QStringLiteral("paused")
+        && status != QStringLiteral("completed") && status != QStringLiteral("abandoned"))
+        return fail(QStringLiteral("invalid_status"));
+    const QString draft = proposal.value(QStringLiteral("draft")).toString().trimmed();
+    if (draft.size() > 800) return fail(QStringLiteral("draft_too_long"));
+    const QString reflection = proposal.value(QStringLiteral("reflection")).toString().trimmed();
+    // completed 必须有实际产物；不能把"没做成的外部行为"写成完成经历。
+    if (status == QStringLiteral("completed") && draft.isEmpty() && reflection.isEmpty())
+        return fail(QStringLiteral("missing_result"));
+    const qlonglong now = QDateTime::currentSecsSinceEpoch();
+    const int hours = qBound(1, proposal.value(QStringLiteral("review_hours")).toInt(24), 168);
+    const qlonglong reviewAfter =
+        (status == QStringLiteral("completed") || status == QStringLiteral("abandoned"))
+        ? 0 : now + qlonglong(hours) * 3600;
+    QJsonObject patch{{QStringLiteral("deferred_reason"), QJsonValue::Null},
+                      {QStringLiteral("paused_reason"), QJsonValue::Null}};
+    for (const auto &key : {QStringLiteral("reflection"), QStringLiteral("goal"),
+                            QStringLiteral("progress"), QStringLiteral("next_step"),
+                            QStringLiteral("mood"), QStringLiteral("paused_reason")})
+        insertActivityText(&patch, key, proposal.value(key), 200);
+    insertActivityText(&patch, QStringLiteral("draft"), proposal.value(QStringLiteral("draft")), 800);
+    if (proposal.value(QStringLiteral("share_with_owner")).toBool())
+        patch.insert(QStringLiteral("share_offered"), true);
+    const bool completedWithDraft = status == QStringLiteral("completed") && !draft.isEmpty();
+    const QString artifactRef = completedWithDraft ? parsed.ref() : QString{};
+    if (!m_db.transaction()) return fail(QStringLiteral("db_error"));
+    auto rollback = qScopeGuard([this] { m_db.rollback(); });
+    QSqlQuery update(m_db);
+    update.prepare(QStringLiteral(
+        "UPDATE internal_activity SET status=?,"
+        "result_json=json_patch(coalesce(result_json,'{}'),?),"
+        "version=version+1,review_after=?,updated_at=?,"
+        "artifact_ref=CASE WHEN ? THEN ? ELSE artifact_ref END "
+        "WHERE id=? AND version=? AND status IN ('active','paused')"));
+    update.addBindValue(status);
+    update.addBindValue(QString::fromUtf8(QJsonDocument(patch).toJson(QJsonDocument::Compact)));
+    update.addBindValue(reviewAfter);
+    update.addBindValue(now);
+    update.addBindValue(completedWithDraft ? 1 : 0);
+    update.addBindValue(artifactRef);
+    update.addBindValue(parsed.id);
+    update.addBindValue(version);
+    if (!update.exec()) return fail(QStringLiteral("db_error"));
+    if (update.numRowsAffected() != 1) return fail(QStringLiteral("cas_conflict"));
+    if (!m_db.commit()) return fail(QStringLiteral("db_error"));
+    rollback.dismiss();
+    QJsonObject result{{QStringLiteral("ref"), parsed.ref()},
+                       {QStringLiteral("status"), status},
+                       {QStringLiteral("version"), version + 1}};
+    if (completedWithDraft) result.insert(QStringLiteral("artifact_ref"), artifactRef);
+    return result;
+}
+
+// 统一延后：不改 lifecycle，只推下一次回顾时间（0=立即可再领取）。
+bool MemoryManager::deferActivity(const QString &ref, int version, int retrySeconds,
+                                  const QString &reason)
+{
+    ActivityRef parsed;
+    if (!ActivityRef::parse(ref, &parsed)) return false;
+    if (!m_db.isOpen()) return false;
+    if (parsed.kind == ActivityRef::LegacyThought)
+        return deferThoughtReview(parsed.id, version, reason);
+    const int retry = qBound(0, retrySeconds, 7 * 24 * 3600);
+    QSqlQuery update(m_db);
+    update.prepare(QStringLiteral(
+        "UPDATE internal_activity SET review_after=unixepoch()+?,version=version+1,"
+        "updated_at=unixepoch(),"
+        "result_json=json_set(coalesce(result_json,'{}'),'$.deferred_reason',?) "
+        "WHERE id=? AND version=? AND status IN ('active','paused')"));
+    update.addBindValue(retry);
+    update.addBindValue(reason.trimmed().left(240));
+    update.addBindValue(parsed.id);
+    update.addBindValue(version);
+    return update.exec() && update.numRowsAffected() == 1;
+}
+
+// 统一动作。legacy 复用 applyThoughtAction（完成必须走 finishActivity 带产物）；
+// internal 做显式状态机 + version CAS，resume 先做跨存储 active/paused 检查。
+QJsonObject MemoryManager::applyActivityAction(const QString &ref, int expectedVersion,
+                                               const QString &action, int afterMinutes,
+                                               const QString &reason, QString *error)
+{
+    if (error) error->clear();
+    const auto fail = [error](const QString &code) {
+        if (error) *error = code;
+        return QJsonObject{};
+    };
+    ActivityRef parsed;
+    if (!ActivityRef::parse(ref, &parsed)) return fail(QStringLiteral("invalid_ref"));
+    if (!m_db.isOpen()) return fail(QStringLiteral("db_error"));
+    const QString trimmedAction = action.trimmed();
+    if (trimmedAction != QStringLiteral("pause") && trimmedAction != QStringLiteral("resume")
+        && trimmedAction != QStringLiteral("abandon") && trimmedAction != QStringLiteral("complete")
+        && trimmedAction != QStringLiteral("reschedule"))
+        return fail(QStringLiteral("invalid_action"));
+    if (parsed.kind == ActivityRef::LegacyThought) {
+        // legacy 的 applyThoughtAction 只支持 pause/resume/abandon/reschedule；
+        // "complete" 必须带产物走 finishActivity，不能在这里伪造完成。
+        if (trimmedAction == QStringLiteral("complete"))
+            return fail(QStringLiteral("unsupported_action"));
+        // R12-1b：resume 与 internal 走同一跨存储单 active 检查（排除自身后仍有当前活动
+        // 就拒绝，绝不把双开写回来）。
+        if (trimmedAction == QStringLiteral("resume")) {
+            QString activeError;
+            if (hasActiveActivityInStore(m_db, QStringLiteral("owner"), parsed.ref(),
+                                         &activeError))
+                return fail(QStringLiteral("already_active"));
+            if (!activeError.isEmpty()) return fail(QStringLiteral("db_error"));
+        }
+        if (!applyThoughtAction(parsed.id, expectedVersion, trimmedAction, afterMinutes, reason))
+            return fail(QStringLiteral("invalid_or_stale"));
+        const QJsonObject view = activityByRef(parsed.ref());
+        return QJsonObject{{QStringLiteral("ref"), parsed.ref()},
+                           {QStringLiteral("origin"), QStringLiteral("legacy")},
+                           {QStringLiteral("status"), view.value(QStringLiteral("status"))},
+                           {QStringLiteral("version"), view.value(QStringLiteral("version"))}};
+    }
+    const qlonglong now = QDateTime::currentSecsSinceEpoch();
+    if (!m_db.transaction()) return fail(QStringLiteral("db_error"));
+    auto rollback = qScopeGuard([this] { m_db.rollback(); });
+    QSqlQuery current(m_db);
+    current.prepare(QStringLiteral("SELECT * FROM internal_activity WHERE id=?"));
+    current.addBindValue(parsed.id);
+    if (!current.exec()) return fail(QStringLiteral("db_error"));
+    if (!current.next()) return fail(QStringLiteral("cas_conflict"));
+    const int currentVersion = current.value(QStringLiteral("version")).toInt();
+    const QString currentStatus = current.value(QStringLiteral("status")).toString();
+    const QString scopeKey = current.value(QStringLiteral("scope_key")).toString();
+    const qlonglong currentReviewAfter = current.value(QStringLiteral("review_after")).toLongLong();
+    const QJsonObject stored = QJsonDocument::fromJson(
+        current.value(QStringLiteral("result_json")).toString().toUtf8()).object();
+    current.finish();
+    if (currentVersion != expectedVersion) return fail(QStringLiteral("cas_conflict"));
+    const bool currentlyOpen = currentStatus == QStringLiteral("active")
+        || currentStatus == QStringLiteral("paused");
+    if (!currentlyOpen) return fail(QStringLiteral("invalid_transition"));
+    QString newStatus = currentStatus;
+    qlonglong newReviewAfter = currentReviewAfter;
+    bool setArtifact = false;
+    QString artifactRef;
+    const QString trimmedReason = reason.trimmed().left(200);
+    QJsonObject patch{{QStringLiteral("last_action"), trimmedAction}};
+    if (trimmedAction == QStringLiteral("pause")) {
+        if (currentStatus != QStringLiteral("active")) return fail(QStringLiteral("invalid_transition"));
+        newStatus = QStringLiteral("paused");
+        patch.insert(QStringLiteral("paused_reason"),
+                     trimmedReason.isEmpty() ? QStringLiteral("user_paused") : trimmedReason);
+    } else if (trimmedAction == QStringLiteral("resume")) {
+        if (currentStatus != QStringLiteral("paused")) return fail(QStringLiteral("invalid_transition"));
+        QString activeError;
+        // 跨存储检查（排除自身）：历史数据里若遗留多个 active，resume 不能把双开写回来。
+        if (hasActiveActivityInStore(m_db, scopeKey, parsed.ref(), &activeError))
+            return fail(QStringLiteral("already_active"));
+        if (!activeError.isEmpty()) return fail(QStringLiteral("db_error"));
+        if (afterMinutes > 10080) return fail(QStringLiteral("invalid_argument"));
+        newStatus = QStringLiteral("active");
+        newReviewAfter = now + (afterMinutes > 0 ? qlonglong(afterMinutes) * 60 : 1800);
+        patch.insert(QStringLiteral("paused_reason"), QJsonValue::Null);
+        if (!trimmedReason.isEmpty())
+            patch.insert(QStringLiteral("reason"), trimmedReason);
+    } else if (trimmedAction == QStringLiteral("abandon")) {
+        newStatus = QStringLiteral("abandoned");
+        newReviewAfter = 0;
+        if (!trimmedReason.isEmpty())
+            patch.insert(QStringLiteral("reason"), trimmedReason);
+    } else if (trimmedAction == QStringLiteral("complete")) {
+        const QString storedDraft = stored.value(QStringLiteral("draft")).toString().trimmed();
+        const QString storedReflection =
+            stored.value(QStringLiteral("reflection")).toString().trimmed();
+        if (storedDraft.isEmpty() && storedReflection.isEmpty())
+            return fail(QStringLiteral("missing_result"));
+        newStatus = QStringLiteral("completed");
+        newReviewAfter = 0;
+        if (!trimmedReason.isEmpty())
+            patch.insert(QStringLiteral("reason"), trimmedReason);
+        if (!storedDraft.isEmpty()) {
+            setArtifact = true;
+            artifactRef = parsed.ref();
+        }
+    } else { // reschedule
+        if (afterMinutes < 0 || afterMinutes > 10080)
+            return fail(QStringLiteral("invalid_argument"));
+        newReviewAfter = now + qlonglong(afterMinutes) * 60;
+        if (!trimmedReason.isEmpty())
+            patch.insert(QStringLiteral("schedule_reason"), trimmedReason);
+    }
+    QSqlQuery update(m_db);
+    update.prepare(QStringLiteral(
+        "UPDATE internal_activity SET status=?,review_after=?,"
+        "result_json=json_patch(coalesce(result_json,'{}'),?),version=version+1,updated_at=?,"
+        "artifact_ref=CASE WHEN ? THEN ? ELSE artifact_ref END "
+        "WHERE id=? AND version=? AND status IN ('active','paused')"));
+    update.addBindValue(newStatus);
+    update.addBindValue(newReviewAfter);
+    update.addBindValue(QString::fromUtf8(QJsonDocument(patch).toJson(QJsonDocument::Compact)));
+    update.addBindValue(now);
+    update.addBindValue(setArtifact ? 1 : 0);
+    update.addBindValue(artifactRef);
+    update.addBindValue(parsed.id);
+    update.addBindValue(expectedVersion);
+    if (!update.exec()) return fail(QStringLiteral("db_error"));
+    if (update.numRowsAffected() != 1) return fail(QStringLiteral("cas_conflict"));
+    if (!m_db.commit()) return fail(QStringLiteral("db_error"));
+    rollback.dismiss();
+    return QJsonObject{{QStringLiteral("ref"), parsed.ref()},
+                       {QStringLiteral("origin"), QStringLiteral("internal")},
+                       {QStringLiteral("scope_key"), scopeKey},
+                       {QStringLiteral("status"), newStatus},
+                       {QStringLiteral("version"), expectedVersion + 1}};
+}
+
+// 分享意愿：只写 internal_activity.result_json.share_intent（不发送、不建账本）。
+bool MemoryManager::setActivityShareIntent(const QString &ref, int version,
+                                           const QString &draft, QString *error)
+{
+    if (error) error->clear();
+    const auto fail = [error](const QString &code) {
+        if (error) *error = code;
+        return false;
+    };
+    ActivityRef parsed;
+    if (!ActivityRef::parse(ref, &parsed)) return fail(QStringLiteral("invalid_ref"));
+    if (!m_db.isOpen()) return fail(QStringLiteral("db_error"));
+    if (parsed.kind == ActivityRef::LegacyThought)
+        return fail(QStringLiteral("unsupported_legacy"));
+    const QString trimmedDraft = draft.trimmed();
+    if (trimmedDraft.isEmpty() || trimmedDraft.size() > 800)
+        return fail(QStringLiteral("invalid_draft"));
+    const qlonglong now = QDateTime::currentSecsSinceEpoch();
+    const QJsonObject intent{{QStringLiteral("requested"), true},
+                             {QStringLiteral("draft"), trimmedDraft},
+                             {QStringLiteral("version"), version},
+                             {QStringLiteral("at"), now}};
+    if (!m_db.transaction()) return fail(QStringLiteral("db_error"));
+    auto rollback = qScopeGuard([this] { m_db.rollback(); });
+    QSqlQuery update(m_db);
+    update.prepare(QStringLiteral(
+        "UPDATE internal_activity SET result_json=json_set(coalesce(result_json,'{}'),"
+        "'$.share_intent',json(?),'$.share_offered',json('true')),updated_at=unixepoch() "
+        "WHERE id=? AND version=? AND status IN ('active','completed')"));
+    update.addBindValue(QString::fromUtf8(
+        QJsonDocument(intent).toJson(QJsonDocument::Compact)));
+    update.addBindValue(parsed.id);
+    update.addBindValue(version);
+    if (!update.exec()) return fail(QStringLiteral("db_error"));
+    if (update.numRowsAffected() != 1) return fail(QStringLiteral("cas_conflict"));
+    if (!m_db.commit()) return fail(QStringLiteral("db_error"));
+    rollback.dismiss();
+    return true;
+}
+
+// 启动恢复诊断：只读、幂等。报告跨存储 active/paused 冲突与最早到期列表，
+// 不删除活动、不伪造完成、不发消息。
+QJsonArray MemoryManager::recoverActivities(const QString &scopeKey)
+{
+    QJsonArray result;
+    if (!m_db.isOpen()) return result;
+    const QString scope = normalizedActivityScope(scopeKey);
+    const qlonglong now = QDateTime::currentSecsSinceEpoch();
+    QJsonArray legacyCurrent;
+    if (scope == QStringLiteral("owner")) {
+        QSqlQuery legacy(m_db);
+        legacy.prepare(QStringLiteral(
+            "SELECT id FROM chat_history WHERE thought IS NOT NULL AND thought<>'' "
+            "AND subject='user' AND sensitive=0 "
+            "AND coalesce(json_extract(thought_result,'$.status'),'active') "
+            "IN ('active','paused') ORDER BY id"));
+        if (legacy.exec()) while (legacy.next())
+            legacyCurrent.append(QStringLiteral("thought/%1").arg(legacy.value(0).toLongLong()));
+    }
+    QJsonArray internalCurrent;
+    QSqlQuery internal(m_db);
+    internal.prepare(QStringLiteral(
+        "SELECT id,version,status,review_after FROM internal_activity "
+        "WHERE scope_key=? AND status IN ('active','paused') ORDER BY id"));
+    internal.addBindValue(scope);
+    if (internal.exec()) while (internal.next())
+        internalCurrent.append(QStringLiteral("activity/%1").arg(internal.value(0).toLongLong()));
+    if (!legacyCurrent.isEmpty()) {
+        result.append(QJsonObject{{QStringLiteral("kind"), QStringLiteral("current")},
+                                  {QStringLiteral("origin"), QStringLiteral("legacy")},
+                                  {QStringLiteral("scope_key"), scope},
+                                  {QStringLiteral("count"), legacyCurrent.size()},
+                                  {QStringLiteral("refs"), legacyCurrent}});
+    }
+    if (!internalCurrent.isEmpty()) {
+        result.append(QJsonObject{{QStringLiteral("kind"), QStringLiteral("current")},
+                                  {QStringLiteral("origin"), QStringLiteral("internal")},
+                                  {QStringLiteral("scope_key"), scope},
+                                  {QStringLiteral("count"), internalCurrent.size()},
+                                  {QStringLiteral("refs"), internalCurrent}});
+    }
+    if (!legacyCurrent.isEmpty() && !internalCurrent.isEmpty()) {
+        // 历史并发可能写出双开：只报告，不自动删除/合并，交给调用方按可审计流程处理。
+        result.append(QJsonObject{{QStringLiteral("kind"), QStringLiteral("cross_store_conflict")},
+                                  {QStringLiteral("scope_key"), scope},
+                                  {QStringLiteral("legacy_refs"), legacyCurrent},
+                                  {QStringLiteral("internal_refs"), internalCurrent},
+                                  {QStringLiteral("action"), QStringLiteral("none")}});
+    }
+    // legacy 到期列表（只在 owner 域）。
+    if (scope == QStringLiteral("owner")) {
+        QSqlQuery dueLegacy(m_db);
+        dueLegacy.prepare(QStringLiteral(
+            "SELECT id,thought_version,coalesce(review_after,0) FROM chat_history "
+            "WHERE thought IS NOT NULL AND thought<>'' AND subject='user' AND sensitive=0 "
+            "AND coalesce(json_extract(thought_result,'$.status'),'active')='active' "
+            "AND coalesce(review_after,0)<=? ORDER BY coalesce(review_after,0),id"));
+        dueLegacy.addBindValue(now);
+        if (dueLegacy.exec()) while (dueLegacy.next()) {
+            const qlonglong id = dueLegacy.value(0).toLongLong();
+            result.append(QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("due")},
+                {QStringLiteral("ref"), QStringLiteral("thought/%1").arg(id)},
+                {QStringLiteral("origin"), QStringLiteral("legacy")},
+                {QStringLiteral("version"), dueLegacy.value(1).toInt()},
+                {QStringLiteral("review_after"), dueLegacy.value(2).toLongLong()}});
+        }
+    }
+    QSqlQuery dueInternal(m_db);
+    dueInternal.prepare(QStringLiteral(
+        "SELECT id,version,review_after FROM internal_activity "
+        "WHERE scope_key=? AND status='active' AND channel IN ('pet','qq_private') "
+        "AND review_after<=? ORDER BY review_after,id"));
+    dueInternal.addBindValue(scope);
+    dueInternal.addBindValue(now);
+    if (dueInternal.exec()) while (dueInternal.next()) {
+        const qlonglong id = dueInternal.value(0).toLongLong();
+        result.append(QJsonObject{{QStringLiteral("kind"), QStringLiteral("due")},
+                                  {QStringLiteral("ref"), QStringLiteral("activity/%1").arg(id)},
+                                  {QStringLiteral("origin"), QStringLiteral("internal")},
+                                  {QStringLiteral("version"), dueInternal.value(1).toInt()},
+                                  {QStringLiteral("review_after"), dueInternal.value(2).toLongLong()}});
+    }
+    if (result.isEmpty()) {
+        result.append(QJsonObject{{QStringLiteral("kind"), QStringLiteral("clean")},
+                                  {QStringLiteral("scope_key"), scope}});
+    }
+    return result;
 }
 
 // ============================ 认知快照只读查询 ============================

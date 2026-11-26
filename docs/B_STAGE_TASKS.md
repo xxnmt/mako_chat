@@ -257,3 +257,23 @@ R12（自主认知入口）开工基线为 `c28d23d`、schema v30；R12-0 是唯
 验证：实际 `ctest 23/23`；`tst_memorymanager` 122 passed/1 skipped、`tst_memoryagent` 86、`tst_cognitivesnapshot` 13、`tst_configmanager` 17。生产库 v31 迁移后旧行数不变（chat 534/reminder 3/reflection 65/ledger 137/thought_review_log 101）。真实运行（临时启用 OpenWake、allow_contact=false）验证 `[OpenWake] claimed → [Review] attempt kind=open_wake → [OpenWake] committed decision=reflect`，`[Outbox]=0` 无 contact；同轮 concern 响应 `truncated` 进入持久退避。验证后恢复配置并清理测试产生的 OpenWake 行。
 
 **未做**：R12-1b 活动创建/完整生命周期、R12-2 OpenWake contact/outbox、R12-3 跨入口快照一致性、后台通用 tool loop。**剩余风险**：真实模型对 OpenWake rest/reflect schema 的长期服从性、OpenWake epoch 仅 state version 占位、失败退避与重启窗口需长期观察、快照 4096 预算在极端域组合下仍可能 overflow。
+
+## 15. R12-1a 补充修正与 R12-1b 统一活动（2026-11-26）
+
+### R12-1a 补充修正（独立 commit）
+- OpenWake 间隔在提交边界按管理员 min/max 夹紧，记录 requested/effective；默认 min=300 秒。
+- 所有真实回顾生成独立 runId，成功/失败回调必须带服务端 `_origin`；删除生产兼容放行。
+- Concern 保留期结束终止定时重试：清 failure、next_check_at=0、保留关注与事实、审计 `retry_expired`。
+- Prompt 旧 basis 说明仅旧数据兼容；OpenWake 内部状态 scope/盲区/群聊隔离。
+
+### R12-1b 统一活动
+| 项 | 实现 |
+|---|---|
+| ActivityRef | `thought/<id>` legacy / `activity/<id>` internal，同 id 不串线 |
+| 统一接口 | create/lookup/current/hasActive/claim/finish/defer/pause/resume/abandon/complete/reschedule/recover；版本 CAS/runId/单 active 跨存储事务 |
+| 前台 | personal_interest 新活动写 internal_activity，不再写 chat_history.thought；privateWriting=false 禁止；幂等 |
+| OpenWake | 可选 start_activity；单事务完成唤醒+创建活动；rest/reflect 合法；无 contact/outbox |
+| ActivityReview | 统一领取/提交新旧活动；internal 分享只存 share_intent；legacy 分享链保留 |
+| 感知 | 快照/前台统一活动视图；completed 不显示过时 next_step；群聊/第三方隔离 |
+
+验证：全量 `ctest 23/23`；`tst_memorymanager 139/1 skipped`、`tst_memoryagent 91`、`tst_cognitivesnapshot 15`、`tst_actionoutbox 15`、`tst_actionpolicy 9`。无 schema 变更。真实运行 ActivityReview 实际领取 internal activity，但模型返回契约外 status，服务端拒绝并持久退避，无 chat/outbox；成功路径由单测覆盖。**未做**：R12-2 contact/outbox、R12-3 快照连续性、后台 tool loop。

@@ -470,3 +470,21 @@ B5 节奏按报告修正：固定提交基线 → 2–4h 受控冒烟（self_des
 - **集成修复**：新增 `cognitiveorigin.h` 缺 Qt include；测试夹具 backoff 时钟只拨 400 未覆盖 900 档；OpenWake claim 补 `current_context_epoch`。
 - **验证**：实际 `ctest 23/23`；`tst_memorymanager 122/1 skipped`、`tst_memoryagent 86`、`tst_cognitivesnapshot 13`、`tst_configmanager 17`。生产库 v30→v31 迁移后行数不变；真实运行 OpenWake `claimed→reflect committed`，无 Outbox/contact；同轮 concern `truncated` 进入持久退避；验证后恢复配置并清理测试 OpenWake 行。
 - **未做**：R12-1b 活动创建、R12-2 contact/outbox、R12-3 快照一致性、后台 tool loop。**风险**：真实模型对 rest/reflect 契约的长期服从、epoch 为占位、4096 预算极端 overflow、失败状态长期观察。
+
+---
+
+## 2026-11-26 · R12-1a 补充修正 + R12-1b 统一活动
+
+### R12-1a 补充
+- OpenWake after_minutes 提交边界按配置 min/max 夹紧（requested/effective 日志），默认 min 300 秒；协议外才失败。
+- 所有回顾领取独立 runId；success/error 回调必须 `_origin`，删除生产 id/version 兼容放行。
+- Concern 保留期结束终止定时重试（next_check_at=0、清 failure、保留关注/事实、审计）。
+- Prompt 旧 basis 仅旧数据兼容；OpenWake 内部状态 scope/盲区/群聊隔离。
+
+### R12-1b
+- 新增 `ActivityRef`/统一活动 API（create/lookup/current/hasActive/claim/finish/defer/action/share intent/recover），legacy thought 只读适配，internal_activity 承载新活动；版本 CAS、单 active 跨存储事务、runId 幂等。
+- 前台 personal_interest 改走 internal_activity；OpenWake 可选 start_activity（单事务完成唤醒+建活动）；ActivityReview 统一新旧活动；internal 分享只存 share_intent，legacy 分享链保留；快照/前台统一读取，无 chat/索引污染。
+- 测试适配旧 legacy 分享夹具（`tst_actionoutbox`/`tst_actionpolicy` 直接 SQL 造存量活动，不伪造用户轮次）；修复测试辅助引用/时钟偏差。
+- 验证：全量 `ctest 23/23`；`tst_memorymanager 139/1 skipped`、`tst_memoryagent 91`、`tst_cognitivesnapshot 15`、`tst_actionoutbox 15`、`tst_actionpolicy 9`。无 schema 变更。
+- 真实运行：v31 OpenWake rest/reflect 已实证；内部活动运行时被 ActivityReview 实际领取，但模型返回契约外 status，被正确拒绝并持久退避，无 chat/outbox；临时数据已清理。成功路径由单测覆盖。
+- 未做：R12-2 contact/outbox、R12-3 快照连续性、后台 tool loop。

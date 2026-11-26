@@ -57,6 +57,19 @@ struct CognitiveOrigin {
         return QString{};
     }
 
+    // R12-1b：internal 活动的统一引用是 activity/<id>；与 legacy 的 thought/<id>
+    // 共用 Activity 类型但身份空间不同（两张表可以有相同的整数 id）。
+    static QString internalActivityRef(qlonglong id)
+    {
+        return QStringLiteral("activity/%1").arg(id);
+    }
+
+    // Activity 类型允许两种合法 ref：legacy thought/<id> 与 internal activity/<id>。
+    static bool validActivityRef(const QString &ref, qlonglong id)
+    {
+        return ref == refFor(Activity, id) || ref == internalActivityRef(id);
+    }
+
     static bool kindFromName(const QString &name, Kind *kind)
     {
         if (!kind) return false;
@@ -103,6 +116,26 @@ struct CognitiveOrigin {
         return origin;
     }
 
+    // R12-1b：按统一引用创建活动来源身份。ref 必须是 thought/<id> 或 activity/<id>，
+    // 未知格式返回一个 !isValid() 的 origin（调用方按 storage_error 拒绝）。
+    static CognitiveOrigin forActivityRef(const QString &activityRef, int version,
+                                          const QString &scopeKey = QStringLiteral("owner"))
+    {
+        CognitiveOrigin origin;
+        origin.kind = Activity;
+        origin.version = version;
+        origin.scope = scopeKey;
+        const QString trimmed = activityRef.trimmed();
+        if (trimmed.startsWith(QStringLiteral("activity/"))) {
+            origin.id = trimmed.mid(QStringLiteral("activity/").size()).toLongLong();
+            origin.ref = internalActivityRef(origin.id);
+        } else if (trimmed.startsWith(QStringLiteral("thought/"))) {
+            origin.id = trimmed.mid(QStringLiteral("thought/").size()).toLongLong();
+            origin.ref = refFor(Activity, origin.id);
+        }
+        return origin;
+    }
+
     static CognitiveOrigin forOpenWake(qlonglong wakeId, int version, const QString &wakeRunId,
                                        const QString &scopeKey, qint64 contextEpoch = 0)
     {
@@ -121,7 +154,12 @@ struct CognitiveOrigin {
     bool isValid() const
     {
         if (id <= 0 || version <= 0 || ref.isEmpty()) return false;
-        if (ref != refFor(kind, id)) return false;
+        if (kind == Activity) {
+            // R12-1b：活动来源允许 legacy thought/<id> 与 internal activity/<id> 两种规范引用。
+            if (!validActivityRef(ref, id)) return false;
+        } else if (ref != refFor(kind, id)) {
+            return false;
+        }
         if (kind == OpenWake) return !runId.isEmpty() && !scope.isEmpty();
         return true;
     }

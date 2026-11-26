@@ -201,19 +201,35 @@ static qint64 insertReminder(const QString &dbPath, const QString &tag, int dueO
 }
 
 // 造一个 completed、有产物、可分享的活动；返回 id 与本次回顾后的版本。
-static qlonglong seedCompletedActivity(MemoryManager &mm, const QString &userText,
+// R12-1b：前台 personal_interest 已改走 internal_activity，本测试显式构造 legacy 存量活动，
+// 验证旧分享/Outbox 路径仍兼容（不伪造聊天用户轮次，只是补历史活动列）。
+static qlonglong seedCompletedActivity(const QString &dbPath, MemoryManager &mm,
+                                       const QString &userText,
                                        const QString &interestJson, const QString &draft,
                                        int *sharedVersion = nullptr)
 {
-    if (!mm.saveQATurn(userText, interestJson, {})) return 0;
-    const auto thought = mm.nextThought(true);
-    const qlonglong id = thought["id"].toInteger();
-    const int version = thought["version"].toInt();
-    if (id <= 0) return 0;
-    if (!mm.finishThoughtReview(id, version,
-            QJsonObject{{"status", "completed"}, {"reflection", "写好了两句"}, {"draft", draft}}))
+    Q_UNUSED(mm)
+    RawDb raw(dbPath, QStringLiteral("seed-completed-activity"));
+    if (!raw.open()) return 0;
+    if (!raw.execPrepared(
+            QStringLiteral("INSERT INTO chat_history(user_input,raw_reply,channel,session_id,"
+                           "speaker,sensitive,turn_kind,subject,thought,thought_result,"
+                           "thought_version,review_after,timestamp) "
+                           "VALUES(?,\'\',\'pet\',\'default\',\'assistant\',0,\'reply\',\'user\',?,?,1,0,datetime(\'now\'))"),
+            {userText, QStringLiteral("写雨声"), QStringLiteral("{}")}))
         return 0;
-    if (sharedVersion) *sharedVersion = version + 1;
+    const qlonglong id = raw.scalar(QStringLiteral("SELECT last_insert_rowid()")).toLongLong();
+    if (id <= 0) return 0;
+    const QJsonObject result{
+        {QStringLiteral("status"), QStringLiteral("completed")},
+        {QStringLiteral("reflection"), QStringLiteral("写好了两句")},
+        {QStringLiteral("draft"), draft},
+        {QStringLiteral("artifact_ref"), QStringLiteral("thought/%1").arg(id)}};
+    if (!raw.execPrepared(
+            QStringLiteral("UPDATE chat_history SET thought_result=? WHERE id=?"),
+            {QString::fromUtf8(QJsonDocument(result).toJson(QJsonDocument::Compact)), id}))
+        return 0;
+    if (sharedVersion) *sharedVersion = 1;
     return id;
 }
 
@@ -333,7 +349,7 @@ private slots:
         // share
         int sharedVersion = 0;
         const qlonglong activityId = seedCompletedActivity(
-            db, QStringLiteral("想写雨声"), R"({"personal_interest":"写雨声"})",
+            path, db, QStringLiteral("想写雨声"), R"({"personal_interest":"写雨声"})",
             QStringLiteral("屋檐轻响。"), &sharedVersion);
         QVERIFY(activityId > 0);
         QVERIFY(!committer.commitActivityShare(activityId, sharedVersion, QStringLiteral("屋檐轻响。"))
@@ -540,7 +556,7 @@ private slots:
         ActionCommitter committer(&db);
         int sharedVersion = 0;
         const qlonglong activityId = seedCompletedActivity(
-            db, QStringLiteral("想写风声"), R"({"personal_interest":"写风声"})",
+            path, db, QStringLiteral("想写风声"), R"({"personal_interest":"写风声"})",
             QStringLiteral("风从窗缝里钻进来。"), &sharedVersion);
         QVERIFY(activityId > 0);
         const auto committed = committer.commitActivityShare(

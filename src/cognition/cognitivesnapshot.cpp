@@ -315,7 +315,17 @@ CognitiveSnapshot CognitiveSnapshotBuilder::build(const RequestMeta &meta, const
     recordDomain(domainName("inferences"), inferencesQueried + wakeNoteQueried,
                  int(snapshot.inferences.size()), true);
 
-    if (!groupAudience) {
+    // R12-1b：自发动机/私人活动/内部唤醒只属于主人私聊域。群聊投影与第三方会话
+    // （subject 非主人）都不读取，避免把 owner 私有活动/调度泄漏给其他听众。
+    const auto recordPrivateDomainNotQueried = [this, groupAudience, blindZone,
+                                                &recordDomain](const QString &domain) {
+        recordDomain(domain, 0, 0, false);
+        const QString prefix = groupAudience ? QStringLiteral("group_projection:")
+            : blindZone ? QStringLiteral("private_projection:")
+                        : QStringLiteral("third_party_projection:");
+        m_stats.notes.append(prefix + domain + QStringLiteral("_not_queried"));
+    };
+    if (ownerPrivateAudience) {
         int motivationsQueried = 0;
         // OpenWake 的自发动机（可选）：与 inferences 的 note 同源，只表示“她自己想继续/休息”，
         // 不是对主人的承诺；放最前保证最小保留时可见。
@@ -342,9 +352,7 @@ CognitiveSnapshot CognitiveSnapshotBuilder::build(const RequestMeta &meta, const
         recordDomain(domainName("motivations"), motivationsQueried + wakeNoteQueried,
                      int(snapshot.motivations.size()), true);
     } else {
-        // 群聊投影不读取自发动机/私人活动/内部唤醒：记 0 并在 notes 里说明口径。
-        recordDomain(domainName("motivations"), 0, 0, false);
-        m_stats.notes.append(QStringLiteral("group_projection:motivations_not_queried"));
+        recordPrivateDomainNotQueried(domainName("motivations"));
     }
 
     int commitmentsQueried = 0;
@@ -367,21 +375,25 @@ CognitiveSnapshot CognitiveSnapshotBuilder::build(const RequestMeta &meta, const
     recordDomain(domainName("commitments"), commitmentsQueried,
                  int(snapshot.commitments.size()), true);
 
-    // 私人活动与内部唤醒只属于主人私聊域；群聊快照不读取，避免把私聊来源带进群投影。
-    if (!groupAudience) {
+    // 私人活动与内部唤醒只属于主人私聊域；群聊/第三方快照不读取，避免把私聊来源带出去。
+    if (ownerPrivateAudience) {
         int activitiesQueried = 0;
+        int activitiesEligible = 0;
+        // R12-1b：当前活动统一读取 legacy thought/<id> 与 internal activity/<id>；
+        // completed/abandoned 不进入 current，过时 next_step 不会显示为未完成。
         snapshot.activities = limitArray(
-            m_memory->currentActivities(kDomainLimit, &activitiesQueried, nullptr), kDomainLimit);
+            m_memory->currentActivitiesUnified(kDomainLimit, &activitiesQueried,
+                                               &activitiesEligible),
+            kDomainLimit);
         recordDomain(domainName("activities"), activitiesQueried,
-                     int(snapshot.activities.size()), true);
+                     activitiesEligible, true);
 
         int wakesQueried = 0;
         const QJsonArray wakeRows =
             m_memory->internalWakes(kDomainLimit, &wakesQueried, nullptr);
         // OpenWake 调度状态：来自 open_wake_state(scope=owner)，只表示她自己的内部调度，
         // 永远不是主人约定；只在主人私聊域注入，放在最前保证预算裁剪时优先保留。
-        const QJsonObject wakeState = ownerPrivateAudience
-            ? m_memory->openWakeState(QStringLiteral("owner")) : QJsonObject{};
+        const QJsonObject wakeState = m_memory->openWakeState(QStringLiteral("owner"));
         if (!wakeState.isEmpty()) {
             const QString nextDueIso =
                 wakeState.value(QStringLiteral("next_due_iso")).toString();
@@ -400,10 +412,8 @@ CognitiveSnapshot CognitiveSnapshotBuilder::build(const RequestMeta &meta, const
         recordDomain(domainName("internal_wakes"), wakesQueried,
                      int(snapshot.internalWakes.size()), true);
     } else {
-        recordDomain(domainName("activities"), 0, 0, false);
-        recordDomain(domainName("internal_wakes"), 0, 0, false);
-        m_stats.notes.append(QStringLiteral("group_projection:activities_not_queried"));
-        m_stats.notes.append(QStringLiteral("group_projection:internal_wakes_not_queried"));
+        recordPrivateDomainNotQueried(domainName("activities"));
+        recordPrivateDomainNotQueried(domainName("internal_wakes"));
     }
 
     QJsonObject policyView{

@@ -6,6 +6,9 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QTemporaryDir>
+#include <QSqlDatabase>
+#include <QSqlQuery>
+#include <QVariant>
 
 #include "actionpolicy.h"
 #include "configmanager.h"
@@ -13,6 +16,43 @@
 #include "utterance.h"
 
 namespace {
+
+// R12-1b：前台新活动已走 internal_activity；该旧分享策略测试显式构造 legacy 存量活动，
+// 验证历史活动仍可被 ActionPolicy 读取并可完成/分享（不伪造用户聊天轮次）。
+static qlonglong seedLegacyActiveThought(const QString &dbPath, const QString &interest,
+                                         const QString &userText)
+{
+    const QString conn = QStringLiteral("tst_actionpolicy_legacy_%1")
+        .arg(QDateTime::currentMSecsSinceEpoch());
+    {
+        QSqlDatabase db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), conn);
+        db.setDatabaseName(dbPath);
+        if (!db.open()) {
+            QSqlDatabase::removeDatabase(conn);
+            return 0;
+        }
+        QSqlQuery q(db);
+        q.prepare(QStringLiteral(
+            "INSERT INTO chat_history(user_input,raw_reply,channel,session_id,speaker,"
+            "sensitive,turn_kind,subject,thought,thought_result,thought_version,"
+            "review_after,timestamp) "
+            "VALUES(?,'','pet','default','assistant',0,'reply','user',?,?,0,0,datetime('now'))"));
+        q.addBindValue(userText);
+        q.addBindValue(interest);
+        const QJsonObject initial{{QStringLiteral("status"), QStringLiteral("active")},
+                                  {QStringLiteral("artifact_ref"), QString()}};
+        q.addBindValue(QString::fromUtf8(QJsonDocument(initial).toJson(QJsonDocument::Compact)));
+        if (!q.exec()) {
+            db.close();
+            QSqlDatabase::removeDatabase(conn);
+            return 0;
+        }
+        const qlonglong id = q.lastInsertId().toLongLong();
+        db.close();
+        QSqlDatabase::removeDatabase(conn);
+        return id;
+    }
+}
 
 // 主动联系/语义核验配置在 identity.json。测试里临时启用，析构时恢复。
 class PolicyIdentityGuard
@@ -363,11 +403,10 @@ private slots:
         PolicyIdentityGuard identity;
         QVERIFY(identity.enable());
         MemoryManager memory(dir.filePath(QStringLiteral("activity.db")));
-        QVERIFY(memory.saveQATurn(QStringLiteral("你想做点什么"),
-                                  QStringLiteral(R"({"personal_interest":"写一首关于雨的诗"})"), {}));
-        const auto thought = memory.nextThought(false);
-        const auto activityId = thought.value(QStringLiteral("id")).toInteger();
-        const int version = thought.value(QStringLiteral("version")).toInt();
+        const auto activityId = seedLegacyActiveThought(
+            dir.filePath(QStringLiteral("activity.db")),
+            QStringLiteral("写一首关于雨的诗"), QStringLiteral("你想做点什么"));
+        const int version = 0;
         QVERIFY(activityId > 0);
 
         ActionPolicy policy(&memory);

@@ -15,6 +15,7 @@
 #include "historyturn.h"
 #include "utterance.h"
 #include "recentcontext.h"
+#include "activityref.h"
 
 class MemoryEmbeddingProvider;
 class MemoryReadPolicy;
@@ -329,6 +330,19 @@ public:
                               const QString &scopeKey=QStringLiteral("owner"));
     bool finishOpenWake(qlonglong id,int version,const QString &decision,const QString &note,
                         const QJsonObject &intent,int nextWakeMinutes,QString *error=nullptr);
+    // R12-1b：OpenWake 的 start_activity 提交。与 finishOpenWake 一样是带 version CAS 的
+    // 单一事务：先创建 internal 活动（origin_kind=open_wake、origin_ref=wake/<id>、
+    // run_id=open_wake.run_id，单 active 跨存储检查），再完成 open_wake/更新调度状态；
+    // 任一步失败整体回滚，绝不出现"只建活动"或"只完成 wake"的半写状态。
+    // decision 必须为 start_activity；activityProposal 字段：
+    //   interest（必填，≤120）、goal（可空，≤200）、initial_review_after_minutes（可选 5..1440，
+    //   默认 30）、channel/session（可选，只允许主人私聊域 pet/qq_private，默认 pet/default）。
+    // 成功时 result 输出新活动统一视图（ref=activity/<id>），error 为空；
+    // 失败（already_active/db_error/cas_conflict/invalid_*）返回 false 并写 error。
+    bool finishOpenWakeWithActivity(qlonglong id,int version,const QString &decision,
+                                    const QString &note,const QJsonObject &intent,
+                                    int nextWakeMinutes,const QJsonObject &activityProposal,
+                                    QJsonObject *result=nullptr,QString *error=nullptr);
     bool deferOpenWake(qlonglong id,int version,int retrySeconds,const QString &reason);
     bool cancelOpenWake(qlonglong id,int version,const QString &reason);
     int recoverOpenWakeLeases(int staleSeconds=1800);
@@ -341,7 +355,51 @@ public:
     // hasActiveInternalActivity 合并检查两种来源的 active/paused；currentActivitiesUnified
     // 返回带 origin 字段的合并列表，不改变既有 currentActivities 的返回形状。
     bool hasActiveInternalActivity() const;
-    QJsonArray currentActivitiesUnified(int limit) const;
+    QJsonArray currentActivitiesUnified(int limit = 8,int *queried=nullptr,
+                                        int *eligible=nullptr) const;
+
+    // ===== R12-1b：统一活动存取 / 生命周期（legacy 适配 + internal 新写）=====
+    // 引用格式见 activityref.h：legacy=thought/<id>，internal=activity/<id>。
+    // 新建活动只写 internal_activity；存量 thought 活动通过适配器读写，不复制/不伪造聊天行。
+    // 所有写接口返回 QJsonObject；失败返回空对象并把原因写入 error（可为 nullptr）。
+    // createActivity：事务内校验 + 同 (origin_kind,origin_ref,run_id) 幂等 + 两存储
+    //   active/paused 单活动检查；成功返回 {ref,id,version,status,review_after,origin,...}。
+    //   新建只允许 originKind=foreground/open_wake、scopeKey=owner、runId 非空。
+    QJsonObject createActivity(const QString &scopeKey,const QString &channel,const QString &session,
+        const QString &interest,const QString &goal,const QString &originKind,const QString &originRef,
+        const QString &runId,QString *error=nullptr);
+    // 统一视图：任何状态的 legacy/internal 活动；不存在返回 {}。字段含
+    // ref/origin/kind/id/status/version/goal/progress/next_step/draft/artifact_ref/
+    // share_intent/review_after/channel/session/updated_at 等（按来源可用字段）。
+    QJsonObject activityByRef(const QString &ref) const;
+    // 两存储 active/paused 统一判断（scope 隔离：legacy 只属于 owner）。
+    bool hasActiveActivity(const QString &scopeKey=QStringLiteral("owner")) const;
+    // 两存储中 status=active、review_after<=now、sensitive=0 的最早候选；
+    // 返回 {ref,kind,version,activity}（kind=legacy|internal），无则 {}。
+    QJsonObject nextDueActivity(const QString &scopeKey=QStringLiteral("owner")) const;
+    // 统一领取：legacy 走 claimThoughtReview，internal 走 version CAS + 共享预算/冷却；
+    // 成功返回 {ref,kind,id,version,activity,origin_kind,run_id,scope_key}。
+    // reason 输出与现有领取一致：daily_limit/cooldown/cas_conflict/db_error/not_due。
+    QJsonObject claimActivity(const QString &ref,int expectedVersion,int dailyLimit,
+        int cooldownSeconds,QString *reason=nullptr);
+    // 统一提交：legacy 走 finishThoughtReview，internal 单事务 CAS 写 status/result_json/
+    // artifact_ref/review_after/version；返回 {status,version(新),ref[,artifact_ref]}。
+    QJsonObject finishActivity(const QString &ref,int version,const QJsonObject &proposal,
+        QString *error=nullptr);
+    // 统一延后：legacy 复用 deferThoughtReview；internal CAS 只推 review_after，不改 lifecycle。
+    bool deferActivity(const QString &ref,int version,int retrySeconds,const QString &reason);
+    // 统一动作：pause/resume/abandon/complete/reschedule。legacy 复用 applyThoughtAction
+    // （complete 不支持，返回 unsupported_action）；internal 在单事务内做状态机 + CAS，
+    // resume 会做跨存储 active/paused 检查（排除自身）。返回 {ref,status,version,origin}。
+    QJsonObject applyActivityAction(const QString &ref,int expectedVersion,const QString &action,
+        int afterMinutes,const QString &reason,QString *error=nullptr);
+    // 分享意愿只落 internal_activity.result_json.share_intent，不写 delivery_ledger/
+    // action_outbox/chat_history、不发消息；legacy 返回 unsupported_legacy。
+    bool setActivityShareIntent(const QString &ref,int version,const QString &draft,
+        QString *error=nullptr);
+    // 启动恢复诊断（只读、幂等）：报告两存储 active/paused 的跨存储冲突与 internal 到期
+    // 列表；不删除活动、不伪造完成。
+    QJsonArray recoverActivities(const QString &scopeKey=QStringLiteral("owner"));
 
 //历史对话crud
     QList<HistoryTurn> getHistoryTurn(int N, const QString &channel = Channel::kPet, const QString &sessionId = Channel::kDefaultSession, qint64 beforeTurn = 0);

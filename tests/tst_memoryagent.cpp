@@ -1,4 +1,5 @@
 #include <QtTest>
+#include <QDateTime>
 #include <QSqlQuery>
 #include <QSqlDatabase>
 #include <QJsonDocument>
@@ -310,6 +311,45 @@ QString textMemorySql(const QString &sql)
     QSqlQuery query(QSqlDatabase::database("memory_db_connection"));
     if (!query.exec(sql) || !query.next()) return {};
     return query.value(0).toString();
+}
+
+// R12-1b：新 saveQATurn 不再写 chat_history.thought；仍在验证 legacy 适配/旧写作路径的
+// 用例必须显式造"存量活动行"。
+static qlonglong seedLegacyThoughtAgent(MemoryManager &db, const QString &interest,
+                                        const QString &channel = Channel::kPet,
+                                        const QString &session = Channel::kDefaultSession,
+                                        const QString &userText = QStringLiteral("legacy write"))
+{
+    Q_UNUSED(db)
+    const auto nowIso = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    QSqlQuery q(QSqlDatabase::database("memory_db_connection"));
+    q.prepare(QStringLiteral(
+        "INSERT INTO chat_history(user_input,raw_reply,channel,session_id,speaker,sensitive,"
+        "turn_kind,subject,thought,thought_result,review_after,timestamp) "
+        "VALUES(?,'',?,?,?,0,'reply','user',?,?,0,datetime('now','localtime'))"));
+    q.addBindValue(userText);
+    q.addBindValue(channel);
+    q.addBindValue(session);
+    q.addBindValue(QStringLiteral("欧尼酱"));
+    q.addBindValue(interest);
+    const QJsonObject initial{
+        {QStringLiteral("status"), QStringLiteral("active")},
+        {QStringLiteral("goal_kind"), QStringLiteral("interest")},
+        {QStringLiteral("created_at"), nowIso},
+        {QStringLiteral("updated_at"), nowIso},
+        {QStringLiteral("artifact_ref"), QString{}}};
+    q.addBindValue(QString::fromUtf8(QJsonDocument(initial).toJson(QJsonDocument::Compact)));
+    if (!q.exec()) return 0;
+    const qlonglong id = q.lastInsertId().toLongLong();
+    if (id <= 0) return 0;
+    QSqlQuery source(QSqlDatabase::database("memory_db_connection"));
+    source.prepare(QStringLiteral(
+        "UPDATE chat_history SET thought_result=json_set(thought_result,'$.source_turn',?) "
+        "WHERE id=?"));
+    source.addBindValue(id);
+    source.addBindValue(id);
+    if (!source.exec()) return 0;
+    return id;
 }
 
 // 把 OpenWake 调度拨到"现在到期"，并回拨回顾冷却，模拟等待期已过。
@@ -1223,7 +1263,7 @@ private slots:
                 const auto turn=beforeRestart.recordInput("the street sounds different today",meta,true);
                 QVERIFY(beforeRestart.recordQuiet(turn,"close"));
             } else {
-                QVERIFY(beforeRestart.saveQATurn("write", R"({"personal_interest":"quiet rain"})", {}));
+                QVERIFY(seedLegacyThoughtAgent(beforeRestart, QStringLiteral("quiet rain")) > 0);
                 const auto initial = beforeRestart.nextThought(true);
                 QVERIFY(beforeRestart.finishThoughtReview(initial["id"].toInteger(),initial["version"].toInt(),
                     {{"status","active"},{"reflection","opening"},{"draft","first line"},{"next_step","add a sound"}}));
@@ -2136,6 +2176,11 @@ private slots:
         // 不包含"新提案必须写 contact.basis / 必须有新主人证据"的旧硬约束。
         QVERIFY(body.contains(QStringLiteral("没有 contact 能力").toUtf8()));
         QVERIFY(body.contains(QStringLiteral("self_desire 等联系动机仅作为内部记录").toUtf8()));
+        // R12-1b：prompt 明确 start_activity 是可选安排（private_writing=false 时只能 rest/reflect），
+        // 且它不代表执行/分享/联系。
+        QVERIFY(body.contains("start_activity"));
+        QVERIFY(body.contains("private_writing"));
+        QVERIFY(body.contains(QStringLiteral("不代表已经执行、完成或分享").toUtf8()));
         QVERIFY(!body.contains(QStringLiteral("必须把依据写进 contact.basis").toUtf8()));
         QVERIFY(!body.contains(QStringLiteral("旧契约 contact.basis 仍被接受").toUtf8()));
         QVERIFY(!body.contains(QStringLiteral("必须有新主人证据").toUtf8()));
@@ -2344,6 +2389,195 @@ private slots:
                      "SELECT count(*) FROM review_failure WHERE source_kind='open_wake'")), qint64(2));
     }
 
+    // R12-1b：OpenWake 可以 start_activity。只在 private_writing=true 时接受；同一事务创建
+    // internal 活动并完成 wake；不写 chat_history/outbox/contact，也不伪造分享或完成。
+    void openWakeStartActivityCreatesInternalOnly()
+    {
+        OpenWakeConfigGuard config;
+        QVERIFY(config.write(openWakeTestJson(true, 12, 3),
+                             QJsonObject{{QStringLiteral("private_writing"), true}}));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath(QStringLiteral("openwake-start.db"));
+        MemoryManager db(path);
+        QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+        PrivateReview review(db);
+        QSignalSpy requested(&review, &PrivateReview::requested);
+        QSignalSpy contactSpy(&review, &PrivateReview::contactProposed);
+        QSignalSpy shareSpy(&review, &PrivateReview::shareRequested);
+        const auto openWake = ConfigManager::instance().getOpenWakeConfig();
+        const auto wake = review.wake(12, 60, openWake);
+        QVERIFY2(wake.started, qPrintable(wake.reason));
+        QCOMPARE(wake.kind, QStringLiteral("open_wake"));
+        const qlonglong wakeId = requested.last().at(0).toLongLong();
+        const int wakeVersion = requested.last().at(1).toInt();
+        const auto context = requested.last().at(2).toJsonObject();
+        const auto origin = context.value(QStringLiteral("origin")).toObject();
+        QCOMPARE(context.value(QStringLiteral("allow_contact")).toBool(), false);
+        QCOMPARE(context.value(QStringLiteral("private_writing")).toBool(), true);
+
+        QJsonObject proposal{
+            {QStringLiteral("schema_version"), 1},
+            {QStringLiteral("decision"), QStringLiteral("start_activity")},
+            {QStringLiteral("note"), QStringLiteral("想起一段雨声")},
+            {QStringLiteral("next_wake"),
+             QJsonObject{{QStringLiteral("mode"), QStringLiteral("after")},
+                         {QStringLiteral("after_minutes"), 30}}},
+            {QStringLiteral("start_activity"),
+             QJsonObject{{QStringLiteral("interest"), QStringLiteral("写雨声段落")},
+                         {QStringLiteral("goal"), QStringLiteral("先写开头")},
+                         {QStringLiteral("initial_review_after_minutes"), 60}}},
+            {QStringLiteral("_origin"), origin}};
+        {
+            MessageCapture capture;
+            review.receive(wakeId, wakeVersion, proposal, {});
+            const QString activityRef = QStringLiteral("activity/1");
+            QCOMPARE(scalarMemorySql(QStringLiteral(
+                         "SELECT count(*) FROM internal_activity")), qint64(1));
+            QCOMPARE(textMemorySql(QStringLiteral(
+                         "SELECT origin_kind FROM internal_activity LIMIT 1")),
+                     QStringLiteral("open_wake"));
+            QCOMPARE(textMemorySql(QStringLiteral(
+                         "SELECT origin_ref FROM internal_activity LIMIT 1")),
+                     QStringLiteral("wake/%1").arg(wakeId));
+            QCOMPARE(textMemorySql(QStringLiteral(
+                         "SELECT run_id FROM internal_activity LIMIT 1")),
+                     textMemorySql(QStringLiteral(
+                         "SELECT run_id FROM open_wake WHERE id=%1").arg(wakeId)));
+            QCOMPARE(textMemorySql(QStringLiteral(
+                         "SELECT state FROM open_wake WHERE id=%1").arg(wakeId)),
+                     QStringLiteral("committed"));
+            QCOMPARE(textMemorySql(QStringLiteral(
+                         "SELECT decision FROM open_wake WHERE id=%1").arg(wakeId)),
+                     QStringLiteral("start_activity"));
+            QCOMPARE(db.openWakeState().value(QStringLiteral("last_outcome")).toString(),
+                     QStringLiteral("start_activity"));
+            // 初始 review_after 使用 initial_review_after_minutes=60。
+            const qint64 reviewAfter =
+                scalarMemorySql(QStringLiteral(
+                    "SELECT review_after-unixepoch() FROM internal_activity LIMIT 1"));
+            QVERIFY2(reviewAfter >= 3590 && reviewAfter <= 3610,
+                     qPrintable(QString::number(reviewAfter)));
+            // 无 contact/share/outbox/账本/聊天行；日志明确 committed 的活动引用。
+            QCOMPARE(contactSpy.size(), 0);
+            QCOMPARE(shareSpy.size(), 0);
+            QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM chat_history")), qint64(0));
+            QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM chat_history "
+                                                    "WHERE turn_kind='proactive'")), qint64(0));
+            QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM action_outbox")), qint64(0));
+            QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM delivery_ledger")), qint64(0));
+            QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM reflection_contact")), qint64(0));
+            bool sawCommittedLog = false;
+            for (const auto &line : capture.lines())
+                if (line.message.contains(QStringLiteral("[OpenWake] committed decision=start_activity"))
+                    && line.message.contains(activityRef))
+                    sawCommittedLog = true;
+            QVERIFY(sawCommittedLog);
+        }
+        // 统一视图可见：活动只代表安排，不代表完成/产物。
+        const auto unified = db.currentActivitiesUnified(8);
+        QCOMPARE(unified.size(), 1);
+        QCOMPARE(unified.first().toObject().value(QStringLiteral("status")).toString(),
+                 QStringLiteral("active"));
+        QVERIFY(!unified.first().toObject().contains(QStringLiteral("artifact_ref")));
+    }
+
+    // R12-1b：private_writing=false 时 start_activity 按策略拒绝（不计认知失败，wake 退避）；
+    // 已有 legacy active 时整次 OpenWake 失败计数/退避，且不产生半活动。
+    void openWakeStartActivityRejectsWithoutWritingOrWithConflict()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath(QStringLiteral("openwake-start-reject.db"));
+        {
+            OpenWakeConfigGuard config;
+            QVERIFY(config.write(openWakeTestJson(true, 12, 3))); // private_writing=false
+            MemoryManager db(path);
+            QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+            PrivateReview review(db);
+            QSignalSpy requested(&review, &PrivateReview::requested);
+            const auto openWake = ConfigManager::instance().getOpenWakeConfig();
+            const auto wake = review.wake(12, 60, openWake);
+            QVERIFY(wake.started);
+            const qlonglong id = requested.last().at(0).toLongLong();
+            const int version = requested.last().at(1).toInt();
+            const auto origin = requested.last().at(2).toJsonObject()
+                                    .value(QStringLiteral("origin")).toObject();
+            QJsonObject proposal{
+                {QStringLiteral("schema_version"), 1},
+                {QStringLiteral("decision"), QStringLiteral("start_activity")},
+                {QStringLiteral("next_wake"),
+                 QJsonObject{{QStringLiteral("mode"), QStringLiteral("after")},
+                             {QStringLiteral("after_minutes"), 30}}},
+                {QStringLiteral("start_activity"),
+                 QJsonObject{{QStringLiteral("interest"), QStringLiteral("不该被创建")}}},
+                {QStringLiteral("_origin"), origin}};
+            review.receive(id, version, proposal, {});
+            QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM internal_activity")),
+                     qint64(0));
+            QCOMPARE(textMemorySql(QStringLiteral(
+                         "SELECT state FROM open_wake WHERE id=%1").arg(id)),
+                     QStringLiteral("deferred"));
+            QCOMPARE(scalarMemorySql(QStringLiteral(
+                         "SELECT count(*) FROM chat_history")), qint64(0));
+            QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM action_outbox")),
+                     qint64(0));
+            const auto failure = db.reviewFailure(
+                QStringLiteral("open_wake"), QStringLiteral("wake/%1").arg(id));
+            QCOMPARE(failure.value(QStringLiteral("last_reason")).toString(),
+                     QStringLiteral("writing_disabled"));
+            QCOMPARE(failure.value(QStringLiteral("consecutive_failures")).toInt(), 0);
+        }
+        // 冲突：已有 legacy active，private_writing=true 的 start_activity 整次失败。
+        {
+            OpenWakeConfigGuard config;
+            QVERIFY(config.write(openWakeTestJson(true, 12, 3),
+                                 QJsonObject{{QStringLiteral("private_writing"), true}}));
+            QTemporaryDir conflictDir;
+            QVERIFY(conflictDir.isValid());
+            const QString conflictPath = conflictDir.filePath(QStringLiteral("openwake-conflict.db"));
+            MemoryManager db(conflictPath);
+            QVERIFY(seedLegacyThoughtAgent(db, QStringLiteral("旧活动")) > 0);
+            // 让 legacy 活动暂不到期，确保本轮领取的是 OpenWake（冲突发生在 start_activity 提交）。
+            QVERIFY(execMemorySql(QStringLiteral(
+                "UPDATE chat_history SET review_after=unixepoch()+3600")));
+            QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+            PrivateReview review(db);
+            QSignalSpy requested(&review, &PrivateReview::requested);
+            const auto openWake = ConfigManager::instance().getOpenWakeConfig();
+            QVERIFY(rewindOpenWakeClock());
+            const auto wake = review.wake(12, 60, openWake);
+            QVERIFY2(wake.started, qPrintable(wake.reason));
+            const qlonglong id = requested.last().at(0).toLongLong();
+            const int version = requested.last().at(1).toInt();
+            const auto origin = requested.last().at(2).toJsonObject()
+                                    .value(QStringLiteral("origin")).toObject();
+            QJsonObject proposal{
+                {QStringLiteral("schema_version"), 1},
+                {QStringLiteral("decision"), QStringLiteral("start_activity")},
+                {QStringLiteral("next_wake"),
+                 QJsonObject{{QStringLiteral("mode"), QStringLiteral("after")},
+                             {QStringLiteral("after_minutes"), 30}}},
+                {QStringLiteral("start_activity"),
+                 QJsonObject{{QStringLiteral("interest"), QStringLiteral("第二件事")}}},
+                {QStringLiteral("_origin"), origin}};
+            review.receive(id, version, proposal, {});
+            QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM internal_activity")),
+                     qint64(0));
+            QCOMPARE(textMemorySql(QStringLiteral(
+                         "SELECT state FROM open_wake WHERE id=%1").arg(id)),
+                     QStringLiteral("deferred"));
+            const auto failure = db.reviewFailure(
+                QStringLiteral("open_wake"), QStringLiteral("wake/%1").arg(id));
+            QCOMPARE(failure.value(QStringLiteral("last_reason")).toString(),
+                     QStringLiteral("already_active"));
+            QCOMPARE(failure.value(QStringLiteral("consecutive_failures")).toInt(), 1);
+            QCOMPARE(scalarMemorySql(QStringLiteral(
+                         "SELECT count(*) FROM chat_history WHERE thought IS NOT NULL")),
+                     qint64(1));
+        }
+    }
+
     // 4b) R12-1a：OpenWake 间隔配置在提交边界执行。协议 5..1440 分钟先校验；合法值再按
     //     min/max_interval_seconds（秒→分钟换算：600s=10min、1800s=30min）夹紧成 effective。
     //     夹紧不是失败；协议非法才 schema 失败。intent 记录 requested/effective，日志可审计。
@@ -2523,6 +2757,12 @@ private slots:
             QVERIFY(db.saveQATurn(QStringLiteral("write"),
                                   QStringLiteral(R"({"personal_interest":"interest-%1"})").arg(index),
                                   {}));
+            // R12-1b：前台创建的是 internal 活动（review_after 初始在未来），
+            // 公平性用例需要把活动拨到到期并回拨回顾冷却。
+            QVERIFY(execMemorySql(QStringLiteral(
+                "UPDATE internal_activity SET review_after=unixepoch()-1 WHERE status='active'")));
+            QVERIFY(execMemorySql(QStringLiteral(
+                "UPDATE thought_review_log SET started_at=started_at-120")));
             const auto wake = review.wake(12, 60, openWake);
             QVERIFY(wake.started);
             QCOMPARE(wake.kind, QStringLiteral("activity"));
@@ -2555,7 +2795,8 @@ private slots:
     void originMismatchRejected()
     {
         OpenWakeConfigGuard config;
-        QVERIFY(config.write(openWakeTestJson(true, 12, 3)));
+        QVERIFY(config.write(openWakeTestJson(true, 12, 3),
+                             QJsonObject{{QStringLiteral("private_writing"), true}}));
         QTemporaryDir dir;
         QVERIFY(dir.isValid());
         MemoryManager db(dir.filePath("origin-mismatch.db"));
@@ -2601,8 +2842,7 @@ private slots:
 
         // --- Activity：origin.kind/ref 不一致 -> 不提交；正确 origin 才提交 ---
         QVERIFY(rewindOpenWakeClock());
-        QVERIFY(db.saveQATurn(QStringLiteral("write"),
-                              QStringLiteral(R"({"personal_interest":"雨声"})"), {}));
+        QVERIFY(seedLegacyThoughtAgent(db, QStringLiteral("雨声")) > 0);
         QVERIFY(execMemorySql(QStringLiteral("UPDATE thought_review_log SET started_at=started_at-120")));
         auto activityWake = review.wake(12, 60);
         QVERIFY(activityWake.started);
@@ -2694,8 +2934,7 @@ private slots:
         };
 
         // --- Activity：缺失 / runId 不匹配 -> 不提交、不记失败；匹配 -> 提交 ---
-        QVERIFY(db.saveQATurn(QStringLiteral("write"),
-                              QStringLiteral(R"({"personal_interest":"雨声"})"), {}));
+        QVERIFY(seedLegacyThoughtAgent(db, QStringLiteral("雨声")) > 0);
         auto wake = review.wake(12, 60, openWake);
         QVERIFY(wake.started);
         QCOMPARE(wake.kind, QStringLiteral("activity"));
