@@ -255,10 +255,20 @@ QJsonObject MemoryManager::claimPrivateReflection(int dailyLimit, int cooldownSe
     }
     auto rollback = qScopeGuard([this]{ m_db.rollback(); });
     QSqlQuery q(m_db);
+    // R12-1a：新来源候选仍要求 24h 窗口；但该源存在失败行且 next_retry_at<=now 时允许重领
+    //（即使源已超出 24h）。只覆盖"领取过、失败过"的任务，不会把陈旧来源无限拉回；
+    // 仍在暂停期内的失败行永远不进入候选。
     q.prepare("SELECT h.id,h.channel,h.session_id,s.input,s.reported,coalesce(r.version,0),h.raw_reply,h.turn_state" + sourceRows +
               "LEFT JOIN private_reflection r ON r.turn_id=h.id WHERE " + eligible +
-              " AND coalesce(h.thought,'')='' AND julianday(s.reported) BETWEEN julianday('now','-1 day') AND julianday('now') "
-              "AND (r.turn_id IS NULL OR (r.state IN ('pending','deferred') AND r.eligible_at<=unixepoch())) "
+              " AND coalesce(h.thought,'')='' "
+              " AND (julianday(s.reported) BETWEEN julianday('now','-1 day') AND julianday('now') "
+              "      OR EXISTS (SELECT 1 FROM review_failure f WHERE f.source_kind='reflection' "
+              "                 AND f.source_ref='reflection/'||h.id AND f.next_retry_at IS NOT NULL "
+              "                 AND f.next_retry_at<=unixepoch())) "
+              " AND NOT EXISTS (SELECT 1 FROM review_failure f WHERE f.source_kind='reflection' "
+              "                 AND f.source_ref='reflection/'||h.id "
+              "                 AND f.suspended_until IS NOT NULL AND f.suspended_until>unixepoch()) "
+              " AND (r.turn_id IS NULL OR (r.state IN ('pending','deferred') AND r.eligible_at<=unixepoch())) "
               "ORDER BY h.id DESC LIMIT 24");
     if (!q.exec()) {
         if (reason) *reason = QStringLiteral("db_error");
@@ -279,9 +289,17 @@ QJsonObject MemoryManager::claimPrivateReflection(int dailyLimit, int cooldownSe
         if (!policy.allows(q.value(1).toString(),q.value(2).toString(),ownReply)) ownReply.clear();
         const auto handoff=q.value(7).toString();
         q.finish();
+        // R12-1a：暂停到期后的恢复尝试（重置连续失败计数，保留 last_reason）。
+        if (!recoverSuspendedFailure(QStringLiteral("reflection"),
+                                     QStringLiteral("reflection/%1").arg(id))) {
+            if (reason) *reason = QStringLiteral("db_error");
+            return {};
+        }
         QString chargeReason;
         QDateTime next;
-        if (!chargePrivateReview(id,dailyLimit,cooldownSeconds,&chargeReason,&next)) {
+        if (!chargePrivateReview(id,dailyLimit,cooldownSeconds,&chargeReason,&next,
+                                 QStringLiteral("reflection"),
+                                 QStringLiteral("reflection/%1").arg(id))) {
             if (reason) *reason = chargeReason.isEmpty() ? QStringLiteral("db_error") : chargeReason;
             if (nextEligibleAt) *nextEligibleAt = next;
             return {};
@@ -301,6 +319,11 @@ QJsonObject MemoryManager::claimPrivateReflection(int dailyLimit, int cooldownSe
         if (q.numRowsAffected()!=1) {
             // 领取行在事务内被并发修改，CAS 不再匹配。
             if (reason) *reason = QStringLiteral("cas_conflict");
+            return {};
+        }
+        // 公平性：成功领取非 OpenWake 任务时，在同一事务内推进持久化公平计数。
+        if (!bumpOpenWakeFairness()) {
+            if (reason) *reason = QStringLiteral("db_error");
             return {};
         }
         if (!m_db.commit()) {
@@ -617,7 +640,7 @@ QJsonObject MemoryManager::claimDueConcern(int dailyLimit,int cooldownSeconds,
         if (reason) *reason = QStringLiteral("db_error");
         return {};
     }
-    auto rollback=qScopeGuard([this]{m_db.rollback();});
+    auto rollback=qScopeGuard([this]{ m_db.rollback(); });
     // 保留期只约束"按时间到期"的回顾；新证据命中走 matchedConcerns，不受这里影响。
     const int retentionDays=qBound(1,
         ConfigManager::instance().getProactiveConfig().concernRetentionDays,365);
@@ -685,10 +708,18 @@ QJsonObject MemoryManager::claimDueConcern(int dailyLimit,int cooldownSeconds,
     for (const auto &item : due) {
         if (!policy.allows(item.channel,item.session,item.input)
             || !policy.allows(item.channel,item.session,item.note)) continue;
+        // R12-1a：暂停到期后的恢复尝试（重置连续失败计数，保留 last_reason）。
+        if (!recoverSuspendedFailure(QStringLiteral("concern"),
+                                     QStringLiteral("concern/%1").arg(item.turn))) {
+            if (reason) *reason = QStringLiteral("db_error");
+            return {};
+        }
         // 到期回顾与新来源回顾共用同一份每日预算与冷却；预算用尽时本轮不再领取。
         QString chargeReason;
         QDateTime next;
-        if (!chargePrivateReview(item.turn,dailyLimit,cooldownSeconds,&chargeReason,&next)) {
+        if (!chargePrivateReview(item.turn,dailyLimit,cooldownSeconds,&chargeReason,&next,
+                                 QStringLiteral("concern"),
+                                 QStringLiteral("concern/%1").arg(item.turn))) {
             if (reason) *reason = chargeReason.isEmpty() ? QStringLiteral("db_error") : chargeReason;
             if (nextEligibleAt) *nextEligibleAt = next;
             return {};
@@ -706,6 +737,11 @@ QJsonObject MemoryManager::claimDueConcern(int dailyLimit,int cooldownSeconds,
         }
         if (q.numRowsAffected()!=1) {
             if (reason) *reason = QStringLiteral("cas_conflict");
+            return {};
+        }
+        // 公平性：成功领取非 OpenWake 任务时，在同一事务内推进持久化公平计数。
+        if (!bumpOpenWakeFairness()) {
+            if (reason) *reason = QStringLiteral("db_error");
             return {};
         }
         if (!m_db.commit()) {

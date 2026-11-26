@@ -241,3 +241,19 @@ R12（自主认知入口）开工基线为 `c28d23d`、schema v30；R12-0 是唯
 | 快照统计 | `SnapshotBuildStats{queried,eligible,serialized,omitted,bytesBefore,bytesAfter,notes}`；DEBUG 每域 + INFO 摘要；**未改 1200 预算/静态说明/裁剪顺序**，最小修复按确认放 R12-1a |
 
 验证：实际全量 `ctest 23/23`（包含新增诊断测试）；无 schema 变更；应用运行中的旧进程需重启后启用新诊断。后续 R12-1a 待确认后实施，状态见 [R12_OPEN_WAKE.md](R12_OPEN_WAKE.md)。
+
+## 14. R12-1a 持久 OpenWake、统一失败生命周期与最小快照（2026-11-26）
+
+按用户授权实施 R12-1a。数据库 **v30→v31**；OpenWake 仅 rest/reflect，不生成 contact/activity/outbox；类型化 origin、持久失败覆盖四类来源、共享预算/公平、最小快照修复均落地。
+
+| 项 | 实现 |
+|---|---|
+| v31 迁移 | `open_wake_state/open_wake/internal_activity/review_failure`；`thought_review_log` 加 `source_kind/source_ref/run_id`；单事务幂等；旧数据/Outbox 完整 |
+| 失败生命周期 | 四类来源统一持久失败：120/300/900 退避、第 4 次默认 suspended 24h；内容哈希检测实质修订（不因正常领取 version 增长误判）；用户让出/策略拦截不计数；失败行+源状态同事务，写失败回滚；暂停到期恢复并允许超 24h 重领；源消失清理并审计 |
+| OpenWake | 独立状态/租约/唯一 running/重启中断恢复；共享预算+独立每日上限+30% 比例，取整至少 1 不破全局；公平计数按成功领取持久化、重启不重置；到期后最多 3 次普通回顾优先；rest/reflect 合法提交，不写 current_activity、无外部动作 |
+| 类型化 origin | `CognitiveOrigin{kind,ref,id,version,runId,scope,epoch}` 随请求/回调/取消边界传递并校验，所有来源覆盖，迟到/串线回调丢弃；OpenWake epoch 由 claim 提供 |
+| 最小快照 | 静态说明移出 JSON 预算；默认 4096（2048–8192）；非空域最小 1 条、overflow 显式记录；OpenWake note 以 `wake/<id>:<version>`/InternalState 进入 inferences/motivation，不进 observations；跨渠道/当前会话时间分开；群聊不读私人状态 |
+
+验证：实际 `ctest 23/23`；`tst_memorymanager` 122 passed/1 skipped、`tst_memoryagent` 86、`tst_cognitivesnapshot` 13、`tst_configmanager` 17。生产库 v31 迁移后旧行数不变（chat 534/reminder 3/reflection 65/ledger 137/thought_review_log 101）。真实运行（临时启用 OpenWake、allow_contact=false）验证 `[OpenWake] claimed → [Review] attempt kind=open_wake → [OpenWake] committed decision=reflect`，`[Outbox]=0` 无 contact；同轮 concern 响应 `truncated` 进入持久退避。验证后恢复配置并清理测试产生的 OpenWake 行。
+
+**未做**：R12-1b 活动创建/完整生命周期、R12-2 OpenWake contact/outbox、R12-3 跨入口快照一致性、后台通用 tool loop。**剩余风险**：真实模型对 OpenWake rest/reflect schema 的长期服从性、OpenWake epoch 仅 state version 占位、失败退避与重启窗口需长期观察、快照 4096 预算在极端域组合下仍可能 overflow。

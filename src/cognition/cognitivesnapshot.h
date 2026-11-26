@@ -65,21 +65,27 @@ struct DelegatedCommitment
     QString text; // 委托内容（提醒原文，已按读取策略过滤并截断）
 };
 
-// R12-0：每域统计口径（只做观测，不改预算/裁剪策略）：
-//   queried    = 记忆层查询命中的原始行数（读取策略过滤前）
+// R12-0/R12-1a：每域统计口径：
+//   queried    = 记忆层查询命中的原始行数（读取策略过滤前；受查询 LIMIT 影响，是下界）
 //   eligible   = 通过读取策略、进入快照的行数
-//   serialized = 最终进入提示词 JSON 的行数（可能被每域上限或字符预算裁掉）
-//   omitted    = eligible - serialized
+//   serialized = 最终进入提示词 JSON 的行数（可能被每域上限或字节预算裁掉）
+//   omitted    = eligible - serialized（区分预算裁剪与策略过滤见 status/notes）
+//   queriedDomain = 本次是否真的查询了该域（群聊投影显式不查询私人域，与"查询了但为空"分开）
+//   status     = empty|filtered|query_cap|serialized|budget_trimmed|overflow
+//                （build 先给出查询侧状态，toPromptJson 再按最终序列化结果收敛）
 struct SnapshotDomainStats
 {
     int queried = 0;
     int eligible = 0;
     int serialized = 0;
     int omitted = 0;
+    bool queriedDomain = false;
+    QString status;
 };
 
 // 一次构建 + 序列化的整体统计。bytesBefore/bytesAfter 是 QJsonDocument::Compact 的
-// UTF-8 字节数（裁剪前/后），notes 记录裁剪/群聊投影等口径说明。
+// UTF-8 字节数（裁剪前/后，只统计数据域，不含提示词固定说明），
+// notes 记录裁剪/溢出/群聊投影/策略过滤/查询上限等口径说明。
 struct SnapshotBuildStats
 {
     QHash<QString, SnapshotDomainStats> domains;
@@ -93,6 +99,7 @@ struct CognitiveSnapshot
 {
     QString runId;
     QString triggerRef;
+    QString purpose;                           // foreground_reply / private_review，进哈希的 scope 契约
     QString subjectId;
     QString currentChannel;
     QString currentSession;
@@ -119,15 +126,19 @@ public:
     CognitiveSnapshot build(const RequestMeta &meta, const QString &runId,
                             const QString &triggerRef, const QString &purpose) const;
 
-    // 输出给模型的紧凑 JSON：每类只给必要字段、文本截断、每域最多 8 条，
-    // 并带 internal_wake_note 说明“内部唤醒不是主人约定”。
+    // 输出给模型的紧凑 JSON：每类只给必要字段、文本截断、每域最多 kDomainLimit 条。
+    // R12-1a：快照 JSON 只含数据域，不再带静态说明键（note/internal_wake_note）；
+    // 固定规则由 LLMService::cognitiveSnapshotMessage 放进 system content，不占数据预算。
+    // 预算不够时先按低优先域裁剪到"每个非空域至少 1 条"，连最小集都放不下才整域
+    // overflow 并写 budget:overflow:<domain>/budget:unresolved 说明，绝不静默。
     QJsonObject toPromptJson(const CognitiveSnapshot &snapshot) const;
 
     // 注入提示词时的固定前缀（前台与回顾共用，测试据此识别注入消息）。
     static QString promptPrefix();
 
-    // 快照 JSON 的字符预算：超量按域裁剪，先保留 observations / commitments / internal_wakes。
-    static int promptCharBudget();
+    // 快照数据 JSON 的字节预算（UTF-8 bytes）：读 ConfigManager 的
+    // cognition.snapshot_budget_bytes（默认 4096，配置层已夹紧 2048..8192，这里再兜底）。
+    static int promptByteBudget();
 
     // R12-0：最近一次 build/toPromptJson 的每域统计（只读）。build 记录 queried/eligible，
     // toPromptJson 记录 serialized/omitted 与裁剪前后字节数。build 会重置统计。

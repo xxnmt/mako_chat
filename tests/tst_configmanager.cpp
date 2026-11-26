@@ -472,6 +472,111 @@ private slots:
         QCOMPARE(parsed.concernRetentionDays, 365);
     }
 
+    // R12-1a：OpenWake 配置的缺省/合法解析/夹紧，以及快照字节预算字段。
+    void openWakeConfigDefaultsAndClamps()
+    {
+        ConfigManager &cfg = ConfigManager::instance();
+        // 缺省：identity.json 没有 cognition.open_wake 段。
+        writeIdentityFile(QJsonObject{});
+        cfg.reloadIdentity();
+        OpenWakeConfig openWake = cfg.getOpenWakeConfig();
+        QVERIFY(!openWake.enabled);
+        QVERIFY(!openWake.allowContact);
+        QCOMPARE(openWake.initialDelaySeconds, 900);
+        QCOMPARE(openWake.minIntervalSeconds, 600);
+        QCOMPARE(openWake.defaultIntervalSeconds, 1800);
+        QCOMPARE(openWake.maxIntervalSeconds, 86400);
+        QCOMPARE(openWake.maxNonOpenJobsWhenDue, 3);
+        QCOMPARE(openWake.maxModelStepsPerWake, 3);
+        QCOMPARE(openWake.maxPerDay, 12);
+        QCOMPARE(openWake.sharedBudgetPercent, 30);
+        QCOMPARE(cfg.getSnapshotBudgetBytes(), 4096);
+
+        // 合法值解析。
+        QJsonObject cognition{
+            {QStringLiteral("open_wake"),
+             QJsonObject{{QStringLiteral("enabled"), true},
+                         {QStringLiteral("allow_contact"), true},
+                         {QStringLiteral("initial_delay_seconds"), 1200},
+                         {QStringLiteral("min_interval_seconds"), 900},
+                         {QStringLiteral("default_interval_seconds"), 2400},
+                         {QStringLiteral("max_interval_seconds"), 7200},
+                         {QStringLiteral("max_non_open_jobs_when_due"), 5},
+                         {QStringLiteral("max_model_steps_per_wake"), 6},
+                         {QStringLiteral("max_per_day"), 20},
+                         {QStringLiteral("shared_budget_percent"), 45}}},
+            {QStringLiteral("snapshot_budget_bytes"), 6000}};
+        QJsonObject root;
+        root.insert(QStringLiteral("cognition"), cognition);
+        writeIdentityFile(root);
+        cfg.reloadIdentity();
+        openWake = cfg.getOpenWakeConfig();
+        QVERIFY(openWake.enabled);
+        QVERIFY(openWake.allowContact);
+        QCOMPARE(openWake.initialDelaySeconds, 1200);
+        QCOMPARE(openWake.minIntervalSeconds, 900);
+        QCOMPARE(openWake.defaultIntervalSeconds, 2400);
+        QCOMPARE(openWake.maxIntervalSeconds, 7200);
+        QCOMPARE(openWake.maxNonOpenJobsWhenDue, 5);
+        QCOMPARE(openWake.maxModelStepsPerWake, 6);
+        QCOMPARE(openWake.maxPerDay, 20);
+        QCOMPARE(openWake.sharedBudgetPercent, 45);
+        QCOMPARE(cfg.getSnapshotBudgetBytes(), 6000);
+
+        // 下界夹紧；default_interval 落在 [min,max] 内。
+        cognition.insert(QStringLiteral("open_wake"),
+                         QJsonObject{{QStringLiteral("enabled"), true},
+                                     {QStringLiteral("initial_delay_seconds"), -100},
+                                     {QStringLiteral("min_interval_seconds"), 1},
+                                     {QStringLiteral("default_interval_seconds"), 1},
+                                     {QStringLiteral("max_interval_seconds"), 999999},
+                                     {QStringLiteral("max_non_open_jobs_when_due"), -1},
+                                     {QStringLiteral("max_model_steps_per_wake"), 0},
+                                     {QStringLiteral("max_per_day"), -3},
+                                     {QStringLiteral("shared_budget_percent"), 0}});
+        cognition.insert(QStringLiteral("snapshot_budget_bytes"), 100);
+        root.insert(QStringLiteral("cognition"), cognition);
+        writeIdentityFile(root);
+        cfg.reloadIdentity();
+        openWake = cfg.getOpenWakeConfig();
+        QCOMPARE(openWake.initialDelaySeconds, 60);
+        QCOMPARE(openWake.minIntervalSeconds, 300);
+        QCOMPARE(openWake.defaultIntervalSeconds, 300);
+        QCOMPARE(openWake.maxIntervalSeconds, 86400);
+        QCOMPARE(openWake.maxNonOpenJobsWhenDue, 0);
+        QCOMPARE(openWake.maxModelStepsPerWake, 1);
+        QCOMPARE(openWake.maxPerDay, 0);
+        QCOMPARE(openWake.sharedBudgetPercent, 1);
+        QCOMPARE(cfg.getSnapshotBudgetBytes(), 2048);
+
+        // 上界夹紧。
+        cognition.insert(QStringLiteral("open_wake"),
+                         QJsonObject{{QStringLiteral("enabled"), false},
+                                     {QStringLiteral("initial_delay_seconds"), 999999},
+                                     {QStringLiteral("min_interval_seconds"), 999999},
+                                     {QStringLiteral("default_interval_seconds"), 999999},
+                                     {QStringLiteral("max_interval_seconds"), 999999},
+                                     {QStringLiteral("max_non_open_jobs_when_due"), 99},
+                                     {QStringLiteral("max_model_steps_per_wake"), 99},
+                                     {QStringLiteral("max_per_day"), 999},
+                                     {QStringLiteral("shared_budget_percent"), 999}});
+        cognition.insert(QStringLiteral("snapshot_budget_bytes"), 999999);
+        root.insert(QStringLiteral("cognition"), cognition);
+        writeIdentityFile(root);
+        cfg.reloadIdentity();
+        openWake = cfg.getOpenWakeConfig();
+        QVERIFY(!openWake.enabled);
+        QCOMPARE(openWake.initialDelaySeconds, 86400);
+        QCOMPARE(openWake.minIntervalSeconds, 86400);
+        QCOMPARE(openWake.defaultIntervalSeconds, 86400);
+        QCOMPARE(openWake.maxIntervalSeconds, 86400);
+        QCOMPARE(openWake.maxNonOpenJobsWhenDue, 20);
+        QCOMPARE(openWake.maxModelStepsPerWake, 8);
+        QCOMPARE(openWake.maxPerDay, 96);
+        QCOMPARE(openWake.sharedBudgetPercent, 100);
+        QCOMPARE(cfg.getSnapshotBudgetBytes(), 8192);
+    }
+
 private:
     void writeSettingFile(const QJsonObject &root)
     {

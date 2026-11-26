@@ -404,6 +404,67 @@ static QJsonObject reclaimDueConcern(MemoryManager &db, const QString &dbPath, q
     return db.claimDueConcern(12, 60);
 }
 
+// ===== R12-1a 测试辅助 =====
+// 把 SQLite 里与回顾调度相关的时间整体往回拨 seconds 秒，模拟"退避/暂停/冷却已过"，
+// 让用例不必真的等待。只用于测试夹具。
+static bool advanceReviewClock(const QString &dbPath, const QString &tag, int seconds)
+{
+    RawDb raw(dbPath, tag);
+    if (!raw.open()) return false;
+    const QString secs = QString::number(seconds);
+    const QStringList statements{
+        QStringLiteral("UPDATE thought_review_log SET started_at=started_at-") + secs,
+        QStringLiteral("UPDATE private_reflection SET eligible_at=eligible_at-") + secs
+            + QStringLiteral(",next_check_at=CASE WHEN next_check_at>0 THEN next_check_at-")
+            + secs + QStringLiteral(" ELSE 0 END,updated_at=updated_at-") + secs,
+        QStringLiteral("UPDATE review_failure SET "
+                       "next_retry_at=CASE WHEN next_retry_at IS NULL THEN NULL ELSE next_retry_at-")
+            + secs
+            + QStringLiteral(" END,suspended_until=CASE WHEN suspended_until IS NULL THEN NULL "
+                             "ELSE suspended_until-")
+            + secs
+            + QStringLiteral(" END,last_attempt_at=CASE WHEN last_attempt_at IS NULL THEN NULL "
+                             "ELSE last_attempt_at-")
+            + secs + QStringLiteral(" END,updated_at=updated_at-") + secs,
+        QStringLiteral("UPDATE chat_history SET review_after=CASE WHEN coalesce(review_after,0)>0 "
+                       "THEN review_after-")
+            + secs + QStringLiteral(" ELSE review_after END"),
+        QStringLiteral("UPDATE open_wake_state SET next_due_at=next_due_at-") + secs
+            + QStringLiteral(",suspended_until=CASE WHEN suspended_until IS NULL THEN NULL "
+                             "ELSE suspended_until-")
+            + secs + QStringLiteral(" END,updated_at=updated_at-") + secs,
+        QStringLiteral("UPDATE open_wake SET next_due_at=CASE WHEN next_due_at IS NULL THEN NULL "
+                       "ELSE next_due_at-")
+            + secs + QStringLiteral(" END,lease_until=CASE WHEN lease_until IS NULL THEN NULL "
+                                    "ELSE lease_until-")
+            + secs + QStringLiteral(" END")};
+    for (const auto &statement : statements)
+        if (!raw.exec(statement)) return false;
+    return true;
+}
+
+// 把 OpenWake 的调度时间拨到"现在到期"。
+static bool makeOpenWakeDue(const QString &dbPath, const QString &tag)
+{
+    RawDb raw(dbPath, tag);
+    if (!raw.open()) return false;
+    return raw.exec(QStringLiteral("UPDATE open_wake_state SET next_due_at=unixepoch()-1"));
+}
+
+// 把今日回顾预算行统一拨到一分钟前：清冷却但不逐次累计偏移，减少跨本地午夜的用例抖动。
+static bool rewindReviewBudgetClock(const QString &dbPath, const QString &tag)
+{
+    RawDb raw(dbPath, tag);
+    if (!raw.open()) return false;
+    return raw.exec(QStringLiteral("UPDATE thought_review_log SET started_at=unixepoch()-60"));
+}
+
+// 相对 now 的秒数差是否落在期望值附近（容忍用例执行的少量抖动）。
+static bool withinSeconds(qlonglong value, qlonglong expected, qlonglong tolerance)
+{
+    return value >= expected - tolerance && value <= expected + tolerance;
+}
+
 class FailingEmbeddingProvider : public MemoryEmbeddingProvider
 {
 public:
@@ -487,7 +548,7 @@ private slots:
         QVERIFY(raw.exec("DROP TABLE matter_revision"));
         for (int reopen=0; reopen<2; ++reopen) {
             MemoryManager db(path);
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),30);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),31);
             QCOMPARE(raw.scalar("SELECT state_updates FROM chat_history").toString(),QString("[]"));
             QVERIFY(db.matterHeads("user").isEmpty());
         }
@@ -848,7 +909,7 @@ private slots:
         }
         RawDb raw(path,"v17-semantics");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),30);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),31);
         QCOMPARE(raw.scalar("SELECT count(*) FROM matter_revision").toInt(),1);
         QVERIFY(raw.scalar("SELECT semantics IS NULL FROM matter_revision").toBool());
     }
@@ -922,7 +983,7 @@ private slots:
         RawDb raw(path,"lifecycle");
         QVERIFY(raw.open());
         QCOMPARE(raw.scalar("SELECT count(*) FROM matter_revision").toInt(),2);
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),30);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),31);
     }
 
     void currentUnderstandingRetainsLatestSelfReport()
@@ -1883,7 +1944,7 @@ private slots:
         }
         RawDb raw(path, "v15-verify");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 30);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 31);
     }
 
     void databaseBackupIsConsistent()
@@ -1903,7 +1964,7 @@ private slots:
         RawDb copy(backup, "backup-copy");
         QVERIFY(copy.open());
         QCOMPARE(copy.scalar("SELECT count(*) FROM chat_history").toInt(), 1);
-        QCOMPARE(copy.scalar("PRAGMA user_version").toInt(), 30);
+        QCOMPARE(copy.scalar("PRAGMA user_version").toInt(), 31);
         QVERIFY(copy.scalar("SELECT count(*) FROM memory_chunks").toInt() > 0);
     }
 
@@ -2178,7 +2239,7 @@ private slots:
             QVERIFY(raw.open());
 
             // 版本推进到 v3
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 30);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 31);
 
             // 列扩展（v2 渠道 + v3 轮次）
             const QStringList historyCols = raw.columns("chat_history");
@@ -2283,7 +2344,7 @@ private slots:
             MemoryManager second(dbPath);
             RawDb raw(dbPath, "verify2");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 30);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 31);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM chat_history").toInt(), 1);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM relationship_state").toInt(), 2);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM long_term_summary").toInt(), 1);
@@ -2300,7 +2361,7 @@ private slots:
             MemoryManager mm(dbPath);
             RawDb raw(dbPath, "fresh");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 30);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 31);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('raw_events')").toInt() > 0);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('memory_cursor')").toInt() > 0);
 
@@ -2507,7 +2568,7 @@ private slots:
         Q_UNUSED(mm);
         RawDb raw(dbPath, "v2verify");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 30);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 31);
         QCOMPARE(raw.scalar("SELECT user_input FROM chat_history").toString(), QStringLiteral("旧输入"));
         QCOMPARE(raw.scalar("SELECT turn_kind FROM chat_history").toString(), QStringLiteral("reply"));
         QCOMPARE(raw.scalar("SELECT subject FROM chat_history").toString(), QStringLiteral("user"));
@@ -3444,7 +3505,7 @@ private slots:
         {
             RawDb raw(path, "ledger-schema");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 30);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 31);
             const QStringList contact = raw.columns("reflection_contact");
             for (const auto &column : {QStringLiteral("attempts"), QStringLiteral("last_outcome"),
                                        QStringLiteral("last_attempt_at"),
@@ -4491,7 +4552,7 @@ private slots:
         MemoryManager reopened(path);
         RawDb raw(path, "v27-legacy-verify");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 30);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 31);
         QCOMPARE(raw.scalar(QStringLiteral("SELECT outcome FROM reflection_contact WHERE turn_id=99001"))
                      .toString(), QStringLiteral("withheld"));
         QCOMPARE(raw.scalar(QStringLiteral("SELECT last_outcome FROM reflection_contact WHERE turn_id=99001"))
@@ -4706,7 +4767,7 @@ private slots:
             MemoryManager db(path);
             RawDb schema(path, "attention-schema");
             QVERIFY(schema.open());
-            QCOMPARE(schema.scalar("PRAGMA user_version").toInt(), 30);
+            QCOMPARE(schema.scalar("PRAGMA user_version").toInt(), 31);
             const QStringList eventColumns = schema.columns("attention_event");
             for (const auto &column : {QStringLiteral("kind"), QStringLiteral("ref"),
                                        QStringLiteral("payload"), QStringLiteral("state"),
@@ -5152,6 +5213,965 @@ private slots:
                      QStringLiteral("unknown"));
         }
     }
+
+    // ===== R12-1a：v31 迁移（幂等重放；旧事实/Outbox 完整）=====
+    void v31MigrationReplaysIdempotently()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath(QStringLiteral("v31-migration.db"));
+        {
+            // 先建一个完整(v31)库，再压回 v30 旧形状，模拟真实 v30 库重开升级。
+            MemoryManager seed(path);
+            makePetTurn(seed, QStringLiteral("窗边有光"), QStringLiteral("嗯，我看见了"));
+            RequestMeta meta;
+            meta.eventId = QStringLiteral("v31-legacy-event");
+            QVERIFY(seed.recordInput(QStringLiteral("旧输入仍在"), meta) > 0);
+        }
+        {
+            RawDb raw(path, "v31-downgrade");
+            QVERIFY(raw.open());
+            // 旧 thought_review_log 行（v30 没有 source_* 列），用重建表模拟旧形状并保留数据。
+            QVERIFY(raw.exec(QStringLiteral(
+                "INSERT INTO thought_review_log(turn_id,started_at) VALUES(1,unixepoch())")));
+            QVERIFY(raw.exec(QStringLiteral(
+                "ALTER TABLE thought_review_log RENAME TO thought_review_log_v31")));
+            QVERIFY(raw.exec(QStringLiteral(
+                "CREATE TABLE thought_review_log(turn_id INTEGER,started_at INTEGER NOT NULL)")));
+            QVERIFY(raw.exec(QStringLiteral(
+                "INSERT INTO thought_review_log(turn_id,started_at) "
+                "SELECT turn_id,started_at FROM thought_review_log_v31")));
+            QVERIFY(raw.exec(QStringLiteral("DROP TABLE thought_review_log_v31")));
+            for (const auto &table : {QStringLiteral("open_wake_state"), QStringLiteral("open_wake"),
+                                      QStringLiteral("internal_activity"), QStringLiteral("review_failure")})
+                QVERIFY(raw.exec(QStringLiteral("DROP TABLE IF EXISTS %1").arg(table)));
+            // action/outbox 存量提交行必须原样保留（迁移不碰发送路径）。
+            QVERIFY(raw.exec(QStringLiteral(
+                "INSERT INTO cognitive_action(action_key,kind,channel,session_id,payload_json,state) "
+                "VALUES('v31-legacy-action','SpontaneousContact','pet','default','{}','queued')")));
+            QVERIFY(raw.exec(QStringLiteral(
+                "INSERT INTO action_outbox(action_id,action_key,channel,session_id,payload_json,state) "
+                "VALUES(1,'v31-legacy-action','pet','default','{}','queued')")));
+            QVERIFY(raw.exec(QStringLiteral("PRAGMA user_version=30")));
+        }
+        { MemoryManager upgraded(path); }
+        {
+            RawDb raw(path, "v31-verify");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 31);
+            for (const auto &table : {QStringLiteral("open_wake_state"), QStringLiteral("open_wake"),
+                                      QStringLiteral("internal_activity"), QStringLiteral("review_failure")})
+                QCOMPARE(raw.scalar(QStringLiteral(
+                             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='%1'")
+                             .arg(table)).toInt(), 1);
+            const QStringList reviewColumns = raw.columns("thought_review_log");
+            for (const auto &column : {QStringLiteral("source_kind"), QStringLiteral("source_ref"),
+                                       QStringLiteral("run_id")})
+                QVERIFY2(reviewColumns.contains(column), qPrintable(column));
+            // 旧行 source_* 保持 NULL；旧表数据未被改写。
+            QCOMPARE(raw.scalar(QStringLiteral(
+                "SELECT count(*) FROM thought_review_log WHERE source_kind IS NULL")).toInt(), 1);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM chat_history")).toInt(), 2);
+            QCOMPARE(raw.scalar(QStringLiteral(
+                "SELECT state FROM cognitive_action WHERE action_key='v31-legacy-action'")).toString(),
+                QStringLiteral("queued"));
+            QCOMPARE(raw.scalar(QStringLiteral(
+                "SELECT count(*) FROM action_outbox WHERE action_key='v31-legacy-action'")).toInt(), 1);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM review_failure")).toInt(), 0);
+        }
+        // 重复启动：v31 迁移幂等重放，不重复建表/不改旧行。
+        for (int reopen = 0; reopen < 2; ++reopen) { MemoryManager again(path); }
+        {
+            RawDb raw(path, "v31-verify-replay");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 31);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM thought_review_log")).toInt(), 1);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM open_wake")).toInt(), 0);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM chat_history")).toInt(), 2);
+        }
+    }
+
+    // R12-1a：四类来源的失败计数/退避/源状态持久化（各来源一次 -> 计数递增）。
+    void reviewFailureBackoffAcrossSources()
+    {
+        ProactiveIdentityGuard guard;
+        QVERIFY(guard.writeIdentity(QByteArray(
+            R"({"cognition":{"review_backoff_seconds":[120,300,900],"max_review_failures":4}})")));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath(QStringLiteral("review-failure.db"));
+        MemoryManager db(path);
+        const qlonglong now = QDateTime::currentSecsSinceEpoch();
+
+        // reflection：领取后失败 -> deferred + 120s；再领取失败 -> 300s（version 增长不重置计数）。
+        const auto reflectionTurn = seedReflectionSource(db, QStringLiteral("failure-reflection"));
+        QVERIFY(reflectionTurn > 0);
+        const QString reflectionRef = QStringLiteral("reflection/%1").arg(reflectionTurn);
+        auto claim = db.claimPrivateReflection(12, 60);
+        QCOMPARE(claim.value("id").toInteger(), reflectionTurn);
+        const int reflectionVersion = claim.value("version").toInt();
+        QVERIFY(db.recordReviewFailure(QStringLiteral("reflection"), reflectionRef,
+                                       QStringLiteral("generate"), QStringLiteral("network_error"), true));
+        auto failure = db.reviewFailure(QStringLiteral("reflection"), reflectionRef);
+        QCOMPARE(failure.value("consecutive_failures").toInt(), 1);
+        const qlonglong reflectionRetry = failure.value("next_retry_at").toInteger();
+        QVERIFY(withinSeconds(reflectionRetry - now, 120, 10));
+        QCOMPARE(failure.value("suspended_until").toInteger(), qlonglong(0));
+        {
+            RawDb raw(path, "failure-reflection-verify");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT state FROM private_reflection WHERE turn_id=%1").arg(reflectionTurn)).toString(),
+                     QStringLiteral("deferred"));
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT eligible_at FROM private_reflection WHERE turn_id=%1").arg(reflectionTurn)).toLongLong(),
+                     reflectionRetry);
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT claimed_by FROM private_reflection WHERE turn_id=%1").arg(reflectionTurn)).isNull(), true);
+        }
+        QVERIFY(advanceReviewClock(path, QStringLiteral("failure-reflection-clock"), 400));
+        claim = db.claimPrivateReflection(12, 60);
+        QCOMPARE(claim.value("version").toInt(), reflectionVersion + 1);
+        QVERIFY(db.recordReviewFailure(QStringLiteral("reflection"), reflectionRef,
+                                       QStringLiteral("generate"), QStringLiteral("network_error"), true));
+        failure = db.reviewFailure(QStringLiteral("reflection"), reflectionRef);
+        QCOMPARE(failure.value("consecutive_failures").toInt(), 2);
+        QVERIFY(withinSeconds(failure.value("next_retry_at").toInteger() - now, 300, 10));
+
+        // concern：到期回顾失败 -> consider + next_check_at=next_retry；内容修订重置计数。
+        QVERIFY(advanceReviewClock(path, QStringLiteral("failure-concern-prep"), 120));
+        const auto concernTurn = seedOpenConcern(
+            db, concernTurnMeta(QStringLiteral("failure-concern")),
+            QStringLiteral("周末想去看一场电影"), QStringLiteral("电影好不好看"),
+            QJsonObject{{QStringLiteral("topic"), QStringLiteral("电影")},
+                        {QStringLiteral("watch"), QStringLiteral("评价如何")},
+                        {QStringLiteral("next_check_after_minutes"), 1}});
+        QVERIFY(concernTurn > 0);
+        const QString concernRef = QStringLiteral("concern/%1").arg(concernTurn);
+        QVERIFY(advanceReviewClock(path, QStringLiteral("failure-concern-clock-0"), 120));
+        auto concernClaim = db.claimDueConcern(12, 60);
+        QCOMPARE(concernClaim.value("id").toInteger(), concernTurn);
+        const int concernVersion = concernClaim.value("version").toInt();
+        QVERIFY(db.recordReviewFailure(QStringLiteral("concern"), concernRef,
+                                       QStringLiteral("generate"), QStringLiteral("network_error"), true));
+        auto concernFailure = db.reviewFailure(QStringLiteral("concern"), concernRef);
+        QCOMPARE(concernFailure.value("consecutive_failures").toInt(), 1);
+        const qlonglong concernRetry = concernFailure.value("next_retry_at").toInteger();
+        QVERIFY(withinSeconds(concernRetry - now, 120, 10));
+        {
+            RawDb raw(path, "failure-concern-verify");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT state FROM private_reflection WHERE turn_id=%1").arg(concernTurn)).toString(),
+                     QStringLiteral("consider"));
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT next_check_at FROM private_reflection WHERE turn_id=%1").arg(concernTurn)).toLongLong(),
+                     concernRetry);
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT eligible_at FROM private_reflection WHERE turn_id=%1").arg(concernTurn)).toLongLong(),
+                     concernRetry);
+        }
+        QVERIFY(advanceReviewClock(path, QStringLiteral("failure-concern-clock-1"), 400));
+        concernClaim = db.claimDueConcern(12, 60);
+        QCOMPARE(concernClaim.value("version").toInt(), concernVersion + 1);
+        QVERIFY(db.recordReviewFailure(QStringLiteral("concern"), concernRef,
+                                       QStringLiteral("generate"), QStringLiteral("network_error"), true));
+        QCOMPARE(db.reviewFailure(QStringLiteral("concern"), concernRef)
+                     .value("consecutive_failures").toInt(), 2);
+        // 关注内容实质修订（note/topic 变化）-> 计数重置为 0 后再计本次。
+        QVERIFY(advanceReviewClock(path, QStringLiteral("failure-concern-clock-2"), 400));
+        {
+            RawDb raw(path, "failure-concern-revise");
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral(
+                "UPDATE private_reflection SET note='要不要约她一起看',topic='新安排' "
+                "WHERE turn_id=%1").arg(concernTurn)));
+        }
+        concernClaim = db.claimDueConcern(12, 60);
+        QVERIFY(!concernClaim.isEmpty());
+        QVERIFY(db.recordReviewFailure(QStringLiteral("concern"), concernRef,
+                                       QStringLiteral("generate"), QStringLiteral("network_error"), true));
+        QCOMPARE(db.reviewFailure(QStringLiteral("concern"), concernRef)
+                     .value("consecutive_failures").toInt(), 1);
+
+        // activity：chat_history 的 review_after/deferred_reason/thought_version 同步更新。
+        QVERIFY(db.saveQATurn(QStringLiteral("在写雨声的段落"),
+                              QStringLiteral(R"({"personal_interest":"雨声"})"), {}));
+        const auto thought = db.nextThought(true);
+        const qlonglong activityId = thought.value("id").toInteger();
+        const int activityVersion = thought.value("version").toInt();
+        QVERIFY(activityId > 0);
+        const QString activityRef = QStringLiteral("thought/%1").arg(activityId);
+        QVERIFY(rewindReviewCooldown(path, QStringLiteral("failure-activity-clock-0")));
+        QVERIFY(db.claimThoughtReview(activityId, activityVersion, 12, 60));
+        QVERIFY(db.recordReviewFailure(QStringLiteral("activity"), activityRef,
+                                       QStringLiteral("generate"), QStringLiteral("truncated"), true));
+        auto activityFailure = db.reviewFailure(QStringLiteral("activity"), activityRef);
+        QCOMPARE(activityFailure.value("consecutive_failures").toInt(), 1);
+        const qlonglong activityRetry = activityFailure.value("next_retry_at").toInteger();
+        QVERIFY(withinSeconds(activityRetry - now, 120, 10));
+        {
+            RawDb raw(path, "failure-activity-verify");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT review_after FROM chat_history WHERE id=%1").arg(activityId)).toLongLong(),
+                     activityRetry);
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT thought_version FROM chat_history WHERE id=%1").arg(activityId)).toInt(),
+                     activityVersion + 2);
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT json_extract(thought_result,'$.deferred_reason') "
+                         "FROM chat_history WHERE id=%1").arg(activityId)).toString(),
+                     QStringLiteral("truncated"));
+        }
+        QVERIFY(advanceReviewClock(path, QStringLiteral("failure-activity-clock-1"), 400));
+        QVERIFY(db.claimThoughtReview(activityId, activityVersion + 2, 12, 60));
+        QVERIFY(db.recordReviewFailure(QStringLiteral("activity"), activityRef,
+                                       QStringLiteral("generate"), QStringLiteral("truncated"), true));
+        QCOMPARE(db.reviewFailure(QStringLiteral("activity"), activityRef)
+                     .value("consecutive_failures").toInt(), 2);
+
+        // open_wake：running -> deferred/lease 清空，调度状态推到 next_retry。
+        QVERIFY(advanceReviewClock(path, QStringLiteral("failure-open-wake-prep"), 120));
+        QString wakeReason;
+        QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+        auto wake = db.claimOpenWake(12, 60, 12, 100, 4, &wakeReason);
+        QVERIFY2(!wake.isEmpty(), qPrintable(wakeReason));
+        const qlonglong wakeId = wake.value("id").toInteger();
+        const int wakeVersion = wake.value("version").toInt();
+        const QString wakeRef = QStringLiteral("wake/%1:%2").arg(wakeId).arg(wakeVersion);
+        QVERIFY(db.recordReviewFailure(QStringLiteral("open_wake"), wakeRef,
+                                       QStringLiteral("generate"), QStringLiteral("json_parse"), true));
+        failure = db.reviewFailure(QStringLiteral("open_wake"), wakeRef);
+        QCOMPARE(failure.value("consecutive_failures").toInt(), 1);
+        const qlonglong wakeRetry = failure.value("next_retry_at").toInteger();
+        QVERIFY(withinSeconds(wakeRetry - now, 120, 10));
+        {
+            RawDb raw(path, "failure-open-wake-verify");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT state FROM open_wake WHERE id=%1").arg(wakeId)).toString(),
+                     QStringLiteral("deferred"));
+            QVERIFY(raw.scalar(QStringLiteral(
+                        "SELECT lease_until FROM open_wake WHERE id=%1").arg(wakeId)).isNull());
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT next_due_at FROM open_wake WHERE id=%1").arg(wakeId)).toLongLong(),
+                     wakeRetry);
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT next_due_at FROM open_wake_state WHERE scope_key='owner'")).toLongLong(),
+                     wakeRetry);
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT consecutive_failures FROM open_wake_state WHERE scope_key='owner'")).toInt(), 1);
+        }
+        QVERIFY(advanceReviewClock(path, QStringLiteral("failure-open-wake-clock"), 400));
+        wake = db.claimOpenWake(12, 60, 12, 100, 4, &wakeReason);
+        QVERIFY2(!wake.isEmpty(), qPrintable(wakeReason));
+        const QString wakeRef2 = QStringLiteral("wake/%1:%2")
+            .arg(wake.value("id").toInteger()).arg(wake.value("version").toInt());
+        QVERIFY(db.recordReviewFailure(QStringLiteral("open_wake"), wakeRef2,
+                                       QStringLiteral("generate"), QStringLiteral("json_parse"), true));
+        QCOMPARE(db.reviewFailure(QStringLiteral("open_wake"), wakeRef2)
+                     .value("consecutive_failures").toInt(), 2);
+        {
+            RawDb raw(path, "failure-open-wake-verify-2");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT consecutive_failures FROM open_wake_state WHERE scope_key='owner'")).toInt(), 2);
+        }
+    }
+
+    // R12-1a：来源实质修订重置连续失败计数；正常领取的 version 增长不重置。
+    void reviewFailureContentRevisionResetsCount()
+    {
+        ProactiveIdentityGuard guard;
+        QVERIFY(guard.writeIdentity(QByteArray(
+            R"({"cognition":{"review_backoff_seconds":[120,300,900],"max_review_failures":4}})")));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath(QStringLiteral("revision-reset.db"));
+        MemoryManager db(path);
+        const auto turn = seedReflectionSource(db, QStringLiteral("revision-reset-source"));
+        QVERIFY(turn > 0);
+        const QString ref = QStringLiteral("reflection/%1").arg(turn);
+        QVERIFY(!db.claimPrivateReflection(12, 60).isEmpty());
+        QVERIFY(db.recordReviewFailure(QStringLiteral("reflection"), ref,
+                                       QStringLiteral("generate"), QStringLiteral("network_error"), true));
+        QCOMPARE(db.reviewFailure(QStringLiteral("reflection"), ref)
+                     .value("consecutive_failures").toInt(), 1);
+        // 正常重新领取：version 从 1 -> 2，计数应继续累计而不是被当作修订。
+        QVERIFY(advanceReviewClock(path, QStringLiteral("revision-reset-clock-1"), 400));
+        QVERIFY(!db.claimPrivateReflection(12, 60).isEmpty());
+        QVERIFY(db.recordReviewFailure(QStringLiteral("reflection"), ref,
+                                       QStringLiteral("generate"), QStringLiteral("network_error"), true));
+        QCOMPARE(db.reviewFailure(QStringLiteral("reflection"), ref)
+                     .value("consecutive_failures").toInt(), 2);
+        // 来源内容实质修订：note/topic 变化 -> 计数重置后再计本次（1）。
+        QVERIFY(advanceReviewClock(path, QStringLiteral("revision-reset-clock-2"), 400));
+        QVERIFY(!db.claimPrivateReflection(12, 60).isEmpty());
+        {
+            RawDb raw(path, "revision-reset-revise");
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral(
+                "UPDATE private_reflection SET note='换成另一件在意的事',topic='新话题' "
+                "WHERE turn_id=%1").arg(turn)));
+        }
+        QVERIFY(db.recordReviewFailure(QStringLiteral("reflection"), ref,
+                                       QStringLiteral("generate"), QStringLiteral("network_error"), true));
+        const auto failure = db.reviewFailure(QStringLiteral("reflection"), ref);
+        QCOMPARE(failure.value("consecutive_failures").toInt(), 1);
+        QVERIFY(withinSeconds(failure.value("next_retry_at").toInteger()
+                                  - QDateTime::currentSecsSinceEpoch(), 120, 10));
+        QVERIFY(failure.value("last_stage").toString() == QStringLiteral("generate"));
+    }
+
+    // R12-1a：策略/权限拦截与用户主动让出 countsAsFailure=false：只记 stage/reason，不退避。
+    void reviewFailureNonCountingDoesNotBackOff()
+    {
+        ProactiveIdentityGuard guard;
+        QVERIFY(guard.writeIdentity(QByteArray(
+            R"({"cognition":{"review_backoff_seconds":[120,300,900],"max_review_failures":4}})")));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath(QStringLiteral("non-counting.db"));
+        MemoryManager db(path);
+        const auto turn = seedReflectionSource(db, QStringLiteral("non-counting-source"));
+        QVERIFY(turn > 0);
+        const QString ref = QStringLiteral("reflection/%1").arg(turn);
+        QVERIFY(!db.claimPrivateReflection(12, 60).isEmpty());
+        qlonglong eligibleBefore = 0;
+        {
+            RawDb raw(path, "non-counting-before");
+            QVERIFY(raw.open());
+            eligibleBefore = raw.scalar(QStringLiteral(
+                "SELECT eligible_at FROM private_reflection WHERE turn_id=%1").arg(turn)).toLongLong();
+        }
+        // 没有失败行时：counts=false 只落事实，计数为 0，不写源状态。
+        QVERIFY(db.recordReviewFailure(QStringLiteral("reflection"), ref,
+                                       QStringLiteral("verify"), QStringLiteral("permission_denied"),
+                                       false));
+        auto failure = db.reviewFailure(QStringLiteral("reflection"), ref);
+        QCOMPARE(failure.value("consecutive_failures").toInt(), 0);
+        QCOMPARE(failure.value("next_retry_at").toInteger(), qlonglong(0));
+        QCOMPARE(failure.value("suspended_until").toInteger(), qlonglong(0));
+        QCOMPARE(failure.value("last_stage").toString(), QStringLiteral("verify"));
+        QCOMPARE(failure.value("last_reason").toString(), QStringLiteral("permission_denied"));
+        {
+            RawDb raw(path, "non-counting-after");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT state FROM private_reflection WHERE turn_id=%1").arg(turn)).toString(),
+                     QStringLiteral("pending"));
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT eligible_at FROM private_reflection WHERE turn_id=%1").arg(turn)).toLongLong(),
+                     eligibleBefore);
+        }
+        // 真正失败一次：从 0 计到 1，并写回 deferred/120s。
+        QVERIFY(db.recordReviewFailure(QStringLiteral("reflection"), ref,
+                                       QStringLiteral("generate"), QStringLiteral("network_error"), true));
+        failure = db.reviewFailure(QStringLiteral("reflection"), ref);
+        QCOMPARE(failure.value("consecutive_failures").toInt(), 1);
+        const qlonglong retry = failure.value("next_retry_at").toInteger();
+        QVERIFY(withinSeconds(retry - QDateTime::currentSecsSinceEpoch(), 120, 10));
+        // 再记一次 counts=false：计数/退避不变，只更新 stage/reason。
+        QVERIFY(db.recordReviewFailure(QStringLiteral("reflection"), ref,
+                                       QStringLiteral("yield"), QStringLiteral("user_interrupt"),
+                                       false));
+        failure = db.reviewFailure(QStringLiteral("reflection"), ref);
+        QCOMPARE(failure.value("consecutive_failures").toInt(), 1);
+        QCOMPARE(failure.value("next_retry_at").toInteger(), retry);
+        QCOMPARE(failure.value("last_stage").toString(), QStringLiteral("yield"));
+        QCOMPARE(failure.value("last_reason").toString(), QStringLiteral("user_interrupt"));
+        // 活动来源的 yield 同样只记录事实，不改 review_after/version。
+        QVERIFY(db.saveQATurn(QStringLiteral("随便写点"),
+                              QStringLiteral(R"({"personal_interest":"写作"})"), {}));
+        const auto thought = db.nextThought(true);
+        const qlonglong activityId = thought.value("id").toInteger();
+        const int activityVersion = thought.value("version").toInt();
+        QVERIFY(activityId > 0);
+        QVERIFY(rewindReviewCooldown(path, QStringLiteral("non-counting-activity-clock")));
+        QVERIFY(db.claimThoughtReview(activityId, activityVersion, 12, 60));
+        const int claimedVersion = activityVersion + 1;
+        QVERIFY(db.recordReviewFailure(QStringLiteral("activity"),
+                                       QStringLiteral("thought/%1").arg(activityId),
+                                       QStringLiteral("yield"), QStringLiteral("user_interrupt"),
+                                       false));
+        QVERIFY(db.reviewFailure(QStringLiteral("activity"),
+                                 QStringLiteral("thought/%1").arg(activityId)).value("consecutive_failures").toInt() == 0);
+        {
+            RawDb raw(path, "non-counting-activity-verify");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT thought_version FROM chat_history WHERE id=%1").arg(activityId)).toInt(),
+                     claimedVersion);
+        }
+    }
+
+    // R12-1a：连续失败达到上限 -> suspended(86400)；到期后允许一次恢复，并允许超过 24h 窗口重领。
+    void reviewFailureSuspendedRecoversBeyondWindow()
+    {
+        ProactiveIdentityGuard guard;
+        QVERIFY(guard.writeIdentity(QByteArray(
+            R"({"cognition":{"review_backoff_seconds":[120,300,900],"max_review_failures":4}})")));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath(QStringLiteral("suspended.db"));
+        MemoryManager db(path);
+        const auto turn = seedReflectionSource(db, QStringLiteral("suspended-source"));
+        QVERIFY(turn > 0);
+        const QString ref = QStringLiteral("reflection/%1").arg(turn);
+        for (int attempt = 1; attempt <= 4; ++attempt) {
+            const auto claim = db.claimPrivateReflection(12, 60);
+            QVERIFY2(!claim.isEmpty(), qPrintable(QStringLiteral("claim %1").arg(attempt)));
+            QVERIFY(db.recordReviewFailure(QStringLiteral("reflection"), ref,
+                                           QStringLiteral("generate"),
+                                           QStringLiteral("network_error"), true));
+            const auto failure = db.reviewFailure(QStringLiteral("reflection"), ref);
+            QCOMPARE(failure.value("consecutive_failures").toInt(), attempt);
+            if (attempt < 4) {
+                // backoff 序列 120/300/900；至少拨过当前档位，才能进入下一次领取。
+                QVERIFY(advanceReviewClock(path, QStringLiteral("suspended-clock-%1").arg(attempt),
+                                           1200));
+            }
+        }
+        auto failure = db.reviewFailure(QStringLiteral("reflection"), ref);
+        QCOMPARE(failure.value("consecutive_failures").toInt(), 4);
+        const qlonglong suspended = failure.value("suspended_until").toInteger();
+        QVERIFY(withinSeconds(suspended - QDateTime::currentSecsSinceEpoch(), 86400, 10));
+        QCOMPARE(failure.value("next_retry_at").toInteger(), suspended);
+        // 暂停期内不得重领。
+        QVERIFY(db.claimPrivateReflection(12, 60).isEmpty());
+        // 把来源拨到 24h 窗口之外：正常情况下新来源已不可领取，失败恢复路径应允许重领。
+        {
+            RawDb raw(path, "suspended-backdate");
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral(
+                "UPDATE cognitive_source SET reported=datetime('now','-2 day') "
+                "WHERE event=(SELECT cognitive_event FROM chat_history WHERE id=%1)").arg(turn)));
+        }
+        QVERIFY(advanceReviewClock(path, QStringLiteral("suspended-clock-recover"), 86401));
+        const auto recoveredClaim = db.claimPrivateReflection(12, 60);
+        QVERIFY2(!recoveredClaim.isEmpty(), "失败任务在暂停到期后应可重领（即使源超出 24h）");
+        failure = db.reviewFailure(QStringLiteral("reflection"), ref);
+        QCOMPARE(failure.value("consecutive_failures").toInt(), 0);   // 恢复：计数清零
+        QCOMPARE(failure.value("suspended_until").toInteger(), qlonglong(0));
+        QCOMPARE(failure.value("last_reason").toString(), QStringLiteral("network_error")); // 保留
+        // 恢复后再次失败按 1,2,... 重新累计。
+        QVERIFY(db.recordReviewFailure(QStringLiteral("reflection"), ref,
+                                       QStringLiteral("generate"), QStringLiteral("network_error"), true));
+        failure = db.reviewFailure(QStringLiteral("reflection"), ref);
+        QCOMPARE(failure.value("consecutive_failures").toInt(), 1);
+        QVERIFY(withinSeconds(failure.value("next_retry_at").toInteger()
+                                  - QDateTime::currentSecsSinceEpoch(), 120, 10));
+    }
+
+    // R12-1a：源已删除/已终态时失败行被清理且返回可审计错误码，不静默残留。
+    void reviewFailureDeletedSourceIsAudited()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath(QStringLiteral("deleted-source.db"));
+        MemoryManager db(path);
+        const auto turn = seedReflectionSource(db, QStringLiteral("deleted-source"));
+        QVERIFY(turn > 0);
+        const QString ref = QStringLiteral("reflection/%1").arg(turn);
+        QVERIFY(!db.claimPrivateReflection(12, 60).isEmpty());
+        QVERIFY(db.recordReviewFailure(QStringLiteral("reflection"), ref,
+                                       QStringLiteral("generate"), QStringLiteral("network_error"), true));
+        QVERIFY(!db.reviewFailure(QStringLiteral("reflection"), ref).isEmpty());
+        // 删除来源轮次（既有触发器会级联删 private_reflection）。
+        QVERIFY(db.deleteTurnByID(turn));
+        MessageCapture capture;
+        QString error;
+        QVERIFY(!db.recordReviewFailure(QStringLiteral("reflection"), ref,
+                                        QStringLiteral("generate"), QStringLiteral("network_error"),
+                                        true, &error));
+        QCOMPARE(error, QStringLiteral("source_missing"));
+        QVERIFY(db.reviewFailure(QStringLiteral("reflection"), ref).isEmpty());
+        bool sawAudit = false;
+        for (const auto &line : capture.lines())
+            if (line.message.contains(QStringLiteral("[Review] failure_dropped"))) sawAudit = true;
+        QVERIFY(sawAudit);
+    }
+
+    // R12-1a：存储写入失败不报成功，且事务回滚不留半写状态。
+    void reviewFailureWriteFailureRollsBack()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath(QStringLiteral("write-failure.db"));
+        MemoryManager db(path);
+        QVERIFY(db.saveQATurn(QStringLiteral("在写点什么"),
+                              QStringLiteral(R"({"personal_interest":"写作"})"), {}));
+        const auto thought = db.nextThought(true);
+        const qlonglong activityId = thought.value("id").toInteger();
+        QVERIFY(activityId > 0);
+        {
+            // 模拟存储层故障：迁移后表被破坏。
+            RawDb raw(path, "write-failure-broken");
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral("DROP TABLE review_failure")));
+        }
+        QString error;
+        QVERIFY(!db.recordReviewFailure(QStringLiteral("activity"),
+                                        QStringLiteral("thought/%1").arg(activityId),
+                                        QStringLiteral("generate"), QStringLiteral("db_error"),
+                                        true, &error));
+        QCOMPARE(error, QStringLiteral("db_error"));
+        {
+            RawDb raw(path, "write-failure-verify");
+            QVERIFY(raw.open());
+            QVERIFY(raw.scalar(QStringLiteral(
+                        "SELECT review_after FROM chat_history WHERE id=%1").arg(activityId)).isNull());
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT thought_version FROM chat_history WHERE id=%1").arg(activityId)).toInt(), 0);
+        }
+    }
+
+    // R12-1a：管理员重置（清行 + 源立即变为可领取）与成功后的 clear。
+    void reviewFailureResetAndClear()
+    {
+        ProactiveIdentityGuard guard;
+        QVERIFY(guard.writeIdentity(QByteArray(
+            R"({"cognition":{"review_backoff_seconds":[120,300,900],"max_review_failures":4}})")));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath(QStringLiteral("reset.db"));
+        MemoryManager db(path);
+        const auto turn = seedReflectionSource(db, QStringLiteral("reset-source"));
+        QVERIFY(turn > 0);
+        const QString ref = QStringLiteral("reflection/%1").arg(turn);
+        QVERIFY(!db.claimPrivateReflection(12, 60).isEmpty());
+        QVERIFY(db.recordReviewFailure(QStringLiteral("reflection"), ref,
+                                       QStringLiteral("generate"), QStringLiteral("network_error"), true));
+        QCOMPARE(db.reviewFailure(QStringLiteral("reflection"), ref)
+                     .value("consecutive_failures").toInt(), 1);
+        // 管理员重置：清行并把源 eligible_at 拨到 now（deferred 状态仍可被 claim 重新领取）。
+        QVERIFY(db.resetReviewFailure(QStringLiteral("reflection"), ref));
+        QVERIFY(db.reviewFailure(QStringLiteral("reflection"), ref).isEmpty());
+        {
+            RawDb raw(path, "reset-verify");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT state FROM private_reflection WHERE turn_id=%1").arg(turn)).toString(),
+                     QStringLiteral("deferred"));
+            QVERIFY(raw.scalar(QStringLiteral(
+                        "SELECT eligible_at FROM private_reflection WHERE turn_id=%1").arg(turn)).toLongLong()
+                    <= QDateTime::currentSecsSinceEpoch());
+        }
+        QVERIFY(rewindReviewCooldown(path, QStringLiteral("reset-clock")));
+        QVERIFY(!db.claimPrivateReflection(12, 60).isEmpty());
+        // 成功提交后由调用方 clear；重复 clear 幂等。
+        QVERIFY(db.recordReviewFailure(QStringLiteral("reflection"), ref,
+                                       QStringLiteral("generate"), QStringLiteral("network_error"), true));
+        QVERIFY(db.clearReviewFailure(QStringLiteral("reflection"), ref));
+        QVERIFY(db.reviewFailure(QStringLiteral("reflection"), ref).isEmpty());
+        QVERIFY(db.clearReviewFailure(QStringLiteral("reflection"), ref));
+    }
+
+    // R12-1a：OpenWake 初始排期、每日独立预算取整与共享总量。
+    void openWakeScheduleAndBudgetRounding()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath(QStringLiteral("open-wake-budget.db"));
+        MemoryManager db(path);
+        QString error;
+        const qlonglong now = QDateTime::currentSecsSinceEpoch();
+        QVERIFY2(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 3600, &error),
+                 qPrintable(error));
+        auto state = db.openWakeState();
+        QVERIFY(!state.isEmpty());
+        QVERIFY(withinSeconds(state.value("next_due_at").toInteger() - now, 3600, 10));
+        // 幂等：已存在调度行时再次 ensure 不改变 due。
+        const qlonglong originalDue = state.value("next_due_at").toInteger();
+        QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0, &error));
+        QCOMPARE(db.openWakeState().value("next_due_at").toInteger(), originalDue);
+        QVERIFY(makeOpenWakeDue(path, "ow-budget-due"));
+        // daily=3, shared=30% -> cap=max(1,0)=1；首个领取成功。
+        QString reason;
+        auto claimed = db.claimOpenWake(3, 60, 12, 30, 4, &reason);
+        QVERIFY2(!claimed.isEmpty(), qPrintable(reason));
+        QCOMPARE(claimed.value("state").toString(), QStringLiteral("running"));
+        QCOMPARE(claimed.value("version").toInt(), 1);
+        QVERIFY(claimed.value("run_id").toString().size() >= 32);
+        QCOMPARE(db.openWakeState().value("non_open_since_due").toInt(), 0);
+        QVERIFY(db.finishOpenWake(claimed.value("id").toInteger(), claimed.value("version").toInt(),
+                                  QStringLiteral("rest"), QStringLiteral("先把这一阵的光收起来"),
+                                  {}, 30, &error));
+        auto budget = db.reviewBudgetUsage();
+        QCOMPARE(budget.value("open_wake").toInt(), 1);
+        QVERIFY(budget.value("by_source").toObject().contains(QStringLiteral("open_wake")));
+        // 冷却过去但独立预算已用完（cap=1）-> budget。
+        QVERIFY(makeOpenWakeDue(path, "ow-budget-due-2"));
+        QVERIFY(advanceReviewClock(path, "ow-budget-clock", 120));
+        QVERIFY(db.claimOpenWake(3, 60, 12, 30, 4, &reason).isEmpty());
+        QCOMPARE(reason, QStringLiteral("budget"));
+        // daily=1：取整至少 1 次机会（cap=min(12,min(1,max(1,0)))=1）。
+        {
+            const auto path2 = dir.filePath(QStringLiteral("open-wake-daily1.db"));
+            MemoryManager db2(path2);
+            QVERIFY(db2.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+            auto dailyOne = db2.claimOpenWake(1, 60, 12, 30, 4, &reason);
+            QVERIFY2(!dailyOne.isEmpty(), qPrintable(reason));
+            QVERIFY(db2.finishOpenWake(dailyOne.value("id").toInteger(),
+                                       dailyOne.value("version").toInt(),
+                                       QStringLiteral("rest"), QString(), {}, 5));
+        }
+        // cap 12：daily=100, 30% -> 30，再被 openWakeDailyLimit=12 截断。
+        {
+            const auto path3 = dir.filePath(QStringLiteral("open-wake-cap12.db"));
+            MemoryManager db3(path3);
+            QVERIFY(db3.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+            for (int index = 0; index < 12; ++index) {
+                if (index > 0) {
+                    QVERIFY(makeOpenWakeDue(path3, QStringLiteral("ow-cap12-due-%1").arg(index)));
+                    QVERIFY(rewindReviewBudgetClock(path3, QStringLiteral("ow-cap12-clock-%1").arg(index)));
+                }
+                const auto claim = db3.claimOpenWake(100, 60, 12, 30, 4, &reason);
+                QVERIFY2(!claim.isEmpty(),
+                         qPrintable(QStringLiteral("cap12 claim %1 reason %2").arg(index).arg(reason)));
+                QVERIFY(db3.finishOpenWake(claim.value("id").toInteger(),
+                                           claim.value("version").toInt(),
+                                           QStringLiteral("reflect"),
+                                           QStringLiteral("第 %1 次回顾").arg(index), {}, 5));
+            }
+            QVERIFY(makeOpenWakeDue(path3, "ow-cap12-due-block"));
+            QVERIFY(rewindReviewBudgetClock(path3, "ow-cap12-clock-block"));
+            QVERIFY(db3.claimOpenWake(100, 60, 12, 30, 4, &reason).isEmpty());
+            QCOMPARE(reason, QStringLiteral("budget"));
+            QCOMPARE(db3.reviewBudgetUsage().value("open_wake").toInt(), 12);
+        }
+    }
+
+    // R12-1a：OpenWake 拒绝 dailyLimit=0 / 独立上限 0；共享预算与冷却生效。
+    void openWakeBudgetGatesAndCooldown()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath(QStringLiteral("open-wake-gates.db"));
+        MemoryManager db(path);
+        QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+        QString reason;
+        // dailyLimit=0 禁止所有后台认知。
+        QVERIFY(db.claimOpenWake(0, 60, 12, 100, 4, &reason).isEmpty());
+        QCOMPARE(reason, QStringLiteral("budget"));
+        // 独立上限为 0 -> 无机会。
+        QVERIFY(db.claimOpenWake(12, 60, 0, 100, 4, &reason).isEmpty());
+        QCOMPARE(reason, QStringLiteral("budget"));
+        auto first = db.claimOpenWake(12, 300, 12, 100, 4, &reason);
+        QVERIFY2(!first.isEmpty(), qPrintable(reason));
+        QVERIFY(db.finishOpenWake(first.value("id").toInteger(), first.value("version").toInt(),
+                                  QStringLiteral("rest"), QString(), {}, 5));
+        // 共享冷却：300s 未过 -> cooldown。
+        QVERIFY(makeOpenWakeDue(path, "ow-gates-due"));
+        QVERIFY(db.claimOpenWake(12, 300, 12, 100, 4, &reason).isEmpty());
+        QCOMPARE(reason, QStringLiteral("cooldown"));
+        // 共享每日总量：open wake 占用后 dailyLimit=1 时新来源回顾被总量挡住。
+        {
+            const auto path2 = dir.filePath(QStringLiteral("open-wake-shared.db"));
+            MemoryManager db2(path2);
+            QVERIFY(db2.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+            auto wake = db2.claimOpenWake(1, 60, 12, 100, 4, &reason);
+            QVERIFY2(!wake.isEmpty(), qPrintable(reason));
+            QVERIFY(db2.finishOpenWake(wake.value("id").toInteger(), wake.value("version").toInt(),
+                                       QStringLiteral("rest"), QString(), {}, 5));
+            const auto turn = seedReflectionSource(db2, QStringLiteral("ow-shared-source"));
+            QVERIFY(turn > 0);
+            QVERIFY(rewindReviewCooldown(path2, QStringLiteral("ow-shared-clock")));
+            QString reflectionReason;
+            QVERIFY(db2.claimPrivateReflection(1, 60, &reflectionReason).isEmpty());
+            QCOMPARE(reflectionReason, QStringLiteral("daily_limit"));
+        }
+    }
+
+    // R12-1a：running 唯一/租约；启动恢复只恢复一次；过期租约可被下一次领取就地打断。
+    void openWakeRunningLeaseAndRecovery()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath(QStringLiteral("open-wake-lease.db"));
+        MemoryManager db(path);
+        QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+        QString reason;
+        auto first = db.claimOpenWake(12, 60, 12, 100, 4, &reason);
+        QVERIFY2(!first.isEmpty(), qPrintable(reason));
+        const qlonglong firstId = first.value("id").toInteger();
+        {
+            RawDb raw(path, "ow-lease-first");
+            QVERIFY(raw.open());
+            const qlonglong lease = raw.scalar(QStringLiteral(
+                "SELECT lease_until FROM open_wake WHERE id=%1").arg(firstId)).toLongLong();
+            QVERIFY(withinSeconds(lease - QDateTime::currentSecsSinceEpoch(), 1800, 10));
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT count(*) FROM open_wake WHERE scope_key='owner' AND state='running'")).toInt(), 1);
+        }
+        // 同一 scope 已有 running（租约有效）-> busy。
+        QVERIFY(db.claimOpenWake(12, 60, 12, 100, 4, &reason).isEmpty());
+        QCOMPARE(reason, QStringLiteral("busy"));
+        // 租约过期：启动恢复 -> interrupted，下一次调用幂等返回 0。
+        {
+            RawDb raw(path, "ow-lease-expire");
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral(
+                "UPDATE open_wake SET lease_until=unixepoch()-7200 WHERE id=%1").arg(firstId)));
+        }
+        QCOMPARE(db.recoverOpenWakeLeases(1800), 1);
+        QCOMPARE(db.recoverOpenWakeLeases(1800), 0);
+        {
+            RawDb raw(path, "ow-lease-verify");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT state FROM open_wake WHERE id=%1").arg(firstId)).toString(),
+                     QStringLiteral("interrupted"));
+            QVERIFY(raw.scalar(QStringLiteral(
+                        "SELECT lease_until FROM open_wake WHERE id=%1").arg(firstId)).isNull());
+            QVERIFY(raw.scalar(QStringLiteral(
+                        "SELECT next_due_at FROM open_wake_state WHERE scope_key='owner'")).toLongLong()
+                    <= QDateTime::currentSecsSinceEpoch());
+        }
+        QVERIFY(advanceReviewClock(path, QStringLiteral("ow-lease-clock"), 120));
+        auto second = db.claimOpenWake(12, 60, 12, 100, 4, &reason);
+        QVERIFY2(!second.isEmpty(), qPrintable(reason));
+        const qlonglong secondId = second.value("id").toInteger();
+        // 领取时遇到过期租约：就地标记 interrupted 再插入新 running（唯一索引不冲突）。
+        {
+            RawDb raw(path, "ow-lease-expire-2");
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral(
+                "UPDATE open_wake SET lease_until=unixepoch()-7200 WHERE id=%1").arg(secondId)));
+        }
+        QVERIFY(advanceReviewClock(path, QStringLiteral("ow-lease-clock-2"), 120));
+        auto third = db.claimOpenWake(12, 60, 12, 100, 4, &reason);
+        QVERIFY2(!third.isEmpty(), qPrintable(reason));
+        {
+            RawDb raw(path, "ow-lease-verify-2");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT state FROM open_wake WHERE id=%1").arg(secondId)).toString(),
+                     QStringLiteral("interrupted"));
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT count(*) FROM open_wake WHERE scope_key='owner' AND state='running'")).toInt(), 1);
+        }
+    }
+
+    // R12-1a：finish（rest/reflect）CAS、非法 decision/超长 note 拒绝、defer/cancel、recent notes。
+    void openWakeFinishDeferCancelAndNotes()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath(QStringLiteral("open-wake-lifecycle.db"));
+        MemoryManager db(path);
+        QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+        QString reason;
+        QString error;
+        auto first = db.claimOpenWake(12, 60, 12, 100, 4, &reason);
+        QVERIFY2(!first.isEmpty(), qPrintable(reason));
+        const qlonglong firstId = first.value("id").toInteger();
+        const int firstVersion = first.value("version").toInt();
+        // 非法 decision / note 超长：拒绝且不落库（仍是 running）。
+        QVERIFY(!db.finishOpenWake(firstId, firstVersion, QStringLiteral("contact"), QString(),
+                                   {}, 30, &error));
+        QCOMPARE(error, QStringLiteral("invalid_decision"));
+        QVERIFY(!db.finishOpenWake(firstId, firstVersion, QStringLiteral("rest"),
+                                   QString(241, u'x'), {}, 30, &error));
+        QCOMPARE(error, QStringLiteral("invalid_note"));
+        {
+            RawDb raw(path, "ow-lifecycle-open");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT state FROM open_wake WHERE id=%1").arg(firstId)).toString(),
+                     QStringLiteral("running"));
+        }
+        // rest 也成功提交，并写 note/decision；next_due 按分钟 clamp。
+        QVERIFY2(db.finishOpenWake(firstId, firstVersion, QStringLiteral("rest"),
+                                   QStringLiteral("先把手边的光收好"), {}, 10, &error),
+                 qPrintable(error));
+        {
+            RawDb raw(path, "ow-lifecycle-rest");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT state FROM open_wake WHERE id=%1").arg(firstId)).toString(),
+                     QStringLiteral("committed"));
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT decision FROM open_wake WHERE id=%1").arg(firstId)).toString(),
+                     QStringLiteral("rest"));
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT note FROM open_wake WHERE id=%1").arg(firstId)).toString(),
+                     QStringLiteral("先把手边的光收好"));
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT last_outcome FROM open_wake_state WHERE scope_key='owner'")).toString(),
+                     QStringLiteral("rest"));
+            QVERIFY(withinSeconds(raw.scalar(QStringLiteral(
+                         "SELECT next_due_at FROM open_wake_state WHERE scope_key='owner'")).toLongLong()
+                                      - QDateTime::currentSecsSinceEpoch(), 600, 10));
+        }
+        // 已完成行不能再次 CAS 提交。
+        QVERIFY(!db.finishOpenWake(firstId, firstVersion, QStringLiteral("rest"), QString(),
+                                   {}, 10, &error));
+        // recent notes：只返回 committed 且 note 非空的记录，ref=wake/<id>:<version>。
+        auto notes = db.recentOpenWakeNotes(2);
+        QCOMPARE(notes.size(), 1);
+        QCOMPARE(notes.first().toObject().value("ref").toString(),
+                 QStringLiteral("wake/%1:%2").arg(firstId).arg(firstVersion));
+        QCOMPARE(notes.first().toObject().value("note").toString(),
+                 QStringLiteral("先把手边的光收好"));
+        QCOMPARE(notes.first().toObject().value("decision").toString(), QStringLiteral("rest"));
+        QVERIFY(!notes.first().toObject().value("at").toString().isEmpty());
+        // defer：用户插话/关停路径，不增加失败计数，next_due=now。
+        QVERIFY(makeOpenWakeDue(path, "ow-lifecycle-due-2"));
+        QVERIFY(advanceReviewClock(path, "ow-lifecycle-clock-2", 120));
+        auto second = db.claimOpenWake(12, 60, 12, 100, 4, &reason);
+        QVERIFY2(!second.isEmpty(), qPrintable(reason));
+        const qlonglong secondId = second.value("id").toInteger();
+        QVERIFY(db.deferOpenWake(secondId, second.value("version").toInt(), 0,
+                                 QStringLiteral("user_interrupt")));
+        {
+            RawDb raw(path, "ow-lifecycle-deferred");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT state FROM open_wake WHERE id=%1").arg(secondId)).toString(),
+                     QStringLiteral("deferred"));
+            QVERIFY(raw.scalar(QStringLiteral(
+                        "SELECT lease_until FROM open_wake WHERE id=%1").arg(secondId)).isNull());
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT consecutive_failures FROM open_wake_state WHERE scope_key='owner'")).toInt(), 0);
+        }
+        QVERIFY(db.reviewFailure(QStringLiteral("open_wake"),
+                                 QStringLiteral("wake/%1:%2").arg(secondId)
+                                     .arg(second.value("version").toInt())).isEmpty());
+        // reflect：重新领取后提交 reflect，note 进入 recent notes。
+        QVERIFY(advanceReviewClock(path, "ow-lifecycle-clock-3", 120));
+        auto third = db.claimOpenWake(12, 60, 12, 100, 4, &reason);
+        QVERIFY2(!third.isEmpty(), qPrintable(reason));
+        const qlonglong thirdId = third.value("id").toInteger();
+        QVERIFY2(db.finishOpenWake(thirdId, third.value("version").toInt(),
+                                   QStringLiteral("reflect"),
+                                   QStringLiteral("雨声的段落还能再细一点"), {}, 30, &error),
+                 qPrintable(error));
+        notes = db.recentOpenWakeNotes(2);
+        QCOMPARE(notes.size(), 2);
+        QCOMPARE(notes.first().toObject().value("decision").toString(), QStringLiteral("reflect"));
+        QCOMPARE(notes.first().toObject().value("ref").toString(),
+                 QStringLiteral("wake/%1:%2").arg(thirdId).arg(third.value("version").toInt()));
+        QCOMPARE(notes.last().toObject().value("decision").toString(), QStringLiteral("rest"));
+        // cancel：终态，不影响失败计数。
+        QVERIFY(makeOpenWakeDue(path, "ow-lifecycle-due-4"));
+        QVERIFY(advanceReviewClock(path, "ow-lifecycle-clock-4", 120));
+        auto fourth = db.claimOpenWake(12, 60, 12, 100, 4, &reason);
+        QVERIFY2(!fourth.isEmpty(), qPrintable(reason));
+        const qlonglong fourthId = fourth.value("id").toInteger();
+        QVERIFY(db.cancelOpenWake(fourthId, fourth.value("version").toInt(),
+                                  QStringLiteral("shutdown")));
+        {
+            RawDb raw(path, "ow-lifecycle-cancelled");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT state FROM open_wake WHERE id=%1").arg(fourthId)).toString(),
+                     QStringLiteral("cancelled"));
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT last_outcome FROM open_wake_state WHERE scope_key='owner'")).toString(),
+                     QStringLiteral("cancelled"));
+        }
+    }
+
+    // R12-1a：公平计数持久化、按"实际成功领取"递增、OpenWake 领取清零、重启不重置。
+    void openWakeFairnessCounterPersists()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath(QStringLiteral("open-wake-fairness.db"));
+        {
+            MemoryManager db(path);
+            QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+            const auto turn = seedReflectionSource(db, QStringLiteral("fairness-source"));
+            QVERIFY(turn > 0);
+            QVERIFY(!db.claimPrivateReflection(12, 60).isEmpty());
+            QCOMPARE(db.openWakeState().value("non_open_since_due").toInt(), 1);
+            // 没有候选的 tick 不增加计数。
+            QVERIFY(rewindReviewCooldown(path, QStringLiteral("fairness-clock")));
+            QVERIFY(db.claimDueConcern(12, 60).isEmpty());
+            QCOMPARE(db.openWakeState().value("non_open_since_due").toInt(), 1);
+            // 活动领取同样递增（按成功领取的任务计数）。
+            QVERIFY(db.saveQATurn(QStringLiteral("还在写雨声"),
+                                  QStringLiteral(R"({"personal_interest":"雨声"})"), {}));
+            const auto thought = db.nextThought(true);
+            QVERIFY(thought.value("id").toInteger() > 0);
+            QVERIFY(rewindReviewCooldown(path, QStringLiteral("fairness-clock-activity")));
+            QVERIFY(db.claimThoughtReview(thought.value("id").toInteger(),
+                                          thought.value("version").toInt(), 12, 60));
+            QCOMPARE(db.openWakeState().value("non_open_since_due").toInt(), 2);
+        }
+        // 重开数据库：计数仍在（持久化，进程重启不清零）。
+        {
+            MemoryManager db(path);
+            QCOMPARE(db.openWakeState().value("non_open_since_due").toInt(), 2);
+            QVERIFY(makeOpenWakeDue(path, "fairness-due"));
+            QVERIFY(advanceReviewClock(path, "fairness-clock-wake", 120));
+            QString reason;
+            const auto wake = db.claimOpenWake(12, 60, 12, 100, 4, &reason);
+            QVERIFY2(!wake.isEmpty(), qPrintable(reason));
+            QCOMPARE(db.openWakeState().value("non_open_since_due").toInt(), 0);
+        }
+    }
+
+    // R12-1a：internal_activity 只读骨架（可见 activity/<id>，legacy 仍可见，旧接口不变）。
+    void internalActivityReadSkeleton()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath(QStringLiteral("internal-activity.db"));
+        MemoryManager db(path);
+        {
+            RawDb raw(path, "internal-activity-insert");
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral(
+                "INSERT INTO internal_activity(scope_key,origin_kind,channel,session_id,interest,"
+                "status,version,result_json,artifact_ref,review_after,created_at,updated_at) "
+                "VALUES('owner','internal','pet','default','把窗边的光写进段落','active',0,'{}','',"
+                "0,unixepoch(),unixepoch())")));
+        }
+        QVERIFY(db.hasActiveInternalActivity());
+        QCOMPARE(db.currentActivities().size(), 0);   // 旧接口只读 legacy，不受影响
+        auto unified = db.currentActivitiesUnified(8);
+        QCOMPARE(unified.size(), 1);
+        {
+            const auto row = unified.first().toObject();
+            QCOMPARE(row.value("origin").toString(), QStringLiteral("internal"));
+            QVERIFY(row.value("ref").toString().startsWith(QStringLiteral("activity/")));
+            QCOMPARE(row.value("interest").toString(), QStringLiteral("把窗边的光写进段落"));
+            QCOMPARE(row.value("status").toString(), QStringLiteral("active"));
+        }
+        // legacy 活动仍然可见，并带 origin=legacy；旧 currentActivities 返回形状不变。
+        QVERIFY(db.saveQATurn(QStringLiteral("在写雨声"),
+                              QStringLiteral(R"({"personal_interest":"雨声"})"), {}));
+        QCOMPARE(db.currentActivities().size(), 1);
+        QCOMPARE(db.currentActivities().first().toObject().value("ref").toString().left(8),
+                 QStringLiteral("thought/"));
+        unified = db.currentActivitiesUnified(8);
+        QCOMPARE(unified.size(), 2);
+        bool sawLegacy = false, sawInternal = false;
+        for (const auto &value : unified) {
+            const auto row = value.toObject();
+            const auto origin = row.value("origin").toString();
+            const auto ref = row.value("ref").toString();
+            if (origin == QStringLiteral("legacy") && ref.startsWith(QStringLiteral("thought/")))
+                sawLegacy = true;
+            if (origin == QStringLiteral("internal") && ref.startsWith(QStringLiteral("activity/")))
+                sawInternal = true;
+        }
+        QVERIFY(sawLegacy);
+        QVERIFY(sawInternal);
+        // paused 的内部活动仍算"当前活动"。
+        {
+            RawDb raw(path, "internal-activity-pause");
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral(
+                "UPDATE internal_activity SET status='paused' WHERE origin_kind='internal'")));
+        }
+        QVERIFY(db.hasActiveInternalActivity());
+        QCOMPARE(db.currentActivitiesUnified(8).size(), 2);
+    }
+
 };
 
 QTEST_GUILESS_MAIN(TestMemoryManager)

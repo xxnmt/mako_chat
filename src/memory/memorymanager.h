@@ -126,10 +126,17 @@ public:
     QJsonArray internalWakes(int limit=8,int *queried=nullptr,int *eligible=nullptr) const;
     // canonical subject：主人归一为 'user'，第三方取 actor（没有 actor 时沿用 subject）。
     QString snapshotSubjectId(const RequestMeta &meta) const;
-    // R12-0：回顾提示词的服务端时间上下文（只读，不新造状态）。
-    // 返回 last_owner_interaction_at（最近一条 subject=user 的 reply 发言时间）与
-    // last_confirmed_outbound_at（最近一条已落库的 assistant/proactive 成功表达时间：
-    // turn_state='handed_off'，沿用现有落库语义）。没有记录时返回空串，由调用方写 unknown。
+    // R12-0/R12-1a：回顾提示词的服务端时间上下文（只读，不新造状态）。
+    // R12-1a 区分“当前会话最近交互”与“跨渠道最近交互”，并保留旧字段别名：
+    //   last_owner_session_at / last_owner_cross_channel_at：
+    //     当前渠道+会话 / 主人私聊域（pet、qq_private）最近一条 subject=user 的 reply；
+    //   last_confirmed_outbound_session_at / last_confirmed_outbound_cross_channel_at：
+    //     同范围最近一条已落库的成功表达（turn_state='handed_off' 的 reply/proactive，
+    //     沿用现有落库语义：只证明“她确实说过/发出过”，不代表主人读过）；
+    //   last_owner_interaction_at / last_confirmed_outbound_at：旧别名（有渠道时=当前会话，
+    //     无渠道时=主人私聊域），保持 R12-0 调用方兼容。
+    // 跨渠道字段仅在 subject='user' 且来源渠道非群聊时返回（群聊/第三方不扩大私人资料权限）；
+    // 没有记录时返回空串。
     QJsonObject reviewInteractionTimes(const QString &channel,const QString &session,
                                        const QString &subject=QStringLiteral("user")) const;
 
@@ -282,6 +289,49 @@ public:
     // 主动轮次 user_input 为 NULL、turn_kind='proactive'，不参与回顾/认识更新。
     qlonglong recordProactiveMessage(const QString &channel, const QString &session, const QString &text,
                                      const QString &kind, const QString &ref);
+
+    // ===== R12-1a：持久化回顾失败 / 退避 / 暂停（v31）=====
+    // 四类来源（reflection|concern|activity|open_wake）共用 review_failure：
+    //   recordReviewFailure 在同一个事务内更新失败行与对应源状态（各步影响行数都要为 1），
+    //   countsAsFailure=false（权限/策略拦截、用户主动让出）只记录 last_stage/last_reason，
+    //   不增加计数、不改退避/源状态，由调用方决定是否 defer；
+    //   clearReviewFailure 在成功提交后清行；resetReviewFailure 是管理员重置（清行并让源立即可领取）。
+    // 来源实质修订（content_hash 变化）会把连续失败计数重置为 0 后再计本次失败；
+    // 普通领取 bump 的 version 不参与重置判断，避免把正常重试误判成修订。
+    QString classifyReviewError(const QString &error) const;
+    QJsonObject reviewFailure(const QString &sourceKind,const QString &sourceRef) const;
+    bool recordReviewFailure(const QString &sourceKind,const QString &sourceRef,
+                             const QString &stage,const QString &reason,
+                             bool countsAsFailure,QString *error=nullptr);
+    bool clearReviewFailure(const QString &sourceKind,const QString &sourceRef);
+    bool resetReviewFailure(const QString &sourceKind,const QString &sourceRef);
+    // 今日回顾预算诊断（只读）：total + 各 source 次数。
+    QJsonObject reviewBudgetUsage() const;
+
+    // ===== R12-1a：OpenWake 状态 / 预算 / 公平 / 租约（本片仅 rest|reflect）=====
+    // 调度状态与租约都在 SQLite 里：重启后由 recoverOpenWakeLeases 恢复过期租约；
+    // 领取/提交/延后/取消都是带 version CAS 的单一事务。本片不创建内部活动，
+    // 也不迁移存量 thought 活动；internal_activity 只提供只读访问骨架。
+    QJsonObject openWakeState(const QString &scopeKey=QStringLiteral("owner")) const;
+    bool ensureOpenWakeScheduled(const QString &scopeKey,int initialDelaySeconds,
+                                 QString *error=nullptr);
+    // reason 输出：budget|cooldown|busy|suspended|not_due|no_candidate|db_error。
+    QJsonObject claimOpenWake(int dailyLimit,int cooldownSeconds,int openWakeDailyLimit,
+                              int sharedBudgetPercent,int maxConsecutiveFailures,
+                              QString *reason=nullptr,QDateTime *nextEligibleAt=nullptr,
+                              const QString &scopeKey=QStringLiteral("owner"));
+    bool finishOpenWake(qlonglong id,int version,const QString &decision,const QString &note,
+                        const QJsonObject &intent,int nextWakeMinutes,QString *error=nullptr);
+    bool deferOpenWake(qlonglong id,int version,int retrySeconds,const QString &reason);
+    bool cancelOpenWake(qlonglong id,int version,const QString &reason);
+    int recoverOpenWakeLeases(int staleSeconds=1800);
+    QJsonArray recentOpenWakeNotes(int limit=2) const;   // R12-1a：最近 committed rest/reflect 非空 note
+    //                                                      （ref/version/decision/note/at），上限 20；只读。
+    // 统一活动访问骨架（只读）：legacy=chat_history thought，internal=internal_activity。
+    // hasActiveInternalActivity 合并检查两种来源的 active/paused；currentActivitiesUnified
+    // 返回带 origin 字段的合并列表，不改变既有 currentActivities 的返回形状。
+    bool hasActiveInternalActivity() const;
+    QJsonArray currentActivitiesUnified(int limit) const;
 
 //历史对话crud
     QList<HistoryTurn> getHistoryTurn(int N, const QString &channel = Channel::kPet, const QString &sessionId = Channel::kDefaultSession, qint64 beforeTurn = 0);
@@ -458,8 +508,15 @@ private:
     // authority/时序校验，不写库。friend 避免把整张库的查询接口暴露到公共 API。
     friend class ActionPolicy;
     // R12-0 诊断：reason 输出 daily_limit/cooldown/db_error；nextEligibleAt 仅在可计算时填写。
+    // R12-1a：sourceKind/sourceRef/runId 写入 thought_review_log；sourceDailyLimit>0 时
+    // 额外限制该来源今日次数（OpenWake 独立预算，仍受共享 dailyLimit 与冷却约束）。
     bool chargePrivateReview(qlonglong turn, int dailyLimit, int cooldownSeconds,
-                             QString *reason = nullptr, QDateTime *nextEligibleAt = nullptr);
+                             QString *reason = nullptr, QDateTime *nextEligibleAt = nullptr,
+                             const QString &sourceKind = QString(),
+                             const QString &sourceRef = QString(),
+                             const QString &runId = QString(),
+                             int sourceDailyLimit = 0);
+
     void initDatabase(const QString &dbFilePath, const QString &connectionName = QString());
     bool upsertMemoryChunk(const MemoryChunkWrite &chunk);
     bool indexRawEvent(qlonglong id);
@@ -467,6 +524,14 @@ private:
     bool ensurePerson(const QString &personId,
                       const QString &role,
                       const QString &canonicalName);
+
+    // R12-1a：非 OpenWake 任务成功领取后、在同一事务内递增公平计数。
+    // 按"实际成功领取的任务"计数（不是 tick）；没有调度行/未到期/暂停中时为空操作。
+    bool bumpOpenWakeFairness();
+    // R12-1a：暂停到期后的恢复尝试：若该源存在 failure 行且 suspended_until<=now，
+    // 把 consecutive_failures 置 0（保留 last_reason）。返回 SQL 是否执行成功。
+    bool recoverSuspendedFailure(const QString &sourceKind, const QString &sourceRef);
+
     QSqlDatabase m_db;
     QString m_databasePath;
     QSet<QString> m_masterUserIds;

@@ -101,6 +101,10 @@ CognitiveCoordinator::CognitiveCoordinator(MemoryManager &memory, LLMService &mo
     const int staleReflections = store.recoverStaleReflections(1800);
     if (staleReflections > 0)
         qInfo() << "[Attention] stale_reflections_recovered=" << staleReflections;
+    // R12-1a：OpenWake 用 SQLite 租约防重入。进程重启后把 running 且租约过期的唤醒
+    // 置为 interrupted，并把调度推到 now，由 reviewIfDue 重新领取；本片只恢复内部唤醒。
+    const int recoveredWakes = store.recoverOpenWakeLeases(1800);
+    qInfo() << "[OpenWake] recovered=" << recoveredWakes;
     // 上次运行若在"联系投递"中退出，会留下 dispatching 的 contact 行。领取后无法确认消息
     // 是否已经交给渠道，只能按 at-most-once 落 unknown（可能已送达），不再重发。
     store.recoverStaleContacts(600);
@@ -167,12 +171,17 @@ void CognitiveCoordinator::reviewIfDue()
     }
     auto &cfg = ConfigManager::instance();
     const auto options = cfg.getProactiveConfig();
+    const auto openWake = cfg.getOpenWakeConfig();
     // 到期关注属于主动联系链（B4），privateWriting=false 但 proactive.enabled=true 时也要允许唤醒；
     // 具体能领取到活动/关注/新来源中的哪一类，由 PrivateReview 与记忆层的领取规则决定。
+    // R12-1a：OpenWake 是独立内部入口（privateWriting=false 也可运行），但 daily_limit=0 时
+    // 连它一起停掉——所有后台认知共享同一份每日预算。
     QString reason;
     if (!cfg.getMemoryPolicyConfig().longTermMemoryEnabled)
         reason = QStringLiteral("memory_disabled");
-    else if (!options.privateWriting && !options.enabled)
+    else if (options.dailyLimit <= 0)
+        reason = QStringLiteral("daily_limit");
+    else if (!options.privateWriting && !options.enabled && !openWake.enabled)
         reason = QStringLiteral("disabled");
     else if (!service.hasWritingProvider())
         reason = QStringLiteral("no_provider");
@@ -197,7 +206,7 @@ void CognitiveCoordinator::reviewIfDue()
         QStringLiteral("idle:%1").arg(QDateTime::currentSecsSinceEpoch() / 60),
         QJsonObject{{QStringLiteral("reason"), QStringLiteral("idle")}},
         QStringLiteral("idle"), 30);
-    const auto wake = review.wake(options.dailyLimit, options.cooldownSeconds);
+    const auto wake = review.wake(options.dailyLimit, options.cooldownSeconds, openWake);
     store.setAttentionState(QStringLiteral("last_wake_at"),
                             QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
     if (wakeEvent > 0)

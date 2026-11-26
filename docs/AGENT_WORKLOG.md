@@ -457,3 +457,16 @@ B5 节奏按报告修正：固定提交基线 → 2–4h 受控冒烟（self_des
 
 集成期修复：新活动合法 `thought_version=0` 被 `version<=0` 守卫误判为 storage_error，已改为仅拒绝 `id<=0`/负版本。
 验证：实际构建测试后 **ctest 23/23**；应用运行中（旧二进制占用），新二进制待重启前重链。后续 R12-1a 待确认。
+
+---
+
+## 2026-11-26 · R12-1a：持久 OpenWake、失败生命周期、最小快照
+
+按授权实施 R12-1a；v30→v31；OpenWake 仅 rest/reflect，无 contact/activity/outbox。
+
+- **内存层**：v31 四表+ledger 列；四类来源持久失败（120/300/900、第 4 次 suspended、内容哈希修订检测、事务回滚、暂停恢复/终止审计）；OpenWake 状态/租约/预算取整/公平计数；internal_activity 只读骨架；`claimPrivateReflection` 失败重领可超 24h 源窗口。
+- **运行时**：`CognitiveOrigin` 类型化并全来源校验；`PrivateReview::Kind::OpenWake` 调度（公平优先/本地检查不耗预算）；LLMService open_wake rest/reflect schema（拒绝 contact/activity）；失败接线到持久表；coordinator 启动恢复/门控；配置 `cognition.open_wake`/snapshot budget。
+- **快照**：静态说明移出 JSON；4096 可配；非空域最小保留/overflow；OpenWake note 以 InternalState 进入 inferences/motivation；跨渠道 vs 当前会话时间字段。
+- **集成修复**：新增 `cognitiveorigin.h` 缺 Qt include；测试夹具 backoff 时钟只拨 400 未覆盖 900 档；OpenWake claim 补 `current_context_epoch`。
+- **验证**：实际 `ctest 23/23`；`tst_memorymanager 122/1 skipped`、`tst_memoryagent 86`、`tst_cognitivesnapshot 13`、`tst_configmanager 17`。生产库 v30→v31 迁移后行数不变；真实运行 OpenWake `claimed→reflect committed`，无 Outbox/contact；同轮 concern `truncated` 进入持久退避；验证后恢复配置并清理测试 OpenWake 行。
+- **未做**：R12-1b 活动创建、R12-2 contact/outbox、R12-3 快照一致性、后台 tool loop。**风险**：真实模型对 rest/reflect 契约的长期服从、epoch 为占位、4096 预算极端 overflow、失败状态长期观察。

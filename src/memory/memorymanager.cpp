@@ -9,10 +9,12 @@
 #include <QScopeGuard>
 #include <QDir>
 #include <QCryptographicHash>
+#include <QUuid>
 #include <QElapsedTimer>
 #include <QThread>
 #include <QSqlQuery>
 #include <QSqlError>
+#include <QVariant>
 #include <QDebug>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -322,7 +324,9 @@ QJsonObject MemoryManager::activityById(qlonglong id) const
 }
 
 bool MemoryManager::chargePrivateReview(qlonglong turn, int dailyLimit, int cooldownSeconds,
-                                        QString *reason, QDateTime *nextEligibleAt)
+                                        QString *reason, QDateTime *nextEligibleAt,
+                                        const QString &sourceKind, const QString &sourceRef,
+                                        const QString &runId, int sourceDailyLimit)
 {
     if (reason) reason->clear();
     if (nextEligibleAt) *nextEligibleAt = QDateTime{};
@@ -334,28 +338,52 @@ bool MemoryManager::chargePrivateReview(qlonglong turn, int dailyLimit, int cool
         if (nextEligibleAt) *nextEligibleAt = nextLocalDay();
         return false;
     }
+    // 独立来源预算（OpenWake）：仍受共享每日总量与冷却约束。取整时保证正预算至少有一次
+    // 机会，但绝不突破共享 dailyLimit 或配置的 openWakeDailyLimit。
+    const bool perSourceCap = sourceDailyLimit > 0 && !sourceKind.isEmpty();
+    const int cooldown = qMax(60, cooldownSeconds);
+    QString sql = QStringLiteral(
+        "INSERT INTO thought_review_log(turn_id,started_at,source_kind,source_ref,run_id) "
+        "SELECT ?,unixepoch(),?,?,? WHERE (SELECT count(*) FROM thought_review_log "
+        "WHERE date(started_at,'unixepoch','localtime')=date('now','localtime')) < ? "
+        "AND coalesce((SELECT max(started_at) FROM thought_review_log),0)+?<=unixepoch()");
+    if (perSourceCap) {
+        sql += QStringLiteral(
+            " AND (SELECT count(*) FROM thought_review_log "
+            "WHERE date(started_at,'unixepoch','localtime')=date('now','localtime') "
+            "AND source_kind=?) < ?");
+    }
     QSqlQuery q(m_db);
-    q.prepare(R"(
-        INSERT INTO thought_review_log(turn_id,started_at)
-        SELECT ?,unixepoch() WHERE (SELECT count(*) FROM thought_review_log
-             WHERE date(started_at,'unixepoch','localtime')=date('now','localtime')) < ?
-        AND coalesce((SELECT max(started_at) FROM thought_review_log),0)+?<=unixepoch()
-    )");
+    q.prepare(sql);
     q.addBindValue(turn);
+    q.addBindValue(sourceKind.isEmpty() ? QVariant() : QVariant(sourceKind));
+    q.addBindValue(sourceRef.isEmpty() ? QVariant() : QVariant(sourceRef));
+    q.addBindValue(runId.isEmpty() ? QVariant() : QVariant(runId));
     q.addBindValue(dailyLimit);
-    q.addBindValue(qMax(60,cooldownSeconds));
+    q.addBindValue(cooldown);
+    if (perSourceCap) {
+        q.addBindValue(sourceKind);
+        q.addBindValue(sourceDailyLimit);
+    }
     if (!q.exec()) {
         if (reason) *reason = QStringLiteral("db_error");
         return false;
     }
     if (q.numRowsAffected() == 1) return true;
-    // 未插入：再查一次当日已用次数与上次开始时间，把"预算用尽"和"冷却未到"分开。
+    // 未插入：再查一次当日已用次数、上次开始时间与该来源今日次数，把原因分开。
     // 只读诊断，不影响预算/冷却语义。
-    QSqlQuery diag(m_db);
-    diag.prepare(QStringLiteral(
+    QString diagSql = QStringLiteral(
         "SELECT (SELECT count(*) FROM thought_review_log "
         "WHERE date(started_at,'unixepoch','localtime')=date('now','localtime')),"
-        "coalesce((SELECT max(started_at) FROM thought_review_log),0),unixepoch()"));
+        "coalesce((SELECT max(started_at) FROM thought_review_log),0),unixepoch()");
+    if (perSourceCap)
+        diagSql += QStringLiteral(
+            ",(SELECT count(*) FROM thought_review_log "
+            "WHERE date(started_at,'unixepoch','localtime')=date('now','localtime') "
+            "AND source_kind=?)");
+    QSqlQuery diag(m_db);
+    diag.prepare(diagSql);
+    if (perSourceCap) diag.addBindValue(sourceKind);
     if (!diag.exec() || !diag.next()) {
         if (reason) *reason = QStringLiteral("db_error");
         return false;
@@ -363,9 +391,12 @@ bool MemoryManager::chargePrivateReview(qlonglong turn, int dailyLimit, int cool
     const int used = diag.value(0).toInt();
     const qlonglong last = diag.value(1).toLongLong();
     const qlonglong now = diag.value(2).toLongLong();
-    const int cooldown = qMax(60, cooldownSeconds);
+    const int sourceUsed = perSourceCap ? diag.value(3).toInt() : 0;
     if (used >= dailyLimit) {
         if (reason) *reason = QStringLiteral("daily_limit");
+        if (nextEligibleAt) *nextEligibleAt = nextLocalDay();
+    } else if (perSourceCap && sourceUsed >= sourceDailyLimit) {
+        if (reason) *reason = QStringLiteral("budget");
         if (nextEligibleAt) *nextEligibleAt = nextLocalDay();
     } else if (last > 0 && last + cooldown > now) {
         if (reason) *reason = QStringLiteral("cooldown");
@@ -408,11 +439,24 @@ bool MemoryManager::claimThoughtReview(qlonglong id, int version, int dailyLimit
         m_db.rollback();
         return false;
     }
+    // R12-1a：暂停到期后的恢复尝试（重置连续失败计数，保留 last_reason）。
+    if (!recoverSuspendedFailure(QStringLiteral("activity"), QStringLiteral("thought/%1").arg(id))) {
+        if (reason) *reason = QStringLiteral("db_error");
+        m_db.rollback();
+        return false;
+    }
     QString chargeReason;
     QDateTime next;
-    if (!chargePrivateReview(id, dailyLimit, cooldownSeconds, &chargeReason, &next)) {
+    if (!chargePrivateReview(id, dailyLimit, cooldownSeconds, &chargeReason, &next,
+                             QStringLiteral("activity"), QStringLiteral("thought/%1").arg(id))) {
         if (reason) *reason = chargeReason.isEmpty() ? QStringLiteral("db_error") : chargeReason;
         if (nextEligibleAt) *nextEligibleAt = next;
+        m_db.rollback();
+        return false;
+    }
+    // 公平性：成功领取非 OpenWake 任务时，在同一事务内推进持久化公平计数。
+    if (!bumpOpenWakeFairness()) {
+        if (reason) *reason = QStringLiteral("db_error");
         m_db.rollback();
         return false;
     }
@@ -5370,6 +5414,97 @@ void MemoryManager::initDatabase(const QString &dbFilePath, const QString &conne
             if (!query.exec("PRAGMA user_version=30")) throw query.lastError();
             currentVersion=30;
         }
+
+        if (currentVersion<31) {
+            // v31（R12-1a）：OpenWake 调度状态/租约、内部活动骨架、持久化回顾失败退避。
+            // 全部 IF NOT EXISTS / 判列幂等，旧测试把 user_version 压回更小值重放迁移也安全；
+            // 本块不改写任何既有事实行，也不触碰 action/outbox 的存量提交。
+            const QStringList v31Statements = {
+                "CREATE TABLE IF NOT EXISTS open_wake_state("
+                "scope_key TEXT PRIMARY KEY,"
+                "next_due_at INTEGER NOT NULL,"
+                "last_started_at INTEGER,"
+                "last_finished_at INTEGER,"
+                "last_outcome TEXT,"
+                "last_wake_id INTEGER,"
+                "consecutive_failures INTEGER NOT NULL DEFAULT 0,"
+                "non_open_since_due INTEGER NOT NULL DEFAULT 0,"
+                "suspended_until INTEGER,"
+                "version INTEGER NOT NULL DEFAULT 0,"
+                "updated_at INTEGER NOT NULL)",
+                "CREATE TABLE IF NOT EXISTS open_wake("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "scope_key TEXT NOT NULL,"
+                "run_id TEXT NOT NULL UNIQUE,"
+                "version INTEGER NOT NULL DEFAULT 1,"
+                "state TEXT NOT NULL,"
+                "trigger_reason TEXT NOT NULL,"
+                "created_at INTEGER NOT NULL,"
+                "started_at INTEGER,"
+                "finished_at INTEGER,"
+                "lease_until INTEGER,"
+                "current_context_epoch INTEGER,"
+                "snapshot_hash TEXT,"
+                "decision TEXT,"
+                "note TEXT,"
+                "intent_json TEXT,"
+                "next_due_at INTEGER,"
+                "error_code TEXT)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS open_wake_running_unique "
+                "ON open_wake(scope_key) WHERE state='running'",
+                "CREATE INDEX IF NOT EXISTS open_wake_scope_state ON open_wake(scope_key,state,id)",
+                "CREATE TABLE IF NOT EXISTS internal_activity("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "scope_key TEXT NOT NULL,"
+                "origin_kind TEXT NOT NULL,"
+                "origin_ref TEXT,"
+                "run_id TEXT,"
+                "subject TEXT NOT NULL DEFAULT 'user',"
+                "channel TEXT NOT NULL,"
+                "session_id TEXT NOT NULL,"
+                "interest TEXT NOT NULL,"
+                "status TEXT NOT NULL DEFAULT 'active',"
+                "version INTEGER NOT NULL DEFAULT 0,"
+                "result_json TEXT NOT NULL DEFAULT '{}',"
+                "artifact_ref TEXT,"
+                "review_after INTEGER NOT NULL DEFAULT 0,"
+                "created_at INTEGER NOT NULL,"
+                "updated_at INTEGER NOT NULL)",
+                "CREATE TABLE IF NOT EXISTS review_failure("
+                "source_kind TEXT NOT NULL,"
+                "source_ref TEXT NOT NULL,"
+                "consecutive_failures INTEGER NOT NULL DEFAULT 0,"
+                "next_retry_at INTEGER,"
+                "suspended_until INTEGER,"
+                "last_stage TEXT,"
+                "last_reason TEXT,"
+                "content_hash TEXT,"
+                "last_attempt_at INTEGER,"
+                "updated_at INTEGER NOT NULL,"
+                "PRIMARY KEY(source_kind,source_ref))"
+            };
+            for (const auto &statement : v31Statements)
+                if (!query.exec(statement)) throw query.lastError();
+            // 迁移重放场景里 thought_review_log 可能因为跳过 v10 而不存在，先幂等补表再补列；
+            // 旧行的 source_* 保持 NULL，现有"按整表当日行数"计预算的逻辑不变。
+            if (!query.exec("CREATE TABLE IF NOT EXISTS thought_review_log("
+                            "turn_id INTEGER,started_at INTEGER NOT NULL)"))
+                throw query.lastError();
+            if (!ensureColumn(query, "thought_review_log", "source_kind",
+                              "ALTER TABLE thought_review_log ADD COLUMN source_kind TEXT")
+                || !ensureColumn(query, "thought_review_log", "source_ref",
+                                 "ALTER TABLE thought_review_log ADD COLUMN source_ref TEXT")
+                || !ensureColumn(query, "thought_review_log", "run_id",
+                                 "ALTER TABLE thought_review_log ADD COLUMN run_id TEXT"))
+                throw query.lastError();
+            if (!query.exec("CREATE INDEX IF NOT EXISTS idx_thought_review_time "
+                            "ON thought_review_log(started_at)"))
+                throw query.lastError();
+            if (!query.exec("PRAGMA user_version=31")) throw query.lastError();
+            currentVersion=31;
+            qDebug()<<"[MemoryManager]数据库结构升级完成,版本:"<<currentVersion;
+        }
+
         // 关注了结的独立流水（v22 的补充表）。与 reflection_change（回顾链修订）分开：
         // 前者由正常对话写回，后者由私下回顾写，共用 turn 主键会互相覆盖。
         // 用 IF NOT EXISTS 幂等补表，不改变结构版本号，旧库升级与新库初始化走同一句。
@@ -5388,6 +5523,1050 @@ void MemoryManager::initDatabase(const QString &dbFilePath, const QString &conne
         m_db.rollback();
         qDebug()<<"[MemoryManager]数据库更新失败:"<<error;
     }
+}
+
+// ============================ R12-1a：回顾失败持久化 / OpenWake ============================
+// 这一片只做内存/SQLite 层：
+//   * review_failure 记录四类来源（reflection|concern|activity|open_wake）的连续失败、
+//     退避与暂停；计数/退避/恢复/终止规则集中在这里，调用方只负责传错误分类与日志；
+//   * OpenWake 的调度状态、租约、每日独立预算和公平计数都持久化在 SQLite；
+//     领取/提交/延后/取消/恢复都是带 version CAS 的单一事务；
+//   * internal_activity 本片只读：不创建 OpenWake 活动、不迁移存量 thought 活动。
+namespace {
+
+const QString kReviewKindReflection = QStringLiteral("reflection");
+const QString kReviewKindConcern = QStringLiteral("concern");
+const QString kReviewKindActivity = QStringLiteral("activity");
+const QString kReviewKindOpenWake = QStringLiteral("open_wake");
+
+bool reviewKindValid(const QString &kind)
+{
+    return kind == kReviewKindReflection || kind == kReviewKindConcern
+        || kind == kReviewKindActivity || kind == kReviewKindOpenWake;
+}
+
+// 内容摘要：SHA-256 取前 16 个 hex 字符。只用于"来源是否实质修订"的比较，不承载安全含义。
+QString reviewHash16(const QString &payload)
+{
+    return QString::fromLatin1(QCryptographicHash::hash(payload.toUtf8(),
+                                                        QCryptographicHash::Sha256)
+                                   .toHex()
+                                   .left(16));
+}
+
+QString reviewIsoFromEpoch(qlonglong seconds)
+{
+    return seconds > 0
+        ? QDateTime::fromSecsSinceEpoch(seconds).toUTC().toString(Qt::ISODateWithMs)
+        : QString{};
+}
+
+// source_ref 约定（与 recentOpenWakeNotes 的 ref 一致）：
+//   reflection/<turn>、concern/<turn>、thought/<id>、wake/<id>:<version>。
+// 也接受裸数字 id（open_wake 除外：open_wake 需要行版本做 CAS）。
+bool parseReviewSourceRef(const QString &kind, const QString &ref, qlonglong *id, int *version)
+{
+    if (!id) return false;
+    *id = 0;
+    if (version) *version = 0;
+    const QString trimmed = ref.trimmed();
+    if (trimmed.isEmpty()) return false;
+    const int slash = trimmed.indexOf(QLatin1Char('/'));
+    const QString idText = slash >= 0 ? trimmed.mid(slash + 1).section(QLatin1Char(':'), 0, 0)
+                                      : trimmed;
+    bool ok = false;
+    const qlonglong parsed = idText.toLongLong(&ok);
+    if (!ok || parsed <= 0) return false;
+    *id = parsed;
+    if (version) {
+        const QString versionText = slash >= 0
+            ? trimmed.mid(slash + 1).section(QLatin1Char(':'), 1, 1) : QString{};
+        if (!versionText.isEmpty()) {
+            bool versionOk = false;
+            const int parsedVersion = versionText.toInt(&versionOk);
+            if (!versionOk || parsedVersion <= 0) return false;
+            *version = parsedVersion;
+        }
+    }
+    return true;
+}
+
+struct ReviewSourceSnapshot
+{
+    bool present = false;
+    QString state;                    // 源状态机当前状态
+    int version = 0;                  // 与 CAS 相关的行版本
+    QString contentHash;              // 用于检测来源实质修订
+    QString scopeKey;                 // open_wake 的调度 scope
+    qlonglong scheduleFailures = 0;   // open_wake_state.consecutive_failures（跨 wake 的权威计数）
+};
+
+// 只读来源快照：内容字段按来源定义拼接后取哈希。
+//   reflection/concern = note/topic/watch；activity = thought/status/goal/progress/draft；
+//   open_wake = note/intent。
+ReviewSourceSnapshot reviewSourceSnapshot(const QSqlDatabase &db, const QString &kind,
+                                          qlonglong id, int refVersion, QString *error)
+{
+    ReviewSourceSnapshot snapshot;
+    if (error) error->clear();
+    QSqlQuery q(db);
+    if (kind == kReviewKindReflection || kind == kReviewKindConcern) {
+        q.prepare(QStringLiteral(
+            "SELECT coalesce(note,''),coalesce(topic,''),coalesce(watch,''),state,version "
+            "FROM private_reflection WHERE turn_id=?"));
+        q.addBindValue(id);
+        if (!q.exec()) {
+            if (error) *error = QStringLiteral("db_error");
+            return snapshot;
+        }
+        if (!q.next()) return snapshot;
+        snapshot.present = true;
+        snapshot.state = q.value(3).toString();
+        snapshot.version = q.value(4).toInt();
+        snapshot.contentHash = reviewHash16(q.value(0).toString() + QChar(31)
+                                            + q.value(1).toString() + QChar(31)
+                                            + q.value(2).toString());
+        return snapshot;
+    }
+    if (kind == kReviewKindActivity) {
+        q.prepare(QStringLiteral(
+            "SELECT thought,coalesce(thought_result,'{}'),thought_version FROM chat_history "
+            "WHERE id=? AND thought IS NOT NULL AND thought<>'' AND sensitive=0"));
+        q.addBindValue(id);
+        if (!q.exec()) {
+            if (error) *error = QStringLiteral("db_error");
+            return snapshot;
+        }
+        if (!q.next()) return snapshot;
+        snapshot.present = true;
+        snapshot.version = q.value(2).toInt();
+        const auto result = QJsonDocument::fromJson(q.value(1).toByteArray()).object();
+        snapshot.state = result.value(QStringLiteral("status")).toString(QStringLiteral("active"));
+        snapshot.contentHash = reviewHash16(
+            q.value(0).toString() + QChar(31)
+            + result.value(QStringLiteral("status")).toString() + QChar(31)
+            + result.value(QStringLiteral("goal")).toString() + QChar(31)
+            + result.value(QStringLiteral("progress")).toString() + QChar(31)
+            + result.value(QStringLiteral("draft")).toString());
+        return snapshot;
+    }
+    // open_wake
+    q.prepare(QStringLiteral(
+        "SELECT state,coalesce(note,''),coalesce(intent_json,''),version,scope_key "
+        "FROM open_wake WHERE id=?"));
+    q.addBindValue(id);
+    if (!q.exec()) {
+        if (error) *error = QStringLiteral("db_error");
+        return snapshot;
+    }
+    if (!q.next()) return snapshot;
+    snapshot.present = true;
+    snapshot.state = q.value(0).toString();
+    snapshot.version = q.value(3).toInt();
+    snapshot.scopeKey = q.value(4).toString();
+    snapshot.contentHash = reviewHash16(q.value(1).toString() + QChar(31) + q.value(2).toString());
+    Q_UNUSED(refVersion);
+    QSqlQuery schedule(db);
+    schedule.prepare(QStringLiteral(
+        "SELECT consecutive_failures FROM open_wake_state WHERE scope_key=?"));
+    schedule.addBindValue(snapshot.scopeKey);
+    if (schedule.exec() && schedule.next())
+        snapshot.scheduleFailures = schedule.value(0).toLongLong();
+    return snapshot;
+}
+
+// 失败可否写回源状态机：只有"已领取"（pending/running/active）的源才可写；
+// 源已删除/resolved/dropped/abandoned 时清遗留失败行并报可审计错误码。
+QString reviewClaimabilityError(const QString &kind, const ReviewSourceSnapshot &snapshot,
+                                int refVersion)
+{
+    if (!snapshot.present) return QStringLiteral("source_missing");
+    if (kind == kReviewKindReflection || kind == kReviewKindConcern)
+        return snapshot.state == QStringLiteral("pending") ? QString{}
+                                                           : QStringLiteral("source_inactive");
+    if (kind == kReviewKindActivity)
+        return snapshot.state == QStringLiteral("active") ? QString{}
+                                                          : QStringLiteral("source_inactive");
+    // open_wake：ref 带版本时必须与 running 行版本一致；否则是迟到回执，不写回状态。
+    if (refVersion > 0 && snapshot.version != refVersion)
+        return QStringLiteral("cas_conflict");
+    return snapshot.state == QStringLiteral("running") ? QString{}
+                                                       : QStringLiteral("source_inactive");
+}
+
+} // namespace
+
+QString MemoryManager::classifyReviewError(const QString &error) const
+{
+    const QString text = error.trimmed().toLower();
+    if (text.isEmpty()) return QStringLiteral("unknown");
+    if (text.contains(QStringLiteral("network")) || text.contains(QStringLiteral("timeout"))
+        || text.contains(QStringLiteral("connection")) || text.contains(QStringLiteral("unreachable"))
+        || text.contains(QStringLiteral("socket")) || text.contains(QStringLiteral("eof")))
+        return QStringLiteral("network_error");
+    if (text.contains(QStringLiteral("truncat")) || text.contains(QStringLiteral("empty_content"))
+        || text.contains(QStringLiteral("too_long")))
+        return QStringLiteral("truncated");
+    if (text.contains(QStringLiteral("json")) || text.contains(QStringLiteral("parse")))
+        return QStringLiteral("json_parse");
+    if (text.contains(QStringLiteral("schema")) || text.contains(QStringLiteral("missing_field")))
+        return QStringLiteral("schema");
+    if (text.contains(QStringLiteral("cas")) || text.contains(QStringLiteral("conflict"))
+        || text.contains(QStringLiteral("stale")) || text.contains(QStringLiteral("version")))
+        return QStringLiteral("cas_conflict");
+    if (text.contains(QStringLiteral("permission")) || text.contains(QStringLiteral("policy"))
+        || text.contains(QStringLiteral("denied")) || text.contains(QStringLiteral("forbidden"))
+        || text.contains(QStringLiteral("withheld")))
+        return QStringLiteral("permission_denied");
+    return QStringLiteral("db_error");
+}
+
+QJsonObject MemoryManager::reviewFailure(const QString &sourceKind,
+                                         const QString &sourceRef) const
+{
+    QJsonObject result;
+    if (!m_db.isOpen()) return result;
+    const QString kind = sourceKind.trimmed();
+    const QString ref = sourceRef.trimmed();
+    if (!reviewKindValid(kind) || ref.isEmpty()) return result;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral(
+        "SELECT consecutive_failures,next_retry_at,suspended_until,last_stage,last_reason,"
+        "content_hash,last_attempt_at,updated_at FROM review_failure "
+        "WHERE source_kind=? AND source_ref=?"));
+    q.addBindValue(kind);
+    q.addBindValue(ref);
+    if (!q.exec() || !q.next()) return result;
+    const qlonglong nextRetry = q.value(1).toLongLong();
+    const qlonglong suspended = q.value(2).toLongLong();
+    result = QJsonObject{{QStringLiteral("source_kind"), kind},
+                         {QStringLiteral("source_ref"), ref},
+                         {QStringLiteral("consecutive_failures"), q.value(0).toInt()},
+                         {QStringLiteral("next_retry_at"), nextRetry},
+                         {QStringLiteral("suspended_until"), suspended},
+                         {QStringLiteral("last_stage"), q.value(3).toString()},
+                         {QStringLiteral("last_reason"), q.value(4).toString()},
+                         {QStringLiteral("content_hash"), q.value(5).toString()},
+                         {QStringLiteral("last_attempt_at"), q.value(6).toLongLong()},
+                         {QStringLiteral("updated_at"), q.value(7).toLongLong()}};
+    result[QStringLiteral("next_retry_iso")] = reviewIsoFromEpoch(nextRetry);
+    result[QStringLiteral("suspended_iso")] = reviewIsoFromEpoch(suspended);
+    return result;
+}
+
+bool MemoryManager::recordReviewFailure(const QString &sourceKind, const QString &sourceRef,
+                                        const QString &stage, const QString &reason,
+                                        bool countsAsFailure, QString *error)
+{
+    if (error) error->clear();
+    const auto fail = [error](const QString &code) {
+        if (error) *error = code;
+        return false;
+    };
+    if (!m_db.isOpen()) return fail(QStringLiteral("db_error"));
+    const QString kind = sourceKind.trimmed();
+    const QString ref = sourceRef.trimmed();
+    if (!reviewKindValid(kind) || ref.isEmpty()) return fail(QStringLiteral("invalid_source"));
+    qlonglong sourceId = 0;
+    int refVersion = 0;
+    if (!parseReviewSourceRef(kind, ref, &sourceId, &refVersion))
+        return fail(QStringLiteral("invalid_source"));
+    if (!m_db.transaction()) return fail(QStringLiteral("db_error"));
+    auto rollback = qScopeGuard([this] { m_db.rollback(); });
+    QString snapshotError;
+    const ReviewSourceSnapshot snapshot = reviewSourceSnapshot(m_db, kind, sourceId, refVersion,
+                                                               &snapshotError);
+    if (!snapshotError.isEmpty()) return fail(QStringLiteral("db_error"));
+    // 源已删除 / 已 resolved / drop / 已不是可写状态：失败记录不能静默残留，
+    // 清掉遗留行并返回明确错误码，由调用方据此写可审计日志。
+    const QString nonWritable = countsAsFailure
+        ? reviewClaimabilityError(kind, snapshot, refVersion) : QString{};
+    if (!snapshot.present || !nonWritable.isEmpty()) {
+        QSqlQuery del(m_db);
+        del.prepare(QStringLiteral(
+            "DELETE FROM review_failure WHERE source_kind=? AND source_ref=?"));
+        del.addBindValue(kind);
+        del.addBindValue(ref);
+        if (!del.exec()) return fail(QStringLiteral("db_error"));
+        if (!m_db.commit()) return fail(QStringLiteral("db_error"));
+        rollback.dismiss();
+        const QString code = snapshot.present ? nonWritable : QStringLiteral("source_missing");
+        qWarning() << "[Review] failure_dropped kind=" << kind << "ref=" << ref
+                   << "reason=" << code;
+        return fail(code);
+    }
+    QSqlQuery existing(m_db);
+    existing.prepare(QStringLiteral(
+        "SELECT consecutive_failures,next_retry_at,suspended_until,content_hash "
+        "FROM review_failure WHERE source_kind=? AND source_ref=?"));
+    existing.addBindValue(kind);
+    existing.addBindValue(ref);
+    if (!existing.exec()) return fail(QStringLiteral("db_error"));
+    int existingFailures = 0;
+    qlonglong existingNext = 0;
+    qlonglong existingSuspended = 0;
+    QString existingHash;
+    const bool hadRow = existing.next();
+    if (hadRow) {
+        existingFailures = existing.value(0).toInt();
+        if (!existing.value(1).isNull()) existingNext = existing.value(1).toLongLong();
+        if (!existing.value(2).isNull()) existingSuspended = existing.value(2).toLongLong();
+        existingHash = existing.value(3).toString();
+    }
+    existing.finish();
+    const qlonglong now = QDateTime::currentSecsSinceEpoch();
+    int baseFailures = hadRow ? existingFailures : 0;
+    if (kind == kReviewKindOpenWake)
+        baseFailures = qMax(baseFailures, int(snapshot.scheduleFailures));
+    // 来源实质修订检测：内容哈希变化说明"她在意的事已经变了"，旧失败链不再成立，
+    // 计数重置为 0 后再计本次。普通领取 bump 的 version 不参与判断（正常重试必须累计）。
+    const bool revisionReset = hadRow && countsAsFailure && kind != kReviewKindOpenWake
+        && !existingHash.isEmpty() && !snapshot.contentHash.isEmpty()
+        && existingHash != snapshot.contentHash;
+    if (revisionReset) {
+        baseFailures = 0;
+        qDebug() << "[Review] failure_revision_reset kind=" << kind << "ref=" << ref;
+    }
+    int failures = existingFailures;
+    qlonglong nextRetry = existingNext;
+    qlonglong suspended = existingSuspended;
+    QString contentHash = existingHash;
+    if (countsAsFailure) {
+        failures = baseFailures + 1;
+        const auto options = ConfigManager::instance().getProactiveConfig();
+        const int maxFailures = qMax(1, options.maxReviewFailures);
+        if (failures >= maxFailures) {
+            // 达到上限：暂停 24h，next_retry 与 suspended_until 对齐。
+            suspended = now + 86400;
+            nextRetry = suspended;
+        } else {
+            const QList<int> &backoff = options.reviewBackoffSeconds;
+            const int index = qMin(failures - 1,
+                                   backoff.isEmpty() ? 0 : int(backoff.size()) - 1);
+            const int seconds = backoff.isEmpty() ? 120 : backoff.at(index);
+            nextRetry = now + seconds;
+            suspended = 0;
+        }
+        contentHash = snapshot.contentHash;
+    }
+    QSqlQuery upsert(m_db);
+    upsert.prepare(QStringLiteral(
+        "INSERT INTO review_failure(source_kind,source_ref,consecutive_failures,next_retry_at,"
+        "suspended_until,last_stage,last_reason,content_hash,last_attempt_at,updated_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source_kind,source_ref) DO UPDATE SET "
+        "consecutive_failures=excluded.consecutive_failures,"
+        "next_retry_at=excluded.next_retry_at,"
+        "suspended_until=excluded.suspended_until,"
+        "last_stage=excluded.last_stage,last_reason=excluded.last_reason,"
+        "content_hash=excluded.content_hash,last_attempt_at=excluded.last_attempt_at,"
+        "updated_at=excluded.updated_at"));
+    upsert.addBindValue(kind);
+    upsert.addBindValue(ref);
+    upsert.addBindValue(failures);
+    upsert.addBindValue(nextRetry > 0 ? QVariant(nextRetry) : QVariant());
+    upsert.addBindValue(suspended > 0 ? QVariant(suspended) : QVariant());
+    upsert.addBindValue(stage.trimmed().left(120));
+    upsert.addBindValue(reason.trimmed().left(240));
+    upsert.addBindValue(contentHash.isEmpty() ? QVariant() : QVariant(contentHash));
+    upsert.addBindValue(now);
+    upsert.addBindValue(now);
+    if (!upsert.exec()) return fail(QStringLiteral("db_error"));
+    if (countsAsFailure) {
+        // 失败行与源状态机同事务写回；每步影响行数必须为 1，否则整体失败回滚，
+        // 绝不出现"失败计数更新了、源却没被延后"的半写状态。
+        QSqlQuery source(m_db);
+        int affected = 0;
+        if (kind == kReviewKindReflection) {
+            source.prepare(QStringLiteral(
+                "UPDATE private_reflection SET state='deferred',claimed_by=NULL,"
+                "eligible_at=?,updated_at=? WHERE turn_id=? AND version=? AND state='pending'"));
+            source.addBindValue(nextRetry);
+            source.addBindValue(now);
+            source.addBindValue(sourceId);
+            source.addBindValue(snapshot.version);
+            if (!source.exec()) return fail(QStringLiteral("db_error"));
+            affected = source.numRowsAffected();
+        } else if (kind == kReviewKindConcern) {
+            source.prepare(QStringLiteral(
+                "UPDATE private_reflection SET state='consider',claimed_by=NULL,"
+                "next_check_at=?,eligible_at=?,updated_at=? "
+                "WHERE turn_id=? AND version=? AND state='pending'"));
+            source.addBindValue(nextRetry);
+            source.addBindValue(nextRetry);
+            source.addBindValue(now);
+            source.addBindValue(sourceId);
+            source.addBindValue(snapshot.version);
+            if (!source.exec()) return fail(QStringLiteral("db_error"));
+            affected = source.numRowsAffected();
+        } else if (kind == kReviewKindActivity) {
+            source.prepare(QStringLiteral(
+                "UPDATE chat_history SET review_after=?,"
+                "thought_result=json_set(coalesce(thought_result,'{}'),'$.deferred_reason',?),"
+                "thought_version=thought_version+1 "
+                "WHERE id=? AND thought_version=? AND thought IS NOT NULL AND sensitive=0 "
+                "AND coalesce(json_extract(thought_result,'$.status'),'active')='active'"));
+            source.addBindValue(nextRetry);
+            source.addBindValue(reason.trimmed().left(240));
+            source.addBindValue(sourceId);
+            source.addBindValue(snapshot.version);
+            if (!source.exec()) return fail(QStringLiteral("db_error"));
+            affected = source.numRowsAffected();
+        } else {
+            source.prepare(QStringLiteral(
+                "UPDATE open_wake SET state='deferred',lease_until=NULL,next_due_at=?,"
+                "finished_at=?,error_code=? WHERE id=? AND version=? AND state='running'"));
+            source.addBindValue(nextRetry);
+            source.addBindValue(now);
+            source.addBindValue(reason.trimmed().left(120));
+            source.addBindValue(sourceId);
+            source.addBindValue(snapshot.version);
+            if (!source.exec()) return fail(QStringLiteral("db_error"));
+            affected = source.numRowsAffected();
+            if (affected == 1) {
+                // 调度状态一并推到 next_retry，避免 deferred 行立刻又被领取。
+                QSqlQuery scheduling(m_db);
+                scheduling.prepare(QStringLiteral(
+                    "UPDATE open_wake_state SET next_due_at=?,suspended_until=?,"
+                    "consecutive_failures=?,version=version+1,updated_at=? WHERE scope_key=?"));
+                scheduling.addBindValue(nextRetry);
+                scheduling.addBindValue(suspended > 0 ? QVariant(suspended) : QVariant());
+                scheduling.addBindValue(failures);
+                scheduling.addBindValue(now);
+                scheduling.addBindValue(snapshot.scopeKey);
+                if (!scheduling.exec()) return fail(QStringLiteral("db_error"));
+                if (scheduling.numRowsAffected() != 1)
+                    return fail(QStringLiteral("cas_conflict"));
+            }
+        }
+        if (affected != 1) return fail(QStringLiteral("cas_conflict"));
+    }
+    if (!m_db.commit()) return fail(QStringLiteral("db_error"));
+    rollback.dismiss();
+    qDebug() << "[Review] failure kind=" << kind << "ref=" << ref
+             << "stage=" << stage << "reason=" << reason
+             << "counts=" << countsAsFailure << "failures=" << failures
+             << "next_retry=" << nextRetry << "suspended=" << suspended;
+    return true;
+}
+
+bool MemoryManager::clearReviewFailure(const QString &sourceKind, const QString &sourceRef)
+{
+    if (!m_db.isOpen()) return false;
+    const QString kind = sourceKind.trimmed();
+    const QString ref = sourceRef.trimmed();
+    if (!reviewKindValid(kind) || ref.isEmpty()) return false;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("DELETE FROM review_failure WHERE source_kind=? AND source_ref=?"));
+    q.addBindValue(kind);
+    q.addBindValue(ref);
+    return q.exec();
+}
+
+bool MemoryManager::resetReviewFailure(const QString &sourceKind, const QString &sourceRef)
+{
+    if (!m_db.isOpen()) return false;
+    const QString kind = sourceKind.trimmed();
+    const QString ref = sourceRef.trimmed();
+    if (!reviewKindValid(kind) || ref.isEmpty()) return false;
+    qlonglong sourceId = 0;
+    int refVersion = 0;
+    if (!parseReviewSourceRef(kind, ref, &sourceId, &refVersion)) return false;
+    if (!m_db.transaction()) return false;
+    auto rollback = qScopeGuard([this] { m_db.rollback(); });
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("DELETE FROM review_failure WHERE source_kind=? AND source_ref=?"));
+    q.addBindValue(kind);
+    q.addBindValue(ref);
+    if (!q.exec()) return false;
+    if (kind == kReviewKindReflection) {
+        q.prepare(QStringLiteral(
+            "UPDATE private_reflection SET eligible_at=unixepoch(),updated_at=unixepoch() "
+            "WHERE turn_id=?"));
+        q.addBindValue(sourceId);
+    } else if (kind == kReviewKindConcern) {
+        q.prepare(QStringLiteral(
+            "UPDATE private_reflection SET eligible_at=unixepoch(),next_check_at=unixepoch(),"
+            "updated_at=unixepoch() WHERE turn_id=?"));
+        q.addBindValue(sourceId);
+    } else if (kind == kReviewKindActivity) {
+        q.prepare(QStringLiteral("UPDATE chat_history SET review_after=0 WHERE id=?"));
+        q.addBindValue(sourceId);
+    } else {
+        q.prepare(QStringLiteral(
+            "UPDATE open_wake SET next_due_at=unixepoch() WHERE id=? AND state IN ('running','deferred')"));
+        q.addBindValue(sourceId);
+        if (!q.exec()) return false;
+        q.prepare(QStringLiteral(
+            "UPDATE open_wake_state SET next_due_at=unixepoch(),suspended_until=NULL,"
+            "consecutive_failures=0,version=version+1,updated_at=unixepoch() "
+            "WHERE scope_key=(SELECT scope_key FROM open_wake WHERE id=?)"));
+        q.addBindValue(sourceId);
+    }
+    if (!q.exec()) return false;
+    if (!m_db.commit()) return false;
+    rollback.dismiss();
+    return true;
+}
+
+QJsonObject MemoryManager::reviewBudgetUsage() const
+{
+    QJsonObject result;
+    if (!m_db.isOpen()) return result;
+    QSqlQuery q(m_db);
+    if (!q.exec(QStringLiteral(
+            "SELECT coalesce(source_kind,'legacy'),count(*) FROM thought_review_log "
+            "WHERE date(started_at,'unixepoch','localtime')=date('now','localtime') "
+            "GROUP BY coalesce(source_kind,'legacy')")))
+        return result;
+    QJsonObject bySource;
+    int total = 0;
+    while (q.next()) {
+        const int count = q.value(1).toInt();
+        bySource.insert(q.value(0).toString(), count);
+        total += count;
+    }
+    result[QStringLiteral("date")] = QDate::currentDate().toString(Qt::ISODate);
+    result[QStringLiteral("total")] = total;
+    result[QStringLiteral("by_source")] = bySource;
+    result[QStringLiteral("open_wake")] = bySource.value(QStringLiteral("open_wake")).toInt();
+    return result;
+}
+
+bool MemoryManager::bumpOpenWakeFairness()
+{
+    QSqlQuery q(m_db);
+    // 只按"成功领取的任务"计数：调用方只在 claim 事务里、成功后调用。
+    if (!q.exec(QStringLiteral(
+            "UPDATE open_wake_state SET non_open_since_due=non_open_since_due+1,"
+            "updated_at=unixepoch() WHERE next_due_at<=unixepoch() "
+            "AND (suspended_until IS NULL OR suspended_until<=unixepoch())"))) {
+        // 迁移未完成（测试/旧库回退重放）时公平计数表可能不存在：不阻断领取主路径。
+        qWarning() << "[OpenWake] fairness bump failed" << q.lastError();
+        return true;
+    }
+    return true;
+}
+
+bool MemoryManager::recoverSuspendedFailure(const QString &sourceKind, const QString &sourceRef)
+{
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral(
+        "UPDATE review_failure SET consecutive_failures=0,suspended_until=NULL,"
+        "next_retry_at=unixepoch(),updated_at=unixepoch() "
+        "WHERE source_kind=? AND source_ref=? AND suspended_until IS NOT NULL "
+        "AND suspended_until<=unixepoch()"));
+    q.addBindValue(sourceKind);
+    q.addBindValue(sourceRef);
+    if (!q.exec()) {
+        // 迁移未完成（测试/旧库回退重放）时失败表可能不存在：不阻断领取主路径。
+        qWarning() << "[Review] suspended recovery failed" << sourceKind << sourceRef
+                   << q.lastError();
+        return true;
+    }
+    if (q.numRowsAffected() > 0)
+        qInfo() << "[Review] suspended_recovered kind=" << sourceKind << "ref=" << sourceRef;
+    return true;
+}
+
+QJsonObject MemoryManager::openWakeState(const QString &scopeKey) const
+{
+    QJsonObject result;
+    if (!m_db.isOpen() || scopeKey.trimmed().isEmpty()) return result;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral(
+        "SELECT next_due_at,last_started_at,last_finished_at,last_outcome,last_wake_id,"
+        "consecutive_failures,non_open_since_due,suspended_until,version,updated_at "
+        "FROM open_wake_state WHERE scope_key=?"));
+    q.addBindValue(scopeKey);
+    if (!q.exec() || !q.next()) return result;
+    result = QJsonObject{{QStringLiteral("scope_key"), scopeKey},
+                         {QStringLiteral("next_due_at"), q.value(0).toLongLong()},
+                         {QStringLiteral("last_started_at"), q.value(1).toLongLong()},
+                         {QStringLiteral("last_finished_at"), q.value(2).toLongLong()},
+                         {QStringLiteral("last_outcome"), q.value(3).toString()},
+                         {QStringLiteral("last_wake_id"), q.value(4).toLongLong()},
+                         {QStringLiteral("consecutive_failures"), q.value(5).toInt()},
+                         {QStringLiteral("non_open_since_due"), q.value(6).toInt()},
+                         {QStringLiteral("suspended_until"), q.value(7).toLongLong()},
+                         {QStringLiteral("version"), q.value(8).toInt()},
+                         {QStringLiteral("updated_at"), q.value(9).toLongLong()}};
+    result[QStringLiteral("next_due_iso")] = reviewIsoFromEpoch(q.value(0).toLongLong());
+    result[QStringLiteral("suspended_iso")] = reviewIsoFromEpoch(q.value(7).toLongLong());
+    return result;
+}
+
+bool MemoryManager::ensureOpenWakeScheduled(const QString &scopeKey, int initialDelaySeconds,
+                                            QString *error)
+{
+    if (error) error->clear();
+    if (!m_db.isOpen()) {
+        if (error) *error = QStringLiteral("db_error");
+        return false;
+    }
+    const QString scope = scopeKey.trimmed();
+    if (scope.isEmpty()) {
+        if (error) *error = QStringLiteral("invalid_scope");
+        return false;
+    }
+    const int delay = qBound(0, initialDelaySeconds, 7 * 24 * 3600);
+    // 幂等：已存在调度行时保持原 due，不因重复启动把下一次唤醒推迟/提前。
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral(
+        "INSERT INTO open_wake_state(scope_key,next_due_at,updated_at) "
+        "VALUES(?,unixepoch()+?,unixepoch()) ON CONFLICT(scope_key) DO NOTHING"));
+    q.addBindValue(scope);
+    q.addBindValue(delay);
+    if (!q.exec()) {
+        if (error) *error = QStringLiteral("db_error");
+        return false;
+    }
+    return true;
+}
+
+QJsonObject MemoryManager::claimOpenWake(int dailyLimit, int cooldownSeconds,
+                                         int openWakeDailyLimit, int sharedBudgetPercent,
+                                         int maxConsecutiveFailures, QString *reason,
+                                         QDateTime *nextEligibleAt, const QString &scopeKey)
+{
+    if (reason) reason->clear();
+    if (nextEligibleAt) *nextEligibleAt = QDateTime{};
+    const auto fail = [reason](const QString &code) {
+        if (reason) *reason = code;
+        return QJsonObject{};
+    };
+    if (!m_db.isOpen()) return fail(QStringLiteral("db_error"));
+    const QString scope = scopeKey.trimmed().isEmpty() ? QStringLiteral("owner")
+                                                       : scopeKey.trimmed();
+    // 独立每日预算：min(openWakeDailyLimit, dailyLimit*sharedBudgetPercent/100)。
+    // 取整至少 1（正预算不能因整除被永久饿死），但绝不突破共享 dailyLimit。
+    int cap = 0;
+    if (dailyLimit > 0 && openWakeDailyLimit > 0) {
+        const int share = qMax(1, dailyLimit * qMax(0, sharedBudgetPercent) / 100);
+        cap = qMin(openWakeDailyLimit, qMin(dailyLimit, share));
+    }
+    if (cap <= 0) return fail(QStringLiteral("budget"));
+    if (!m_db.transaction()) return fail(QStringLiteral("db_error"));
+    auto rollback = qScopeGuard([this] { m_db.rollback(); });
+    const qlonglong now = QDateTime::currentSecsSinceEpoch();
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral(
+        "SELECT next_due_at,consecutive_failures,suspended_until,version FROM open_wake_state "
+        "WHERE scope_key=?"));
+    q.addBindValue(scope);
+    if (!q.exec()) return fail(QStringLiteral("db_error"));
+    if (!q.next()) return fail(QStringLiteral("no_candidate"));
+    const qlonglong dueAt = q.value(0).toLongLong();
+    const int scheduleFailures = q.value(1).toInt();
+    const qlonglong suspendedUntil = q.value(2).isNull() ? 0 : q.value(2).toLongLong();
+    const qint64 contextEpoch = qint64(q.value(3).toInt()) + 1;
+    q.finish();
+    // 同一 scope 只允许一个 running：租约仍有效 → busy；租约已过期 → 就地标记 interrupted，
+    // 保证唯一索引不会挡住本次领取（等价于一次轻量 recover；重启恢复仍由 recoverOpenWakeLeases 负责）。
+    QSqlQuery running(m_db);
+    running.prepare(QStringLiteral(
+        "SELECT id,lease_until FROM open_wake WHERE scope_key=? AND state='running' "
+        "ORDER BY id DESC LIMIT 1"));
+    running.addBindValue(scope);
+    if (!running.exec()) return fail(QStringLiteral("db_error"));
+    if (running.next()) {
+        const qlonglong staleWakeId = running.value(0).toLongLong();
+        const qlonglong lease = running.value(1).isNull() ? 0 : running.value(1).toLongLong();
+        running.finish();
+        if (lease > now) {
+            if (nextEligibleAt)
+                *nextEligibleAt = QDateTime::fromSecsSinceEpoch(lease).toUTC();
+            return fail(QStringLiteral("busy"));
+        }
+        QSqlQuery interrupt(m_db);
+        interrupt.prepare(QStringLiteral(
+            "UPDATE open_wake SET state='interrupted',lease_until=NULL,finished_at=?,"
+            "error_code='lease_expired',next_due_at=? WHERE id=? AND state='running'"));
+        interrupt.addBindValue(now);
+        interrupt.addBindValue(now);
+        interrupt.addBindValue(staleWakeId);
+        if (!interrupt.exec()) return fail(QStringLiteral("db_error"));
+        qWarning() << "[OpenWake] stale_running_interrupted id=" << staleWakeId
+                   << "scope=" << scope;
+    } else {
+        running.finish();
+    }
+    if (suspendedUntil > now) {
+        if (nextEligibleAt)
+            *nextEligibleAt = QDateTime::fromSecsSinceEpoch(suspendedUntil).toUTC();
+        return fail(QStringLiteral("suspended"));
+    }
+    // 暂停到期：允许一次恢复尝试，连续失败清零（last_outcome 等审计字段保留）。
+    const bool recovering = suspendedUntil > 0 && suspendedUntil <= now;
+    const int effectiveFailures = recovering ? 0 : scheduleFailures;
+    if (recovering)
+        qInfo() << "[OpenWake] suspended_recovered scope=" << scope
+                << "failures=" << scheduleFailures;
+    if (maxConsecutiveFailures > 0 && effectiveFailures >= maxConsecutiveFailures)
+        return fail(QStringLiteral("suspended"));
+    if (dueAt > now) {
+        if (nextEligibleAt)
+            *nextEligibleAt = QDateTime::fromSecsSinceEpoch(dueAt).toUTC();
+        return fail(QStringLiteral("not_due"));
+    }
+    const QString runId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    QString chargeReason;
+    QDateTime chargeNext;
+    if (!chargePrivateReview(0, dailyLimit, cooldownSeconds, &chargeReason, &chargeNext,
+                             QStringLiteral("open_wake"), QString(), runId, cap)) {
+        if (nextEligibleAt) *nextEligibleAt = chargeNext;
+        if (chargeReason == QStringLiteral("cooldown")) return fail(QStringLiteral("cooldown"));
+        if (chargeReason == QStringLiteral("db_error")) return fail(QStringLiteral("db_error"));
+        return fail(QStringLiteral("budget"));
+    }
+    QSqlQuery insert(m_db);
+    insert.prepare(QStringLiteral(
+        "INSERT INTO open_wake(scope_key,run_id,version,state,trigger_reason,created_at,"
+        "started_at,lease_until,next_due_at,current_context_epoch) "
+        "VALUES(?,?,1,'running','due',?,?,?,?,?)"));
+    insert.addBindValue(scope);
+    insert.addBindValue(runId);
+    insert.addBindValue(now);
+    insert.addBindValue(now);
+    insert.addBindValue(now + 1800);
+    insert.addBindValue(dueAt);
+    insert.addBindValue(contextEpoch);
+    if (!insert.exec()) return fail(QStringLiteral("db_error"));
+    const qlonglong wakeId = insert.lastInsertId().toLongLong();
+    QSqlQuery schedule(m_db);
+    schedule.prepare(QStringLiteral(
+        "UPDATE open_wake_state SET last_started_at=?,version=version+1,updated_at=?,"
+        "non_open_since_due=0,last_wake_id=?,consecutive_failures=?,suspended_until=NULL "
+        "WHERE scope_key=?"));
+    schedule.addBindValue(now);
+    schedule.addBindValue(now);
+    schedule.addBindValue(wakeId);
+    schedule.addBindValue(effectiveFailures);
+    schedule.addBindValue(scope);
+    if (!schedule.exec()) return fail(QStringLiteral("db_error"));
+    if (schedule.numRowsAffected() != 1) return fail(QStringLiteral("cas_conflict"));
+    if (!m_db.commit()) return fail(QStringLiteral("db_error"));
+    rollback.dismiss();
+    qInfo() << "[OpenWake] claimed id=" << wakeId << "scope=" << scope
+            << "run=" << runId << "cap=" << cap << "failures=" << effectiveFailures;
+    return QJsonObject{{QStringLiteral("id"), wakeId},
+                       {QStringLiteral("version"), 1},
+                       {QStringLiteral("run_id"), runId},
+                       {QStringLiteral("scope_key"), scope},
+                       {QStringLiteral("next_due_at"), dueAt},
+                       {QStringLiteral("current_context_epoch"), contextEpoch},
+                       {QStringLiteral("state"), QStringLiteral("running")}};
+}
+
+bool MemoryManager::finishOpenWake(qlonglong id, int version, const QString &decision,
+                                   const QString &note, const QJsonObject &intent,
+                                   int nextWakeMinutes, QString *error)
+{
+    if (error) error->clear();
+    const auto fail = [error](const QString &code) {
+        if (error) *error = code;
+        return false;
+    };
+    if (!m_db.isOpen()) return fail(QStringLiteral("db_error"));
+    if (decision != QStringLiteral("rest") && decision != QStringLiteral("reflect"))
+        return fail(QStringLiteral("invalid_decision"));
+    const QString trimmedNote = note.trimmed();
+    if (trimmedNote.size() > 240) return fail(QStringLiteral("invalid_note"));
+    if (!m_db.transaction()) return fail(QStringLiteral("db_error"));
+    auto rollback = qScopeGuard([this] { m_db.rollback(); });
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral(
+        "SELECT scope_key FROM open_wake WHERE id=? AND version=? AND state='running'"));
+    q.addBindValue(id);
+    q.addBindValue(version);
+    if (!q.exec()) return fail(QStringLiteral("db_error"));
+    if (!q.next()) return fail(QStringLiteral("cas_conflict"));
+    const QString scope = q.value(0).toString();
+    q.finish();
+    // nextWakeMinutes 由调用方按分钟给出；内存层夹紧 5..1440（0 按最小值 5 处理）。
+    const int minutes = qBound(5, nextWakeMinutes, 1440);
+    const qlonglong now = QDateTime::currentSecsSinceEpoch();
+    const qlonglong nextDue = now + qint64(minutes) * 60;
+    const QString intentJson =
+        QString::fromUtf8(QJsonDocument(intent).toJson(QJsonDocument::Compact));
+    q.prepare(QStringLiteral(
+        "UPDATE open_wake SET state='committed',decision=?,note=?,intent_json=?,"
+        "finished_at=?,lease_until=NULL,next_due_at=? "
+        "WHERE id=? AND version=? AND state='running'"));
+    q.addBindValue(decision);
+    q.addBindValue(trimmedNote);
+    q.addBindValue(intentJson);
+    q.addBindValue(now);
+    q.addBindValue(nextDue);
+    q.addBindValue(id);
+    q.addBindValue(version);
+    if (!q.exec()) return fail(QStringLiteral("db_error"));
+    if (q.numRowsAffected() != 1) return fail(QStringLiteral("cas_conflict"));
+    q.prepare(QStringLiteral(
+        "UPDATE open_wake_state SET next_due_at=?,last_finished_at=?,last_outcome=?,"
+        "version=version+1,updated_at=?,suspended_until=NULL,consecutive_failures=0 "
+        "WHERE scope_key=?"));
+    q.addBindValue(nextDue);
+    q.addBindValue(now);
+    q.addBindValue(decision);
+    q.addBindValue(now);
+    q.addBindValue(scope);
+    if (!q.exec()) return fail(QStringLiteral("db_error"));
+    if (q.numRowsAffected() != 1) return fail(QStringLiteral("cas_conflict"));
+    // 成功提交（rest 与 reflect 都算成功）时清掉该 wake 的失败记录。
+    q.prepare(QStringLiteral(
+        "DELETE FROM review_failure WHERE source_kind='open_wake' AND source_ref IN (?,?)"));
+    q.addBindValue(QStringLiteral("wake/%1:%2").arg(id).arg(version));
+    q.addBindValue(QStringLiteral("wake/%1").arg(id));
+    if (!q.exec()) return fail(QStringLiteral("db_error"));
+    if (!m_db.commit()) return fail(QStringLiteral("db_error"));
+    rollback.dismiss();
+    qInfo() << "[OpenWake] finished id=" << id << "decision=" << decision
+            << "next_due=" << nextDue;
+    return true;
+}
+
+bool MemoryManager::deferOpenWake(qlonglong id, int version, int retrySeconds,
+                                  const QString &reason)
+{
+    if (!m_db.isOpen()) return false;
+    const int retry = qBound(0, retrySeconds, 7 * 24 * 3600);
+    if (!m_db.transaction()) return false;
+    auto rollback = qScopeGuard([this] { m_db.rollback(); });
+    const qlonglong now = QDateTime::currentSecsSinceEpoch();
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral(
+        "SELECT scope_key FROM open_wake WHERE id=? AND version=? AND state='running'"));
+    q.addBindValue(id);
+    q.addBindValue(version);
+    if (!q.exec() || !q.next()) return false;
+    const QString scope = q.value(0).toString();
+    q.finish();
+    q.prepare(QStringLiteral(
+        "UPDATE open_wake SET state='deferred',next_due_at=?,finished_at=?,lease_until=NULL,"
+        "error_code=? WHERE id=? AND version=? AND state='running'"));
+    q.addBindValue(now + retry);
+    q.addBindValue(now);
+    q.addBindValue(reason.trimmed().left(120));
+    q.addBindValue(id);
+    q.addBindValue(version);
+    if (!q.exec() || q.numRowsAffected() != 1) return false;
+    // 主动让出/用户插话不增加失败计数，只把调度推到（可立即）再试。
+    q.prepare(QStringLiteral(
+        "UPDATE open_wake_state SET next_due_at=?,version=version+1,updated_at=? "
+        "WHERE scope_key=?"));
+    q.addBindValue(now + retry);
+    q.addBindValue(now);
+    q.addBindValue(scope);
+    if (!q.exec() || q.numRowsAffected() != 1) return false;
+    if (!m_db.commit()) return false;
+    rollback.dismiss();
+    qInfo() << "[OpenWake] deferred id=" << id << "retry_seconds=" << retry
+            << "reason=" << reason;
+    return true;
+}
+
+bool MemoryManager::cancelOpenWake(qlonglong id, int version, const QString &reason)
+{
+    if (!m_db.isOpen()) return false;
+    if (!m_db.transaction()) return false;
+    auto rollback = qScopeGuard([this] { m_db.rollback(); });
+    const qlonglong now = QDateTime::currentSecsSinceEpoch();
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral(
+        "SELECT scope_key FROM open_wake WHERE id=? AND version=? AND state='running'"));
+    q.addBindValue(id);
+    q.addBindValue(version);
+    if (!q.exec() || !q.next()) return false;
+    const QString scope = q.value(0).toString();
+    q.finish();
+    // 取消是终态：不增加失败计数，也不改下一次到期（由调度方决定后续节奏）。
+    q.prepare(QStringLiteral(
+        "UPDATE open_wake SET state='cancelled',finished_at=?,lease_until=NULL,error_code=? "
+        "WHERE id=? AND version=? AND state='running'"));
+    q.addBindValue(now);
+    q.addBindValue(reason.trimmed().left(120));
+    q.addBindValue(id);
+    q.addBindValue(version);
+    if (!q.exec() || q.numRowsAffected() != 1) return false;
+    q.prepare(QStringLiteral(
+        "UPDATE open_wake_state SET last_finished_at=?,last_outcome='cancelled',"
+        "version=version+1,updated_at=? WHERE scope_key=?"));
+    q.addBindValue(now);
+    q.addBindValue(now);
+    q.addBindValue(scope);
+    if (!q.exec() || q.numRowsAffected() != 1) return false;
+    if (!m_db.commit()) return false;
+    rollback.dismiss();
+    qInfo() << "[OpenWake] cancelled id=" << id << "reason=" << reason;
+    return true;
+}
+
+int MemoryManager::recoverOpenWakeLeases(int staleSeconds)
+{
+    if (staleSeconds < 0) staleSeconds = 0;
+    if (!m_db.isOpen()) return 0;
+    if (!m_db.transaction()) return 0;
+    auto rollback = qScopeGuard([this] { m_db.rollback(); });
+    const qlonglong now = QDateTime::currentSecsSinceEpoch();
+    const QString staleCondition = QStringLiteral(
+        "state='running' AND (lease_until IS NULL OR lease_until < unixepoch()-%1)")
+        .arg(staleSeconds);
+    QSqlQuery scopes(m_db);
+    if (!scopes.exec(QStringLiteral("SELECT DISTINCT scope_key FROM open_wake WHERE ")
+                     + staleCondition))
+        return 0;
+    QStringList scopeKeys;
+    while (scopes.next()) scopeKeys.append(scopes.value(0).toString());
+    scopes.finish();
+    if (scopeKeys.isEmpty())
+        return 0;
+    QSqlQuery q(m_db);
+    // 重启恢复只做一次：running → interrupted，下一次到期拨到 now，由调度方重新领取。
+    q.prepare(QStringLiteral(
+        "UPDATE open_wake SET state='interrupted',lease_until=NULL,finished_at=?,"
+        "error_code='lease_expired',next_due_at=? WHERE ") + staleCondition);
+    q.addBindValue(now);
+    q.addBindValue(now);
+    if (!q.exec()) return 0;
+    const int recovered = q.numRowsAffected();
+    for (const QString &scope : scopeKeys) {
+        QSqlQuery update(m_db);
+        update.prepare(QStringLiteral(
+            "UPDATE open_wake_state SET next_due_at=?,version=version+1,updated_at=? "
+            "WHERE scope_key=?"));
+        update.addBindValue(now);
+        update.addBindValue(now);
+        update.addBindValue(scope);
+        if (!update.exec()) return 0;
+    }
+    if (!m_db.commit()) return 0;
+    rollback.dismiss();
+    if (recovered > 0)
+        qInfo() << "[OpenWake] leases_recovered=" << recovered;
+    return recovered;
+}
+
+QJsonArray MemoryManager::recentOpenWakeNotes(int limit) const
+{
+    QJsonArray result;
+    if (!m_db.isOpen() || limit <= 0) return result;
+    const int capped = qMin(limit, 20);
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral(
+        "SELECT id,version,decision,note,finished_at FROM open_wake "
+        "WHERE state='committed' AND decision IN ('rest','reflect') "
+        "AND note IS NOT NULL AND trim(note)<>'' "
+        "ORDER BY coalesce(finished_at,0) DESC,id DESC LIMIT ?"));
+    q.addBindValue(capped);
+    if (!q.exec()) return result;
+    while (q.next()) {
+        const qlonglong id = q.value(0).toLongLong();
+        const int version = q.value(1).toInt();
+        const qlonglong finishedAt = q.value(4).toLongLong();
+        result.append(QJsonObject{
+            {QStringLiteral("ref"), QStringLiteral("wake/%1:%2").arg(id).arg(version)},
+            {QStringLiteral("version"), version},
+            {QStringLiteral("note"), q.value(3).toString()},
+            {QStringLiteral("decision"), q.value(2).toString()},
+            {QStringLiteral("at"), reviewIsoFromEpoch(finishedAt)},
+            {QStringLiteral("finished_at"), finishedAt}});
+    }
+    return result;
+}
+
+bool MemoryManager::hasActiveInternalActivity() const
+{
+    if (!m_db.isOpen()) return false;
+    // legacy：chat_history 的 active/paused 念头。
+    QSqlQuery legacy(m_db);
+    if (legacy.exec(QStringLiteral(
+            "SELECT 1 FROM chat_history WHERE thought IS NOT NULL AND thought<>'' "
+            "AND sensitive=0 AND coalesce(json_extract(thought_result,'$.status'),'active') "
+            "IN ('active','paused') LIMIT 1"))
+        && legacy.next())
+        return true;
+    // internal：v31 骨架表（本片只读）。
+    QSqlQuery internal(m_db);
+    if (internal.exec(QStringLiteral(
+            "SELECT 1 FROM internal_activity WHERE status IN ('active','paused') LIMIT 1"))
+        && internal.next())
+        return true;
+    return false;
+}
+
+QJsonArray MemoryManager::currentActivitiesUnified(int limit) const
+{
+    QJsonArray rows;
+    if (!m_db.isOpen() || limit <= 0) return rows;
+    const MemoryReadPolicy policy;
+    // legacy：字段与 currentActivities 一致，只额外标 origin=legacy；旧接口保持不变。
+    QSqlQuery legacy(m_db);
+    legacy.prepare(QStringLiteral(
+        "SELECT id,coalesce(json_extract(thought_result,'$.status'),'active'),thought_version,"
+        "coalesce(json_extract(thought_result,'$.artifact_ref'),''),"
+        "coalesce(json_extract(thought_result,'$.progress'),''),"
+        "coalesce(json_extract(thought_result,'$.goal'),''),"
+        "coalesce(json_extract(thought_result,'$.next_step'),''),h.channel,h.session_id "
+        "FROM chat_history h WHERE h.thought IS NOT NULL AND h.thought<>'' "
+        "AND h.sensitive=0 AND h.subject='user' "
+        "AND coalesce(json_extract(h.thought_result,'$.status'),'active') IN ('active','paused') "
+        "ORDER BY h.id DESC LIMIT ?"));
+    legacy.addBindValue(limit);
+    if (legacy.exec()) {
+        while (legacy.next() && rows.size() < limit) {
+            const auto channel = legacy.value(7).toString();
+            const auto session = legacy.value(8).toString();
+            QJsonObject row{
+                {QStringLiteral("ref"), QStringLiteral("thought/%1").arg(legacy.value(0).toLongLong())},
+                {QStringLiteral("origin"), QStringLiteral("legacy")},
+                {QStringLiteral("status"), legacy.value(1).toString()},
+                {QStringLiteral("version"), legacy.value(2).toInt()},
+                {QStringLiteral("artifact_ref"), QString{}},
+                {QStringLiteral("progress"), QString{}}};
+            for (const auto &pair : {qMakePair(QStringLiteral("artifact_ref"), legacy.value(3).toString()),
+                                     qMakePair(QStringLiteral("progress"), legacy.value(4).toString()),
+                                     qMakePair(QStringLiteral("goal"), legacy.value(5).toString()),
+                                     qMakePair(QStringLiteral("next_step"), legacy.value(6).toString())}) {
+                const auto text = pair.second.trimmed();
+                if (text.isEmpty() || !policy.allows(channel, session, text)) continue;
+                row.insert(pair.first, text.left(120));
+            }
+            rows.append(row);
+        }
+    }
+    if (rows.size() >= limit) return rows;
+    // internal：本片只读骨架（不创建、不迁移），ref=activity/<id>，origin=internal。
+    QSqlQuery internal(m_db);
+    internal.prepare(QStringLiteral(
+        "SELECT id,scope_key,origin_kind,subject,channel,session_id,interest,status,version,"
+        "artifact_ref,review_after FROM internal_activity "
+        "WHERE status IN ('active','paused') ORDER BY id DESC LIMIT ?"));
+    internal.addBindValue(limit - rows.size());
+    if (internal.exec()) {
+        while (internal.next() && rows.size() < limit) {
+            const auto channel = internal.value(4).toString();
+            const auto session = internal.value(5).toString();
+            const auto interest = internal.value(6).toString();
+            if (!policy.allows(channel, session, interest)) continue;
+            QJsonObject row{
+                {QStringLiteral("ref"), QStringLiteral("activity/%1").arg(internal.value(0).toLongLong())},
+                {QStringLiteral("origin"), QStringLiteral("internal")},
+                {QStringLiteral("origin_kind"), internal.value(2).toString()},
+                {QStringLiteral("scope_key"), internal.value(1).toString()},
+                {QStringLiteral("subject"), internal.value(3).toString()},
+                {QStringLiteral("channel"), channel},
+                {QStringLiteral("session"), session},
+                {QStringLiteral("interest"), interest.left(160)},
+                {QStringLiteral("status"), internal.value(7).toString()},
+                {QStringLiteral("version"), internal.value(8).toInt()},
+                {QStringLiteral("review_after"), internal.value(10).toLongLong()}};
+            const auto artifact = internal.value(9).toString().trimmed();
+            if (!artifact.isEmpty() && policy.allows(channel, session, artifact))
+                row.insert(QStringLiteral("artifact_ref"), artifact.left(120));
+            rows.append(row);
+        }
+    }
+    return rows;
 }
 
 // ============================ 认知快照只读查询 ============================
@@ -5793,52 +6972,92 @@ QJsonArray MemoryManager::internalWakes(int limit,int *queried,int *eligible) co
 QJsonObject MemoryManager::reviewInteractionTimes(const QString &channel,const QString &session,
                                                   const QString &subject) const
 {
-    QJsonObject result{{QStringLiteral("last_owner_interaction_at"),QString()},
-                       {QStringLiteral("last_confirmed_outbound_at"),QString()}};
+    // R12-1a：区分“当前会话最近交互”与“跨渠道最近交互”，并保留 R12-0 的旧字段别名，
+    // 供回顾 prompt 的 time_context 向后兼容。只读，不新造状态、不扩大读取范围。
+    QJsonObject result{
+        {QStringLiteral("last_owner_interaction_at"),QString()},
+        {QStringLiteral("last_confirmed_outbound_at"),QString()},
+        {QStringLiteral("last_owner_session_at"),QString()},
+        {QStringLiteral("last_owner_cross_channel_at"),QString()},
+        {QStringLiteral("last_confirmed_outbound_session_at"),QString()},
+        {QStringLiteral("last_confirmed_outbound_cross_channel_at"),QString()}};
     if (!m_db.isOpen()) return result;
+
     const bool hasChannel = !channel.isEmpty();
     const bool hasSession = hasChannel && !session.isEmpty();
-    const QString scopeSuffix = hasSession
+    // 当前会话范围：有渠道就按渠道（+会话）；只知道“这是主人私聊来源”时退化为主人私聊域。
+    const QString sessionScopeSuffix = hasSession
         ? QStringLiteral(" AND h.channel=? AND h.session_id=?")
         : hasChannel ? QStringLiteral(" AND h.channel=?")
                      : QStringLiteral(" AND h.channel IN ('pet','qq_private')");
-    const auto bindScope = [&](QSqlQuery &q) {
-        q.addBindValue(subject);
-        if (hasChannel) q.addBindValue(channel);
-        if (hasSession) q.addBindValue(session);
+    // 跨渠道范围：只在主人私聊域（pet/qq_private）内跨会话读取，绝不扩到群聊。
+    const bool ownerSubject = subject == QStringLiteral("user");
+    const bool ownerPrivateChannel = !hasChannel
+        || channel == Channel::kPet || channel == Channel::kQQPrivate;
+    // 新字段暴露条件：主人 + 非群聊来源；群聊/第三方不读私人跨渠道时间。
+    const bool crossAllowed = ownerSubject && ownerPrivateChannel;
+    const QString crossScopeSuffix = QStringLiteral(" AND h.channel IN ('pet','qq_private')");
+
+    const auto firstTime = [this](const QString &sql, const QVariantList &binds) {
+        QSqlQuery q(m_db);
+        q.prepare(sql);
+        for (const auto &value : binds) q.addBindValue(value);
+        if (q.exec() && q.next()) return snapshotIsoText(q.value(0).toString());
+        return QString{};
     };
-    // 最近一条主人 reply 发言（subject=user，真实用户输入）。reported 优先，其次落库时间。
-    {
-        QSqlQuery q(m_db);
-        q.prepare(QStringLiteral(
-            "SELECT coalesce(s.reported,h.timestamp) FROM chat_history h "
-            "LEFT JOIN cognitive_source s ON s.event=h.cognitive_event AND s.channel=h.channel "
-            "AND s.session=h.session_id AND s.subject=h.subject AND s.input=h.user_input "
-            "WHERE h.subject=? AND h.sensitive=0 AND h.turn_kind='reply' "
-            "AND h.user_input IS NOT NULL AND h.user_input<>''")
-            + scopeSuffix + QStringLiteral(" ORDER BY h.id DESC LIMIT 1"));
-        bindScope(q);
-        if (q.exec() && q.next())
-            result[QStringLiteral("last_owner_interaction_at")] =
-                snapshotIsoText(q.value(0).toString());
-    }
+
+    // 主人最近一次真实输入（subject=user、turn_kind='reply'，reported 优先、其次落库时间）。
+    const QString ownerSql = QStringLiteral(
+        "SELECT coalesce(s.reported,h.timestamp) FROM chat_history h "
+        "LEFT JOIN cognitive_source s ON s.event=h.cognitive_event AND s.channel=h.channel "
+        "AND s.session=h.session_id AND s.subject=h.subject AND s.input=h.user_input "
+        "WHERE h.subject=? AND h.sensitive=0 AND h.turn_kind='reply' "
+        "AND h.user_input IS NOT NULL AND h.user_input<>''");
+    QVariantList sessionBinds{QVariant(subject)};
+    if (hasChannel) sessionBinds.append(QVariant(channel));
+    if (hasSession) sessionBinds.append(QVariant(session));
+    const QString sessionOwner = firstTime(
+        ownerSql + sessionScopeSuffix + QStringLiteral(" ORDER BY h.id DESC LIMIT 1"),
+        sessionBinds);
+
     // 最近一条已落库的成功表达：沿用现有落库语义（turn_state='handed_off'），
-    // 普通 reply 与 proactive 都只证明"她确实说过/发出过"，不代表主人已经读过。
-    {
-        QSqlQuery q(m_db);
-        q.prepare(QStringLiteral(
-            "SELECT coalesce(s.reported,h.timestamp) FROM chat_history h "
-            "LEFT JOIN cognitive_source s ON s.event=h.cognitive_event AND s.channel=h.channel "
-            "AND s.session=h.session_id AND s.subject=h.subject AND s.input=h.user_input "
-            "WHERE h.subject=? AND h.sensitive=0 AND h.turn_state='handed_off' "
-            "AND h.turn_kind IN ('reply','proactive') "
-            "AND h.raw_reply IS NOT NULL AND h.raw_reply<>''")
-            + scopeSuffix + QStringLiteral(" ORDER BY h.id DESC LIMIT 1"));
-        bindScope(q);
-        if (q.exec() && q.next())
-            result[QStringLiteral("last_confirmed_outbound_at")] =
-                snapshotIsoText(q.value(0).toString());
+    // 普通 reply 与 proactive 都只证明“她确实说过/发出过”，不代表主人已经读过。
+    const QString outboundSql = QStringLiteral(
+        "SELECT coalesce(s.reported,h.timestamp) FROM chat_history h "
+        "LEFT JOIN cognitive_source s ON s.event=h.cognitive_event AND s.channel=h.channel "
+        "AND s.session=h.session_id AND s.subject=h.subject AND s.input=h.user_input "
+        "WHERE h.subject=? AND h.sensitive=0 AND h.turn_state='handed_off' "
+        "AND h.turn_kind IN ('reply','proactive') "
+        "AND h.raw_reply IS NOT NULL AND h.raw_reply<>''");
+    const QString sessionOutbound = firstTime(
+        outboundSql + sessionScopeSuffix + QStringLiteral(" ORDER BY h.id DESC LIMIT 1"),
+        sessionBinds);
+
+    // 跨渠道查询只在需要时执行：无来源渠道（旧别名语义需要）或主人私聊域（新字段）。
+    QString crossOwner;
+    QString crossOutbound;
+    if (!hasChannel || crossAllowed) {
+        crossOwner = firstTime(
+            ownerSql + crossScopeSuffix + QStringLiteral(" ORDER BY h.id DESC LIMIT 1"),
+            QVariantList{QVariant(subject)});
+        crossOutbound = firstTime(
+            outboundSql + crossScopeSuffix + QStringLiteral(" ORDER BY h.id DESC LIMIT 1"),
+            QVariantList{QVariant(subject)});
     }
+
+    result[QStringLiteral("last_owner_session_at")] = sessionOwner;
+    result[QStringLiteral("last_confirmed_outbound_session_at")] = sessionOutbound;
+    // 跨渠道时间只对“主人 + 非群聊来源”返回：群聊/第三方不扩大私人资料权限。
+    if (crossAllowed) {
+        result[QStringLiteral("last_owner_cross_channel_at")] = crossOwner;
+        result[QStringLiteral("last_confirmed_outbound_cross_channel_at")] = crossOutbound;
+    }
+    // R12-0 旧字段别名：有明确来源渠道/会话时等价于当前会话时间；没有渠道时保持旧语义
+    // （主人私聊域最近一次），既有回顾 prompt 与测试无需同步改语义。
+    result[QStringLiteral("last_owner_interaction_at")] =
+        hasChannel ? sessionOwner : crossOwner;
+    result[QStringLiteral("last_confirmed_outbound_at")] =
+        hasChannel ? sessionOutbound : crossOutbound;
     return result;
 }
 

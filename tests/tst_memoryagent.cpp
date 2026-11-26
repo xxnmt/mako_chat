@@ -8,6 +8,7 @@
 #include <QTimer>
 #include <QTcpServer>
 #include <QTcpSocket>
+#include <memory>
 #include "llmservice.h"
 #include "configmanager.h"
 #include "cognitivecoordinator.h"
@@ -196,6 +197,136 @@ qlonglong seedDueConcernForSemanticReview(MemoryManager &db, const QString &path
     const auto context = db.claimDueConcern(12, 60);
     if (context.value(QStringLiteral("id")).toInteger() != turn) return 0;
     if (version) *version = context.value(QStringLiteral("version")).toInt();
+    return turn;
+}
+
+// R12-1a：OpenWake 运行时用例的配置守卫。setting.json 打开长期记忆；identity.json
+// 保持 privateWriting=false / proactive=false，只启用 cognition.open_wake，用来验证
+// OpenWake 是独立的内部认知入口。析构时恢复原文件，避免影响其它用例。
+class OpenWakeConfigGuard
+{
+public:
+    OpenWakeConfigGuard()
+    {
+        auto &cfg = ConfigManager::instance();
+        QFile setting(cfg.getConfigFilePath());
+        m_settingExisted = setting.open(QIODevice::ReadOnly);
+        if (m_settingExisted) m_setting = setting.readAll();
+        setting.close();
+        m_identityPath = cfg.getConfigDirPath() + "/identity.json";
+        QFile identity(m_identityPath);
+        m_identityExisted = identity.open(QIODevice::ReadOnly);
+        if (m_identityExisted) m_identity = identity.readAll();
+        identity.close();
+    }
+    ~OpenWakeConfigGuard()
+    {
+        auto &cfg = ConfigManager::instance();
+        cfg.writeConfigDocument(QStringLiteral("setting.json"),
+                                m_settingExisted ? m_setting : QByteArray("{}"), nullptr);
+        if (m_identityExisted) {
+            cfg.writeConfigDocument(QStringLiteral("identity.json"), m_identity, nullptr);
+        } else {
+            QFile::remove(m_identityPath);
+            cfg.reloadIdentity();
+        }
+    }
+    // dailyLimit<0 时不写 daily_limit，沿用配置默认值 3。
+    bool write(const QJsonObject &openWake, const QJsonObject &proactiveOverrides = {},
+               int dailyLimit = -1)
+    {
+        auto &cfg = ConfigManager::instance();
+        if (!cfg.writeConfigDocument(QStringLiteral("setting.json"),
+                QJsonDocument(QJsonObject{{QStringLiteral("memory"),
+                                           QJsonObject{{QStringLiteral("long_term_memory_enabled"), true}}}})
+                    .toJson(),
+                nullptr))
+            return false;
+        QJsonObject proactive{{QStringLiteral("enabled"), false},
+                              {QStringLiteral("private_writing"), false},
+                              {QStringLiteral("idle_seconds"), 0}};
+        for (auto it = proactiveOverrides.constBegin(); it != proactiveOverrides.constEnd(); ++it)
+            proactive.insert(it.key(), it.value());
+        if (dailyLimit >= 0) proactive.insert(QStringLiteral("daily_limit"), dailyLimit);
+        const QJsonObject root{
+            {QStringLiteral("proactive"), proactive},
+            {QStringLiteral("cognition"), QJsonObject{{QStringLiteral("open_wake"), openWake}}}};
+        return cfg.writeConfigDocument(QStringLiteral("identity.json"),
+                                       QJsonDocument(root).toJson(QJsonDocument::Compact), nullptr);
+    }
+
+private:
+    QString m_identityPath;
+    QByteArray m_setting;
+    QByteArray m_identity;
+    bool m_settingExisted = false;
+    bool m_identityExisted = false;
+};
+
+QJsonObject openWakeTestJson(bool enabled, int maxPerDay, int maxNonOpen = 3,
+                             int sharedBudgetPercent = 30)
+{
+    return QJsonObject{{QStringLiteral("enabled"), enabled},
+                       {QStringLiteral("allow_contact"), false},
+                       {QStringLiteral("initial_delay_seconds"), 60},
+                       {QStringLiteral("min_interval_seconds"), 300},
+                       {QStringLiteral("default_interval_seconds"), 300},
+                       {QStringLiteral("max_interval_seconds"), 86400},
+                       {QStringLiteral("max_non_open_jobs_when_due"), maxNonOpen},
+                       {QStringLiteral("max_model_steps_per_wake"), 3},
+                       {QStringLiteral("max_per_day"), maxPerDay},
+                       {QStringLiteral("shared_budget_percent"), sharedBudgetPercent}};
+}
+
+// OpenWake rest/reflect 的合法 proposal（_origin 由服务端回显，测试里显式给出）。
+QJsonObject openWakeProposal(const QJsonObject &origin, const QString &decision,
+                             const QString &note = {}, int afterMinutes = 30)
+{
+    QJsonObject proposal{{QStringLiteral("schema_version"), 1},
+                         {QStringLiteral("decision"), decision},
+                         {QStringLiteral("next_wake"),
+                          QJsonObject{{QStringLiteral("mode"), QStringLiteral("after")},
+                                      {QStringLiteral("after_minutes"), afterMinutes}}},
+                         {QStringLiteral("_origin"), origin}};
+    if (!note.isEmpty()) proposal.insert(QStringLiteral("note"), note);
+    return proposal;
+}
+
+bool execMemorySql(const QString &sql)
+{
+    QSqlQuery query(QSqlDatabase::database("memory_db_connection"));
+    return query.exec(sql);
+}
+
+qint64 scalarMemorySql(const QString &sql)
+{
+    QSqlQuery query(QSqlDatabase::database("memory_db_connection"));
+    if (!query.exec(sql) || !query.next()) return -1;
+    return query.value(0).toLongLong();
+}
+
+QString textMemorySql(const QString &sql)
+{
+    QSqlQuery query(QSqlDatabase::database("memory_db_connection"));
+    if (!query.exec(sql) || !query.next()) return {};
+    return query.value(0).toString();
+}
+
+// 把 OpenWake 调度拨到"现在到期"，并回拨回顾冷却，模拟等待期已过。
+bool rewindOpenWakeClock()
+{
+    return execMemorySql(QStringLiteral("UPDATE thought_review_log SET started_at=started_at-120"))
+        && execMemorySql(QStringLiteral("UPDATE open_wake_state SET next_due_at=unixepoch()-1"));
+}
+
+// 造一个可领取的新来源回顾（recordInput + close 收口），返回 turn。
+qlonglong seedRuntimeReflectionSource(MemoryManager &db, const QString &tag)
+{
+    RequestMeta meta;
+    meta.eventId = meta.runId = QStringLiteral("runtime-source-%1").arg(tag);
+    meta.receivedAtUtc = QDateTime::currentDateTimeUtc();
+    const auto turn = db.recordInput(QStringLiteral("今天把窗台擦干净了"), meta, true);
+    if (turn <= 0 || !db.recordQuiet(turn, QStringLiteral("close"))) return 0;
     return turn;
 }
 
@@ -546,6 +677,7 @@ private slots:
 
         const QString prefix = CognitiveSnapshotBuilder::promptPrefix();
         QString snapshotContent;
+        QString snapshotFixedRules;
         for (const auto &value : QJsonDocument::fromJson(bodies.first()).object()
                                      .value(QStringLiteral("messages")).toArray()) {
             const auto message = value.toObject();
@@ -557,12 +689,22 @@ private slots:
         }
         QVERIFY2(!snapshotContent.isEmpty(),
                  "owner-private foreground request must carry cognitive snapshot");
-        const QJsonObject snapshotJson = QJsonDocument::fromJson(snapshotContent.toUtf8()).object();
+        // R12-1a：固定说明（事实分层/只读边界）在 system content 的固定规则行里，
+        // 不占快照数据 JSON 预算；JSON 只含数据域，不再有 note/internal_wake_note 静态键。
+        const qsizetype jsonStart = snapshotContent.indexOf(QLatin1Char('{'));
+        QVERIFY2(jsonStart > 0, qPrintable(snapshotContent.left(120)));
+        snapshotFixedRules = snapshotContent.left(jsonStart);
+        QVERIFY2(snapshotFixedRules.contains(QStringLiteral("服务端事实分层")),
+                 qPrintable(snapshotFixedRules));
+        QVERIFY2(snapshotFixedRules.contains(QStringLiteral("内部唤醒不是主人约定")),
+                 qPrintable(snapshotFixedRules));
+        const QJsonObject snapshotJson =
+            QJsonDocument::fromJson(snapshotContent.mid(jsonStart).toUtf8()).object();
         QVERIFY(snapshotJson.contains(QStringLiteral("internal_wakes")));
         QVERIFY(snapshotJson.contains(QStringLiteral("observations")));
         QVERIFY(snapshotJson.contains(QStringLiteral("commitments")));
-        QCOMPARE(snapshotJson.value(QStringLiteral("internal_wake_note")).toString(),
-                 QStringLiteral("内部唤醒不是主人约定"));
+        QVERIFY(!snapshotJson.contains(QStringLiteral("note")));
+        QVERIFY(!snapshotJson.contains(QStringLiteral("internal_wake_note")));
 
         RequestMeta groupMeta;
         groupMeta.channel = Channel::kQQGroup;
@@ -1921,9 +2063,14 @@ private slots:
         QVERIFY(body.contains(QStringLiteral("不需要新的主人证据").toUtf8()));
         QVERIFY(body.contains(QStringLiteral("claims").toUtf8()));
         QVERIFY(body.contains(QStringLiteral("不要施压").toUtf8()));
-        // 服务端时间上下文。
+        // 服务端时间上下文：R12-1a 新增当前会话/跨渠道两组时间字段，
+        // 旧字段 last_owner_interaction_at / last_confirmed_outbound_at 保留兼容。
         for (const auto &field : {QStringLiteral("now_local"), QStringLiteral("now_utc"),
                                   QStringLiteral("source_reported_at"),
+                                  QStringLiteral("last_owner_session_at"),
+                                  QStringLiteral("last_owner_cross_channel_at"),
+                                  QStringLiteral("last_confirmed_outbound_session_at"),
+                                  QStringLiteral("last_confirmed_outbound_cross_channel_at"),
                                   QStringLiteral("last_owner_interaction_at"),
                                   QStringLiteral("last_confirmed_outbound_at"),
                                   QStringLiteral("quiet_hours")})
@@ -1932,6 +2079,515 @@ private slots:
         QVERIFY(!body.contains(QStringLiteral("必须把依据写进 contact.basis").toUtf8()));
         QVERIFY(!body.contains(QStringLiteral("有新的主人证据、或活动有了结果").toUtf8()));
         QVERIFY(body.contains(QStringLiteral("旧契约 contact.basis 仍被接受").toUtf8()));
+    }
+
+    // ===== R12-1a OpenWake 运行时（rest/reflect + 类型化 origin + 持久失败）=====
+
+    // 1) 没有用户消息也能完成一次内部 rest：领取一次 OpenWake → 模型返回 rest →
+    //    open_wake.state='committed'，不写 chat_history/proactive/outbox，下一次 due 前移。
+    void openWakeRestCompletesWithoutUserInput()
+    {
+        OpenWakeConfigGuard config;
+        QVERIFY(config.write(openWakeTestJson(true, 12, 3)));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager db(dir.filePath("openwake-rest.db"));
+        QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QByteArray> bodies;
+        serveCompletions(server, bodies, [](int) -> QString {
+            return QString(R"({"schema_version":1,"decision":"rest","note":"",)"
+                          R"("next_wake":{"mode":"after","after_minutes":30}})");
+        });
+        LLMService model(QStringLiteral("test"), nullptr,
+                         QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.serverPort())));
+        model.setMemoryManager(&db);
+        std::unique_ptr<CognitiveCoordinator> coordinator;
+        bool sawRecoveredLog = false;
+        {
+            MessageCapture capture;
+            coordinator = std::make_unique<CognitiveCoordinator>(db, model, nullptr);
+            for (const auto &line : capture.lines())
+                if (line.message.contains(QStringLiteral("[OpenWake] recovered=")))
+                    sawRecoveredLog = line.type == QtInfoMsg;
+        }
+        QVERIFY(sawRecoveredLog);
+
+        coordinator->reviewIfDue();
+        QTRY_VERIFY_WITH_TIMEOUT(
+            db.openWakeState().value(QStringLiteral("last_outcome")).toString()
+                == QStringLiteral("rest"), 8000);
+        QCOMPARE(bodies.size(), 1);
+        // 模型请求是内部唤醒：说明没有用户消息 + origin/run_id；不是对话轮次。
+        const QByteArray body = bodies.first();
+        QVERIFY(body.contains("open_wake"));
+        QVERIFY(body.contains(QStringLiteral("内部唤醒").toUtf8()));
+        QVERIFY(body.contains("current_input"));
+        QVERIFY(body.contains("run_id"));
+        QVERIFY(body.contains("origin"));
+        QVERIFY(body.contains("time_context"));
+        // rest 不产生任何用户可见/外部动作：无用户行、无主动消息、无 outbox。
+        QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM chat_history")), qint64(0));
+        QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM action_outbox")), qint64(0));
+        // rest 是合法终态，commit 后下一次 due 更新（30 分钟）。
+        QCOMPARE(scalarMemorySql(QStringLiteral(
+                     "SELECT count(*) FROM open_wake WHERE state='committed' AND decision='rest'")),
+                 qint64(1));
+        const qint64 nextDue =
+            scalarMemorySql(QStringLiteral("SELECT next_due_at FROM open_wake_state WHERE scope_key='owner'"));
+        const qint64 now = QDateTime::currentSecsSinceEpoch();
+        QVERIFY2(nextDue - now >= 1750 && nextDue - now <= 1850,
+                 qPrintable(QString::number(nextDue - now)));
+        // rest 没有 note：内部记录可读接口不会返回空说明。
+        QVERIFY(db.recentOpenWakeNotes(2).isEmpty());
+    }
+
+    // 2) reflect 的 note 成为可读的内部记录，但不做 UserStatement、不写用户行；
+    //    下一轮不会立即重领（finish 已更新 next_due）。
+    void openWakeReflectRecordReadableNextRound()
+    {
+        OpenWakeConfigGuard config;
+        QVERIFY(config.write(openWakeTestJson(true, 12, 3)));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager db(dir.filePath("openwake-reflect.db"));
+        QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QByteArray> bodies;
+        serveCompletions(server, bodies, [](int) -> QString {
+            return QString(R"({"schema_version":1,"decision":"reflect",)"
+                          R"("note":"今晚的雨声让我想起窗台",)"
+                          R"("next_wake":{"mode":"after","after_minutes":10}})");
+        });
+        LLMService model(QStringLiteral("test"), nullptr,
+                         QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.serverPort())));
+        model.setMemoryManager(&db);
+        CognitiveCoordinator coordinator(db, model, nullptr);
+        coordinator.reviewIfDue();
+        QTRY_VERIFY_WITH_TIMEOUT(
+            db.openWakeState().value(QStringLiteral("last_outcome")).toString()
+                == QStringLiteral("reflect"), 8000);
+
+        const auto notes = db.recentOpenWakeNotes(2);
+        QCOMPARE(notes.size(), 1);
+        const auto note = notes.first().toObject();
+        QCOMPARE(note.value(QStringLiteral("note")).toString(),
+                 QStringLiteral("今晚的雨声让我想起窗台"));
+        QCOMPARE(note.value(QStringLiteral("decision")).toString(), QStringLiteral("reflect"));
+        QVERIFY(note.value(QStringLiteral("ref")).toString().startsWith(QStringLiteral("wake/")));
+        // 不是用户陈述：没有用户行 / 主动消息 / outbox。
+        QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM chat_history")), qint64(0));
+        QCOMPARE(scalarMemorySql(QStringLiteral(
+                     "SELECT count(*) FROM chat_history WHERE turn_kind='proactive'")), qint64(0));
+        QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM action_outbox")), qint64(0));
+        const qint64 nextDue =
+            scalarMemorySql(QStringLiteral("SELECT next_due_at FROM open_wake_state WHERE scope_key='owner'"));
+        const qint64 now = QDateTime::currentSecsSinceEpoch();
+        QVERIFY2(nextDue - now >= 550 && nextDue - now <= 650,
+                 qPrintable(QString::number(nextDue - now)));
+        // 下一轮（due 未来）不领取、不调模型。
+        coordinator.reviewIfDue();
+        QTest::qWait(100);
+        QCOMPARE(bodies.size(), 1);
+        QCOMPARE(db.openWakeState().value(QStringLiteral("last_outcome")).toString(),
+                 QStringLiteral("reflect"));
+    }
+
+    // 3) disabled / daily_limit=0 / 独立每日上限 / 低预算取整：都不产生模型调用或越界领取。
+    void openWakeDisabledAndBudget()
+    {
+        OpenWakeConfigGuard config;
+        // (1) enabled=false：协调器不创建唤醒、不调用模型（即使调度行已到期）。
+        QVERIFY(config.write(openWakeTestJson(false, 12, 3)));
+        {
+            QTemporaryDir dir;
+            MemoryManager db(dir.filePath("openwake-disabled.db"));
+            QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+            QTcpServer server;
+            QVERIFY(server.listen(QHostAddress::LocalHost));
+            QList<QByteArray> bodies;
+            serveCompletions(server, bodies, [](int) { return QStringLiteral("{}"); });
+            LLMService model(QStringLiteral("test"), nullptr,
+                             QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.serverPort())));
+            model.setMemoryManager(&db);
+            CognitiveCoordinator coordinator(db, model, nullptr);
+            coordinator.reviewIfDue();
+            QTest::qWait(100);
+            QCOMPARE(bodies.size(), 0);
+            QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM open_wake")), qint64(0));
+        }
+        // (2) daily_limit=0：所有后台认知停止，OpenWake 到期也不领取。
+        QVERIFY(config.write(openWakeTestJson(true, 12, 3), {}, 0));
+        {
+            QTemporaryDir dir;
+            MemoryManager db(dir.filePath("openwake-daily-zero.db"));
+            QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+            QTcpServer server;
+            QVERIFY(server.listen(QHostAddress::LocalHost));
+            QList<QByteArray> bodies;
+            serveCompletions(server, bodies, [](int) { return QStringLiteral("{}"); });
+            LLMService model(QStringLiteral("test"), nullptr,
+                             QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.serverPort())));
+            model.setMemoryManager(&db);
+            CognitiveCoordinator coordinator(db, model, nullptr);
+            coordinator.reviewIfDue();
+            QTest::qWait(100);
+            QCOMPARE(bodies.size(), 0);
+            QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM open_wake")), qint64(0));
+        }
+        // (3) maxPerDay=1：第二次到期后按独立预算被挡住，不调模型。
+        QVERIFY(config.write(openWakeTestJson(true, 1, 3)));
+        {
+            QTemporaryDir dir;
+            MemoryManager db(dir.filePath("openwake-max-per-day.db"));
+            QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+            PrivateReview review(db);
+            QSignalSpy requested(&review, &PrivateReview::requested);
+            const auto openWake = ConfigManager::instance().getOpenWakeConfig();
+            QCOMPARE(openWake.maxPerDay, 1);
+            auto wake = review.wake(12, 60, openWake);
+            QVERIFY(wake.started);
+            QCOMPARE(wake.kind, QStringLiteral("open_wake"));
+            const auto context = requested.last().at(2).toJsonObject();
+            review.receive(requested.last().at(0).toLongLong(),
+                           requested.last().at(1).toInt(),
+                           openWakeProposal(context.value(QStringLiteral("origin")).toObject(),
+                                            QStringLiteral("rest")), {});
+            QCOMPARE(db.openWakeState().value(QStringLiteral("last_outcome")).toString(),
+                     QStringLiteral("rest"));
+            QVERIFY(rewindOpenWakeClock());
+            const auto blocked = review.wake(12, 60, openWake);
+            QVERIFY(!blocked.started);
+            QCOMPARE(blocked.kind, QStringLiteral("open_wake"));
+            QCOMPARE(blocked.reason, QStringLiteral("budget"));
+            QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM open_wake")), qint64(1));
+        }
+        // (4) 低预算取整至少 1：dailyLimit=1 且共享预算 1% 时仍能领取一次。
+        QVERIFY(config.write(openWakeTestJson(true, 12, 3, 1)));
+        {
+            QTemporaryDir dir;
+            MemoryManager db(dir.filePath("openwake-low-budget.db"));
+            QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+            PrivateReview review(db);
+            const auto openWake = ConfigManager::instance().getOpenWakeConfig();
+            const auto wake = review.wake(1, 60, openWake);
+            QVERIFY(wake.started);
+            QCOMPARE(wake.kind, QStringLiteral("open_wake"));
+        }
+    }
+
+    // 4) 模型给出 contact/activity：按 schema 违规扣除，不提交、不产生 outbox/外部动作。
+    void openWakeRejectsContactOrActivity()
+    {
+        OpenWakeConfigGuard config;
+        QVERIFY(config.write(openWakeTestJson(true, 12, 3)));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager db(dir.filePath("openwake-reject.db"));
+        QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+        PrivateReview review(db);
+        QSignalSpy requested(&review, &PrivateReview::requested);
+        QSignalSpy contactSpy(&review, &PrivateReview::contactProposed);
+        const auto openWake = ConfigManager::instance().getOpenWakeConfig();
+
+        auto wake = review.wake(12, 60, openWake);
+        QVERIFY(wake.started);
+        auto context = requested.last().at(2).toJsonObject();
+        auto origin = context.value(QStringLiteral("origin")).toObject();
+        auto proposal = openWakeProposal(origin, QStringLiteral("reflect"),
+                                         QStringLiteral("想继续写下去"), 20);
+        proposal.insert(QStringLiteral("contact"),
+                        QJsonObject{{QStringLiteral("timing"), QStringLiteral("now")},
+                                    {QStringLiteral("message"), QStringLiteral("在吗")}});
+        review.receive(requested.last().at(0).toLongLong(),
+                       requested.last().at(1).toInt(), proposal, {});
+        QCOMPARE(contactSpy.size(), 0);
+        QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM action_outbox")), qint64(0));
+        QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM chat_history")), qint64(0));
+        QCOMPARE(scalarMemorySql(QStringLiteral(
+                     "SELECT count(*) FROM open_wake WHERE state='committed'")), qint64(0));
+        QCOMPARE(textMemorySql(QStringLiteral("SELECT state FROM open_wake ORDER BY id DESC LIMIT 1")),
+                 QStringLiteral("deferred"));
+        QCOMPARE(scalarMemorySql(QStringLiteral(
+                     "SELECT count(*) FROM review_failure WHERE source_kind='open_wake'")), qint64(1));
+
+        // 第二次：activity 字段同样越界；仍需可领取的第二次尝试。
+        QVERIFY(rewindOpenWakeClock());
+        wake = review.wake(12, 60, openWake);
+        QVERIFY(wake.started);
+        context = requested.last().at(2).toJsonObject();
+        origin = context.value(QStringLiteral("origin")).toObject();
+        proposal = openWakeProposal(origin, QStringLiteral("rest"));
+        proposal.insert(QStringLiteral("activity"),
+                        QJsonObject{{QStringLiteral("goal"), QStringLiteral("写点什么")}});
+        review.receive(requested.last().at(0).toLongLong(),
+                       requested.last().at(1).toInt(), proposal, {});
+        QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM action_outbox")), qint64(0));
+        QCOMPARE(scalarMemorySql(QStringLiteral(
+                     "SELECT count(*) FROM open_wake WHERE state='committed'")), qint64(0));
+        QCOMPARE(scalarMemorySql(QStringLiteral(
+                     "SELECT count(*) FROM review_failure WHERE source_kind='open_wake'")), qint64(2));
+    }
+
+    // 5) 公平性：OpenWake 到期后先让出 3 次普通回顾；第 4 次领取 OpenWake。
+    void openWakeFairnessAfterNonOpenJobs()
+    {
+        OpenWakeConfigGuard config;
+        QVERIFY(config.write(openWakeTestJson(true, 12, 3),
+                             QJsonObject{{QStringLiteral("private_writing"), true}}));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager db(dir.filePath("openwake-fairness.db"));
+        QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+        PrivateReview review(db);
+        QSignalSpy requested(&review, &PrivateReview::requested);
+        const auto openWake = ConfigManager::instance().getOpenWakeConfig();
+
+        for (int index = 0; index < 3; ++index) {
+            QVERIFY(db.saveQATurn(QStringLiteral("write"),
+                                  QStringLiteral(R"({"personal_interest":"interest-%1"})").arg(index),
+                                  {}));
+            const auto wake = review.wake(12, 60, openWake);
+            QVERIFY(wake.started);
+            QCOMPARE(wake.kind, QStringLiteral("activity"));
+            const auto id = requested.last().at(0).toLongLong();
+            const int version = requested.last().at(1).toInt();
+            review.receive(id, version,
+                           QJsonObject{{QStringLiteral("status"), QStringLiteral("completed")},
+                                       {QStringLiteral("reflection"), QStringLiteral("done")},
+                                       {QStringLiteral("draft"), QString()}}, {});
+            QVERIFY(execMemorySql(QStringLiteral(
+                "UPDATE thought_review_log SET started_at=started_at-120")));
+        }
+        QCOMPARE(db.openWakeState().value(QStringLiteral("non_open_since_due")).toInt(), 3);
+        // 3 次普通任务之后，下一次优先 OpenWake（claim 成功会清零公平计数）。
+        const auto wake = review.wake(12, 60, openWake);
+        QVERIFY(wake.started);
+        QCOMPARE(wake.kind, QStringLiteral("open_wake"));
+        QVERIFY(wake.sourceRef.startsWith(QStringLiteral("wake/")));
+        QCOMPARE(db.openWakeState().value(QStringLiteral("non_open_since_due")).toInt(), 0);
+        QCOMPARE(scalarMemorySql(QStringLiteral(
+                     "SELECT count(*) FROM open_wake WHERE state='running'")), qint64(1));
+    }
+
+    // 6) 来源校验：同 id/version 但 kind/ref/run_id/epoch 不一致的迟到回调被拒，不提交；
+    //    OpenWake 必须严格携带正确 _origin，activity/reflection 同样按 kind/ref 校验。
+    void originMismatchRejected()
+    {
+        OpenWakeConfigGuard config;
+        QVERIFY(config.write(openWakeTestJson(true, 12, 3)));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager db(dir.filePath("origin-mismatch.db"));
+        QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+        PrivateReview review(db);
+        QSignalSpy requested(&review, &PrivateReview::requested);
+        const auto openWake = ConfigManager::instance().getOpenWakeConfig();
+
+        // --- OpenWake：错误的 run_id / kind 都被拒，正确 origin 才提交 ---
+        auto wake = review.wake(12, 60, openWake);
+        QVERIFY(wake.started);
+        QCOMPARE(wake.kind, QStringLiteral("open_wake"));
+        const qlonglong wakeId = requested.last().at(0).toLongLong();
+        const int wakeVersion = requested.last().at(1).toInt();
+        const auto openWakeContext = requested.last().at(2).toJsonObject();
+        const auto openWakeOrigin = openWakeContext.value(QStringLiteral("origin")).toObject();
+        QCOMPARE(openWakeOrigin.value(QStringLiteral("kind")).toString(), QStringLiteral("open_wake"));
+        QCOMPARE(openWakeOrigin.value(QStringLiteral("id")).toInteger(), wakeId);
+        QVERIFY(openWakeOrigin.value(QStringLiteral("run_id")).toString().size() > 0);
+        QVERIFY(openWakeOrigin.value(QStringLiteral("ref")).toString()
+                    .startsWith(QStringLiteral("wake/")));
+        QVERIFY(openWakeContext.value(QStringLiteral("current_input")).isNull());
+        QCOMPARE(openWakeContext.value(QStringLiteral("allow_contact")).toBool(true), false);
+
+        auto forged = openWakeOrigin;
+        forged.insert(QStringLiteral("run_id"), QStringLiteral("forged-run"));
+        review.receive(wakeId, wakeVersion, openWakeProposal(forged, QStringLiteral("rest")), {});
+        QCOMPARE(textMemorySql(QStringLiteral("SELECT state FROM open_wake ORDER BY id DESC LIMIT 1")),
+                 QStringLiteral("running"));
+        QVERIFY(db.reviewFailure(QStringLiteral("open_wake"),
+                                 QStringLiteral("wake/%1").arg(wakeId)).isEmpty());
+
+        forged = openWakeOrigin;
+        forged.insert(QStringLiteral("kind"), QStringLiteral("reflection"));
+        forged.insert(QStringLiteral("ref"), QStringLiteral("reflection/%1").arg(wakeId));
+        review.receive(wakeId, wakeVersion, openWakeProposal(forged, QStringLiteral("rest")), {});
+        QCOMPARE(textMemorySql(QStringLiteral("SELECT state FROM open_wake ORDER BY id DESC LIMIT 1")),
+                 QStringLiteral("running"));
+        review.receive(wakeId, wakeVersion,
+                       openWakeProposal(openWakeOrigin, QStringLiteral("rest")), {});
+        QCOMPARE(db.openWakeState().value(QStringLiteral("last_outcome")).toString(),
+                 QStringLiteral("rest"));
+
+        // --- Activity：origin.kind/ref 不一致 -> 不提交；正确 origin 才提交 ---
+        QVERIFY(rewindOpenWakeClock());
+        QVERIFY(db.saveQATurn(QStringLiteral("write"),
+                              QStringLiteral(R"({"personal_interest":"雨声"})"), {}));
+        QVERIFY(execMemorySql(QStringLiteral("UPDATE thought_review_log SET started_at=started_at-120")));
+        auto activityWake = review.wake(12, 60);
+        QVERIFY(activityWake.started);
+        QCOMPARE(activityWake.kind, QStringLiteral("activity"));
+        const qlonglong activityId = requested.last().at(0).toLongLong();
+        const int activityVersion = requested.last().at(1).toInt();
+        const auto activityOrigin = requested.last().at(2).toJsonObject()
+                                        .value(QStringLiteral("origin")).toObject();
+        auto forgedActivity = activityOrigin;
+        forgedActivity.insert(QStringLiteral("kind"), QStringLiteral("reflection"));
+        forgedActivity.insert(QStringLiteral("ref"),
+                              QStringLiteral("reflection/%1").arg(activityId));
+        review.receive(activityId, activityVersion,
+                       QJsonObject{{QStringLiteral("status"), QStringLiteral("completed")},
+                                   {QStringLiteral("reflection"), QStringLiteral("late")},
+                                   {QStringLiteral("draft"), QStringLiteral("late")},
+                                   {QStringLiteral("_origin"), forgedActivity}}, {});
+        QCOMPARE(db.activityById(activityId).value(QStringLiteral("result")).toObject()
+                     .value(QStringLiteral("status")).toString(),
+                 QStringLiteral("active"));
+        review.receive(activityId, activityVersion,
+                       QJsonObject{{QStringLiteral("status"), QStringLiteral("completed")},
+                                   {QStringLiteral("reflection"), QStringLiteral("done")},
+                                   {QStringLiteral("draft"), QStringLiteral("done")},
+                                   {QStringLiteral("_origin"), activityOrigin}}, {});
+        QCOMPARE(db.activityById(activityId).value(QStringLiteral("result")).toObject()
+                     .value(QStringLiteral("status")).toString(),
+                 QStringLiteral("completed"));
+
+        // --- Reflection：epoch 不一致被拒，正确 origin 才落库 ---
+        QVERIFY(execMemorySql(QStringLiteral("UPDATE thought_review_log SET started_at=started_at-120")));
+        const auto turn = seedRuntimeReflectionSource(db, QStringLiteral("origin-mismatch"));
+        QVERIFY(turn > 0);
+        auto reflectionWake = review.wake(12, 60);
+        QVERIFY(reflectionWake.started);
+        QCOMPARE(reflectionWake.kind, QStringLiteral("reflection"));
+        const int reflectionVersion = requested.last().at(1).toInt();
+        const auto reflectionOrigin = requested.last().at(2).toJsonObject()
+                                          .value(QStringLiteral("origin")).toObject();
+        auto forgedReflection = reflectionOrigin;
+        forgedReflection.insert(QStringLiteral("epoch"), 7);
+        review.receive(turn, reflectionVersion,
+                       QJsonObject{{QStringLiteral("choice"), QStringLiteral("rest")},
+                                   {QStringLiteral("_origin"), forgedReflection}}, {});
+        QCOMPARE(textMemorySql(QStringLiteral(
+                     "SELECT state FROM private_reflection WHERE turn_id=%1").arg(turn)),
+                 QStringLiteral("pending"));
+        QVERIFY(db.reviewFailure(QStringLiteral("reflection"),
+                                 QStringLiteral("reflection/%1").arg(turn)).isEmpty());
+        review.receive(turn, reflectionVersion,
+                       QJsonObject{{QStringLiteral("choice"), QStringLiteral("rest")},
+                                   {QStringLiteral("_origin"), reflectionOrigin}}, {});
+        QVERIFY(textMemorySql(QStringLiteral(
+                    "SELECT state FROM private_reflection WHERE turn_id=%1").arg(turn))
+                != QStringLiteral("pending"));
+    }
+
+    // 7) 失败接线：Reflection/OpenWake 失败写 MemoryManager 持久失败并按退避重试；
+    //    用户 yield 不增失败计数。
+    void persistentFailureWired()
+    {
+        OpenWakeConfigGuard config;
+        QVERIFY(config.write(openWakeTestJson(false, 12, 3)));
+        {
+            QTemporaryDir dir;
+            MemoryManager db(dir.filePath("failure-reflection.db"));
+            const auto turn = seedRuntimeReflectionSource(db, QStringLiteral("failure"));
+            QVERIFY(turn > 0);
+            const QString ref = QStringLiteral("reflection/%1").arg(turn);
+            PrivateReview review(db);
+            QSignalSpy requested(&review, &PrivateReview::requested);
+            auto wake = review.wake(12, 60);
+            QVERIFY(wake.started);
+            QCOMPARE(wake.kind, QStringLiteral("reflection"));
+            review.receive(requested.last().at(0).toLongLong(),
+                           requested.last().at(1).toInt(), {}, QStringLiteral("network_error"));
+            const qint64 now = QDateTime::currentSecsSinceEpoch();
+            auto failure = db.reviewFailure(QStringLiteral("reflection"), ref);
+            QCOMPARE(failure.value(QStringLiteral("consecutive_failures")).toInt(), 1);
+            const qint64 retry = failure.value(QStringLiteral("next_retry_at")).toInteger();
+            QVERIFY2(retry - now >= 115 && retry - now <= 125,
+                     qPrintable(QString::number(retry - now)));
+            QCOMPARE(textMemorySql(QStringLiteral(
+                         "SELECT state FROM private_reflection WHERE turn_id=%1").arg(turn)),
+                     QStringLiteral("deferred"));
+            // 退避期内不立即重领。
+            const auto blocked = review.wake(12, 60);
+            QVERIFY(!blocked.started);
+            // 模拟退避时间已过 -> 第二次失败累计到 2，退避 300 秒。
+            QVERIFY(execMemorySql(QStringLiteral(
+                "UPDATE private_reflection SET eligible_at=unixepoch()-1 WHERE turn_id=%1").arg(turn)));
+            QVERIFY(execMemorySql(QStringLiteral(
+                "UPDATE thought_review_log SET started_at=started_at-500")));
+            wake = review.wake(12, 60);
+            QVERIFY(wake.started);
+            review.receive(requested.last().at(0).toLongLong(),
+                           requested.last().at(1).toInt(), {}, QStringLiteral("network_error"));
+            failure = db.reviewFailure(QStringLiteral("reflection"), ref);
+            QCOMPARE(failure.value(QStringLiteral("consecutive_failures")).toInt(), 2);
+            const qint64 retry2 = failure.value(QStringLiteral("next_retry_at")).toInteger();
+            QVERIFY2(retry2 - QDateTime::currentSecsSinceEpoch() >= 295
+                         && retry2 - QDateTime::currentSecsSinceEpoch() <= 305,
+                     qPrintable(QString::number(retry2 - QDateTime::currentSecsSinceEpoch())));
+            // 用户插话 yield：立即放回队列，不增加失败计数。
+            QVERIFY(execMemorySql(QStringLiteral(
+                "UPDATE private_reflection SET eligible_at=unixepoch()-1 WHERE turn_id=%1").arg(turn)));
+            QVERIFY(execMemorySql(QStringLiteral(
+                "UPDATE thought_review_log SET started_at=started_at-500")));
+            wake = review.wake(12, 60);
+            QVERIFY(wake.started);
+            review.yieldAttention(QStringLiteral("incoming_message"));
+            QCOMPARE(db.reviewFailure(QStringLiteral("reflection"), ref)
+                         .value(QStringLiteral("consecutive_failures")).toInt(), 2);
+            const qint64 immediate = scalarMemorySql(QStringLiteral(
+                "SELECT eligible_at-unixepoch() FROM private_reflection WHERE turn_id=%1").arg(turn));
+            QVERIFY2(immediate >= -2 && immediate <= 2, qPrintable(QString::number(immediate)));
+        }
+        // OpenWake：失败写入同一张 review_failure 表，源状态 deferred，调度推到 next_retry。
+        QVERIFY(config.write(openWakeTestJson(true, 12, 3)));
+        {
+            QTemporaryDir dir;
+            MemoryManager db(dir.filePath("failure-openwake.db"));
+            QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+            PrivateReview review(db);
+            QSignalSpy requested(&review, &PrivateReview::requested);
+            const auto openWake = ConfigManager::instance().getOpenWakeConfig();
+            auto wake = review.wake(12, 60, openWake);
+            QVERIFY(wake.started);
+            QCOMPARE(wake.kind, QStringLiteral("open_wake"));
+            const qlonglong id = requested.last().at(0).toLongLong();
+            const int version = requested.last().at(1).toInt();
+            review.receive(id, version, {}, QStringLiteral("network_error"));
+            const QString ref = QStringLiteral("wake/%1").arg(id);
+            auto failure = db.reviewFailure(QStringLiteral("open_wake"), ref);
+            QCOMPARE(failure.value(QStringLiteral("consecutive_failures")).toInt(), 1);
+            QVERIFY(failure.value(QStringLiteral("next_retry_at")).toInteger() > 0);
+            QCOMPARE(textMemorySql(QStringLiteral(
+                         "SELECT state FROM open_wake WHERE id=%1").arg(id)),
+                     QStringLiteral("deferred"));
+            const qint64 scheduled = scalarMemorySql(QStringLiteral(
+                "SELECT next_due_at-unixepoch() FROM open_wake_state WHERE scope_key='owner'"));
+            QVERIFY2(scheduled > 100 && scheduled <= 125,
+                     qPrintable(QString::number(scheduled)));
+            const auto blocked = review.wake(12, 60, openWake);
+            QVERIFY(!blocked.started);
+            // 退避期过后重新领取；yield（主动让出）不新增失败、不写 current_activity。
+            QVERIFY(rewindOpenWakeClock());
+            wake = review.wake(12, 60, openWake);
+            QVERIFY(wake.started);
+            const qlonglong secondId = requested.last().at(0).toLongLong();
+            review.yieldAttention(QStringLiteral("incoming_message"));
+            QCOMPARE(textMemorySql(QStringLiteral(
+                         "SELECT state FROM open_wake WHERE id=%1").arg(secondId)),
+                     QStringLiteral("deferred"));
+            QVERIFY(db.reviewFailure(QStringLiteral("open_wake"),
+                                     QStringLiteral("wake/%1").arg(secondId)).isEmpty());
+            const qint64 immediate = scalarMemorySql(QStringLiteral(
+                "SELECT next_due_at-unixepoch() FROM open_wake_state WHERE scope_key='owner'"));
+            QVERIFY2(immediate >= -2 && immediate <= 2, qPrintable(QString::number(immediate)));
+            QVERIFY(db.attentionState(QStringLiteral("current_activity")).isEmpty());
+        }
     }
 
     void initTestCase()

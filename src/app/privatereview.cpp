@@ -1,8 +1,10 @@
 #include "privatereview.h"
-#include "memorymanager.h"
 #include "configmanager.h"
+#include "memorymanager.h"
+
 #include <QJsonArray>
 #include <QJsonDocument>
+#include <QJsonValue>
 
 namespace {
 
@@ -11,16 +13,48 @@ namespace {
 // policy=授权/隐私过滤；verify=联系核验未通过；cancel=让出注意力；commit=提交/CAS/来源失效。
 QString reviewErrorStage(const QString &error)
 {
-    if (error == QStringLiteral("truncated") || error == QStringLiteral("network_error"))
+    if (error == QStringLiteral("network_error") || error == QStringLiteral("truncated")
+        || error == QStringLiteral("json_parse"))
         return QStringLiteral("parse");
     if (error == QStringLiteral("filtered") || error == QStringLiteral("writing_disabled"))
         return QStringLiteral("policy");
-    if (error == QStringLiteral("invalid_or_stale_proposal"))
+    if (error == QStringLiteral("invalid_or_stale_proposal")
+        || error == QStringLiteral("schema"))
         return QStringLiteral("schema");
     if (error == QStringLiteral("cancelled") || error == QStringLiteral("cancel"))
         return QStringLiteral("cancel");
     // source_unavailable / evidence_changed / db_error 等：提交前来源或状态失效。
     return QStringLiteral("commit");
+}
+
+QString reviewIsoFromEpoch(qint64 seconds)
+{
+    return seconds > 0
+        ? QDateTime::fromSecsSinceEpoch(seconds).toUTC().toString(Qt::ISODateWithMs)
+        : QString{};
+}
+
+// R12-1a：OpenWake 回顾的服务端时间上下文。复用 R12-0 的时间字段形状，但来源类是内部唤醒，
+// 没有对应的用户消息，source_reported_at 固定 unknown；最近主人互动/最近成功表达仍按
+// 主人私聊域只读查询（沿用 reviewInteractionTimes 的空 channel 语义）。
+QJsonObject openWakeTimeContext(MemoryManager &store, const ProactiveConfig &options)
+{
+    const auto times = store.reviewInteractionTimes(QString(), QString());
+    const auto known = [&times](const QString &key) {
+        const QString value = times.value(key).toString().trimmed();
+        return value.isEmpty() ? QStringLiteral("unknown") : value;
+    };
+    return QJsonObject{
+        {QStringLiteral("now_local"), QDateTime::currentDateTime().toString(Qt::ISODate)},
+        {QStringLiteral("now_utc"), QDateTime::currentDateTimeUtc().toString(Qt::ISODate)},
+        {QStringLiteral("source_reported_at"), QStringLiteral("unknown")},
+        {QStringLiteral("last_owner_interaction_at"),
+         known(QStringLiteral("last_owner_interaction_at"))},
+        {QStringLiteral("last_confirmed_outbound_at"),
+         known(QStringLiteral("last_confirmed_outbound_at"))},
+        {QStringLiteral("quiet_hours"),
+         QJsonObject{{QStringLiteral("start"), options.quietStart},
+                     {QStringLiteral("end"), options.quietEnd}}}};
 }
 
 } // namespace
@@ -30,34 +64,25 @@ PrivateReview::PrivateReview(MemoryManager &memory, QObject *parent)
 {
 }
 
-QString PrivateReview::kindTag(Kind kind)
+QString PrivateReview::kindTag(CognitiveOrigin::Kind kind)
 {
     switch (kind) {
-    case Kind::Reflection: return QStringLiteral("[Reflection]");
-    case Kind::Concern: return QStringLiteral("[Concern]");
-    case Kind::Activity: break;
+    case CognitiveOrigin::Reflection: return QStringLiteral("[Reflection]");
+    case CognitiveOrigin::Concern: return QStringLiteral("[Concern]");
+    case CognitiveOrigin::Activity: return QStringLiteral("[Activity]");
+    case CognitiveOrigin::OpenWake: return QStringLiteral("[OpenWake]");
     }
-    return QStringLiteral("[Activity]");
+    return QStringLiteral("[Review]");
 }
 
-QString PrivateReview::kindName(Kind kind)
+QString PrivateReview::kindName(CognitiveOrigin::Kind kind)
 {
-    switch (kind) {
-    case Kind::Reflection: return QStringLiteral("reflection");
-    case Kind::Concern: return QStringLiteral("concern");
-    case Kind::Activity: break;
-    }
-    return QStringLiteral("activity");
+    return CognitiveOrigin::kindNameOf(kind);
 }
 
 QString PrivateReview::sourceRef(const Attempt &attempt)
 {
-    switch (attempt.kind) {
-    case Kind::Reflection: return QStringLiteral("reflection/%1").arg(attempt.id);
-    case Kind::Concern: return QStringLiteral("concern/%1").arg(attempt.id);
-    case Kind::Activity: break;
-    }
-    return QStringLiteral("thought/%1").arg(attempt.id);
+    return attempt.origin.ref;
 }
 
 QString PrivateReview::reviewStage(const QJsonObject &proposal, const QString &error, bool committed)
@@ -74,73 +99,199 @@ QString PrivateReview::reviewStage(const QJsonObject &proposal, const QString &e
     return QStringLiteral("commit");
 }
 
-void PrivateReview::clearFailures(const QString &ref)
+bool PrivateReview::errorCountsAsFailure(const QString &error)
 {
-    failures.remove(ref);
+    const QString text = error.trimmed();
+    if (text.isEmpty()) return true;
+    // 策略/权限拦截：不计入认知失败，但调用方仍按原语义 defer。
+    if (text == QStringLiteral("filtered") || text == QStringLiteral("writing_disabled")
+        || text == QStringLiteral("permission_denied"))
+        return false;
+    // 来源已变/CAS 冲突不是"她想错了"，记录诊断但不累计连续失败。
+    if (text == QStringLiteral("invalid_or_stale_proposal")
+        || text == QStringLiteral("evidence_changed")
+        || text == QStringLiteral("source_unavailable")
+        || text == QStringLiteral("cas_conflict"))
+        return false;
+    // 网络/截断/JSON 解析/schema/提交失败/DB 错误都算一次真实失败。
+    return true;
 }
 
-void PrivateReview::noteFailure(const Attempt &attempt, const QString &ref, const QString &reason)
+bool PrivateReview::originMatches(const Attempt &attempt, const QJsonObject &proposal,
+                                  const QString &error) const
 {
-    const auto options = ConfigManager::instance().getProactiveConfig();
-    auto &state = failures[ref];
-    // 版本跳变 >1：说明中间有外部操作刷新了源（例如活动被用户改过），旧连续失败链
-    // 不再成立，按"新的源版本"恢复。进程重启会清空整个 QHash（内存计数归零）。
-    if (state.version >= 0 && attempt.version > state.version + 1)
-        state = FailureState{};
-    state.version = attempt.version;
-    ++state.count;
-    const int failureCount = state.count;
-    if (attempt.kind != Kind::Reflection) {
-        // 不扩大退避范围：关注/活动保持原来的"立即放回队列"语义，原因只进 [Review] result。
-        if (attempt.kind == Kind::Concern)
-            store.deferConcernReview(attempt.id, attempt.version, reason);
-        else
-            store.deferThoughtReview(attempt.id, attempt.version, reason);
-        return;
+    const auto originJson = proposal.value(QStringLiteral("_origin")).toObject();
+    if (originJson.isEmpty()) {
+        // OpenWake 成功 proposal 必须严格携带 _origin；只有非空的失败回调（网络/策略等，
+        // LLMService 不解析 proposal）允许缺省，此时仍由 active 的 id/version 定位。
+        if (attempt.origin.kind == CognitiveOrigin::OpenWake)
+            return !error.isEmpty();
+        // 其它来源：旧路径（R12-0 及更早的测试/调用方）只按 id/version 校验。
+        return true;
     }
-    const int maxFailures = qMax(1, options.maxReviewFailures);
-    if (failureCount >= maxFailures) {
-        // 连续失败达到上限：suspended，24 小时后再由正常的领取条件重试。
-        constexpr int suspendSeconds = 86400;
-        store.deferPrivateReflection(attempt.id, attempt.version, suspendSeconds);
-        const auto nextEligible = QDateTime::currentDateTimeUtc().addSecs(suspendSeconds);
-        qInfo().noquote()
-            << QStringLiteral("[Review] suspended kind=reflection ref=%1 version=%2 failures=%3"
-                              " reason=%4 next_eligible=%5")
-                   .arg(ref)
-                   .arg(attempt.version)
-                   .arg(failureCount)
-                   .arg(reason, nextEligible.toString(Qt::ISODate));
-        return;
+    CognitiveOrigin echoed;
+    if (!CognitiveOrigin::fromJson(originJson, &echoed)) return false;
+    return attempt.origin.sameIdentity(echoed);
+}
+
+void PrivateReview::recordFailure(const Attempt &attempt, const QString &reason,
+                                  const QString &stage, bool countsAsFailure)
+{
+    const QString kind = attempt.origin.kindName();
+    const QString ref = attempt.origin.ref;
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    QString recordError;
+    const bool recorded = store.recordReviewFailure(kind, ref, stage, reason,
+                                                    countsAsFailure, &recordError);
+    if (!recorded) {
+        qWarning().noquote()
+            << QStringLiteral("[Review] failure_not_recorded kind=%1 ref=%2 version=%3"
+                              " stage=%4 reason=%5 error=%6")
+                   .arg(kind, ref)
+                   .arg(attempt.origin.version)
+                   .arg(stage, reason, recordError.isEmpty() ? QStringLiteral("-") : recordError);
+    } else {
+        const auto failure = store.reviewFailure(kind, ref);
+        const int failures = failure.value(QStringLiteral("consecutive_failures")).toInt();
+        const qint64 nextRetry = failure.value(QStringLiteral("next_retry_at")).toInteger();
+        const qint64 suspended = failure.value(QStringLiteral("suspended_until")).toInteger();
+        if (suspended > now) {
+            qInfo().noquote()
+                << QStringLiteral("[Review] suspended kind=%1 ref=%2 version=%3 failures=%4"
+                                  " reason=%5 next_eligible=%6")
+                       .arg(kind, ref)
+                       .arg(attempt.origin.version)
+                       .arg(failures)
+                       .arg(reason, reviewIsoFromEpoch(suspended));
+        } else if (countsAsFailure) {
+            const qint64 seconds = qMax<qint64>(0, nextRetry - now);
+            qInfo().noquote()
+                << QStringLiteral("[Review] backoff kind=%1 ref=%2 version=%3 failures=%4"
+                                  " seconds=%5 reason=%6 next_eligible=%7")
+                       .arg(kind, ref)
+                       .arg(attempt.origin.version)
+                       .arg(failures)
+                       .arg(seconds)
+                       .arg(reason, reviewIsoFromEpoch(nextRetry));
+        } else {
+            qInfo().noquote()
+                << QStringLiteral("[Review] deferred kind=%1 ref=%2 version=%3"
+                                  " reason=%4 counts=false")
+                       .arg(kind, ref)
+                       .arg(attempt.origin.version)
+                       .arg(reason);
+        }
     }
-    const auto &backoff = options.reviewBackoffSeconds;
-    const int index = qMin(failureCount - 1,
-                           backoff.isEmpty() ? 0 : int(backoff.size()) - 1);
-    const int seconds = backoff.isEmpty() ? 120 : backoff.at(index);
-    store.deferPrivateReflection(attempt.id, attempt.version, seconds);
-    qInfo().noquote()
-        << QStringLiteral("[Review] backoff kind=reflection ref=%1 version=%2 failures=%3"
-                          " seconds=%4 reason=%5")
-               .arg(ref)
-               .arg(attempt.version)
-               .arg(failureCount)
-               .arg(seconds)
-               .arg(reason);
+    if (countsAsFailure) return;
+    // 非认知失败：保持既有"立即放回队列"语义（权限拦截 / 来源已变 / 用户主动让出）。
+    bool deferred = false;
+    switch (attempt.origin.kind) {
+    case CognitiveOrigin::Reflection:
+        deferred = store.deferPrivateReflection(attempt.origin.id, attempt.origin.version);
+        break;
+    case CognitiveOrigin::Concern:
+        deferred = store.deferConcernReview(attempt.origin.id, attempt.origin.version, reason);
+        break;
+    case CognitiveOrigin::Activity:
+        deferred = store.deferThoughtReview(attempt.origin.id, attempt.origin.version, reason);
+        break;
+    case CognitiveOrigin::OpenWake:
+        deferred = store.deferOpenWake(attempt.origin.id, attempt.origin.version, 0, reason);
+        break;
+    }
+    if (!deferred) {
+        qWarning().noquote()
+            << QStringLiteral("[Review] defer_failed kind=%1 ref=%2 version=%3 reason=%4")
+                   .arg(kind, ref)
+                   .arg(attempt.origin.version)
+                   .arg(reason);
+    }
 }
 
 WakeResult PrivateReview::wake(int dailyLimit, int cooldownSeconds)
+{
+    // 旧调用/旧测试：不启用 OpenWake，保持 R12-0 的三步顺序。
+    return wakeInternal(dailyLimit, cooldownSeconds, nullptr, true);
+}
+
+WakeResult PrivateReview::wake(int dailyLimit, int cooldownSeconds, const OpenWakeConfig &openWake)
+{
+    // 按任务契约，调度顺序只由 openWake.enabled / daily_limit 决定：启用 OpenWake 时
+    // 仍先走现有 Activity→Concern→Reflection，三步无候选/被预算挡住后才尝试 OpenWake。
+    return wakeInternal(dailyLimit, cooldownSeconds, openWake.enabled ? &openWake : nullptr, true);
+}
+
+WakeResult PrivateReview::wakeInternal(int dailyLimit, int cooldownSeconds,
+                                       const OpenWakeConfig *openWake, bool nonOpenAllowed)
 {
     WakeResult result;
     result.kind = QStringLiteral("none");
     result.reason = QStringLiteral("no_candidate");
     if (active) {
         // 已有在途回顾：不重复领取，但把当前在途的类型化状态带回给调用方。
-        result.kind = kindName(active->kind);
+        result.kind = kindName(active->origin.kind);
         result.sourceRef = sourceRef(*active);
-        result.version = active->version;
+        result.version = active->origin.version;
         result.reason = QStringLiteral("busy");
         return result;
     }
+
+    // OpenWake 本地到期检查：只读状态，不调用模型、不消耗预算。
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    bool openWakeDue = false;
+    bool openWakeAttempted = false;
+    if (openWake && dailyLimit > 0) {
+        QString scheduleError;
+        if (!store.ensureOpenWakeScheduled(QStringLiteral("owner"),
+                                           openWake->initialDelaySeconds, &scheduleError)) {
+            qWarning() << "[OpenWake] schedule_failed" << scheduleError;
+        }
+        const auto state = store.openWakeState(QStringLiteral("owner"));
+        const qint64 dueAt = state.value(QStringLiteral("next_due_at")).toInteger();
+        const qint64 suspendedUntil = state.value(QStringLiteral("suspended_until")).toInteger();
+        openWakeDue = dueAt > 0 && dueAt <= now
+            && (suspendedUntil == 0 || suspendedUntil <= now);
+        // 公平性：到期后先让出 maxNonOpenJobsWhenDue 次普通回顾，再优先 OpenWake。
+        if (openWakeDue
+            && state.value(QStringLiteral("non_open_since_due")).toInt()
+                >= openWake->maxNonOpenJobsWhenDue) {
+            openWakeAttempted = true;
+            const auto openWakeResult = wakeOpenWake(*openWake, dailyLimit, cooldownSeconds);
+            if (openWakeResult.started) return openWakeResult;
+            if (openWakeResult.reason != QStringLiteral("not_due")
+                && openWakeResult.reason != QStringLiteral("no_candidate"))
+                result = openWakeResult;
+        }
+    }
+
+    // 第二步：原有 到期活动 → 到期关注 → 新来源回顾。OpenWake 单独运行时跳过它们。
+    WakeResult nonOpenResult;
+    nonOpenResult.kind = QStringLiteral("none");
+    nonOpenResult.reason = QStringLiteral("no_candidate");
+    if (nonOpenAllowed) {
+        nonOpenResult = wakeNonOpen(dailyLimit, cooldownSeconds);
+        if (nonOpenResult.started) return nonOpenResult;
+    }
+
+    // 第三步：普通来源都无候选/被预算挡住时，若 OpenWake 到期再尝试领取。
+    if (openWake && dailyLimit > 0 && openWakeDue && !openWakeAttempted) {
+        const auto openWakeResult = wakeOpenWake(*openWake, dailyLimit, cooldownSeconds);
+        if (openWakeResult.started) return openWakeResult;
+        if (openWakeResult.reason != QStringLiteral("not_due")
+            && openWakeResult.reason != QStringLiteral("no_candidate"))
+            return openWakeResult;
+    }
+    if (nonOpenResult.reason != QStringLiteral("no_candidate")) return nonOpenResult;
+    // fairness 阶段已经尝试并记录了阻塞原因时，用它解释这次 tick。
+    return result;
+}
+
+WakeResult PrivateReview::wakeNonOpen(int dailyLimit, int cooldownSeconds)
+{
+    WakeResult result;
+    result.kind = QStringLiteral("none");
+    result.reason = QStringLiteral("no_candidate");
+
     // 优先级：到期活动 → 到期关注 → 新来源回顾。活动和关注都有"到期"，
     // 新来源回顾有 24h 窗口、可以补，所以先处理有时效的，避免回顾额度被新来源吃掉。
     QString claimReason;
@@ -150,10 +301,10 @@ WakeResult PrivateReview::wake(int dailyLimit, int cooldownSeconds)
     QString blockedReason;
     QDateTime blockedNextEligibleAt;
     auto context = store.nextThought(true);
-    auto kind = Kind::Activity;
+    auto kind = CognitiveOrigin::Activity;
     if (context.isEmpty()) {
         context = store.claimDueConcern(dailyLimit, cooldownSeconds, &claimReason, &nextEligibleAt);
-        kind = Kind::Concern;
+        kind = CognitiveOrigin::Concern;
         if (context.isEmpty() && claimReason != QStringLiteral("no_candidate")) {
             blockedReason = claimReason;
             blockedNextEligibleAt = nextEligibleAt;
@@ -163,7 +314,7 @@ WakeResult PrivateReview::wake(int dailyLimit, int cooldownSeconds)
         claimReason.clear();
         nextEligibleAt = QDateTime{};
         context = store.claimPrivateReflection(dailyLimit, cooldownSeconds, &claimReason, &nextEligibleAt);
-        kind = Kind::Reflection;
+        kind = CognitiveOrigin::Reflection;
         if (context.isEmpty()) {
             const bool reflectionBlocked = !claimReason.isEmpty()
                 && claimReason != QStringLiteral("no_candidate");
@@ -182,8 +333,8 @@ WakeResult PrivateReview::wake(int dailyLimit, int cooldownSeconds)
             return result;
         }
     }
-    const auto id = context.take("id").toInteger();
-    int version = context.take("version").toInt();
+    const auto id = context.take(QStringLiteral("id")).toInteger();
+    int version = context.take(QStringLiteral("version")).toInt();
     if (id <= 0 || version < 0) {
         // 领取上下文缺少可提交的行标识：不进入在途状态，交给下一轮重新领取。
         // 注意 version==0 是新建活动/首次回顾的合法版本，不能拒绝。
@@ -191,97 +342,201 @@ WakeResult PrivateReview::wake(int dailyLimit, int cooldownSeconds)
         result.reason = QStringLiteral("storage_error");
         return result;
     }
-    if (kind == Kind::Activity) {
+    if (kind == CognitiveOrigin::Activity) {
         // 活动回顾的预算由 claimThoughtReview 扣；关注/新来源回顾的预算已在各自 claim 内扣。
         QString reason;
         QDateTime next;
         if (!store.claimThoughtReview(id, version, dailyLimit, cooldownSeconds, &reason, &next)) {
             result.kind = kindName(kind);
             result.reason = reason.isEmpty() ? QStringLiteral("db_error") : reason;
-            result.sourceRef = QStringLiteral("thought/%1").arg(id);
+            result.sourceRef = CognitiveOrigin::refFor(kind, id);
             result.version = version;
             result.nextEligibleAt = next;
             return result;
         }
         ++version;
-    } else if (kind == Kind::Concern) {
+    } else if (kind == CognitiveOrigin::Concern) {
         // 记忆层的契约要求上下文带 kind=concern；这里显式保证，避免路由到活动提示词。
         context.insert(QStringLiteral("kind"), QStringLiteral("concern"));
     }
     const auto options = ConfigManager::instance().getProactiveConfig();
-    active = Attempt{id, version, kind, options.enabled && !options.targets.isEmpty()};
-    // B1：当前活动（仅活动回顾有"活动"语义；关注/新来源回顾不写入 current_activity）。
-    if (kind == Kind::Activity) {
-        const auto activityRef = QStringLiteral("thought/%1").arg(id);
-        store.setAttentionState(QStringLiteral("current_activity"), activityRef);
-        qInfo() << "[Attention] current_activity=" << activityRef << "version=" << version;
+    CognitiveOrigin origin;
+    switch (kind) {
+    case CognitiveOrigin::Activity: origin = CognitiveOrigin::forActivity(id, version); break;
+    case CognitiveOrigin::Concern: origin = CognitiveOrigin::forConcern(id, version); break;
+    case CognitiveOrigin::Reflection: origin = CognitiveOrigin::forReflection(id, version); break;
+    case CognitiveOrigin::OpenWake: break; // 不会走到这里
+    }
+    if (!origin.isValid()) {
+        result.kind = kindName(kind);
+        result.reason = QStringLiteral("storage_error");
+        return result;
+    }
+    context.insert(QStringLiteral("origin"), origin.toJson());
+    active = Attempt{origin, options.enabled && !options.targets.isEmpty()};
+    // B1：当前活动（仅活动回顾有"活动"语义；关注/新来源回顾/OpenWake 不写入 current_activity）。
+    if (kind == CognitiveOrigin::Activity) {
+        store.setAttentionState(QStringLiteral("current_activity"), origin.ref);
+        qInfo() << "[Attention] current_activity=" << origin.ref
+                << "version=" << version;
     }
     qInfo() << kindTag(kind) + QStringLiteral(" reviewing") << id << version;
-    // R12-0：真正开始时留一行结构化诊断（INFO，只含定位字段与服务端时间，不含原文）。
     qInfo().noquote()
-        << QStringLiteral("[Review] attempt kind=%1 ref=%2 version=%3 current_local_time=%4")
-               .arg(kindName(kind), sourceRef(*active))
+        << QStringLiteral("[Review] attempt kind=%1 ref=%2 version=%3 run_id=%4 scope=%5"
+                          " epoch=%6 steps_limit=%7 current_local_time=%8")
+               .arg(kindName(kind), origin.ref)
                .arg(version)
+               .arg(origin.runId.isEmpty() ? QStringLiteral("-") : origin.runId)
+               .arg(origin.scope.isEmpty() ? QStringLiteral("-") : origin.scope)
+               .arg(origin.epoch)
+               .arg(0)
                .arg(QDateTime::currentDateTime().toString(Qt::ISODate));
     result.started = true;
     result.kind = kindName(kind);
     result.reason = QStringLiteral("started");
-    result.sourceRef = sourceRef(*active);
+    result.sourceRef = origin.ref;
     result.version = version;
-    emit requested(id, active->version, context);
+    emit requested(id, version, context);
+    return result;
+}
+
+WakeResult PrivateReview::wakeOpenWake(const OpenWakeConfig &openWake, int dailyLimit,
+                                       int cooldownSeconds)
+{
+    WakeResult result;
+    result.kind = QStringLiteral("open_wake");
+    result.reason = QStringLiteral("no_candidate");
+    const auto options = ConfigManager::instance().getProactiveConfig();
+    QString reason;
+    QDateTime nextEligibleAt;
+    auto context = store.claimOpenWake(dailyLimit, cooldownSeconds, openWake.maxPerDay,
+                                       openWake.sharedBudgetPercent,
+                                       options.maxReviewFailures, &reason, &nextEligibleAt,
+                                       QStringLiteral("owner"));
+    if (context.isEmpty()) {
+        result.reason = reason.isEmpty() ? QStringLiteral("no_candidate") : reason;
+        result.nextEligibleAt = nextEligibleAt;
+        return result;
+    }
+    const qlonglong id = context.take(QStringLiteral("id")).toInteger();
+    const int version = context.take(QStringLiteral("version")).toInt();
+    const QString runId = context.take(QStringLiteral("run_id")).toString();
+    const QString scope = context.value(QStringLiteral("scope_key")).toString();
+    const qint64 epoch = context.value(QStringLiteral("current_context_epoch")).toInteger();
+    if (id <= 0 || version <= 0 || runId.isEmpty()) {
+        // 领取上下文不自洽：不进入在途状态；下次 tick 由租约恢复/重新领取兜底。
+        result.reason = QStringLiteral("storage_error");
+        return result;
+    }
+    const auto origin = CognitiveOrigin::forOpenWake(id, version, runId,
+                                                     scope.isEmpty() ? QStringLiteral("owner")
+                                                                     : scope,
+                                                     epoch);
+    if (!origin.isValid()) {
+        result.reason = QStringLiteral("storage_error");
+        return result;
+    }
+    // 模型上下文：内部唤醒没有用户输入；带服务端时间/触发原因/最近内部记录，
+    // 并明确本片 allow_contact=false（不产生 contact/activity，也不写 current_activity）。
+    context.insert(QStringLiteral("kind"), QStringLiteral("open_wake"));
+    context.insert(QStringLiteral("origin"), origin.toJson());
+    context.insert(QStringLiteral("current_input"), QJsonValue::Null);
+    context.insert(QStringLiteral("allow_contact"), false);
+    context.insert(QStringLiteral("trigger"), QStringLiteral("due"));
+    context.insert(QStringLiteral("time_context"), openWakeTimeContext(store, options));
+    context.insert(QStringLiteral("recent_open_wake_notes"), store.recentOpenWakeNotes(2));
+    active = Attempt{origin, false};
+    qInfo() << "[OpenWake] reviewing" << id << version << "run=" << runId
+            << "scope=" << origin.scope;
+    qInfo().noquote()
+        << QStringLiteral("[Review] attempt kind=open_wake ref=%1 version=%2 run_id=%3"
+                          " scope=%4 epoch=%5 steps_limit=%6 current_local_time=%7")
+               .arg(origin.ref)
+               .arg(version)
+               .arg(runId, origin.scope)
+               .arg(origin.epoch)
+               .arg(openWake.maxModelStepsPerWake)
+               .arg(QDateTime::currentDateTime().toString(Qt::ISODate));
+    result.started = true;
+    result.reason = QStringLiteral("started");
+    result.sourceRef = origin.ref;
+    result.version = version;
+    emit requested(id, version, context);
     return result;
 }
 
 void PrivateReview::yieldAttention(const QString &reason)
 {
     if (!active) return;
-    // B1：让出注意力时记录"切换原因"，并清掉当前活动；重启后据此解释活动为什么停下。
-    store.setAttentionState(QStringLiteral("last_switch_reason"), reason);
-    store.setAttentionState(QStringLiteral("current_activity"), QString());
-    qInfo() << "[Attention] switch reason=" << reason;
     const auto attempt = *active;
+    // B1：让出注意力时记录"切换原因"；OpenWake 不得写 attention_state.current_activity。
+    store.setAttentionState(QStringLiteral("last_switch_reason"), reason);
+    if (attempt.origin.kind != CognitiveOrigin::OpenWake)
+        store.setAttentionState(QStringLiteral("current_activity"), QString());
+    qInfo() << "[Attention] switch reason=" << reason;
     active.reset();
     bool saved = false;
-    switch (attempt.kind) {
-    case Kind::Concern:
-        saved = store.deferConcernReview(attempt.id, attempt.version, reason);
+    switch (attempt.origin.kind) {
+    case CognitiveOrigin::Concern:
+        saved = store.deferConcernReview(attempt.origin.id, attempt.origin.version, reason);
         break;
-    case Kind::Reflection:
+    case CognitiveOrigin::Reflection:
         // 用户插话/关停造成的主动让出：立即 defer，不累计失败、不退避。
-        saved = store.deferPrivateReflection(attempt.id, attempt.version);
+        saved = store.deferPrivateReflection(attempt.origin.id, attempt.origin.version);
         break;
-    case Kind::Activity:
-        saved = store.deferThoughtReview(attempt.id, attempt.version, reason);
+    case CognitiveOrigin::Activity:
+        saved = store.deferThoughtReview(attempt.origin.id, attempt.origin.version, reason);
+        break;
+    case CognitiveOrigin::OpenWake:
+        // R12-1a：主动让出不增失败计数，只把调度推到（可立即）再试。
+        saved = store.deferOpenWake(attempt.origin.id, attempt.origin.version, 0, reason);
         break;
     }
-    qInfo() << kindTag(attempt.kind) + QStringLiteral(" yielded")
-            << attempt.id << attempt.version << reason << saved;
+    qInfo() << kindTag(attempt.origin.kind) + QStringLiteral(" yielded")
+            << attempt.origin.id << attempt.origin.version << reason << saved;
     qInfo().noquote()
         << QStringLiteral("[Review] result kind=%1 ref=%2 version=%3 decision=yielded"
                           " stage=cancel reason=%4")
-               .arg(kindName(attempt.kind), sourceRef(attempt))
-               .arg(attempt.version)
+               .arg(kindName(attempt.origin.kind), attempt.origin.ref)
+               .arg(attempt.origin.version)
                .arg(reason);
     emit cancelled();
 }
 
-void PrivateReview::receive(qlonglong id, int version, const QJsonObject &proposal, const QString &error)
+void PrivateReview::receive(qlonglong id, int version, const QJsonObject &proposal,
+                            const QString &error)
 {
-    if (!active || active->id != id || active->version != version) return;
+    if (!active || active->origin.id != id || active->origin.version != version) return;
     const auto attempt = *active;
-    const bool contactAllowed = attempt.contactAllowed && ConfigManager::instance().getProactiveConfig().enabled;
+    if (!originMatches(attempt, proposal, error)) {
+        // 迟到的/伪造的回调：不提交、不发送，也不写失败（不是一次认知失败）。
+        qInfo().noquote()
+            << QStringLiteral("[Review] stale_callback kind=%1 ref=%2 version=%3"
+                              " reason=origin_mismatch")
+                   .arg(kindName(attempt.origin.kind), attempt.origin.ref)
+                   .arg(attempt.origin.version);
+        return;
+    }
+    const bool contactAllowed = attempt.contactAllowed
+        && ConfigManager::instance().getProactiveConfig().enabled;
     active.reset();
     const auto ref = sourceRef(attempt);
     const auto logResult = [&](const QString &decision, const QString &stage, const QString &reason) {
         qInfo().noquote()
             << QStringLiteral("[Review] result kind=%1 ref=%2 version=%3 decision=%4"
                               " stage=%5 reason=%6")
-                   .arg(kindName(attempt.kind), ref)
-                   .arg(attempt.version)
+                   .arg(kindName(attempt.origin.kind), ref)
+                   .arg(attempt.origin.version)
                    .arg(decision, stage,
                         reason.trimmed().isEmpty() ? QStringLiteral("-") : reason);
     };
-    if (attempt.kind == Kind::Reflection) {
+
+    if (attempt.origin.kind == CognitiveOrigin::OpenWake) {
+        receiveOpenWake(attempt, proposal, error);
+        return;
+    }
+
+    if (attempt.origin.kind == CognitiveOrigin::Reflection) {
         const auto choice = proposal["choice"].toString();
         const auto decision = choice.isEmpty() ? QStringLiteral("none") : choice;
         const auto contact = contactAllowed ? proposal["contact"].toObject() : QJsonObject{};
@@ -300,19 +555,20 @@ void PrivateReview::receive(qlonglong id, int version, const QJsonObject &propos
             if (choice=="consider" && contact["timing"].toString()=="now"
                 && store.hasProposedContact(id,version))
                 emit contactProposed(id,version);
-            clearFailures(ref);
+            store.clearReviewFailure(kindName(attempt.origin.kind), ref);
             logResult(decision, reviewStage(proposal,error,true),
                       proposal["contact"].toObject()["withhold_reason"].toString());
         } else {
             const QString reason = error.isEmpty() ? QStringLiteral("invalid_or_stale_proposal") : error;
-            // R12-0 失败退避：只有真正的失败（error 或 commit 失败）才累计；
-            // yieldAttention 走的是另一条路径，不经过这里。
-            noteFailure(attempt, ref, reason);
+            // R12-1a：失败退避持久化到 review_failure（跨重启可靠），
+            // 主动让出（yieldAttention）走另一条路径，不经过这里。
+            recordFailure(attempt, reason, reviewStage(proposal,error,false),
+                          errorCountsAsFailure(reason));
             logResult(decision, reviewStage(proposal,error,false), reason);
         }
         return;
     }
-    if (attempt.kind == Kind::Concern) {
+    if (attempt.origin.kind == CognitiveOrigin::Concern) {
         const auto contact = proposal["contact"].toObject();
         const auto action = proposal["concern_action"].toString();
         const auto decision = action.isEmpty() ? QStringLiteral("none") : action;
@@ -324,21 +580,23 @@ void PrivateReview::receive(qlonglong id, int version, const QJsonObject &propos
             if (action == "contact" && contact["timing"].toString() == "now"
                 && store.hasProposedContact(id,version))
                 emit contactProposed(id,version);
-            clearFailures(ref);
+            store.clearReviewFailure(kindName(attempt.origin.kind), ref);
             logResult(decision, reviewStage(proposal,error,true),
                       contact["withhold_reason"].toString());
             return;
         }
-        // 领取时已经扣过预算/冷却，失败只把关注放回队列，不重新领取。
+        // 领取时已经扣过预算/冷却，失败把关注放回队列（持久失败行决定退避）。
         const QString reason = error.isEmpty() ? QStringLiteral("invalid_or_stale_proposal") : error;
-        noteFailure(attempt, ref, reason);
+        recordFailure(attempt, reason, reviewStage(proposal,error,false),
+                      errorCountsAsFailure(reason));
         logResult(decision, reviewStage(proposal,error,false), reason);
         return;
     }
     if (!error.isEmpty() || !store.finishThoughtReview(id, version, proposal)) {
         // 原来的领取仍然计入冷却与每日预算。
         const QString reason = error.isEmpty() ? QStringLiteral("invalid_or_stale_proposal") : error;
-        noteFailure(attempt, ref, reason);
+        recordFailure(attempt, reason, reviewStage(proposal,error,false),
+                      errorCountsAsFailure(reason));
         logResult(proposal["status"].toString().isEmpty() ? QStringLiteral("none")
                                                          : proposal["status"].toString(),
                   reviewStage(proposal,error,false), reason);
@@ -346,20 +604,124 @@ void PrivateReview::receive(qlonglong id, int version, const QJsonObject &propos
     }
     qInfo() << "[Activity] review committed" << id << version + 1;
     // B1：活动结果作为注意力事件留档（供协调器/观测按 kind 汇总），并把当前活动指回该活动。
-    const auto activityRef = QStringLiteral("thought/%1").arg(id);
+    store.setAttentionState(QStringLiteral("current_activity"), ref);
     const auto resultStatus = proposal["status"].toString();
-    store.setAttentionState(QStringLiteral("current_activity"), activityRef);
     store.setAttentionState(QStringLiteral("last_activity_result"),
                             QStringLiteral("thought/%1:%2:%3").arg(id).arg(version).arg(resultStatus));
     store.enqueueAttentionEvent(QStringLiteral("activity_result"),
                                 QStringLiteral("thought/%1:%2").arg(id).arg(version),
                                 QJsonObject{{QStringLiteral("status"), resultStatus}},
                                 QStringLiteral("activity"), 40);
-    qInfo() << "[Attention] current_activity=" << activityRef << "result=" << resultStatus;
-    clearFailures(ref);
+    qInfo() << "[Attention] current_activity=" << ref << "result=" << resultStatus;
+    store.clearReviewFailure(kindName(attempt.origin.kind), ref);
     logResult(resultStatus.isEmpty() ? QStringLiteral("none") : resultStatus,
               QStringLiteral("commit"), QString());
     const auto draft = proposal["draft"].toString().trimmed();
     if (!draft.isEmpty() && proposal["share_with_owner"].toBool() && store.canShareThought(id, version + 1))
         emit shareRequested(QStringLiteral("thought/%1").arg(id), version + 1, draft);
+}
+
+void PrivateReview::receiveOpenWake(const Attempt &attempt, const QJsonObject &proposal,
+                                    const QString &error)
+{
+    const qlonglong id = attempt.origin.id;
+    const int version = attempt.origin.version;
+    const QString ref = attempt.origin.ref;
+    const auto openWake = ConfigManager::instance().getOpenWakeConfig();
+    const auto logResult = [&](const QString &decision, const QString &stage, const QString &reason) {
+        qInfo().noquote()
+            << QStringLiteral("[Review] result kind=open_wake ref=%1 version=%2 decision=%3"
+                              " stage=%4 reason=%5")
+                   .arg(ref)
+                   .arg(version)
+                   .arg(decision, stage,
+                        reason.trimmed().isEmpty() ? QStringLiteral("-") : reason);
+    };
+
+    // 默认下一次间隔：模型没给 next_wake 时用配置的 default_interval_seconds（并按配置
+    // min/max 归一）。模型显式给出的 after_minutes 只要在协议 5..1440 内就按原值执行，
+    // 不在协议范围时按 schema 违规处理（记忆层最终仍会夹在 5..1440）。
+    const int minMinutes = qBound(5, openWake.minIntervalSeconds / 60, 1440);
+    const int maxMinutes = qBound(minMinutes, openWake.maxIntervalSeconds / 60, 1440);
+    const int defaultMinutes = qBound(
+        5, qBound(minMinutes, openWake.defaultIntervalSeconds / 60, maxMinutes), 1440);
+    int nextMinutes = defaultMinutes;
+
+    QString rejectReason = error;
+    QString decision;
+    QString note;
+    if (rejectReason.isEmpty()) {
+        const int schemaVersion = proposal.contains(QStringLiteral("schema_version"))
+            ? proposal.value(QStringLiteral("schema_version")).toInt(-1)
+            : proposal.value(QStringLiteral("schedule_version")).toInt(-1);
+        if (proposal.isEmpty()) {
+            rejectReason = QStringLiteral("json_parse");
+        } else if (schemaVersion != 1) {
+            rejectReason = QStringLiteral("schema");
+        } else if (proposal.contains(QStringLiteral("contact"))
+                   || proposal.contains(QStringLiteral("activity"))) {
+            // 本片 open wake 只做 rest/reflect：出现任何外部动作字段即视为越界 schema。
+            rejectReason = QStringLiteral("schema");
+        } else {
+            decision = proposal.value(QStringLiteral("decision")).toString();
+            if (decision != QStringLiteral("rest") && decision != QStringLiteral("reflect")) {
+                rejectReason = QStringLiteral("schema");
+            } else if (proposal.contains(QStringLiteral("note"))
+                       && !proposal.value(QStringLiteral("note")).isNull()
+                       && !proposal.value(QStringLiteral("note")).isString()) {
+                rejectReason = QStringLiteral("schema");
+            } else {
+                note = proposal.value(QStringLiteral("note")).toString().trimmed();
+                if (note.size() > 240) rejectReason = QStringLiteral("schema");
+            }
+        }
+        if (rejectReason.isEmpty() && proposal.contains(QStringLiteral("next_wake"))) {
+            const auto nextWake = proposal.value(QStringLiteral("next_wake"));
+            if (!nextWake.isObject()) {
+                rejectReason = QStringLiteral("schema");
+            } else {
+                const auto nextWakeObj = nextWake.toObject();
+                const QString mode = nextWakeObj.value(QStringLiteral("mode"))
+                                         .toString(QStringLiteral("after"));
+                if (mode != QStringLiteral("after")) {
+                    // 本片只支持 after；on_event 不领取/不提交（按 schema 违规拒绝）。
+                    rejectReason = QStringLiteral("schema");
+                } else if (nextWakeObj.contains(QStringLiteral("after_minutes"))) {
+                    const auto minutesValue = nextWakeObj.value(QStringLiteral("after_minutes"));
+                    const int minutes = minutesValue.isDouble() ? minutesValue.toInt(-1) : -1;
+                    if (minutes < 5 || minutes > 1440)
+                        rejectReason = QStringLiteral("schema");
+                    else
+                        nextMinutes = minutes;
+                }
+            }
+        }
+    }
+
+    if (!rejectReason.isEmpty()) {
+        const QString stage = reviewErrorStage(rejectReason);
+        const bool counts = errorCountsAsFailure(rejectReason);
+        recordFailure(attempt, rejectReason, stage, counts);
+        logResult(decision.isEmpty() ? QStringLiteral("none") : decision, stage, rejectReason);
+        return;
+    }
+
+    const QJsonObject intent{{QStringLiteral("mode"), QStringLiteral("after")},
+                             {QStringLiteral("after_minutes"), nextMinutes}};
+    QString commitError;
+    if (store.finishOpenWake(id, version, decision, note, intent, nextMinutes, &commitError)) {
+        store.clearReviewFailure(QStringLiteral("open_wake"), ref);
+        const qint64 nextDue = QDateTime::currentSecsSinceEpoch() + qint64(nextMinutes) * 60;
+        qInfo().noquote()
+            << QStringLiteral("[OpenWake] committed decision=%1 next_due=%2 note_len=%3")
+                   .arg(decision, reviewIsoFromEpoch(nextDue))
+                   .arg(note.size());
+        logResult(decision, QStringLiteral("commit"), QString());
+        return;
+    }
+    const QString reason = commitError.isEmpty() ? QStringLiteral("invalid_or_stale_proposal")
+                                                 : commitError;
+    recordFailure(attempt, reason, QStringLiteral("commit"), errorCountsAsFailure(reason));
+    logResult(decision.isEmpty() ? QStringLiteral("none") : decision,
+              QStringLiteral("commit"), reason);
 }

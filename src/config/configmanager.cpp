@@ -942,6 +942,41 @@ void ConfigManager::ensureIdentityLoaded() const
         }
         m_proactive.maxReviewFailures =
             qBound(1, cognitionObj.value("max_review_failures").toInt(4), 10);
+
+        // R12-1a：OpenWake 调度配置。缺省 enabled=false / allow_contact=false（安全默认：
+        // 不开启就不创建任何内部唤醒）。各字段在这里夹紧；min/default/max 之间再做一次
+        // 一致性归一，避免非法配置把"默认间隔"落在 [min,max] 之外。
+        {
+            const QJsonObject openWakeObj = cognitionObj.value("open_wake").toObject();
+            OpenWakeConfig openWake;
+            openWake.enabled = openWakeObj.value("enabled").toBool(false);
+            openWake.allowContact = openWakeObj.value("allow_contact").toBool(false);
+            openWake.initialDelaySeconds =
+                qBound(60, openWakeObj.value("initial_delay_seconds").toInt(900), 86400);
+            int minInterval =
+                qBound(300, openWakeObj.value("min_interval_seconds").toInt(600), 86400);
+            int maxInterval =
+                qBound(300, openWakeObj.value("max_interval_seconds").toInt(86400), 86400);
+            if (maxInterval < minInterval) maxInterval = minInterval;
+            const int defaultInterval = qBound(
+                minInterval,
+                openWakeObj.value("default_interval_seconds").toInt(1800),
+                maxInterval);
+            openWake.minIntervalSeconds = minInterval;
+            openWake.maxIntervalSeconds = maxInterval;
+            openWake.defaultIntervalSeconds = defaultInterval;
+            openWake.maxNonOpenJobsWhenDue =
+                qBound(0, openWakeObj.value("max_non_open_jobs_when_due").toInt(3), 20);
+            openWake.maxModelStepsPerWake =
+                qBound(1, openWakeObj.value("max_model_steps_per_wake").toInt(3), 8);
+            openWake.maxPerDay = qBound(0, openWakeObj.value("max_per_day").toInt(12), 96);
+            openWake.sharedBudgetPercent =
+                qBound(1, openWakeObj.value("shared_budget_percent").toInt(30), 100);
+            m_openWake = openWake;
+        }
+        // R12-1a：快照提示词字节预算。本片只解析/保存，接线由下一 agent 完成。
+        m_snapshotBudgetBytes =
+            qBound(2048, cognitionObj.value("snapshot_budget_bytes").toInt(4096), 8192);
     }
     QJsonObject quietObj = proObj.value("quiet_hours").toObject();
     m_proactive.quietStart = quietObj.value("start").toString("23:00");
@@ -1012,6 +1047,18 @@ SemanticVerifierConfig ConfigManager::getSemanticVerifierConfig()
     return m_semanticVerifier;
 }
 
+OpenWakeConfig ConfigManager::getOpenWakeConfig() const
+{
+    ensureIdentityLoaded();
+    return m_openWake;
+}
+
+int ConfigManager::getSnapshotBudgetBytes() const
+{
+    ensureIdentityLoaded();
+    return m_snapshotBudgetBytes;
+}
+
 QQConfig ConfigManager::getQQConfig() const
 {
     QQConfig config;
@@ -1042,6 +1089,8 @@ void ConfigManager::reloadIdentity()
     m_followExternalMood = true;
     m_proactive = ProactiveConfig();
     m_semanticVerifier = SemanticVerifierConfig();
+    m_openWake = OpenWakeConfig();
+    m_snapshotBudgetBytes = 4096;
     ensureIdentityLoaded();
 }
 

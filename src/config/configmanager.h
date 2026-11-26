@@ -64,6 +64,23 @@ struct SemanticVerifierConfig {
     int maxRepairs = 1;                        // 每个 action 最多几次 constrained repair
 };
 
+// R12-1a 内部唤醒（OpenWake）配置。identity.json 的 cognition.open_wake 段。
+// 本片只做内部 rest/reflect：allowContact 会被解析保存，但运行时绝不产生 contact；
+// enabled=false 时不创建唤醒，daily_limit=0 时连 OpenWake 一起停掉（由协调器门控）。
+// 所有整数字段在 ConfigManager 里夹紧，运行期不再二次判断。
+struct OpenWakeConfig {
+    bool enabled = false;             // cognition.open_wake.enabled
+    bool allowContact = false;        // 本片仅解析，运行时不产生 contact
+    int initialDelaySeconds = 900;    // 首次调度延迟（60..86400）
+    int minIntervalSeconds = 600;     // 模型可提议的最小间隔（300..86400，内部秒）
+    int defaultIntervalSeconds = 1800;// 模型没给 next_wake 时的默认间隔（300..86400）
+    int maxIntervalSeconds = 86400;   // 模型可提议的最大间隔（300..86400）
+    int maxNonOpenJobsWhenDue = 3;    // 到期后先让出的普通回顾次数（0..20）
+    int maxModelStepsPerWake = 3;     // 单次唤醒模型步数上限（1..8；本片用于日志/常量）
+    int maxPerDay = 12;               // OpenWake 独立每日上限（0..96）
+    int sharedBudgetPercent = 30;     // 共享回顾每日预算占比（1..100）
+};
+
 
 class ConfigManager
 {
@@ -149,6 +166,11 @@ public:
     ProactiveConfig getProactiveConfig();
     // 语义核验配置（identity.json 的 cognition 段），已夹紧。
     SemanticVerifierConfig getSemanticVerifierConfig();
+    // R12-1a：OpenWake 调度配置（identity.json 的 cognition.open_wake 段），已夹紧。
+    OpenWakeConfig getOpenWakeConfig() const;
+    // R12-1a：认知快照提示词字节预算（cognition.snapshot_budget_bytes，默认 4096，夹 2048..8192）。
+    // 本片只解析/保存，快照 builder 的接线由下一 agent 完成。
+    int getSnapshotBudgetBytes() const;
     QQConfig getQQConfig() const;
     MemoryPolicyConfig getMemoryPolicyConfig() const;
     QQGroupMemoryConfig getQQGroupMemoryConfig() const;
@@ -198,6 +220,8 @@ private:
     mutable bool m_followExternalMood = true;
     mutable ProactiveConfig m_proactive;
     mutable SemanticVerifierConfig m_semanticVerifier;
+    mutable OpenWakeConfig m_openWake;
+    mutable int m_snapshotBudgetBytes = 4096;
     void ensureIdentityLoaded() const;
 
     QString m_logDirectory;
