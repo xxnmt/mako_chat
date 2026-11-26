@@ -2,7 +2,7 @@
 
 > 更新于 2026-11-23。
 > P5 评审收尾已清理死代码并校准近期上下文过滤，小样逐项结论及最终工作树冻结清单见 [P5 交接](RETRIEVAL_REFACTOR_STATUS.md)。200 题评测暂缓，现场另验。
-> **B 阶段工程路径已落地（B1–B4 开发项）**：v23–v30 迁移、关注生命周期与到期回顾、匹配精度（文档频率）、主动联系可达与执行反馈、主动消息回认、统一注意力事件与重启恢复、活动来源/产物持久化。**改进批次**另落地：重要性检索重排、能力清单、主动联系限额/间隔/保留期、日志会话头、普通回复投递账本与补发、到期修订流水、启动残留恢复、行动依据核验（basis）、执行期授权重验。**架构切片 A/B/C**：CognitiveSnapshot 语义统一、`cognitive_action`+`action_outbox` 统一行动提交与唯一外发、动机/claims 分离与单次语义 verifier/repair。**B5 blocker 修复（R10）**：message/reason ↔ claims 覆盖门禁、QQ 入队等待协议回执、`unknown` 不写主动历史、单一 stale 恢复阈值。**R11**：彻底移除 close/defer 收口抑制（配置+机制+上下文+快照）——晚安后想起事情或单纯想念都可以主动联系；提醒轮询日志降噪（未到期不再提交/不再刷 INFO）。全量 CTest **23/23**。**B5 待跑**：2–4h 受控冒烟 → 7 天自然使用（不做 48h shadow）。见 [B 阶段施工单 §10–12](B_STAGE_TASKS.md)、[B5 观测手册](B_STAGE_ACCEPTANCE.md)。
+> **B 阶段工程路径已落地（B1–B4 开发项）**：v23–v30 迁移、关注生命周期与到期回顾、匹配精度（文档频率）、主动联系可达与执行反馈、主动消息回认、统一注意力事件与重启恢复、活动来源/产物持久化。**改进批次**另落地：重要性检索重排、能力清单、主动联系限额/间隔/保留期、日志会话头、普通回复投递账本与补发、到期修订流水、启动残留恢复、行动依据核验（basis）、执行期授权重验。**架构切片 A/B/C**：CognitiveSnapshot 语义统一、`cognitive_action`+`action_outbox` 统一行动提交与唯一外发、动机/claims 分离与单次语义 verifier/repair。**B5 blocker 修复（R10）**：message/reason ↔ claims 覆盖门禁、QQ 入队等待协议回执、`unknown` 不写主动历史、单一 stale 恢复阈值。**R11**：移除 close/defer 收口抑制；提醒轮询日志降噪。**R12-0（已完成）**：WakeResult/结构化日志、回顾契约统一与时间上下文、Reflection 失败退避、backlog/retention 日志聚合、快照每域 queried/eligible/serialized/omitted 统计（无 schema、无发送变化）。全量 CTest **23/23**。**R12-1a 待确认后实施**。见 [R12 状态](R12_OPEN_WAKE.md)、[B 阶段施工单](B_STAGE_TASKS.md)、[B5 观测手册](B_STAGE_ACCEPTANCE.md)。
 > 本文只回答“现在在哪”。能力清单看 [开发路线图](ROADMAP.md)，实现细节看 [架构与当前实现](ARCHITECTURE.md)，历史看 [开发历史](HISTORY.md)。
 
 ## 一句话

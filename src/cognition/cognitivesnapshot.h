@@ -2,10 +2,12 @@
 #define COGNITIVESNAPSHOT_H
 
 #include <QDateTime>
+#include <QHash>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QList>
 #include <QString>
+#include <QStringList>
 
 #include "utterance.h"
 
@@ -63,6 +65,29 @@ struct DelegatedCommitment
     QString text; // 委托内容（提醒原文，已按读取策略过滤并截断）
 };
 
+// R12-0：每域统计口径（只做观测，不改预算/裁剪策略）：
+//   queried    = 记忆层查询命中的原始行数（读取策略过滤前）
+//   eligible   = 通过读取策略、进入快照的行数
+//   serialized = 最终进入提示词 JSON 的行数（可能被每域上限或字符预算裁掉）
+//   omitted    = eligible - serialized
+struct SnapshotDomainStats
+{
+    int queried = 0;
+    int eligible = 0;
+    int serialized = 0;
+    int omitted = 0;
+};
+
+// 一次构建 + 序列化的整体统计。bytesBefore/bytesAfter 是 QJsonDocument::Compact 的
+// UTF-8 字节数（裁剪前/后），notes 记录裁剪/群聊投影等口径说明。
+struct SnapshotBuildStats
+{
+    QHash<QString, SnapshotDomainStats> domains;
+    int bytesBefore = 0;
+    int bytesAfter = 0;
+    QStringList notes;
+};
+
 // 一次构建的只读认知快照。不新增数据库表，也不永久保存整份快照。
 struct CognitiveSnapshot
 {
@@ -104,8 +129,14 @@ public:
     // 快照 JSON 的字符预算：超量按域裁剪，先保留 observations / commitments / internal_wakes。
     static int promptCharBudget();
 
+    // R12-0：最近一次 build/toPromptJson 的每域统计（只读）。build 记录 queried/eligible，
+    // toPromptJson 记录 serialized/omitted 与裁剪前后字节数。build 会重置统计。
+    const SnapshotBuildStats &stats() const { return m_stats; }
+
 private:
     MemoryManager *m_memory = nullptr;
+    // build/toPromptJson 是 const 方法，但统计是可观测性副作用，用 mutable 保存。
+    mutable SnapshotBuildStats m_stats;
 };
 
 #endif // COGNITIVESNAPSHOT_H

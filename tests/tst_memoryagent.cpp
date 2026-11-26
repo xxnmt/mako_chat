@@ -328,6 +328,39 @@ qlonglong makeInteractionAt(MemoryManager &mm,
     return mm.createInteractionBatch(draft, {events.first().id});
 }
 
+// R12-0 日志降噪断言用：捕获 qInfo/qDebug 行（安装期间不转发到默认处理器）。
+// 只在单线程测试中使用，作用域退出时恢复之前的处理器。
+class MessageCapture
+{
+public:
+    struct Line {
+        QtMsgType type;
+        QString message;
+    };
+    MessageCapture()
+    {
+        s_active = this;
+        m_previous = qInstallMessageHandler(&MessageCapture::handle);
+    }
+    ~MessageCapture()
+    {
+        qInstallMessageHandler(m_previous);
+        s_active = nullptr;
+    }
+    QList<Line> lines() const { return m_lines; }
+
+private:
+    static void handle(QtMsgType type, const QMessageLogContext &, const QString &message)
+    {
+        if (!s_active) return;
+        s_active->m_lines.append({type, message});
+    }
+    static MessageCapture *s_active;
+    QtMessageHandler m_previous = nullptr;
+    QList<Line> m_lines;
+};
+MessageCapture *MessageCapture::s_active = nullptr;
+
 } // namespace
 
 class TestMemoryAgent : public QObject
@@ -1091,8 +1124,15 @@ private slots:
             // 回顾提示词末行带一行能力摘要（联系目标/安静时段/写作开关），不是整段 JSON。
             QVERIFY(bodies.first().contains(QStringLiteral("服务端核验的当前授权").toUtf8()));
             QVERIFY(bodies.first().contains(QStringLiteral("私下写作开关").toUtf8()));
-            // v27：回顾提示词写明"现在联系"必须给出可核验依据（contact.basis）。
-            QVERIFY(bodies.first().contains(QStringLiteral("contact.basis").toUtf8()));
+            // R12-0：新提示不再要求"必须有新主人证据/活动结果并写 contact.basis"，
+            // 改为共享契约（自己的意愿可以成为动机、外部事实走 claims 核验）+ 服务端时间上下文；
+            // legacy basis 的兼容读取仍由 memory 层测试覆盖。
+            QVERIFY(!bodies.first().contains(QStringLiteral("必须把依据写进 contact.basis").toUtf8()));
+            QVERIFY(!bodies.first().contains(QStringLiteral("有新的主人证据、或活动有了结果").toUtf8()));
+            QVERIFY(bodies.first().contains(QStringLiteral("不需要新的主人证据").toUtf8()));
+            QVERIFY(bodies.first().contains("claims"));
+            QVERIFY(bodies.first().contains("now_local"));
+            QVERIFY(bodies.first().contains("last_owner_interaction_at"));
             QVERIFY(bodies.at(1).contains("previous street sounds"));
             QVERIFY(db.nextThought(false).isEmpty());
             QVERIFY(cfg.writeConfigDocument("identity.json",
@@ -1788,6 +1828,110 @@ private slots:
         QVERIFY(!disabledText.isEmpty());
         const auto disabledManifest = QJsonDocument::fromJson(disabledText.toUtf8()).object();
         QVERIFY(!disabledManifest.contains(QStringLiteral("memory_recall")));
+    }
+
+    // R12-0：backlog 只在 pending 非空或最老 pending>0 时 INFO；仅 by_state.done 时 DEBUG。
+    void backlogLoggedOnlyWhenPending()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager db(dir.filePath("backlog-log.db"));
+        // 先造一条已完成事件：pending 为空、by_state.done 非空，属于正常终态。
+        const auto doneEvent = db.enqueueAttentionEvent(
+            QStringLiteral("message"), QStringLiteral("backlog-done"), {}, QString(), 50);
+        QVERIFY(doneEvent > 0);
+        QVERIFY(db.completeAttentionEvent(doneEvent, QStringLiteral("done"),
+                                          QStringLiteral("test")));
+        QVERIFY(db.attentionBacklog().value(QStringLiteral("pending")).toObject().isEmpty());
+        QVERIFY(!db.attentionBacklog().value(QStringLiteral("by_state")).toObject().isEmpty());
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        LLMService model(QStringLiteral("test"), nullptr,
+                         QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.serverPort())));
+        model.setMemoryManager(&db);
+        CognitiveCoordinator coordinator(db, model, nullptr);
+        {
+            MessageCapture capture;
+            coordinator.reviewIfDue();
+            int backlogLines = 0;
+            int backlogInfo = 0;
+            for (const auto &line : capture.lines()) {
+                if (!line.message.contains(QStringLiteral("[Attention] backlog="))) continue;
+                ++backlogLines;
+                if (line.type == QtInfoMsg) ++backlogInfo;
+            }
+            QVERIFY(backlogInfo == 0);
+            // qDebug 若被编译掉（QT_NO_DEBUG_OUTPUT），只校验"不是 INFO"。
+            if (backlogLines > 0) QCOMPARE(backlogLines, 1);
+        }
+        // 有 pending 事件时，backlog 行必须升为 INFO。
+        QVERIFY(db.enqueueAttentionEvent(QStringLiteral("message"),
+                                         QStringLiteral("backlog-pending"), {}, QString(), 50) > 0);
+        {
+            MessageCapture capture;
+            coordinator.reviewIfDue();
+            int backlogLines = 0;
+            int backlogInfo = 0;
+            for (const auto &line : capture.lines()) {
+                if (!line.message.contains(QStringLiteral("[Attention] backlog="))) continue;
+                ++backlogLines;
+                if (line.type == QtInfoMsg) ++backlogInfo;
+            }
+            QCOMPARE(backlogLines, 1);
+            QVERIFY(backlogInfo >= 1);
+        }
+    }
+
+    // R12-0：reflect 新的回顾请求体使用共享契约与时间上下文，不再强制 legacy contact.basis。
+    void reviewPromptSharedContract()
+    {
+        SemanticReviewConfigGuard guard;
+        QVERIFY(guard.enable());
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager db(dir.filePath("review-contract.db"));
+        RequestMeta meta;
+        meta.channel = Channel::kPet;
+        meta.sessionId = Channel::kDefaultSession;
+        meta.subject = QStringLiteral("user");
+        meta.eventId = meta.runId = QStringLiteral("review-contract-source");
+        meta.receivedAtUtc = QDateTime::currentDateTimeUtc();
+        const auto turn = db.recordInput(QStringLiteral("今天整理了一下书架"), meta, true);
+        QVERIFY(turn > 0);
+        QVERIFY(db.recordQuiet(turn, QStringLiteral("close")));
+        const auto context = db.claimPrivateReflection(12, 60);
+        QCOMPARE(context.value(QStringLiteral("id")).toInteger(), turn);
+        QCOMPARE(context.value(QStringLiteral("kind")).toString(), QStringLiteral("reflection"));
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QByteArray> bodies;
+        serveCompletions(server, bodies, [](int) -> QString {
+            return QStringLiteral(R"({"choice":"rest"})");
+        });
+        LLMService model(QStringLiteral("test"), nullptr,
+                         QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.serverPort())));
+        model.setMemoryManager(&db);
+        QSignalSpy finished(&model, &LLMService::privateReviewFinished);
+        const int version = context.value(QStringLiteral("version")).toInt();
+        model.requestPrivateReview(turn, version, context);
+        QTRY_COMPARE_WITH_TIMEOUT(bodies.size(), 1, 8000);
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 8000);
+        const QByteArray body = bodies.first();
+        // 共享规则：自己的意愿可成为动机、外部事实必须走 claims、询问不施压。
+        QVERIFY(body.contains(QStringLiteral("不需要新的主人证据").toUtf8()));
+        QVERIFY(body.contains(QStringLiteral("claims").toUtf8()));
+        QVERIFY(body.contains(QStringLiteral("不要施压").toUtf8()));
+        // 服务端时间上下文。
+        for (const auto &field : {QStringLiteral("now_local"), QStringLiteral("now_utc"),
+                                  QStringLiteral("source_reported_at"),
+                                  QStringLiteral("last_owner_interaction_at"),
+                                  QStringLiteral("last_confirmed_outbound_at"),
+                                  QStringLiteral("quiet_hours")})
+            QVERIFY2(body.contains(field.toUtf8()), qPrintable(field));
+        // 旧硬约束已删除，但 legacy basis 的兼容说明仍在。
+        QVERIFY(!body.contains(QStringLiteral("必须把依据写进 contact.basis").toUtf8()));
+        QVERIFY(!body.contains(QStringLiteral("有新的主人证据、或活动有了结果").toUtf8()));
+        QVERIFY(body.contains(QStringLiteral("旧契约 contact.basis 仍被接受").toUtf8()));
     }
 
     void initTestCase()

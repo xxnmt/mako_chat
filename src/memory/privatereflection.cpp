@@ -240,9 +240,19 @@ NewContractCheck checkNewContractContact(const MemoryManager *memory, const QStr
 
 } // namespace
 
-QJsonObject MemoryManager::claimPrivateReflection(int dailyLimit, int cooldownSeconds)
+QJsonObject MemoryManager::claimPrivateReflection(int dailyLimit, int cooldownSeconds,
+                                                  QString *reason, QDateTime *nextEligibleAt)
 {
-    if (dailyLimit <= 0 || !m_db.transaction()) return {};
+    if (reason) reason->clear();
+    if (nextEligibleAt) *nextEligibleAt = QDateTime{};
+    if (dailyLimit <= 0) {
+        if (reason) *reason = QStringLiteral("daily_limit");
+        return {};
+    }
+    if (!m_db.transaction()) {
+        if (reason) *reason = QStringLiteral("db_error");
+        return {};
+    }
     auto rollback = qScopeGuard([this]{ m_db.rollback(); });
     QSqlQuery q(m_db);
     q.prepare("SELECT h.id,h.channel,h.session_id,s.input,s.reported,coalesce(r.version,0),h.raw_reply,h.turn_state" + sourceRows +
@@ -250,7 +260,10 @@ QJsonObject MemoryManager::claimPrivateReflection(int dailyLimit, int cooldownSe
               " AND coalesce(h.thought,'')='' AND julianday(s.reported) BETWEEN julianday('now','-1 day') AND julianday('now') "
               "AND (r.turn_id IS NULL OR (r.state IN ('pending','deferred') AND r.eligible_at<=unixepoch())) "
               "ORDER BY h.id DESC LIMIT 24");
-    if (!q.exec()) return {};
+    if (!q.exec()) {
+        if (reason) *reason = QStringLiteral("db_error");
+        return {};
+    }
     const MemoryReadPolicy policy;
     while (q.next()) {
         const auto input = q.value(3).toString();
@@ -266,7 +279,13 @@ QJsonObject MemoryManager::claimPrivateReflection(int dailyLimit, int cooldownSe
         if (!policy.allows(q.value(1).toString(),q.value(2).toString(),ownReply)) ownReply.clear();
         const auto handoff=q.value(7).toString();
         q.finish();
-        if (!chargePrivateReview(id,dailyLimit,cooldownSeconds)) return {};
+        QString chargeReason;
+        QDateTime next;
+        if (!chargePrivateReview(id,dailyLimit,cooldownSeconds,&chargeReason,&next)) {
+            if (reason) *reason = chargeReason.isEmpty() ? QStringLiteral("db_error") : chargeReason;
+            if (nextEligibleAt) *nextEligibleAt = next;
+            return {};
+        }
         q.prepare("INSERT INTO private_reflection(turn_id,version,state,eligible_at,updated_at,claimed_by,root_turn) "
                   "VALUES(?,?,'pending',unixepoch()+1800,unixepoch(),'source',?) ON CONFLICT(turn_id) DO UPDATE SET "
                   "version=excluded.version,state='pending',eligible_at=excluded.eligible_at,"
@@ -275,7 +294,19 @@ QJsonObject MemoryManager::claimPrivateReflection(int dailyLimit, int cooldownSe
         q.addBindValue(id);
         q.addBindValue(version);
         q.addBindValue(id);
-        if (!q.exec() || q.numRowsAffected()!=1 || !m_db.commit()) return {};
+        if (!q.exec()) {
+            if (reason) *reason = QStringLiteral("db_error");
+            return {};
+        }
+        if (q.numRowsAffected()!=1) {
+            // 领取行在事务内被并发修改，CAS 不再匹配。
+            if (reason) *reason = QStringLiteral("cas_conflict");
+            return {};
+        }
+        if (!m_db.commit()) {
+            if (reason) *reason = QStringLiteral("db_error");
+            return {};
+        }
         rollback.dismiss();
         QJsonArray actions;
         q.prepare("SELECT due,state,message FROM reminder WHERE turn=? ORDER BY due LIMIT 32");
@@ -290,6 +321,8 @@ QJsonObject MemoryManager::claimPrivateReflection(int dailyLimit, int cooldownSe
                 {"source_channel",channel},{"source_session",session},{"source_reminders",actions},
                 {"reported_at",reported},{"excerpt_truncated",input.size()>1000},{"turn_outcome",handoff},{"own_reply_excerpt",ownReply.left(1200)}};
     }
+    // 没有可领取的新来源（查询为空、窗口外、策略过滤或都已在处理中）。
+    if (reason) *reason = QStringLiteral("no_candidate");
     return {};
 }
 
@@ -571,15 +604,26 @@ bool MemoryManager::resolveConcern(qlonglong headTurn,qlonglong byTurn,const QSt
     return true;
 }
 
-QJsonObject MemoryManager::claimDueConcern(int dailyLimit,int cooldownSeconds)
+QJsonObject MemoryManager::claimDueConcern(int dailyLimit,int cooldownSeconds,
+                                            QString *reason,QDateTime *nextEligibleAt)
 {
-    if (dailyLimit<=0 || !m_db.transaction()) return {};
+    if (reason) reason->clear();
+    if (nextEligibleAt) *nextEligibleAt = QDateTime{};
+    if (dailyLimit<=0) {
+        if (reason) *reason = QStringLiteral("daily_limit");
+        return {};
+    }
+    if (!m_db.transaction()) {
+        if (reason) *reason = QStringLiteral("db_error");
+        return {};
+    }
     auto rollback=qScopeGuard([this]{m_db.rollback();});
     // 保留期只约束"按时间到期"的回顾；新证据命中走 matchedConcerns，不受这里影响。
     const int retentionDays=qBound(1,
         ConfigManager::instance().getProactiveConfig().concernRetentionDays,365);
     QSqlQuery q(m_db);
-    // 到期但已超出保留期的关注不再领取；单独记一条日志，便于解释"到期却没被唤醒"。
+    // 到期但已超出保留期的关注不再领取；R12-0：一次 claim 聚合一条 INFO，逐 turn 明细降为
+    // DEBUG，并用进程内 QSet 对相同 turn 去重（只影响日志，不删除/修改任何关注或事实）。
     {
         QSqlQuery expired(m_db);
         expired.prepare(QStringLiteral(
@@ -589,9 +633,29 @@ QJsonObject MemoryManager::claimDueConcern(int dailyLimit,int cooldownSeconds)
             " AND r.next_check_at>0 AND r.next_check_at<=unixepoch()"
             " AND julianday(s.reported)<julianday('now','-" + QString::number(retentionDays) + " day')"
             " ORDER BY r.next_check_at,r.turn_id LIMIT 24");
-        if (expired.exec())
-            while (expired.next())
-                qInfo()<<"[Concern] expired_by_retention turn="<<expired.value(0).toLongLong();
+        if (!expired.exec()) {
+            if (reason) *reason = QStringLiteral("db_error");
+            return {};
+        }
+        QList<qlonglong> expiredTurns;
+        while (expired.next()) expiredTurns.append(expired.value(0).toLongLong());
+        if (!expiredTurns.isEmpty()) {
+            int freshCount = 0;
+            qlonglong firstTurn = 0;
+            for (const qlonglong turn : expiredTurns) {
+                const bool firstInfo = !m_expiredRetentionLogged.contains(turn);
+                if (firstInfo) {
+                    m_expiredRetentionLogged.insert(turn);
+                    ++freshCount;
+                    if (firstTurn == 0) firstTurn = turn;
+                }
+                qDebug()<<"[Concern] expired_by_retention turn="<<turn<<"first_info="<<firstInfo;
+            }
+            // 同一次 claim 最多一条 INFO；已打过 INFO 的 turn 不再重复。
+            if (freshCount > 0)
+                qInfo()<<"[Concern] expired_by_retention count="<<freshCount
+                       <<"first_turn="<<firstTurn;
+        }
     }
     // 只领"按时间到期"的开放关注；被回顾链修订过的旧行不再作为 head。
     q.prepare("SELECT r.turn_id,r.version,r.note,h.channel,h.session_id,s.input" + sourceRows +
@@ -600,7 +664,10 @@ QJsonObject MemoryManager::claimDueConcern(int dailyLimit,int cooldownSeconds)
               " AND r.next_check_at>0 AND r.next_check_at<=unixepoch()"
               " AND julianday(s.reported)>=julianday('now','-" + QString::number(retentionDays) + " day')"
               " ORDER BY r.next_check_at,r.turn_id LIMIT 24");
-    if (!q.exec()) return {};
+    if (!q.exec()) {
+        if (reason) *reason = QStringLiteral("db_error");
+        return {};
+    }
     struct Due {
         qlonglong turn; int version;
         QString note,channel,session,input;
@@ -619,7 +686,13 @@ QJsonObject MemoryManager::claimDueConcern(int dailyLimit,int cooldownSeconds)
         if (!policy.allows(item.channel,item.session,item.input)
             || !policy.allows(item.channel,item.session,item.note)) continue;
         // 到期回顾与新来源回顾共用同一份每日预算与冷却；预算用尽时本轮不再领取。
-        if (!chargePrivateReview(item.turn,dailyLimit,cooldownSeconds)) return {};
+        QString chargeReason;
+        QDateTime next;
+        if (!chargePrivateReview(item.turn,dailyLimit,cooldownSeconds,&chargeReason,&next)) {
+            if (reason) *reason = chargeReason.isEmpty() ? QStringLiteral("db_error") : chargeReason;
+            if (nextEligibleAt) *nextEligibleAt = next;
+            return {};
+        }
         const int nextVersion=item.version+1;
         q.prepare("UPDATE private_reflection SET state='pending',claimed_by='due',version=?,"
                   "eligible_at=unixepoch()+1800 WHERE turn_id=? AND version=? AND state='consider'");
@@ -627,11 +700,24 @@ QJsonObject MemoryManager::claimDueConcern(int dailyLimit,int cooldownSeconds)
         q.addBindValue(item.turn);
         q.addBindValue(item.version);
         // 必须精确命中一行：并发/迟到的领取不能把已变化的关注再取走。
-        if (!q.exec() || q.numRowsAffected()!=1 || !m_db.commit()) return {};
+        if (!q.exec()) {
+            if (reason) *reason = QStringLiteral("db_error");
+            return {};
+        }
+        if (q.numRowsAffected()!=1) {
+            if (reason) *reason = QStringLiteral("cas_conflict");
+            return {};
+        }
+        if (!m_db.commit()) {
+            if (reason) *reason = QStringLiteral("db_error");
+            return {};
+        }
         rollback.dismiss();
         qInfo()<<"[Concern] due claimed turn="<<item.turn<<"version="<<nextVersion;
         return concernReviewContext(item.turn,nextVersion);
     }
+    // 没有可领取的到期关注（可能全部超出保留期、被策略过滤或没有到期项）。
+    if (reason) *reason = QStringLiteral("no_candidate");
     return {};
 }
 
@@ -789,6 +875,8 @@ QJsonObject MemoryManager::concernReviewContext(qint64 turn,int version) const
     QJsonObject result{{"id",turn},{"version",version},{"kind","concern"},
                        {"concern",concernRecord},{"since",since},{"contacts",contacts},
                        {"basis",basis},
+                       // 来源发言的 reported_at：R12-0 回顾时间上下文用它区分"当前"与历史。
+                       {"reported_at",reported},
                        // 服务端内部定位键：切片 C 的策略/验证器需要来源渠道会话做可见性判定，
                        // LLMService 会把它们从模型上下文里剥掉。
                        {"source_channel",channel},{"source_session",session}};
@@ -1594,11 +1682,15 @@ QJsonArray MemoryManager::retryableReflectionContacts(int limit) const
     return result;
 }
 
-bool MemoryManager::deferPrivateReflection(qlonglong turn, int version)
+bool MemoryManager::deferPrivateReflection(qlonglong turn, int version, int backoffSeconds)
 {
+    // R12-0：只有真正的失败才传非零退避；主动让出注意力（用户插话/关停）仍为 0，
+    // 保持"eligible_at=now 立即可重领"的原有语义。
+    const int backoff = qBound(0, backoffSeconds, 7 * 24 * 3600);
     QSqlQuery q(m_db);
-    q.prepare("UPDATE private_reflection SET state='deferred',eligible_at=unixepoch(),updated_at=unixepoch() "
-              "WHERE turn_id=? AND version=? AND state='pending'");
+    q.prepare("UPDATE private_reflection SET state='deferred',eligible_at=unixepoch()+?,"
+              "updated_at=unixepoch() WHERE turn_id=? AND version=? AND state='pending'");
+    q.addBindValue(backoff);
     q.addBindValue(turn);
     q.addBindValue(version);
     return q.exec() && q.numRowsAffected()==1;

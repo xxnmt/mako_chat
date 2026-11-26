@@ -926,6 +926,22 @@ void ConfigManager::ensureIdentityLoaded() const
             qBound(0, verifierObj.value("max_verifier_calls").toInt(1), 4);
         m_semanticVerifier.maxRepairs =
             qBound(0, verifierObj.value("max_repairs").toInt(1), 2);
+        // R12-0 回顾失败退避：数组元素 30..86400 秒、最多 5 个；max_review_failures 1..10。
+        // 非法/缺失时沿用默认 [120,300,900] 与 4（三次退避后第 4 次 suspended），不改 schema、不做配置迁移。
+        m_proactive.reviewBackoffSeconds = {120, 300, 900};
+        if (const auto backoff = cognitionObj.value("review_backoff_seconds");
+            backoff.isArray()) {
+            QList<int> parsed;
+            for (const auto &value : backoff.toArray()) {
+                const int seconds = value.toInt(0);
+                if (seconds <= 0) continue;
+                parsed.append(qBound(30, seconds, 86400));
+                if (parsed.size() >= 5) break;
+            }
+            if (!parsed.isEmpty()) m_proactive.reviewBackoffSeconds = parsed;
+        }
+        m_proactive.maxReviewFailures =
+            qBound(1, cognitionObj.value("max_review_failures").toInt(4), 10);
     }
     QJsonObject quietObj = proObj.value("quiet_hours").toObject();
     m_proactive.quietStart = quietObj.value("start").toString("23:00");

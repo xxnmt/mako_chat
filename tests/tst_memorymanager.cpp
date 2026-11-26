@@ -97,6 +97,38 @@ private:
     QSqlDatabase m_db;
 };
 
+// R12-0 日志断言用：捕获 qInfo/qDebug 行（安装期间不转发到默认处理器）。
+class MessageCapture
+{
+public:
+    struct Line {
+        QtMsgType type;
+        QString message;
+    };
+    MessageCapture()
+    {
+        s_active = this;
+        m_previous = qInstallMessageHandler(&MessageCapture::handle);
+    }
+    ~MessageCapture()
+    {
+        qInstallMessageHandler(m_previous);
+        s_active = nullptr;
+    }
+    QList<Line> lines() const { return m_lines; }
+
+private:
+    static void handle(QtMsgType type, const QMessageLogContext &, const QString &message)
+    {
+        if (!s_active) return;
+        s_active->m_lines.append({type, message});
+    }
+    static MessageCapture *s_active;
+    QtMessageHandler m_previous = nullptr;
+    QList<Line> m_lines;
+};
+MessageCapture *MessageCapture::s_active = nullptr;
+
 // 构造与 Phase 0 改造前一致的 v1 库，并写入存量数据
 static bool createLegacyV1Db(const QString &path)
 {
@@ -222,6 +254,37 @@ static bool rewindReviewCooldown(const QString &dbPath, const QString &tag)
     RawDb clock(dbPath, tag);
     if (!clock.open()) return false;
     return clock.exec(QStringLiteral("UPDATE thought_review_log SET started_at=started_at-120"));
+}
+
+// R12-0 退避测试：造一条可被领取的新来源回顾（recordInput + close 收口）。
+static qlonglong seedReflectionSource(MemoryManager &db, const QString &tag)
+{
+    RequestMeta meta;
+    meta.eventId = meta.runId = QStringLiteral("backoff-source-%1").arg(tag);
+    meta.receivedAtUtc = QDateTime::currentDateTimeUtc();
+    const auto turn = db.recordInput(QStringLiteral("今天把窗台擦干净了"), meta, true);
+    if (turn <= 0 || !db.recordQuiet(turn, QStringLiteral("close"))) return 0;
+    return turn;
+}
+
+// private_reflection.eligible_at 相对当前时间的秒数（用于断言退避/暂停窗口）。
+static qlonglong deferredSeconds(const QString &dbPath, qlonglong turn, const QString &tag)
+{
+    RawDb raw(dbPath, tag);
+    if (!raw.open()) return -1;
+    return raw.scalar(QStringLiteral("SELECT eligible_at-unixepoch() FROM private_reflection "
+                                     "WHERE turn_id=%1").arg(turn)).toLongLong();
+}
+
+// 模拟"退避时间已过"：把 eligible_at 拨回过去并回拨回顾冷却，使下一轮 wake 能重新领取。
+static bool rewindReflectionAttempt(const QString &dbPath, qlonglong turn, const QString &tag)
+{
+    RawDb raw(dbPath, tag);
+    if (!raw.open()) return false;
+    if (!raw.exec(QStringLiteral("UPDATE private_reflection SET eligible_at=unixepoch()-1 "
+                                 "WHERE turn_id=%1").arg(turn)))
+        return false;
+    return raw.exec(QStringLiteral("UPDATE thought_review_log SET started_at=started_at-120"));
 }
 
 static RequestMeta concernTurnMeta(const QString &event)
@@ -899,6 +962,221 @@ private slots:
         QCOMPARE(selfReport["version"].toInteger(), qint64(1));
         QCOMPARE(selfReport["speaker_role"].toString(), QString("user"));
         QVERIFY(selfReport["evidence_ref"].toString().startsWith("source/"));
+    }
+
+    // R12-0：wake 返回类型化原因，区分无候选/预算/在途与真正启动。
+    void wakeReportsTypedReasons()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager db(dir.filePath("wake-reasons.db"));
+        PrivateReview review(db);
+
+        // 空库：没有到期活动/关注/新来源。
+        auto result = review.wake(5, 60);
+        QVERIFY(!result.started);
+        QCOMPARE(result.kind, QStringLiteral("none"));
+        QCOMPARE(result.reason, QStringLiteral("no_candidate"));
+
+        // 造一条到期活动；dailyLimit=0 时应报 daily_limit 而不是 no_candidate。
+        QVERIFY(db.saveQATurn(QStringLiteral("write"),
+                              QStringLiteral(R"({"personal_interest":"雨声"})"), {}));
+        result = review.wake(0, 60);
+        QVERIFY(!result.started);
+        QCOMPARE(result.kind, QStringLiteral("activity"));
+        QCOMPARE(result.reason, QStringLiteral("daily_limit"));
+
+        // 正常领取：started + kind=activity + thought/<id> 引用 + 版本。
+        result = review.wake(5, 60);
+        QVERIFY(result.started);
+        QCOMPARE(result.kind, QStringLiteral("activity"));
+        QCOMPARE(result.reason, QStringLiteral("started"));
+        QVERIFY(result.sourceRef.startsWith(QStringLiteral("thought/")));
+        QVERIFY(result.version > 0);
+
+        // 已有在途回顾：重复 wake 不重复领取。
+        result = review.wake(5, 60);
+        QVERIFY(!result.started);
+        QCOMPARE(result.kind, QStringLiteral("activity"));
+        QCOMPARE(result.reason, QStringLiteral("busy"));
+        QVERIFY(result.sourceRef.startsWith(QStringLiteral("thought/")));
+    }
+
+    // R12-0：仅 Reflection 强制失败退避；120/300/900 → 连续失败达到上限 suspended(86400)。
+    void reflectionFailureBackoff()
+    {
+        ProactiveIdentityGuard guard;
+        const auto writeBackoffConfig = [&guard](int maxFailures) {
+            const QJsonObject cognition{
+                {QStringLiteral("review_backoff_seconds"), QJsonArray{120, 300, 900}},
+                {QStringLiteral("max_review_failures"), maxFailures}};
+            return guard.writeIdentity(QJsonDocument(
+                QJsonObject{{QStringLiteral("cognition"), cognition}})
+                .toJson(QJsonDocument::Compact));
+        };
+        // 连续失败：前 N-1 次按退避序列，第 N 次 suspended(86400)，之后暂停期内不得重领。
+        const auto runScenario = [](int maxFailures, const QList<int> &backoffExpectations) {
+            QTemporaryDir dir;
+            if (!dir.isValid()) return false;
+            const auto path = dir.filePath(QStringLiteral("backoff-%1.db").arg(maxFailures));
+            MemoryManager db(path);
+            const auto turn = seedReflectionSource(db, QStringLiteral("scenario-%1").arg(maxFailures));
+            if (turn <= 0) return false;
+            PrivateReview review(db);
+            QSignalSpy requested(&review, &PrivateReview::requested);
+            bool sawSuspended = false;
+            for (int attempt = 0; attempt <= backoffExpectations.size(); ++attempt) {
+                const auto wake = review.wake(12, 60);
+                if (!wake.started || wake.kind != QStringLiteral("reflection")) return false;
+                const auto id = requested.last()[0].toLongLong();
+                const int version = requested.last()[1].toInt();
+                const bool lastAttempt = attempt == backoffExpectations.size();
+                if (lastAttempt) {
+                    MessageCapture capture;
+                    review.receive(id, version, {}, QStringLiteral("network_error"));
+                    for (const auto &line : capture.lines())
+                        if (line.message.contains(QStringLiteral("[Review] suspended")))
+                            sawSuspended = true;
+                } else {
+                    review.receive(id, version, {}, QStringLiteral("network_error"));
+                }
+                const auto wait = deferredSeconds(
+                    path, turn,
+                    QStringLiteral("deferred-%1-%2").arg(maxFailures).arg(attempt));
+                if (lastAttempt) {
+                    // 超过上限：suspended 24h。
+                    if (wait < 86390 || wait > 86410) return false;
+                    if (!sawSuspended) return false;
+                    // 暂停期内再次 wake 不能重新领取。
+                    const auto blocked = review.wake(12, 60);
+                    if (blocked.started || blocked.reason != QStringLiteral("no_candidate"))
+                        return false;
+                } else {
+                    const int expected = backoffExpectations.at(attempt);
+                    if (wait < expected - 5 || wait > expected + 5) return false;
+                    // 模拟退避时间已过，进入下一次失败尝试。
+                    if (!rewindReflectionAttempt(
+                            path, turn,
+                            QStringLiteral("rewind-%1-%2").arg(maxFailures).arg(attempt)))
+                        return false;
+                }
+            }
+            return true;
+        };
+
+        // max=3：120 → 300 → 第 3 次 suspended(86400)。
+        QVERIFY(writeBackoffConfig(3));
+        QVERIFY(runScenario(3, {120, 300}));
+        // max=4：120 → 300 → 900 → 第 4 次 suspended(86400)（覆盖 900 这一档）。
+        QVERIFY(writeBackoffConfig(4));
+        QVERIFY(runScenario(4, {120, 300, 900}));
+
+        // yieldAttention（用户插话/关停）走原有立即 defer，不累计失败：
+        // 让出后第一次真实失败仍使用第一档 120 秒。
+        QVERIFY(writeBackoffConfig(3));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath(QStringLiteral("backoff-yield.db"));
+        MemoryManager db(path);
+        const auto turn = seedReflectionSource(db, QStringLiteral("yield"));
+        QVERIFY(turn > 0);
+        PrivateReview review(db);
+        QSignalSpy requested(&review, &PrivateReview::requested);
+        auto wake = review.wake(12, 60);
+        QVERIFY(wake.started);
+        review.yieldAttention(QStringLiteral("incoming_message"));
+        const auto immediate = deferredSeconds(path, turn, QStringLiteral("deferred-yield"));
+        QVERIFY2(immediate >= -2 && immediate <= 2, qPrintable(QString::number(immediate)));
+        QVERIFY(rewindReviewCooldown(path, QStringLiteral("yield-clock")));
+        wake = review.wake(12, 60);
+        QVERIFY(wake.started);
+        review.receive(requested.last()[0].toLongLong(), requested.last()[1].toInt(), {},
+                       QStringLiteral("network_error"));
+        const auto wait = deferredSeconds(path, turn, QStringLiteral("deferred-yield-fail"));
+        QVERIFY2(wait >= 115 && wait <= 125, qPrintable(QString::number(wait)));
+    }
+
+    // R12-0：超期关注日志聚合为一次 claim 最多一条 INFO，逐 turn 明细为 DEBUG；
+    // 进程内 QSet 去重相同 turn；关注数据不被修改。
+    void expiredRetentionAggregated()
+    {
+        // 固定保留期，避免依赖测试目录里可能残留的 identity.json。
+        ProactiveIdentityGuard guard;
+        QVERIFY(guard.writeIdentity(
+            QByteArray(R"({"proactive":{"concern_retention_days":14}})")));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath("expired-retention.db");
+        MemoryManager db(path);
+        QList<qlonglong> turns;
+        for (int index = 0; index < 3; ++index) {
+            const auto turn = seedOpenConcern(
+                db, concernTurnMeta(QStringLiteral("expired-%1").arg(index)),
+                QStringLiteral("周末想去看一场电影"),
+                QStringLiteral("电影好不好看"),
+                QJsonObject{{QStringLiteral("topic"), QStringLiteral("电影")},
+                            {QStringLiteral("watch"), QStringLiteral("评价如何")},
+                            {QStringLiteral("next_check_after_minutes"), 60}});
+            QVERIFY(turn > 0);
+            turns.append(turn);
+            QVERIFY(rewindReviewCooldown(path, QStringLiteral("expired-seed-clock-%1").arg(index)));
+        }
+        // 把来源时间拨到保留期（默认 14 天）之外，并让关注到期。
+        {
+            RawDb raw(path, "expired-retention-backdate");
+            QVERIFY(raw.open());
+            for (const auto turn : turns) {
+                QVERIFY(raw.exec(QStringLiteral(
+                    "UPDATE cognitive_source SET reported=datetime('now','-30 day') "
+                    "WHERE event=(SELECT cognitive_event FROM chat_history WHERE id=%1)").arg(turn)));
+                QVERIFY(raw.exec(QStringLiteral(
+                    "UPDATE chat_history SET timestamp=datetime('now','-30 day') WHERE id=%1").arg(turn)));
+                QVERIFY(raw.exec(QStringLiteral(
+                    "UPDATE private_reflection SET next_check_at=unixepoch()-1 WHERE turn_id=%1").arg(turn)));
+            }
+        }
+        QVERIFY(rewindReviewCooldown(path, QStringLiteral("expired-retention-clock")));
+        int infoCount = 0;
+        int detailCount = 0;
+        {
+            MessageCapture capture;
+            const auto claimed = db.claimDueConcern(12, 60);
+            QVERIFY(claimed.isEmpty());
+            for (const auto &line : capture.lines()) {
+                if (!line.message.contains(QStringLiteral("expired_by_retention"))) continue;
+                if (line.type == QtInfoMsg) ++infoCount;
+                else if (line.type == QtDebugMsg) ++detailCount;
+            }
+        }
+        QCOMPARE(infoCount, 1);
+        // 逐 turn 明细应当是 DEBUG；若构建关闭了 qDebug 输出，则不强制条数。
+        QVERIFY(detailCount == 0 || detailCount >= 3);
+        // 同一个 turn 重复 claim：INFO 去重后不再出现（明细 DEBUG 仍可有）。
+        QVERIFY(rewindReviewCooldown(path, QStringLiteral("expired-retention-clock-2")));
+        {
+            MessageCapture capture;
+            QVERIFY(db.claimDueConcern(12, 60).isEmpty());
+            int repeatedInfo = 0;
+            for (const auto &line : capture.lines())
+                if (line.type == QtInfoMsg
+                    && line.message.contains(QStringLiteral("expired_by_retention")))
+                    ++repeatedInfo;
+            QCOMPARE(repeatedInfo, 0);
+        }
+        // 关注数据未被修改：仍然是 consider、next_check_at 仍为到期值（>0）。
+        {
+            RawDb raw(path, "expired-retention-verify");
+            QVERIFY(raw.open());
+            for (const auto turn : turns) {
+                QCOMPARE(raw.scalar(QStringLiteral(
+                             "SELECT state FROM private_reflection WHERE turn_id=%1").arg(turn))
+                             .toString(),
+                         QStringLiteral("consider"));
+                QVERIFY(raw.scalar(QStringLiteral(
+                            "SELECT next_check_at FROM private_reflection WHERE turn_id=%1").arg(turn))
+                            .toLongLong() > 0);
+            }
+        }
     }
 
     void writingResumesFromCommittedDraftAfterInterruption()

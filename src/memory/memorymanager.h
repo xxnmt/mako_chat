@@ -101,26 +101,37 @@ public:
 
     // ===== 认知快照只读查询（服务端事实分层；不新增表、不改迁移）=====
     // 全部按既有 MemoryReadPolicy / sensitive / 盲区过滤，时间统一 UTC ISO。
+    // R12-0：queried/eligible 是可选输出计数（行数），只做可观测性，不改变返回内容/顺序：
+    //   queried = 数据库原始命中行数（策略过滤前）；eligible = 通过读取策略后实际返回的行数。
     // 主人陈述：chat_history 中当前 subject 的 user_input 行。
     QJsonArray recentOwnerObservations(const QString &subject,const QString &channel,
-                                       const QString &session,int limit=8) const;
+                                       const QString &session,int limit=8,
+                                       int *queried=nullptr,int *eligible=nullptr) const;
     // 她自己的表达：assistant reply 与 proactive 行（只证明“说过”）。
     QJsonArray recentSelfExpressions(const QString &subject,const QString &channel,
-                                     const QString &session,int limit=8) const;
+                                     const QString &session,int limit=8,
+                                     int *queried=nullptr,int *eligible=nullptr) const;
     // 她自己的理解：matter_revision 最新 understanding + reflection note。
-    QJsonArray recentInferences(const QString &subject,int limit=8) const;
+    QJsonArray recentInferences(const QString &subject,int limit=8,
+                                int *queried=nullptr,int *eligible=nullptr) const;
     // 自发动机：open concern + active thought（ref/kind/summary/version）。
-    QJsonArray currentMotivations(int limit=8) const;
+    QJsonArray currentMotivations(int limit=8,int *queried=nullptr,int *eligible=nullptr) const;
     // 真实委托：目标 channel/session 匹配的 pending reminder。
     QJsonArray activeCommitments(const QString &channel,const QString &session,
-                                 int limit=8) const;
+                                 int limit=8,int *queried=nullptr,int *eligible=nullptr) const;
     // 私人活动状态/产物：thought 行（ref/status/version/artifact_ref/progress）。
-    QJsonArray currentActivities(int limit=8) const;
+    QJsonArray currentActivities(int limit=8,int *queried=nullptr,int *eligible=nullptr) const;
     // 内部唤醒：attention_state.last_wake_at + 未了结关注的 next_check_at + 已排期的活动回顾。
     // 这些都不是主人约定，不能作为“现在联系”的依据。
-    QJsonArray internalWakes(int limit=8) const;
+    QJsonArray internalWakes(int limit=8,int *queried=nullptr,int *eligible=nullptr) const;
     // canonical subject：主人归一为 'user'，第三方取 actor（没有 actor 时沿用 subject）。
     QString snapshotSubjectId(const RequestMeta &meta) const;
+    // R12-0：回顾提示词的服务端时间上下文（只读，不新造状态）。
+    // 返回 last_owner_interaction_at（最近一条 subject=user 的 reply 发言时间）与
+    // last_confirmed_outbound_at（最近一条已落库的 assistant/proactive 成功表达时间：
+    // turn_state='handed_off'，沿用现有落库语义）。没有记录时返回空串，由调用方写 unknown。
+    QJsonObject reviewInteractionTimes(const QString &channel,const QString &session,
+                                       const QString &subject=QStringLiteral("user")) const;
 
     // 可重建的检索块。原文仍留在原表；这些表只保存检索视图与向量。
     bool rebuildSearchIndex(QString *error = nullptr);
@@ -139,7 +150,8 @@ public:
     bool embedSearchChunks(MemoryEmbeddingProvider *provider, int limit = 2000,
                            QString *error = nullptr, const MemoryReadPolicy *policy = nullptr);
 
-    QJsonObject claimPrivateReflection(int dailyLimit, int cooldownSeconds);
+    QJsonObject claimPrivateReflection(int dailyLimit, int cooldownSeconds,
+                                       QString *reason = nullptr, QDateTime *nextEligibleAt = nullptr);
     bool finishPrivateReflection(qlonglong turn, int version, const QString &choice, const QString &note,
                                  const QJsonObject &contact = {}, const QJsonArray &consulted = {},
                                  const QJsonObject &prior = {}, const QString &priorAction = {},
@@ -159,7 +171,10 @@ public:
     bool applyReminders(qint64 turn,const RequestMeta &viewer,const QJsonObject &plan);
     QJsonObject claimDueReminder(const QString &channel,const QString &session);
     void reminderOutcome(qint64 id,const QString &state);
-    bool deferPrivateReflection(qlonglong turn, int version);
+    // R12-0 失败退避：backoffSeconds>0 时写 eligible_at=unixepoch()+backoffSeconds；
+    // 默认 0 保持原有"立即可重领"语义。仅 Reflection 使用非零退避（内存计数为临时方案，
+    // 跨重启可靠计数留给 R12-1a v31 的持久化字段）。
+    bool deferPrivateReflection(qlonglong turn, int version, int backoffSeconds = 0);
     QJsonObject recentPrivateReflection(const RequestMeta &viewer, const QJsonArray &rankedTurns = {}, bool requireRanked = false) const;
     // 关注解析器：与当前输入相关的开放关注。前台注入与后台回顾共用同一份选择逻辑，
     // 不再要求"旧关注的来源轮次恰好被检索命中"。
@@ -169,7 +184,10 @@ public:
                                const QString &beforeReported = QString()) const;
     QJsonObject concernByHead(qint64 headTurn) const;
     // 到期回顾：不需要新用户消息，也不要求检索命中。领取时占用与回顾相同的预算/冷却。
-    QJsonObject claimDueConcern(int dailyLimit, int cooldownSeconds);
+    // reason/nextEligibleAt 是 R12-0 诊断输出：no_candidate/daily_limit/cooldown/db_error/
+    // storage_error/cas_conflict；nextEligibleAt 仅在已知下次可领取时刻时填写。
+    QJsonObject claimDueConcern(int dailyLimit, int cooldownSeconds,
+                                QString *reason = nullptr, QDateTime *nextEligibleAt = nullptr);
     QJsonObject concernReviewContext(qint64 turn, int version) const;
     bool finishConcernReview(qlonglong turn, int version, const QJsonObject &proposal);
     // 只有 contact.timing=="now" 需要可核验的行动依据；返回空串=通过，否则返回拒绝原因
@@ -185,7 +203,8 @@ public:
     // 认识更新队列的可观测性：用于区分"模型判断错"与"新资料还没处理到"。
     QJsonObject observationQueueStatus() const;
     QJsonObject nextThought(bool dueOnly) const;
-    bool claimThoughtReview(qlonglong id, int version, int dailyLimit, int cooldownSeconds);
+    bool claimThoughtReview(qlonglong id, int version, int dailyLimit, int cooldownSeconds,
+                            QString *reason = nullptr, QDateTime *nextEligibleAt = nullptr);
     bool deferThoughtReview(qlonglong id, int version, const QString &reason);
     bool finishThoughtReview(qlonglong id, int version, const QJsonObject &proposal);
     // Activity actions are conditional on a stable row id and the expected
@@ -438,7 +457,9 @@ private:
     // ActionPolicy 是主动联系策略的确定性校验器：它只读本类的连接做 ref 存在性/
     // authority/时序校验，不写库。friend 避免把整张库的查询接口暴露到公共 API。
     friend class ActionPolicy;
-    bool chargePrivateReview(qlonglong turn, int dailyLimit, int cooldownSeconds);
+    // R12-0 诊断：reason 输出 daily_limit/cooldown/db_error；nextEligibleAt 仅在可计算时填写。
+    bool chargePrivateReview(qlonglong turn, int dailyLimit, int cooldownSeconds,
+                             QString *reason = nullptr, QDateTime *nextEligibleAt = nullptr);
     void initDatabase(const QString &dbFilePath, const QString &connectionName = QString());
     bool upsertMemoryChunk(const MemoryChunkWrite &chunk);
     bool indexRawEvent(qlonglong id);
@@ -449,6 +470,9 @@ private:
     QSqlDatabase m_db;
     QString m_databasePath;
     QSet<QString> m_masterUserIds;
+    // R12-0：进程内已打过 INFO 的"超出保留期关注"轮次，避免每次 claim 重复刷屏。
+    // 只做日志去重，不影响任何关注/事实数据。
+    QSet<qlonglong> m_expiredRetentionLogged;
 };
 
 #endif // MEMORYMANAGER_H

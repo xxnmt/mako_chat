@@ -47,6 +47,12 @@ struct ProactiveConfig {
     int contactDailyLimit = 3;               // 每日"现在联系"投递上限；0=不限制
     int concernDefaultCheckMinutes = 720;    // 关注默认多久后再考虑；0=只在新证据时
     int concernRetentionDays = 14;           // 超过多少天的关注不再按时间到期回顾（仍可被新证据命中）
+    // R12-0 回顾失败退避（仅 Reflection 强制退避）：identity.json 的
+    // cognition.review_backoff_seconds / cognition.max_review_failures。
+    // 内存里的连续失败计数是临时方案；跨重启的可靠计数留给 R12-1a v31 持久化字段。
+    QList<int> reviewBackoffSeconds{120,300,900};
+    // 默认 4：前三次失败按 120/300/900 退避，第 4 次连续失败才 suspended。
+    int maxReviewFailures = 4;
 };
 
 // 语义核验（报告切片 C）。identity.json：

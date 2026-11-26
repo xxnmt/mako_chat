@@ -152,6 +152,16 @@ CognitiveSnapshotBuilder::CognitiveSnapshotBuilder(MemoryManager *memory)
 CognitiveSnapshot CognitiveSnapshotBuilder::build(const RequestMeta &meta, const QString &runId,
                                                   const QString &triggerRef, const QString &purpose) const
 {
+    // R12-0：每次 build 重置统计；queried 来自记忆层查询的原始行数，
+    // eligible 用实际进入快照的行数（= 读取策略 + 群聊投影过滤之后）。
+    m_stats = SnapshotBuildStats{};
+    const auto recordDomain = [this](const QString &domain, int queried, int eligible) {
+        SnapshotDomainStats stat;
+        stat.queried = queried;
+        stat.eligible = eligible;
+        m_stats.domains.insert(domain, stat);
+    };
+    const auto domainName = [](const char *name) { return QString::fromLatin1(name); };
     CognitiveSnapshot snapshot;
     snapshot.runId = runId;
     snapshot.triggerRef = triggerRef;
@@ -172,8 +182,10 @@ CognitiveSnapshot CognitiveSnapshotBuilder::build(const RequestMeta &meta, const
     // 都属于主人私聊域，群聊快照不携带（前台也不会向群聊注入快照）。
     const bool groupAudience = meta.channel == Channel::kQQGroup;
 
+    int observationsQueried = 0;
     for (const auto &value :
-         m_memory->recentOwnerObservations(storedSubject, meta.channel, meta.sessionId, kDomainLimit)) {
+         m_memory->recentOwnerObservations(storedSubject, meta.channel, meta.sessionId, kDomainLimit,
+                                           &observationsQueried, nullptr)) {
         const auto row = value.toObject();
         CognitiveFactRef fact;
         fact.ref = row.value(QStringLiteral("ref")).toString();
@@ -192,9 +204,13 @@ CognitiveSnapshot CognitiveSnapshotBuilder::build(const RequestMeta &meta, const
         fact.sensitive = row.value(QStringLiteral("sensitive")).toBool();
         snapshot.observations.append(fact);
     }
+    recordDomain(domainName("observations"), observationsQueried,
+                 int(snapshot.observations.size()));
 
+    int selfExpressionsQueried = 0;
     for (const auto &value :
-         m_memory->recentSelfExpressions(storedSubject, meta.channel, meta.sessionId, kDomainLimit)) {
+         m_memory->recentSelfExpressions(storedSubject, meta.channel, meta.sessionId, kDomainLimit,
+                                         &selfExpressionsQueried, nullptr)) {
         const auto row = value.toObject();
         CognitiveFactRef fact;
         fact.ref = row.value(QStringLiteral("ref")).toString();
@@ -209,8 +225,12 @@ CognitiveSnapshot CognitiveSnapshotBuilder::build(const RequestMeta &meta, const
             ? QStringLiteral("public") : QStringLiteral("private");
         snapshot.selfExpressions.append(fact);
     }
+    recordDomain(domainName("self_expressions"), selfExpressionsQueried,
+                 int(snapshot.selfExpressions.size()));
 
-    for (const auto &value : m_memory->recentInferences(storedSubject, kDomainLimit)) {
+    int inferencesQueried = 0;
+    for (const auto &value : m_memory->recentInferences(storedSubject, kDomainLimit,
+                                                        &inferencesQueried, nullptr)) {
         const auto row = value.toObject();
         CognitiveFactRef fact;
         fact.ref = row.value(QStringLiteral("ref")).toString();
@@ -228,9 +248,13 @@ CognitiveSnapshot CognitiveSnapshotBuilder::build(const RequestMeta &meta, const
         }
         snapshot.inferences.append(fact);
     }
+    recordDomain(domainName("inferences"), inferencesQueried,
+                 int(snapshot.inferences.size()));
 
     if (!groupAudience) {
-        for (const auto &value : m_memory->currentMotivations(kDomainLimit)) {
+        int motivationsQueried = 0;
+        for (const auto &value : m_memory->currentMotivations(kDomainLimit,
+                                                              &motivationsQueried, nullptr)) {
             const auto row = value.toObject();
             SelfMotivation motivation;
             motivation.ref = row.value(QStringLiteral("ref")).toString();
@@ -239,9 +263,17 @@ CognitiveSnapshot CognitiveSnapshotBuilder::build(const RequestMeta &meta, const
             motivation.version = row.value(QStringLiteral("version")).toInt();
             snapshot.motivations.append(motivation);
         }
+        recordDomain(domainName("motivations"), motivationsQueried,
+                     int(snapshot.motivations.size()));
+    } else {
+        // 群聊投影不读取自发动机/私人活动/内部唤醒：记 0 并在 notes 里说明口径。
+        recordDomain(domainName("motivations"), 0, 0);
+        m_stats.notes.append(QStringLiteral("group_projection:motivations_not_queried"));
     }
 
-    for (const auto &value : m_memory->activeCommitments(meta.channel, meta.sessionId, kDomainLimit)) {
+    int commitmentsQueried = 0;
+    for (const auto &value : m_memory->activeCommitments(meta.channel, meta.sessionId, kDomainLimit,
+                                                         &commitmentsQueried, nullptr)) {
         const auto row = value.toObject();
         DelegatedCommitment commitment;
         commitment.ref = row.value(QStringLiteral("ref")).toString();
@@ -256,11 +288,26 @@ CognitiveSnapshot CognitiveSnapshotBuilder::build(const RequestMeta &meta, const
             commitment.text = row.value(QStringLiteral("message")).toString();
         snapshot.commitments.append(commitment);
     }
+    recordDomain(domainName("commitments"), commitmentsQueried,
+                 int(snapshot.commitments.size()));
 
     // 私人活动与内部唤醒只属于主人私聊域；群聊快照不读取，避免把私聊来源带进群投影。
     if (!groupAudience) {
-        snapshot.activities = limitArray(m_memory->currentActivities(kDomainLimit), kDomainLimit);
-        snapshot.internalWakes = limitArray(m_memory->internalWakes(kDomainLimit), kDomainLimit);
+        int activitiesQueried = 0;
+        snapshot.activities = limitArray(
+            m_memory->currentActivities(kDomainLimit, &activitiesQueried, nullptr), kDomainLimit);
+        recordDomain(domainName("activities"), activitiesQueried,
+                     int(snapshot.activities.size()));
+        int wakesQueried = 0;
+        snapshot.internalWakes = limitArray(
+            m_memory->internalWakes(kDomainLimit, &wakesQueried, nullptr), kDomainLimit);
+        recordDomain(domainName("internal_wakes"), wakesQueried,
+                     int(snapshot.internalWakes.size()));
+    } else {
+        recordDomain(domainName("activities"), 0, 0);
+        recordDomain(domainName("internal_wakes"), 0, 0);
+        m_stats.notes.append(QStringLiteral("group_projection:activities_not_queried"));
+        m_stats.notes.append(QStringLiteral("group_projection:internal_wakes_not_queried"));
     }
 
     QJsonObject policyView{
@@ -287,6 +334,18 @@ CognitiveSnapshot CognitiveSnapshotBuilder::build(const RequestMeta &meta, const
 
 QJsonObject CognitiveSnapshotBuilder::toPromptJson(const CognitiveSnapshot &snapshot) const
 {
+    // R12-0：保留 build 已记录的 queried/eligible；本函数重新记录 serialized/omitted 与字节数。
+    m_stats.bytesBefore = 0;
+    m_stats.bytesAfter = 0;
+    for (auto it = m_stats.domains.begin(); it != m_stats.domains.end(); ++it) {
+        (*it).serialized = 0;
+        (*it).omitted = 0;
+    }
+    for (int i = int(m_stats.notes.size()) - 1; i >= 0; --i) {
+        if (m_stats.notes.at(i).startsWith(QStringLiteral("budget:")))
+            m_stats.notes.removeAt(i);
+    }
+    QStringList trimNotes;
     QJsonObject root;
     // 只读声明：告诉模型每类资料能证明什么、不能证明什么。
     root.insert(QStringLiteral("note"), QStringLiteral(
@@ -341,6 +400,7 @@ QJsonObject CognitiveSnapshotBuilder::toPromptJson(const CognitiveSnapshot &snap
     const auto serializedSize = [&root]() {
         return QJsonDocument(root).toJson(QJsonDocument::Compact).size();
     };
+    m_stats.bytesBefore = serializedSize();
     const auto shrinkArray = [&root](const QString &key) {
         QJsonArray values = root.value(key).toArray();
         if (values.isEmpty()) return false;
@@ -354,6 +414,7 @@ QJsonObject CognitiveSnapshotBuilder::toPromptJson(const CognitiveSnapshot &snap
             const auto value = root.value(key);
             if (value.isObject() && !value.toObject().isEmpty()) {
                 root.insert(key, QJsonObject{});
+                trimNotes.append(QStringLiteral("budget:trimmed:policy_view"));
                 changed = true;
                 break;
             }
@@ -364,11 +425,29 @@ QJsonObject CognitiveSnapshotBuilder::toPromptJson(const CognitiveSnapshot &snap
                                    QStringLiteral("internal_wakes"), QStringLiteral("commitments"),
                                    QStringLiteral("observations")}) {
             if (shrinkArray(key)) {
+                const QString note = QStringLiteral("budget:trimmed:") + key;
+                if (!trimNotes.contains(note)) trimNotes.append(note);
                 changed = true;
                 break;
             }
         }
         if (!changed) break;
+    }
+    m_stats.bytesAfter = serializedSize();
+    if (!trimNotes.isEmpty())
+        m_stats.notes.append(QStringLiteral("budget:exceeded_trims=%1").arg(trimNotes.size()));
+    for (const auto &note : trimNotes)
+        m_stats.notes.append(note);
+    // 每域 serialized/omitted：serialized 是最终提示词 JSON 里的行数，
+    // omitted = eligible - serialized（包含策略过滤之外、被每域上限/字符预算裁掉的部分）。
+    for (const auto &domain : {QStringLiteral("observations"), QStringLiteral("self_expressions"),
+                               QStringLiteral("inferences"), QStringLiteral("motivations"),
+                               QStringLiteral("commitments"), QStringLiteral("activities"),
+                               QStringLiteral("internal_wakes")}) {
+        auto it = m_stats.domains.find(domain);
+        if (it == m_stats.domains.end()) continue;
+        (*it).serialized = int(root.value(domain).toArray().size());
+        (*it).omitted = qMax(0, (*it).eligible - (*it).serialized);
     }
     return root;
 }

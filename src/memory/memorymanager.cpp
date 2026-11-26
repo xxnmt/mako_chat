@@ -19,6 +19,8 @@
 #include <QJsonObject>
 #include <QRegularExpression>
 #include <QDebug>
+#include <QDate>
+#include <QTime>
 #include "qqmessageparser.h"
 #include "memorytextutils.h"
 #include "memoryembedding.h"
@@ -319,8 +321,19 @@ QJsonObject MemoryManager::activityById(qlonglong id) const
             {"result",QJsonDocument::fromJson(q.value(3).toByteArray()).object()}};
 }
 
-bool MemoryManager::chargePrivateReview(qlonglong turn, int dailyLimit, int cooldownSeconds)
+bool MemoryManager::chargePrivateReview(qlonglong turn, int dailyLimit, int cooldownSeconds,
+                                        QString *reason, QDateTime *nextEligibleAt)
 {
+    if (reason) reason->clear();
+    if (nextEligibleAt) *nextEligibleAt = QDateTime{};
+    const auto nextLocalDay = []() {
+        return QDateTime(QDate::currentDate().addDays(1), QTime(0, 0)).toUTC();
+    };
+    if (dailyLimit <= 0) {
+        if (reason) *reason = QStringLiteral("daily_limit");
+        if (nextEligibleAt) *nextEligibleAt = nextLocalDay();
+        return false;
+    }
     QSqlQuery q(m_db);
     q.prepare(R"(
         INSERT INTO thought_review_log(turn_id,started_at)
@@ -331,12 +344,52 @@ bool MemoryManager::chargePrivateReview(qlonglong turn, int dailyLimit, int cool
     q.addBindValue(turn);
     q.addBindValue(dailyLimit);
     q.addBindValue(qMax(60,cooldownSeconds));
-    return q.exec() && q.numRowsAffected()==1;
+    if (!q.exec()) {
+        if (reason) *reason = QStringLiteral("db_error");
+        return false;
+    }
+    if (q.numRowsAffected() == 1) return true;
+    // 未插入：再查一次当日已用次数与上次开始时间，把"预算用尽"和"冷却未到"分开。
+    // 只读诊断，不影响预算/冷却语义。
+    QSqlQuery diag(m_db);
+    diag.prepare(QStringLiteral(
+        "SELECT (SELECT count(*) FROM thought_review_log "
+        "WHERE date(started_at,'unixepoch','localtime')=date('now','localtime')),"
+        "coalesce((SELECT max(started_at) FROM thought_review_log),0),unixepoch()"));
+    if (!diag.exec() || !diag.next()) {
+        if (reason) *reason = QStringLiteral("db_error");
+        return false;
+    }
+    const int used = diag.value(0).toInt();
+    const qlonglong last = diag.value(1).toLongLong();
+    const qlonglong now = diag.value(2).toLongLong();
+    const int cooldown = qMax(60, cooldownSeconds);
+    if (used >= dailyLimit) {
+        if (reason) *reason = QStringLiteral("daily_limit");
+        if (nextEligibleAt) *nextEligibleAt = nextLocalDay();
+    } else if (last > 0 && last + cooldown > now) {
+        if (reason) *reason = QStringLiteral("cooldown");
+        if (nextEligibleAt)
+            *nextEligibleAt = QDateTime::fromSecsSinceEpoch(last + cooldown).toUTC();
+    } else {
+        if (reason) *reason = QStringLiteral("db_error");
+    }
+    return false;
 }
 
-bool MemoryManager::claimThoughtReview(qlonglong id, int version, int dailyLimit, int cooldownSeconds)
+bool MemoryManager::claimThoughtReview(qlonglong id, int version, int dailyLimit, int cooldownSeconds,
+                                       QString *reason, QDateTime *nextEligibleAt)
 {
-    if (dailyLimit <= 0 || !m_db.transaction()) return false;
+    if (reason) reason->clear();
+    if (nextEligibleAt) *nextEligibleAt = QDateTime{};
+    if (dailyLimit <= 0) {
+        if (reason) *reason = QStringLiteral("daily_limit");
+        return false;
+    }
+    if (!m_db.transaction()) {
+        if (reason) *reason = QStringLiteral("db_error");
+        return false;
+    }
     QSqlQuery q(m_db);
     q.prepare("UPDATE chat_history SET review_after=unixepoch()+1800,thought_version=thought_version+1 "
               "WHERE id=? AND thought IS NOT NULL AND thought_version=? AND sensitive=0 AND subject='user' "
@@ -344,10 +397,31 @@ bool MemoryManager::claimThoughtReview(qlonglong id, int version, int dailyLimit
               "AND coalesce(review_after,0)<=unixepoch()");
     q.addBindValue(id);
     q.addBindValue(version);
-    if (q.exec() && q.numRowsAffected()==1 && chargePrivateReview(id,dailyLimit,cooldownSeconds)
-        && m_db.commit()) return true;
-    m_db.rollback();
-    return false;
+    if (!q.exec()) {
+        if (reason) *reason = QStringLiteral("db_error");
+        m_db.rollback();
+        return false;
+    }
+    if (q.numRowsAffected() != 1) {
+        // 版本/状态/到期条件不再满足（迟到回调或并发领取）。
+        if (reason) *reason = QStringLiteral("cas_conflict");
+        m_db.rollback();
+        return false;
+    }
+    QString chargeReason;
+    QDateTime next;
+    if (!chargePrivateReview(id, dailyLimit, cooldownSeconds, &chargeReason, &next)) {
+        if (reason) *reason = chargeReason.isEmpty() ? QStringLiteral("db_error") : chargeReason;
+        if (nextEligibleAt) *nextEligibleAt = next;
+        m_db.rollback();
+        return false;
+    }
+    if (!m_db.commit()) {
+        if (reason) *reason = QStringLiteral("db_error");
+        m_db.rollback();
+        return false;
+    }
+    return true;
 }
 
 bool MemoryManager::deferThoughtReview(qlonglong id, int version, const QString &reason)
@@ -5365,8 +5439,11 @@ QString snapshotExpressionText(const QString &rawReply)
 } // namespace
 
 QJsonArray MemoryManager::recentOwnerObservations(const QString &subject,const QString &channel,
-                                                  const QString &session,int limit) const
+                                                  const QString &session,int limit,
+                                                  int *queried,int *eligible) const
 {
+    if (queried) *queried = 0;
+    if (eligible) *eligible = 0;
     QJsonArray rows;
     if (!m_db.isOpen() || subject.isEmpty() || limit<=0) return rows;
     const MemoryReadPolicy policy;
@@ -5394,6 +5471,7 @@ QJsonArray MemoryManager::recentOwnerObservations(const QString &subject,const Q
     q.addBindValue(limit);
     if (!q.exec()) return rows;
     while (q.next()) {
+        if (queried) ++*queried;
         const auto text=q.value(2).toString();
         const auto rowChannel=q.value(4).toString();
         const auto rowSession=q.value(5).toString();
@@ -5405,13 +5483,17 @@ QJsonArray MemoryManager::recentOwnerObservations(const QString &subject,const Q
                                 {QStringLiteral("occurred_at"),snapshotIsoText(q.value(1).toString())},
                                 {QStringLiteral("text"),text.left(512)},
                                 {QStringLiteral("sensitive"),false}});
+        if (eligible) ++*eligible;
     }
     return rows;
 }
 
 QJsonArray MemoryManager::recentSelfExpressions(const QString &subject,const QString &channel,
-                                                const QString &session,int limit) const
+                                                const QString &session,int limit,
+                                                int *queried,int *eligible) const
 {
+    if (queried) *queried = 0;
+    if (eligible) *eligible = 0;
     QJsonArray rows;
     if (!m_db.isOpen() || subject.isEmpty() || limit<=0) return rows;
     const MemoryReadPolicy policy;
@@ -5438,6 +5520,7 @@ QJsonArray MemoryManager::recentSelfExpressions(const QString &subject,const QSt
     q.addBindValue(limit);
     if (!q.exec()) return rows;
     while (q.next()) {
+        if (queried) ++*queried;
         const auto rowChannel=q.value(4).toString();
         const auto rowSession=q.value(5).toString();
         const auto text=snapshotExpressionText(q.value(2).toString());
@@ -5449,12 +5532,16 @@ QJsonArray MemoryManager::recentSelfExpressions(const QString &subject,const QSt
                                 {QStringLiteral("occurred_at"),snapshotIsoText(q.value(3).toString())},
                                 {QStringLiteral("text"),text.left(512)},
                                 {QStringLiteral("sensitive"),false}});
+        if (eligible) ++*eligible;
     }
     return rows;
 }
 
-QJsonArray MemoryManager::recentInferences(const QString &subject,int limit) const
+QJsonArray MemoryManager::recentInferences(const QString &subject,int limit,
+                                           int *queried,int *eligible) const
 {
+    if (queried) *queried = 0;
+    if (eligible) *eligible = 0;
     QJsonArray rows;
     if (!m_db.isOpen() || subject.isEmpty() || limit<=0) return rows;
     const MemoryReadPolicy policy;
@@ -5469,6 +5556,7 @@ QJsonArray MemoryManager::recentInferences(const QString &subject,int limit) con
     notes.addBindValue(subject);
     notes.addBindValue(limit);
     if (notes.exec()) while (notes.next()) {
+        if (queried) ++*queried;
         const auto channel=notes.value(3).toString();
         const auto session=notes.value(4).toString();
         const auto text=notes.value(1).toString();
@@ -5480,6 +5568,7 @@ QJsonArray MemoryManager::recentInferences(const QString &subject,int limit) con
                                 {QStringLiteral("occurred_at"),snapshotIsoText(notes.value(2).toString())},
                                 {QStringLiteral("text"),text.left(240)},
                                 {QStringLiteral("sensitive"),false}});
+        if (eligible) ++*eligible;
     }
     // 2) 每个事项只取最新一版 understanding（她是如何理解这件事的）。
     if (rows.size()>=limit) return rows;
@@ -5491,6 +5580,7 @@ QJsonArray MemoryManager::recentInferences(const QString &subject,int limit) con
     if (!revisions.exec()) return rows;
     QSet<QString> seen;
     while (revisions.next() && rows.size()<limit) {
+        if (queried) ++*queried;
         const auto matter=revisions.value(0).toString();
         if (seen.contains(matter)) continue;
         seen.insert(matter);
@@ -5506,12 +5596,15 @@ QJsonArray MemoryManager::recentInferences(const QString &subject,int limit) con
                                 {QStringLiteral("occurred_at"),snapshotIsoText(revisions.value(3).toString())},
                                 {QStringLiteral("text"),text.left(240)},
                                 {QStringLiteral("sensitive"),false}});
+        if (eligible) ++*eligible;
     }
     return rows;
 }
 
-QJsonArray MemoryManager::currentMotivations(int limit) const
+QJsonArray MemoryManager::currentMotivations(int limit,int *queried,int *eligible) const
 {
+    if (queried) *queried = 0;
+    if (eligible) *eligible = 0;
     QJsonArray rows;
     if (!m_db.isOpen() || limit<=0) return rows;
     const MemoryReadPolicy policy;
@@ -5526,6 +5619,7 @@ QJsonArray MemoryManager::currentMotivations(int limit) const
                      "AND coalesce(r.note,'')<>'' ORDER BY r.updated_at DESC,r.turn_id DESC LIMIT ?");
     concerns.addBindValue(limit);
     if (concerns.exec()) while (concerns.next() && rows.size()<limit) {
+        if (queried) ++*queried;
         const auto channel=concerns.value(5).toString();
         const auto session=concerns.value(6).toString();
         const auto note=concerns.value(3).toString();
@@ -5535,6 +5629,7 @@ QJsonArray MemoryManager::currentMotivations(int limit) const
                                 {QStringLiteral("kind"),QStringLiteral("concern")},
                                 {QStringLiteral("summary"),(topic.isEmpty()?note:topic).left(160)},
                                 {QStringLiteral("version"),concerns.value(1).toInt()}});
+        if (eligible) ++*eligible;
     }
     if (rows.size()>=limit) return rows;
     // active thought：她自己想继续的兴趣/写作，属于自发动机。
@@ -5545,6 +5640,7 @@ QJsonArray MemoryManager::currentMotivations(int limit) const
                      "ORDER BY h.id DESC LIMIT ?");
     thoughts.addBindValue(limit);
     if (thoughts.exec()) while (thoughts.next() && rows.size()<limit) {
+        if (queried) ++*queried;
         const auto channel=thoughts.value(3).toString();
         const auto session=thoughts.value(4).toString();
         const auto text=thoughts.value(1).toString();
@@ -5553,13 +5649,16 @@ QJsonArray MemoryManager::currentMotivations(int limit) const
                                 {QStringLiteral("kind"),QStringLiteral("interest")},
                                 {QStringLiteral("summary"),text.left(160)},
                                 {QStringLiteral("version"),thoughts.value(2).toInt()}});
+        if (eligible) ++*eligible;
     }
     return rows;
 }
 
 QJsonArray MemoryManager::activeCommitments(const QString &channel,const QString &session,
-                                            int limit) const
+                                            int limit,int *queried,int *eligible) const
 {
+    if (queried) *queried = 0;
+    if (eligible) *eligible = 0;
     QJsonArray rows;
     if (!m_db.isOpen() || channel.isEmpty() || session.isEmpty() || limit<=0) return rows;
     const MemoryReadPolicy policy;
@@ -5574,6 +5673,7 @@ QJsonArray MemoryManager::activeCommitments(const QString &channel,const QString
     q.addBindValue(limit);
     if (!q.exec()) return rows;
     while (q.next()) {
+        if (queried) ++*queried;
         const auto message=q.value(4).toString();
         if (!policy.allows(channel,session,message)) continue;
         rows.append(QJsonObject{{QStringLiteral("ref"),QStringLiteral("reminder/%1").arg(q.value(0).toLongLong())},
@@ -5582,12 +5682,15 @@ QJsonArray MemoryManager::activeCommitments(const QString &channel,const QString
                                 {QStringLiteral("due_at"),snapshotIsoFromEpoch(q.value(2).toLongLong())},
                                 {QStringLiteral("expires_at"),snapshotIsoFromEpoch(q.value(3).toLongLong())},
                                 {QStringLiteral("message"),message.left(80)}});
+        if (eligible) ++*eligible;
     }
     return rows;
 }
 
-QJsonArray MemoryManager::currentActivities(int limit) const
+QJsonArray MemoryManager::currentActivities(int limit,int *queried,int *eligible) const
 {
+    if (queried) *queried = 0;
+    if (eligible) *eligible = 0;
     QJsonArray rows;
     if (!m_db.isOpen() || limit<=0) return rows;
     const MemoryReadPolicy policy;
@@ -5604,6 +5707,7 @@ QJsonArray MemoryManager::currentActivities(int limit) const
     q.addBindValue(limit);
     if (!q.exec()) return rows;
     while (q.next()) {
+        if (queried) ++*queried;
         const auto channel=q.value(7).toString();
         const auto session=q.value(8).toString();
         QJsonObject row{{QStringLiteral("ref"),QStringLiteral("thought/%1").arg(q.value(0).toLongLong())},
@@ -5620,23 +5724,29 @@ QJsonArray MemoryManager::currentActivities(int limit) const
             row.insert(pair.first,text.left(120));
         }
         rows.append(row);
+        if (eligible) ++*eligible;
     }
     return rows;
 }
 
-QJsonArray MemoryManager::internalWakes(int limit) const
+QJsonArray MemoryManager::internalWakes(int limit,int *queried,int *eligible) const
 {
+    if (queried) *queried = 0;
+    if (eligible) *eligible = 0;
     QJsonArray rows;
     if (!m_db.isOpen() || limit<=0) return rows;
     // 1) 最近一次空闲唤醒（idle）。
     {
         QSqlQuery wake(m_db);
         if (wake.exec("SELECT value FROM attention_state WHERE key='last_wake_at'") && wake.next()) {
+            if (queried) ++*queried;
             const auto value=wake.value(0).toString();
-            if (!value.trimmed().isEmpty())
+            if (!value.trimmed().isEmpty()) {
                 rows.append(QJsonObject{{QStringLiteral("ref"),QStringLiteral("attention/last_wake_at")},
                                         {QStringLiteral("kind"),QStringLiteral("idle")},
                                         {QStringLiteral("at"),snapshotIsoText(value)}});
+                if (eligible) ++*eligible;
+            }
         }
     }
     if (rows.size()>=limit) return rows;
@@ -5650,12 +5760,14 @@ QJsonArray MemoryManager::internalWakes(int limit) const
                          "ORDER BY r.next_check_at LIMIT ?");
         concerns.addBindValue(int(limit-rows.size()));
         if (concerns.exec()) while (concerns.next() && rows.size()<limit) {
+            if (queried) ++*queried;
             const auto at=snapshotIsoFromEpoch(concerns.value(2).toLongLong());
             rows.append(QJsonObject{{QStringLiteral("ref"),QStringLiteral("concern/%1").arg(concerns.value(1).toLongLong())},
                                     {QStringLiteral("kind"),QStringLiteral("concern_review")},
                                     {QStringLiteral("at"),at},
                                     // 与回顾提示词里的 own_next_review_at 同义：她自己的再检查时间。
                                     {QStringLiteral("own_next_review_at"),at}});
+            if (eligible) ++*eligible;
         }
     }
     if (rows.size()>=limit) return rows;
@@ -5668,12 +5780,66 @@ QJsonArray MemoryManager::internalWakes(int limit) const
                          "AND coalesce(review_after,0)>0 ORDER BY review_after LIMIT ?");
         thoughts.addBindValue(int(limit-rows.size()));
         if (thoughts.exec()) while (thoughts.next() && rows.size()<limit) {
+            if (queried) ++*queried;
             rows.append(QJsonObject{{QStringLiteral("ref"),QStringLiteral("thought/%1").arg(thoughts.value(0).toLongLong())},
                                     {QStringLiteral("kind"),QStringLiteral("scheduled")},
                                     {QStringLiteral("at"),snapshotIsoFromEpoch(thoughts.value(1).toLongLong())}});
+            if (eligible) ++*eligible;
         }
     }
     return rows;
+}
+
+QJsonObject MemoryManager::reviewInteractionTimes(const QString &channel,const QString &session,
+                                                  const QString &subject) const
+{
+    QJsonObject result{{QStringLiteral("last_owner_interaction_at"),QString()},
+                       {QStringLiteral("last_confirmed_outbound_at"),QString()}};
+    if (!m_db.isOpen()) return result;
+    const bool hasChannel = !channel.isEmpty();
+    const bool hasSession = hasChannel && !session.isEmpty();
+    const QString scopeSuffix = hasSession
+        ? QStringLiteral(" AND h.channel=? AND h.session_id=?")
+        : hasChannel ? QStringLiteral(" AND h.channel=?")
+                     : QStringLiteral(" AND h.channel IN ('pet','qq_private')");
+    const auto bindScope = [&](QSqlQuery &q) {
+        q.addBindValue(subject);
+        if (hasChannel) q.addBindValue(channel);
+        if (hasSession) q.addBindValue(session);
+    };
+    // 最近一条主人 reply 发言（subject=user，真实用户输入）。reported 优先，其次落库时间。
+    {
+        QSqlQuery q(m_db);
+        q.prepare(QStringLiteral(
+            "SELECT coalesce(s.reported,h.timestamp) FROM chat_history h "
+            "LEFT JOIN cognitive_source s ON s.event=h.cognitive_event AND s.channel=h.channel "
+            "AND s.session=h.session_id AND s.subject=h.subject AND s.input=h.user_input "
+            "WHERE h.subject=? AND h.sensitive=0 AND h.turn_kind='reply' "
+            "AND h.user_input IS NOT NULL AND h.user_input<>''")
+            + scopeSuffix + QStringLiteral(" ORDER BY h.id DESC LIMIT 1"));
+        bindScope(q);
+        if (q.exec() && q.next())
+            result[QStringLiteral("last_owner_interaction_at")] =
+                snapshotIsoText(q.value(0).toString());
+    }
+    // 最近一条已落库的成功表达：沿用现有落库语义（turn_state='handed_off'），
+    // 普通 reply 与 proactive 都只证明"她确实说过/发出过"，不代表主人已经读过。
+    {
+        QSqlQuery q(m_db);
+        q.prepare(QStringLiteral(
+            "SELECT coalesce(s.reported,h.timestamp) FROM chat_history h "
+            "LEFT JOIN cognitive_source s ON s.event=h.cognitive_event AND s.channel=h.channel "
+            "AND s.session=h.session_id AND s.subject=h.subject AND s.input=h.user_input "
+            "WHERE h.subject=? AND h.sensitive=0 AND h.turn_state='handed_off' "
+            "AND h.turn_kind IN ('reply','proactive') "
+            "AND h.raw_reply IS NOT NULL AND h.raw_reply<>''")
+            + scopeSuffix + QStringLiteral(" ORDER BY h.id DESC LIMIT 1"));
+        bindScope(q);
+        if (q.exec() && q.next())
+            result[QStringLiteral("last_confirmed_outbound_at")] =
+                snapshotIsoText(q.value(0).toString());
+    }
+    return result;
 }
 
 QString MemoryManager::snapshotSubjectId(const RequestMeta &meta) const

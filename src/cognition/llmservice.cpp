@@ -91,6 +91,23 @@ QList<PlannerTurn> buildPlannerTurns(const QList<HistoryTurn> &history)
     return turns;
 }
 
+// R12-0：回顾共享契约（kind=reflection 与 kind=concern 共用同一段，后续 OpenWake 复用）。
+// 只写通用边界，不写词面模板、不靠关键词判分：
+//   - 允许想法/探索/休息/自然询问或分享，也允许什么都不做；
+//   - 自己的意愿可成为交流动机，不需要新主人证据；
+//   - 但消息/理由中的外部事实、承诺、执行结果必须作为 claims 由服务端核验；
+//   - 询问不代表知道答案，不施压/索取陪伴/要求回应，内部调度时间不是“现在”。
+QString sharedReviewContract()
+{
+    return QStringLiteral(
+        "你可以保留自己的想法、继续探索、休息，或自然地询问/分享；也可以什么都不做。"
+        "你自己的意愿可以成为交流动机，不需要新的主人证据。"
+        "但消息或理由中出现的任何外部事实、承诺或执行结果，都必须列在 claims 里由服务端核验，"
+        "不能编造、也不能把推断当成事实。"
+        "询问不代表你已经知道答案；不要施压、索取陪伴或要求回应。"
+        "内部调度时间、历史记录里的“现在”都不是当前事实，也不是与主人的约定。");
+}
+
 // 认知快照消息：服务端事实分层，只读。前台与回顾共用同一条构造路径，
 // 保证“同一来源同一 authority/type 语义”。没有记忆库时返回空对象（不注入）。
 QJsonObject cognitiveSnapshotMessage(MemoryManager *memory, const RequestMeta &meta,
@@ -100,6 +117,36 @@ QJsonObject cognitiveSnapshotMessage(MemoryManager *memory, const RequestMeta &m
     CognitiveSnapshotBuilder builder(memory);
     const auto snapshot=builder.build(meta,meta.runId,triggerRef,purpose);
     const auto prompt=builder.toPromptJson(snapshot);
+    // R12-0：每域统计只打 DEBUG（可解释“查询为空/权限过滤/预算裁剪”），
+    // 另加一条 INFO 摘要，避免每域一行 INFO 刷屏。
+    const auto &stats = builder.stats();
+    const QStringList domainOrder{
+        QStringLiteral("observations"), QStringLiteral("self_expressions"),
+        QStringLiteral("inferences"), QStringLiteral("motivations"),
+        QStringLiteral("commitments"), QStringLiteral("activities"),
+        QStringLiteral("internal_wakes")};
+    QStringList omittedDomains;
+    for (const auto &domain : domainOrder) {
+        const auto stat = stats.domains.value(domain);
+        if (stat.omitted > 0) omittedDomains.append(domain);
+        qDebug().noquote()
+            << QStringLiteral("[Snapshot] purpose=%1 domain=%2 queried=%3 eligible=%4"
+                              " serialized=%5 omitted=%6 bytes_before=%7 bytes_after=%8")
+                   .arg(purpose, domain)
+                   .arg(stat.queried)
+                   .arg(stat.eligible)
+                   .arg(stat.serialized)
+                   .arg(stat.omitted)
+                   .arg(stats.bytesBefore)
+                   .arg(stats.bytesAfter);
+    }
+    qInfo().noquote()
+        << QStringLiteral("[Snapshot] summary purpose=%1 bytes_before=%2 bytes_after=%3 omitted=%4")
+               .arg(purpose)
+               .arg(stats.bytesBefore)
+               .arg(stats.bytesAfter)
+               .arg(omittedDomains.isEmpty() ? QStringLiteral("-")
+                                             : omittedDomains.join(QLatin1Char(',')));
     if (prompt.isEmpty()) return {};
     return QJsonObject{{QStringLiteral("role"),QStringLiteral("system")},
                        {QStringLiteral("content"),
@@ -1456,14 +1503,17 @@ void LLMService::generatePrivateReview(qlonglong id, int version, const QJsonObj
         instruction += QStringLiteral(" 当前本地时间 %1。owner_statement 和 history 是主人原话；own_reply_excerpt 是你当时说的话。"
             "按 reported_at 理解相对时间，区分谁提出、谁答应和实际结果。prior 是以前留下的想法，"
             "仅在新经历确实改变同一关注时返回 prior_action：revise（consider 并用 note 写更新后的想法）"
-            "或 resolve（关注已解决或决定放下）。关联不清时省略。只是联想到旧事不构成现在联系的理由；"
-            "有新的主人证据、或活动有了结果，才可以现在开口，并且必须把依据写进 contact.basis"
-            "（时间委托由提醒链执行，不能作为现在联系的依据）。")
+            "或 resolve（关注已解决或决定放下）。关联不清时省略。")
             .arg(QDateTime::currentDateTime().toString(Qt::ISODate));
         // 关注的结构化描述：到期回顾要靠 topic/watch/next_check_after_minutes 判断"是否到期、等什么证据"。
         instruction += QStringLiteral(" consider 时可附 concern 对象：topic 最多60字；watch 写什么情况会让它有了下落，"
             "最多200字；next_check_after_minutes 为 0 至 10080，0 表示只在新证据时再看。");
     }
+    // R12-0 契约统一：reflection 与 concern 共用同一段后台规则（后续 OpenWake 复用），
+    // 不再要求"必须有新的主人证据/活动结果，且必须写 contact.basis"。legacy basis 的
+    // 服务端兼容读取保留，但新提示不把 basis 作为硬性要求。
+    if (kind == QStringLiteral("reflection") || kind == QStringLiteral("concern"))
+        instruction += QStringLiteral("\n") + sharedReviewContract();
     if (thread["kind"]=="reflection" && !thread.contains("consulted"))
         instruction += QStringLiteral(" 若判断取决于其他经历，可先输出 choice=consult 和 terms（1至4个检索词），补查一次同会话的用户发言。");
     else if (thread["kind"]=="reflection" && thread.contains("consulted"))
@@ -1532,6 +1582,38 @@ void LLMService::generatePrivateReview(qlonglong id, int version, const QJsonObj
         prior.remove(QStringLiteral("match_score"));
         prior.remove(QStringLiteral("matched_terms"));
         modelThread[QStringLiteral("prior")]=prior;
+    }
+    // R12-0：服务端时间/上下文。只给已有事实；缺失写 unknown，不猜测。
+    // reflection 的来源时间取 thread.reported_at；concern 取 concern.reported_at；
+    // 最近主人互动/最近成功表达来自 MemoryManager 的只读查询（沿用现有落库语义）。
+    {
+        QString sourceReportedAt = thread.value(QStringLiteral("reported_at")).toString().trimmed();
+        if (sourceReportedAt.isEmpty())
+            sourceReportedAt = thread.value(QStringLiteral("concern")).toObject()
+                                   .value(QStringLiteral("reported_at")).toString().trimmed();
+        if (sourceReportedAt.isEmpty()) sourceReportedAt = QStringLiteral("unknown");
+        const auto interactionTimes = m_memoryManager
+            ? m_memoryManager->reviewInteractionTimes(
+                  thread.value(QStringLiteral("source_channel")).toString(),
+                  thread.value(QStringLiteral("source_session")).toString())
+            : QJsonObject{};
+        const auto knownTime = [&interactionTimes](const char *key) {
+            const QString value = interactionTimes.value(QString::fromLatin1(key))
+                                      .toString().trimmed();
+            return value.isEmpty() ? QStringLiteral("unknown") : value;
+        };
+        const QJsonObject timeContext{
+            {QStringLiteral("now_local"), QDateTime::currentDateTime().toString(Qt::ISODate)},
+            {QStringLiteral("now_utc"), QDateTime::currentDateTimeUtc().toString(Qt::ISODate)},
+            {QStringLiteral("source_reported_at"), sourceReportedAt},
+            {QStringLiteral("last_owner_interaction_at"),
+             knownTime("last_owner_interaction_at")},
+            {QStringLiteral("last_confirmed_outbound_at"),
+             knownTime("last_confirmed_outbound_at")},
+            {QStringLiteral("quiet_hours"),
+             QJsonObject{{QStringLiteral("start"), options.quietStart},
+                         {QStringLiteral("end"), options.quietEnd}}}};
+        modelThread[QStringLiteral("time_context")] = timeContext;
     }
     // 认知快照（服务端事实分层，只读）：与前台共用同一套 authority/type 语义。
     // 回顾的来源渠道/会话来自 thread；关注/活动回顾没有显式渠道时，
@@ -1690,6 +1772,50 @@ QJsonObject completionObject(QNetworkReply *reply)
     return QJsonDocument::fromJson(content.toUtf8()).object();
 }
 
+// R12-0：[Contact] proposal 一行结构化诊断。只记录字段（timing/motivation/claims/原因/
+// 被拒 ref），不打印 message/reason 原文，也不做任何词面判断。
+void logContactProposal(qlonglong id, const QJsonObject &proposal, const QString &error)
+{
+    const auto contact = proposal.value(QStringLiteral("contact")).toObject();
+    if (contact.isEmpty()) return;
+    const auto timing = contact.value(QStringLiteral("timing")).toString();
+    const auto semantic = contact.value(QStringLiteral("semantic_status")).toString();
+    const auto withheldReason = contact.value(QStringLiteral("withhold_reason")).toString();
+    const bool withheld = semantic == QStringLiteral("withheld");
+    const auto motivationType = contact.value(QStringLiteral("motivation")).toObject()
+                                    .value(QStringLiteral("type")).toString();
+    const auto claims = contact.value(QStringLiteral("claims")).toArray();
+    // 被拒 ref：核验未通过时列出 claims 引用的 ref 前 4 个（只记 ref，不记文本）。
+    QStringList claimRefs;
+    if (withheld) {
+        for (const auto &value : claims) {
+            for (const auto &ref : value.toObject().value(QStringLiteral("refs")).toArray()) {
+                const QString text = ref.toString();
+                if (!text.isEmpty() && !claimRefs.contains(text)) claimRefs.append(text);
+                if (claimRefs.size() >= 4) break;
+            }
+            if (claimRefs.size() >= 4) break;
+        }
+    }
+    QString reasonCode = error;
+    if (reasonCode.isEmpty())
+        reasonCode = withheld ? withheldReason : (semantic.isEmpty() ? QStringLiteral("none")
+                                                                     : semantic);
+    qInfo().noquote()
+        << QStringLiteral("[Contact] proposal id=%1 requested_timing=%2 final_timing=%3"
+                          " motivation_type=%4 claim_count=%5 reason_code=%6"
+                          " withheld_reason=%7 rejected_refs=%8")
+               .arg(id)
+               .arg(timing.isEmpty() ? QStringLiteral("none") : timing)
+               .arg(withheld ? QStringLiteral("none")
+                             : (timing.isEmpty() ? QStringLiteral("none") : timing))
+               .arg(motivationType.isEmpty() ? QStringLiteral("-") : motivationType)
+               .arg(claims.size())
+               .arg(reasonCode.isEmpty() ? QStringLiteral("-") : reasonCode)
+               .arg(withheldReason.isEmpty() ? QStringLiteral("-") : withheldReason)
+               .arg(claimRefs.isEmpty() ? QStringLiteral("-") : claimRefs.join(QLatin1Char(',')));
+}
+
 } // namespace
 
 QJsonObject LLMService::withholdContactProposal(QJsonObject proposal, QJsonObject contact,
@@ -1710,6 +1836,8 @@ QJsonObject LLMService::withholdContactProposal(QJsonObject proposal, QJsonObjec
 void LLMService::emitPrivateReviewResult(qlonglong id, int version, const QJsonObject &proposal,
                                          const QString &error)
 {
+    // R12-0：所有 finalize/verifier/repair 的终态都从这里发出，统一记录 [Contact] proposal。
+    logContactProposal(id, proposal, error);
     emit privateReviewFinished(id, version, proposal, error);
 }
 

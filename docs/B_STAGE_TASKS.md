@@ -227,3 +227,17 @@ B5 执行方式按报告修正：**不做 48h shadow**（旧直发链已移除�
 验证：全仓 `recentConversationClosure/recent_closure/closeSuppression/spontaneous_close/ambiguous_after_closure` 在 src/tests 中 0 命中；全量构建零错误；**`ctest` 23/23**；用例改为 `closureDoesNotSuppressSpontaneous`、`contactNowAcceptsEvidenceFromBeforeClosure`、`crossChannelClosureNoLongerBlocksContact`、`ownerPrivateChannelsStaySeparated`。应用已重链（新二进制含本修复）。
 
 预期行为变化：晚安/收口后她可以因新想法或单纯想念发起联系；如果出现主动消息，应检查的是"事实声称是否有依据"，而不是"刚收口所以不该发"。B5 指标中"晚安后主动=失败"这条作废。
+
+## 13. R12-0 诊断、契约统一与失败退避（2026-11-26）
+
+R12（自主认知入口）开工基线为 `c28d23d`、schema v30；R12-0 是唯一无 schema 的切片，**不改变发送行为**。
+
+| 项 | 实现 |
+|---|---|
+| Wake 类型化结果 | `PrivateReview::wake` 返回 `WakeResult{started,kind,reason,sourceRef,version,nextEligibleAt}`；coordinator 不再用临时 `requested` 连接推断 started；新增 `[Wake] tick`、`[Review] attempt/result`、`[Contact] proposal` 结构化日志 |
+| 契约统一 | reflection/concern 共用规则文本；删除新提案"必须有新主人证据/basis 才能 now"的旧句；legacy basis 兼容读取保留；回顾 thread 增加 `time_context`（now_local/now_utc/source_reported_at/last_owner_interaction_at/last_confirmed_outbound_at/quiet_hours） |
+| Reflection 失败退避 | 失败按 120/300/900 秒退避，默认第 4 次连续失败 suspended 24h；用户插话/关停的主动让出不累计失败；失败计数为进程内临时态（跨重启持久化留 v31） |
+| 日志降噪 | `[Attention] backlog` 仅 pending/oldest 非空时 INFO（done-only DEBUG）；`expired_by_retention` 一次 claim 一条 INFO + 逐 turn DEBUG + 去重，不改关注/事实 |
+| 快照统计 | `SnapshotBuildStats{queried,eligible,serialized,omitted,bytesBefore,bytesAfter,notes}`；DEBUG 每域 + INFO 摘要；**未改 1200 预算/静态说明/裁剪顺序**，最小修复按确认放 R12-1a |
+
+验证：实际全量 `ctest 23/23`（包含新增诊断测试）；无 schema 变更；应用运行中的旧进程需重启后启用新诊断。后续 R12-1a 待确认后实施，状态见 [R12_OPEN_WAKE.md](R12_OPEN_WAKE.md)。

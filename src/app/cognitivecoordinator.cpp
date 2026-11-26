@@ -17,7 +17,29 @@ bool sameInputStream(const RequestMeta &a, const RequestMeta &b)
         && a.replyToMessageId == b.replyToMessageId && a.sensitive == b.sensitive
         && a.persistTurn == b.persistTurn && a.longTermMemoryEnabled == b.longTermMemoryEnabled;
 }
+
+// R12-0：[Wake] tick 是每轮 reviewIfDue 一行的结构化诊断。正常空转（no_candidate/no_idle/busy）
+// 用 DEBUG，真正领到回顾或出现可解释的阻塞原因才用 INFO，避免每分钟刷一条 INFO。
+void logWakeTick(const WakeResult &result)
+{
+    const bool informative = result.started
+        || (result.reason != QStringLiteral("no_candidate")
+            && result.reason != QStringLiteral("no_idle")
+            && result.reason != QStringLiteral("busy"));
+    const QString selected = result.started && !result.kind.isEmpty()
+        ? result.kind : QStringLiteral("none");
+    const auto line = QStringLiteral("[Wake] tick selected=%1 reason=%2 source=%3 next_due=%4")
+        .arg(selected,
+             result.reason.isEmpty() ? QStringLiteral("no_candidate") : result.reason,
+             result.sourceRef.isEmpty() ? QStringLiteral("-") : result.sourceRef,
+             result.nextEligibleAt.isValid()
+                 ? result.nextEligibleAt.toLocalTime().toString(Qt::ISODate)
+                 : QStringLiteral("-"));
+    if (informative) qInfo().noquote() << line;
+    else qDebug().noquote() << line;
 }
+}
+
 
 CognitiveCoordinator::CognitiveCoordinator(MemoryManager &memory, LLMService &model, QObject *parent)
     : QObject(parent), review(memory), store(memory), service(model)
@@ -101,14 +123,16 @@ CognitiveCoordinator::~CognitiveCoordinator()
 void CognitiveCoordinator::reviewIfDue()
 {
     // 每轮打一次 backlog，用于区分"没东西可回顾"和"回顾被事件挡住"。
-    // 空队列只记 DEBUG，避免每 60s 一条 INFO 噪声；有内容时保留 INFO 便于现场观测。
+    // R12-0 降噪：只有 pending 非空、或最老 pending 已等待>0 秒时才 INFO；
+    // 仅剩 by_state.done 的历史终态属于正常，用 DEBUG（此前 by_state 非空导致每分钟 INFO）。
     const auto backlog = store.attentionBacklog();
-    const bool backlogHasContent =
-        !backlog.value(QStringLiteral("pending")).toObject().isEmpty()
-        || !backlog.value(QStringLiteral("by_state")).toObject().isEmpty();
+    const bool backlogHasPending =
+        !backlog.value(QStringLiteral("pending")).toObject().isEmpty();
+    const bool backlogHasOldest =
+        backlog.value(QStringLiteral("oldest_age_seconds")).toInteger() > 0;
     const auto backlogLine = QStringLiteral("[Attention] backlog=")
         + QString::fromUtf8(QJsonDocument(backlog).toJson(QJsonDocument::Compact));
-    if (backlogHasContent) qInfo().noquote() << backlogLine;
+    if (backlogHasPending || backlogHasOldest) qInfo().noquote() << backlogLine;
     else qDebug().noquote() << backlogLine;
     // 中断恢复优先于一切新回顾：recovery 是最高优先级事件，处理完本轮已排队的恢复就结束
     // 本轮，避免回顾在"上次没说完的话还没收尾"时抢占注意力。只在确实存在 pending recovery
@@ -134,8 +158,12 @@ void CognitiveCoordinator::reviewIfDue()
                     .value(QStringLiteral("recovery")).toInt() == 0)
                 break;
         }
-        if (recoveredAny)
+        if (recoveredAny) {
+            WakeResult recovered;
+            recovered.reason = QStringLiteral("recovery_handled");
+            logWakeTick(recovered);
             return;
+        }
     }
     auto &cfg = ConfigManager::instance();
     const auto options = cfg.getProactiveConfig();
@@ -156,6 +184,9 @@ void CognitiveCoordinator::reviewIfDue()
             qDebug().noquote() << QStringLiteral("[Attention] idle skip reason=%1").arg(reason);
         else
             qInfo().noquote() << QStringLiteral("[Attention] idle skip reason=%1").arg(reason);
+        WakeResult skipped;
+        skipped.reason = reason;
+        logWakeTick(skipped);
         return;
     }
     // 空闲：登记一次"唤醒请求"事件（同一分钟幂等），按实际是否真的启动了回顾落 done。
@@ -166,17 +197,13 @@ void CognitiveCoordinator::reviewIfDue()
         QStringLiteral("idle:%1").arg(QDateTime::currentSecsSinceEpoch() / 60),
         QJsonObject{{QStringLiteral("reason"), QStringLiteral("idle")}},
         QStringLiteral("idle"), 30);
-    bool started = false;
-    // review.wake 同步 emit requested（或什么都不发），这里用一次性连接判断是否领到了工作。
-    const auto startedConnection = connect(&review, &PrivateReview::requested, this,
-        [&started](qlonglong, int, const QJsonObject &) { started = true; });
-    review.wake(options.dailyLimit, options.cooldownSeconds);
-    disconnect(startedConnection);
+    const auto wake = review.wake(options.dailyLimit, options.cooldownSeconds);
     store.setAttentionState(QStringLiteral("last_wake_at"),
                             QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
     if (wakeEvent > 0)
         store.completeAttentionEvent(wakeEvent, QStringLiteral("done"),
-                                     started ? QStringLiteral("requested") : QStringLiteral("none"));
+                                     wake.started ? QStringLiteral("requested") : QStringLiteral("none"));
+    logWakeTick(wake);
 }
 
 bool CognitiveCoordinator::idleForAttention() const

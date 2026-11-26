@@ -442,3 +442,18 @@ B5 节奏按报告修正：固定提交基线 → 2–4h 受控冒烟（self_des
 **日志降噪**：5 秒提醒定时器先按到期时间过滤再提交；`ActionCommitter::commitReminderDelivery` 的拒绝日志降 DEBUG；正常时只在到期时打一次 `[Reminder] dispatch`。修掉了 1.5 小时 894 条 `reminder rejected not_due` 的刷屏。
 
 验证：src/tests 中收口相关标识 0 命中；构建零错误；**ctest 23/23**；应用已重链。测试改写为 `closureDoesNotSuppressSpontaneous`、`contactNowAcceptsEvidenceFromBeforeClosure`、`crossChannelClosureNoLongerBlocksContact`、`ownerPrivateChannelsStaySeparated`。B5 指标中"晚安后主动=失败"作废。
+
+---
+
+## 2026-11-26 · R12-0：诊断/契约/退避/日志/快照统计
+
+按用户确认的分片计划只实施 R12-0；基线 `c28d23d`、schema v30，**无 schema 变更、无发送行为变化**。
+
+- `PrivateReview::wake` 类型化 `WakeResult`（kind/reason/sourceRef/version/nextEligibleAt）；coordinator 用返回值取代临时信号监听，新增 `[Wake] tick`/`[Review] attempt/result`/`[Contact] proposal`。
+- reflection/concern 共用回顾规则；移除新提案的 basis 硬要求（legacy 兼容保留）；回顾注入服务端时间上下文。
+- Reflection 失败退避 120/300/900s，默认第 4 次 suspended 24h；主动让出不计数；失败计数暂存进程内（v31 持久化）。
+- 日志：backlog 仅 pending/oldest 非空 INFO；expired_by_retention 聚合+去重（不删事实）。
+- 快照统计 queried/eligible/serialized/omitted/bytes；本片不改预算与裁剪（R12-1a 做最小修复）。
+
+集成期修复：新活动合法 `thought_version=0` 被 `version<=0` 守卫误判为 storage_error，已改为仅拒绝 `id<=0`/负版本。
+验证：实际构建测试后 **ctest 23/23**；应用运行中（旧二进制占用），新二进制待重启前重链。后续 R12-1a 待确认。

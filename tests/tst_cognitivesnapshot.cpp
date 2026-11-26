@@ -1,5 +1,7 @@
 #include <QtTest>
 #include <QDateTime>
+#include <QDir>
+#include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -10,6 +12,7 @@
 #include <QVariantList>
 
 #include "cognitivesnapshot.h"
+#include "configmanager.h"
 #include "memorymanager.h"
 
 namespace {
@@ -96,6 +99,42 @@ QList<SentenceText> singleSentence(const QString &text)
     sentence.jaText = QString();
     return {sentence};
 }
+
+// R12-0：快照 stats 的权限过滤用例需要临时写 identity.json（盲区），析构时恢复。
+class IdentityFileGuard
+{
+public:
+    IdentityFileGuard()
+    {
+        auto &cfg = ConfigManager::instance();
+        m_path = QDir(cfg.getConfigDirPath()).filePath(QStringLiteral("identity.json"));
+        QFile file(m_path);
+        m_existed = file.open(QIODevice::ReadOnly);
+        if (m_existed) m_original = file.readAll();
+    }
+    ~IdentityFileGuard()
+    {
+        auto &cfg = ConfigManager::instance();
+        if (m_existed) {
+            cfg.writeConfigDocument(QStringLiteral("identity.json"),
+                                    m_original.isEmpty() ? QByteArray("{}") : m_original,
+                                    nullptr);
+        } else {
+            QFile::remove(m_path);
+            cfg.reloadIdentity();
+        }
+    }
+    bool write(const QByteArray &contents)
+    {
+        return ConfigManager::instance().writeConfigDocument(
+            QStringLiteral("identity.json"), contents, nullptr);
+    }
+
+private:
+    QString m_path;
+    QByteArray m_original;
+    bool m_existed = false;
+};
 
 } // namespace
 
@@ -228,6 +267,117 @@ private slots:
                  QStringLiteral("内部唤醒不是主人约定"));
         QVERIFY(QJsonDocument(prompt).toJson(QJsonDocument::Compact).size()
                 <= CognitiveSnapshotBuilder::promptCharBudget());
+    }
+
+    // R12-0：每域 queried/eligible/serialized/omitted 统计与字节前后值；
+    // 用权限过滤（盲区）区分 queried 与 eligible，用大文本触发预算裁剪验证 notes。
+    void snapshotDomainStats()
+    {
+        // 先清空 identity 里的盲区等干扰配置，保证 queried=可读行数的基线；
+        // 后面的权限过滤子用例再显式写入盲区，析构时统一恢复原文件。
+        IdentityFileGuard identityGuard;
+        QVERIFY(identityGuard.write(QByteArray("{}")));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager db(dir.filePath(QStringLiteral("stats.db")));
+
+        // 8 条较长的普通生活观察：序列化后必然超过 1200 字符预算，触发裁剪。
+        const QString longObservation(160, QChar(0x666E));
+        qlonglong firstObservation = 0;
+        for (int index = 0; index < 8; ++index) {
+            const auto turn = db.recordInput(
+                longObservation + QString::number(index), ownerMeta(100 + index), false);
+            QVERIFY(turn > 0);
+            if (firstObservation == 0) firstObservation = turn;
+        }
+        // 开放关注（进入 motivations + internal_wakes 的 next_check_at）。
+        {
+            RequestMeta meta = ownerMeta(50);
+            const auto turn = db.recordInput(QStringLiteral("我明天想去看看那家旧书店"), meta, true);
+            QVERIFY(turn > 0);
+            QVERIFY(db.recordQuiet(turn, QStringLiteral("close")));
+            const auto claim = db.claimPrivateReflection(12, 60);
+            QCOMPARE(claim.value(QStringLiteral("id")).toInteger(), turn);
+            QVERIFY(db.finishPrivateReflection(
+                turn, 1, QStringLiteral("consider"), QStringLiteral("旧书店还在不在"),
+                QJsonObject{}, QJsonArray{}, QJsonObject{}, QString{},
+                QJsonObject{{QStringLiteral("topic"), QStringLiteral("旧书店")},
+                            {QStringLiteral("watch"), QStringLiteral("是否还营业")},
+                            {QStringLiteral("next_check_after_minutes"), 60}}));
+        }
+        // 私人活动 + 真实委托 + 内部唤醒。
+        QVERIFY(db.saveQATurn(
+            QStringLiteral("你想做点什么"),
+            QStringLiteral(R"({"personal_interest":"整理旧照片","sentences":[{"zh_text":"好呀","ja_text":"","tags":{}}]})"),
+            singleSentence(QStringLiteral("好呀")), ownerMeta(60)));
+        {
+            RawDb raw(db.databasePath());
+            QVERIFY(raw.open());
+            const qint64 due = QDateTime::currentSecsSinceEpoch() + 3600;
+            QVERIFY(raw.exec(
+                QStringLiteral("INSERT INTO reminder(turn,channel,session,due,expires,message,state) "
+                               "VALUES(?,?,?,?,?,?,'pending')"),
+                {firstObservation, Channel::kPet, Channel::kDefaultSession, due, due + 3600,
+                 QStringLiteral("提醒我把旧照片整理完")}));
+        }
+        db.setAttentionState(QStringLiteral("last_wake_at"),
+                             QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
+
+        RequestMeta meta = ownerMeta(90);
+        CognitiveSnapshotBuilder builder(&db);
+        const auto snapshot = builder.build(
+            meta, QStringLiteral("run-stats"), QStringLiteral("trigger-stats"),
+            QStringLiteral("test"));
+        const auto buildStats = builder.stats();
+        QCOMPARE(buildStats.domains.value(QStringLiteral("observations")).queried, 8);
+        QCOMPARE(buildStats.domains.value(QStringLiteral("observations")).eligible, 8);
+        QVERIFY(buildStats.domains.value(QStringLiteral("motivations")).eligible >= 1);
+        QVERIFY(buildStats.domains.value(QStringLiteral("commitments")).eligible >= 1);
+        QVERIFY(buildStats.domains.value(QStringLiteral("activities")).eligible >= 1);
+        QVERIFY(buildStats.domains.value(QStringLiteral("internal_wakes")).eligible >= 1);
+        for (auto it = buildStats.domains.constBegin(); it != buildStats.domains.constEnd(); ++it)
+            QVERIFY2((*it).eligible <= (*it).queried, qPrintable(it.key()));
+
+        const auto prompt = builder.toPromptJson(snapshot);
+        Q_UNUSED(prompt)
+        const auto &stats = builder.stats();
+        QVERIFY(stats.bytesBefore > CognitiveSnapshotBuilder::promptCharBudget());
+        QVERIFY(stats.bytesAfter <= CognitiveSnapshotBuilder::promptCharBudget());
+        int omittedTotal = 0;
+        for (auto it = stats.domains.constBegin(); it != stats.domains.constEnd(); ++it) {
+            QVERIFY((*it).serialized <= (*it).eligible);
+            omittedTotal += (*it).omitted;
+        }
+        QVERIFY(omittedTotal > 0);
+        bool budgetNote = false;
+        for (const auto &note : stats.notes)
+            budgetNote = budgetNote || note.startsWith(QStringLiteral("budget:"));
+        QVERIFY2(budgetNote, qPrintable(stats.notes.join(QLatin1Char(';'))));
+
+        // 权限过滤：盲区里的行会被查询命中（queried>0）但全部被读取策略过滤（eligible=0）。
+        {
+            IdentityFileGuard guard;
+            QVERIFY(guard.write(QByteArray(
+                R"({"memory":{"blind_zones":[{"channel":"pet","session_id":"quiet-place"}]}})")));
+            RequestMeta hiddenMeta = ownerMeta(200);
+            hiddenMeta.sessionId = QStringLiteral("quiet-place");
+            for (int index = 0; index < 3; ++index) {
+                hiddenMeta.eventId = QStringLiteral("snapshot-hidden-%1").arg(index);
+                QVERIFY(db.recordInput(QStringLiteral("这是一条在盲区里的生活记录"),
+                                       hiddenMeta, false) > 0);
+            }
+            CognitiveSnapshotBuilder hiddenBuilder(&db);
+            const auto hiddenSnapshot = hiddenBuilder.build(
+                hiddenMeta, QStringLiteral("run-hidden"),
+                QStringLiteral("trigger-hidden"), QStringLiteral("test"));
+            const auto hiddenStats = hiddenBuilder.stats();
+            const auto hiddenObservations =
+                hiddenStats.domains.value(QStringLiteral("observations"));
+            QVERIFY(hiddenObservations.queried >= 3);
+            QCOMPARE(hiddenObservations.eligible, 0);
+            QCOMPARE(hiddenObservations.serialized, 0);
+            QVERIFY(hiddenSnapshot.policyView.value(QStringLiteral("blind_zone")).toBool());
+        }
     }
 
     // 2. own_next_review_at 只作为内部唤醒出现；commitments 只有 reminder。
