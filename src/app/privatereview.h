@@ -49,12 +49,19 @@ public:
     WakeResult wake(int dailyLimit, int cooldownSeconds, const OpenWakeConfig &openWake);
     void yieldAttention(const QString &reason);
     void receive(qlonglong id, int version, const QJsonObject &proposal, const QString &error);
+    // R12-2b：内部活动分享提案的语义核验结果回传（由 CognitiveCoordinator 接线）。
+    // 结果已经过 LLMService 的确定性+coverage+一次语义核验/至多一次修复；这里负责
+    // persistActionProposal → proposed→verified(CAS) → ActionCommitter::commitInternalActivityShare。
+    void receiveShareProposalResult(const QJsonObject &result);
 
 signals:
     void contactProposed(qlonglong turn, int version);
     void requested(qlonglong id, int version, const QJsonObject &context);
     void cancelled();
     void shareRequested(const QString &ref, int version, const QString &draft);
+    // R12-2b：内部活动（internal activity）完成且 share_intent=requested 时，请求 LLMService
+    // 做一次统一提案核验。request 里的 origin/target/payload 全部由服务端组装，模型不可伪造。
+    void internalShareProposalReady(const QJsonObject &request);
 
 private:
     // Activity=自己的文字活动；Reflection=新来源回顾；Concern=到期关注；OpenWake=内部唤醒。

@@ -293,3 +293,11 @@ R12（自主认知入口）开工基线为 `c28d23d`、schema v30；R12-0 是唯
 - 不接 Outbox/发送；生产库保持 v31，待 R12-2b 受控迁移。
 
 验证：`ctest 23/23`；`tst_memorymanager 146/1 skipped`、`tst_memoryagent 93`、`tst_actionpolicy 17`、`tst_cognitivesnapshot 15`、`tst_actionoutbox 15`。**暂停点**：R12-2b 未开始。
+
+## 17. R12-2b 新来源提交、Outbox 与回执（2026-11-26）
+
+- `ActionCommitter` 通用 verified 提案提交 + OpenWake contact / internal share 入口；复用 `cognitive_action/action_outbox/delivery_ledger`，ActionOutboxDispatcher 唯一发送；单事务、幂等 action_key、共享 contact 额度。
+- OpenWake contact：allow_contact 独立默认 false；true 时确定性+coverage（claims=[] 也跑）+1 次 semantic verifier +≤1 repair；通过后 persist→verified→commit；false/拒绝保留内部记录、不记认知失败。
+- Internal share：真实 completed artifact/version/hash 绑定；只入 Outbox；legacy 分享链保留。
+- 回执：actionSettled 支持 wake/activity，recordActionReceipt 幂等回写；unknown 不重发；启动 drain verified 与回执对账。
+- 验证：`ctest 23/23`；`tst_memorymanager 146/1 skipped`、`tst_memoryagent 94`、`tst_actionoutbox 20`、`tst_actionpolicy 17`、`tst_cognitivesnapshot 15`。生产库 v32 迁移完成，行数不变，默认零新发送。**未做**：真实目标发送（需授权）、R12-3、后台 tool loop。

@@ -23,6 +23,17 @@ public:
     // share：等价 canShareThought/draft 校验（completed、版本、artifact、同版本未送达）。
     QJsonObject commitActivityShare(qlonglong activityId,int version,const QString &draft);
 
+    // ===== R12-2b：已验证 ActionProposal 的唯一提交入口 =====
+    // 从 action_proposal 读 state='verified' 的提案，再次经 ActionPolicy 复核后在单事务内
+    // 写 cognitive_action + action_outbox + delivery_ledger，并把提案 CAS 到 committed。
+    // 不直接发送（发送只由 ActionOutboxDispatcher 做）；不写 reflection_contact/chat_history。
+    QJsonObject commitVerifiedActionProposal(const QString &actionKey);
+    // 便捷入口：wake→contact / activity→share 的来源类型前置校验（等价于上面的通用入口）。
+    QJsonObject commitOpenWakeContact(const QString &actionKey);
+    QJsonObject commitInternalActivityShare(const QString &actionKey);
+    // 启动/定时恢复：扫描 verified 提案逐条提交（有界）。委托 MemoryManager 统一实现。
+    QJsonObject drainVerifiedActionProposals(int limit = 8);
+
     // 三条动作的 action_key 约定只暴露给调用方做日志/回执关联。
     static QString contactActionKey(qlonglong turn,int version);
     static QString reminderActionKey(qlonglong reminderId);

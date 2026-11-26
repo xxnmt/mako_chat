@@ -53,6 +53,12 @@ CognitiveCoordinator::CognitiveCoordinator(MemoryManager &memory, LLMService &mo
     connect(&service, &LLMService::privateReviewFinished, &review, &PrivateReview::receive);
     connect(&review, &PrivateReview::contactProposed, this, &CognitiveCoordinator::contactProposed);
     connect(&review, &PrivateReview::shareRequested, this, &CognitiveCoordinator::draftReadyToShare);
+    // R12-2b：internal 活动分享先走 LLMService 的统一核验链（确定性+一次 verifier/repair），
+    // 终态回到 PrivateReview 做 persist/state CAS/唯一提交入口；不新增发送者。
+    connect(&review, &PrivateReview::internalShareProposalReady, &service,
+            &LLMService::requestActionProposalVerification);
+    connect(&service, &LLMService::actionProposalVerificationFinished, &review,
+            &PrivateReview::receiveShareProposalResult);
     auto *reviewTimer = new QTimer(this);
     connect(reviewTimer, &QTimer::timeout, this, &CognitiveCoordinator::reviewIfDue);
     reviewTimer->start(60000);
@@ -115,6 +121,13 @@ CognitiveCoordinator::CognitiveCoordinator(MemoryManager &memory, LLMService &mo
     // 上次运行若在"联系投递"中退出，会留下 dispatching 的 contact 行。领取后无法确认消息
     // 是否已经交给渠道，只能按 at-most-once 落 unknown（可能已送达），不再重发。
     store.recoverStaleContacts(600);
+    // R12-2b：启动恢复把上次进程遗留的 verified 提案逐条提交（有界）；已 committed 的不重发，
+    // outbox 已有行的由 dispatcher 恢复发送。AppController::startApp 会再跑一次作为双保险。
+    const auto startupDrain = store.drainVerifiedActionProposals(8);
+    if (startupDrain.value(QStringLiteral("scanned")).toInt() > 0)
+        qInfo().noquote()
+            << QStringLiteral("[Proposal] startup_drain=")
+                   + QString::fromUtf8(QJsonDocument(startupDrain).toJson(QJsonDocument::Compact));
     store.setAttentionState(QStringLiteral("last_start_at"),
                             QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
 }
@@ -133,6 +146,17 @@ CognitiveCoordinator::~CognitiveCoordinator()
 
 void CognitiveCoordinator::reviewIfDue()
 {
+    // R12-2b：定时恢复入口。启动点之外再按 tick 有界推进 verified 提案；只入 Outbox，
+    // 已 committed 的提案不会重发，安静/额度等可恢复失败保留 verified 等下一次。
+    const auto proposalDrain = store.drainVerifiedActionProposals(4);
+    if (proposalDrain.value(QStringLiteral("committed")).toInt() > 0
+        || proposalDrain.value(QStringLiteral("withheld")).toInt() > 0) {
+        qInfo().noquote()
+            << QStringLiteral("[Proposal] tick_drain committed=%1 withheld=%2 failed=%3")
+                   .arg(proposalDrain.value(QStringLiteral("committed")).toInt())
+                   .arg(proposalDrain.value(QStringLiteral("withheld")).toInt())
+                   .arg(proposalDrain.value(QStringLiteral("failed")).toInt());
+    }
     // 每轮打一次 backlog，用于区分"没东西可回顾"和"回顾被事件挡住"。
     // R12-0 降噪：只有 pending 非空、或最老 pending 已等待>0 秒时才 INFO；
     // 仅剩 by_state.done 的历史终态属于正常，用 DEBUG（此前 by_state 非空导致每分钟 INFO）。

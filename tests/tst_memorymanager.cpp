@@ -6524,7 +6524,7 @@ private slots:
         const qlonglong firstId = first.value("id").toInteger();
         const int firstVersion = first.value("version").toInt();
         // 非法 decision / note 超长：拒绝且不落库（仍是 running）。
-        QVERIFY(!db.finishOpenWake(firstId, firstVersion, QStringLiteral("contact"), QString(),
+        QVERIFY(!db.finishOpenWake(firstId, firstVersion, QStringLiteral("invalid_decision_value"), QString(),
                                    {}, 30, &error));
         QCOMPARE(error, QStringLiteral("invalid_decision"));
         QVERIFY(!db.finishOpenWake(firstId, firstVersion, QStringLiteral("rest"),

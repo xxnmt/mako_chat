@@ -57,3 +57,42 @@ QJsonObject ActionCommitter::commitActivityShare(qlonglong activityId,int versio
                <<"error="<<result.value(QStringLiteral("error")).toString();
     return result;
 }
+
+QJsonObject ActionCommitter::commitVerifiedActionProposal(const QString &actionKey)
+{
+    if (!m_memory) return QJsonObject{{QStringLiteral("error"),QStringLiteral("no_store")}};
+    QString error;
+    const auto result=m_memory->commitVerifiedActionProposal(actionKey,&error);
+    if (result.contains(QStringLiteral("error")))
+        qInfo()<<"[ActionCommitter] verified proposal rejected key="<<actionKey
+               <<"error="<<error;
+    return result;
+}
+
+QJsonObject ActionCommitter::commitOpenWakeContact(const QString &actionKey)
+{
+    if (!m_memory) return QJsonObject{{QStringLiteral("error"),QStringLiteral("no_store")}};
+    QString error;
+    const auto result=m_memory->commitVerifiedOpenWakeContact(actionKey,&error);
+    if (result.contains(QStringLiteral("error")))
+        qInfo()<<"[ActionCommitter] open wake contact rejected key="<<actionKey
+               <<"error="<<error;
+    return result;
+}
+
+QJsonObject ActionCommitter::commitInternalActivityShare(const QString &actionKey)
+{
+    if (!m_memory) return QJsonObject{{QStringLiteral("error"),QStringLiteral("no_store")}};
+    QString error;
+    const auto result=m_memory->commitVerifiedInternalActivityShare(actionKey,&error);
+    if (result.contains(QStringLiteral("error")))
+        qInfo()<<"[ActionCommitter] internal share rejected key="<<actionKey
+               <<"error="<<error;
+    return result;
+}
+
+QJsonObject ActionCommitter::drainVerifiedActionProposals(int limit)
+{
+    if (!m_memory) return QJsonObject{{QStringLiteral("error"),QStringLiteral("no_store")}};
+    return m_memory->drainVerifiedActionProposals(limit);
+}

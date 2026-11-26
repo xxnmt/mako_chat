@@ -11,7 +11,7 @@
 | R12-1a OpenWake 持久化 + 共享调度 + 最小快照 | **已完成（源码+测试已提交）** | v31；OpenWake 仅 rest/reflect，allow_contact=false；无活动创建/投递 |
 | R12-1b 统一活动管理（internal_activity 完整生命周期） | **已完成（源码+测试已提交）** | 前台/OpenWake 新活动写 internal_activity；legacy thought 只读适配；legacy 分享保留，internal 分享仅落意愿 |
 | R12-2a 通用 ActionOrigin/Proposal、Evidence Purpose、统一核验 | **已完成（源码+测试已提交）** | v32 `action_proposal`；不发送、不接 Outbox；生产库仍 v31，待 R12-2b 受控迁移 |
-| R12-2b OpenWake 联系/内部活动分享提交、Outbox、回执 | **暂停待下一次评审** | 用户指定 R12-2a 后暂停 |
+| R12-2b OpenWake 联系/内部活动分享提交、Outbox、回执 | **已完成（源码+测试已提交）** | v32；allow_contact 默认 false；只入 Outbox，受控测试用 mock；生产库已 v32、零新发送 |
 | R12-3 认知快照连续性优化 | 待实施 | 跨入口一致性、去重、来源追踪、进一步预算优化 |
 
 ## R12-1a 补充修正（已独立提交）
@@ -41,6 +41,14 @@
 - 提案持久化 API：persist/actionProposal/update CAS/expire/mark committed；幂等与冲突明确。
 - 验证：全量 `ctest 23/23`；`tst_memorymanager 146/1 skipped`、`tst_memoryagent 93`、`tst_actionpolicy 17`、`tst_cognitivesnapshot 15`、`tst_actionoutbox 15`。生产库仍 v31（未静默迁移）；迁移测试在临时库通过。
 - **未做**：R12-2b 提交路径/Outbox/回执/真实 verifier 请求、R12-3、后台 tool loop。
+
+## R12-2b 已落地
+
+- `ActionCommitter` 新入口 `commitVerifiedActionProposal/commitOpenWakeContact/commitInternalActivityShare/drainVerifiedActionProposals`：读取 verified 提案，复验 ActionPolicy/来源/版本/runId/scope/epoch/target/成果/开关/安静/共享额度，单事务写 `cognitive_action + action_outbox + delivery_ledger` 并 CAS `verified→committed`；失败 hard→withheld，可恢复→保留 verified 等 drain。
+- OpenWake contact：`allow_contact` 独立默认 false；false 时 contact 拒绝/保留内部记录、不记认知失败；true 时服务端 ActionOrigin `wake/<id>:<version>`，确定性+coverage（claims=[] 也跑）+恰好一次 semantic verifier + ≤1 次 bounded repair；通过后 persist→verified→commit；不伪造 chat/reflection。
+- internal activity share：绑定真实 completed artifact_ref/version/hash 与 share_intent，action_key `activity:<id>:<artifact_version>:share`；只入 Outbox，不改变活动完成状态；legacy share 链不变。
+- 回执：`actionSettled` 支持 `wake:`/`activity:`，`recordActionReceipt` 幂等回写 open_wake last_outcome / activity share_outcome/version；成功才写主动历史；unknown 不写成功/不重发；启动 `drainVerifiedActionProposals` + 回执对账。
+- 验证：全量 `ctest 23/23`；`tst_memorymanager 146/1 skipped`、`tst_memoryagent 94`、`tst_actionoutbox 20`、`tst_actionpolicy 17`、`tst_cognitivesnapshot 15`。生产库 v31→v32 迁移后旧行数不变（chat 534/ledger 137/outbox 0），`allow_contact=false` 启动零新发送。**未做**：真实 QQ/pet 目标发送（需另行授权）、R12-3、后台 tool loop。
 
 - 全量 `ctest 23/23`；`tst_memorymanager` 139 passed/1 skipped、`tst_memoryagent` 91、`tst_cognitivesnapshot` 15、`tst_actionoutbox` 15、`tst_actionpolicy` 9。
 - 生产库 v31 无 schema 变更；R12-1b 无新迁移。

@@ -6635,7 +6635,8 @@ bool MemoryManager::finishOpenWake(qlonglong id, int version, const QString &dec
         return false;
     };
     if (!m_db.isOpen()) return fail(QStringLiteral("db_error"));
-    if (decision != QStringLiteral("rest") && decision != QStringLiteral("reflect"))
+    if (decision != QStringLiteral("rest") && decision != QStringLiteral("reflect")
+        && decision != QStringLiteral("contact"))
         return fail(QStringLiteral("invalid_decision"));
     const QString trimmedNote = note.trimmed();
     if (trimmedNote.size() > 240) return fail(QStringLiteral("invalid_note"));
@@ -9218,6 +9219,12 @@ QString MemoryManager::snapshotSubjectId(const RequestMeta &meta) const
 //            settle rejected 且 attempts<2 → 回 queued（受控一次重试）。
 namespace {
 
+// R12-2b：新来源动作在 cognitive_action.kind 上的稳定名称。
+// 与 legacy 的 SpontaneousContact / ActivityShare 分开，settle/恢复分支据此把回执写回
+// open_wake_state / internal_activity，而不会误走 reflection_contact / thought_result 旧路径。
+const QString kActionKindOpenWakeContact = QStringLiteral("OpenWakeContact");
+const QString kActionKindInternalShare = QStringLiteral("InternalActivityShare");
+
 // 与 claimReflectionContact 完全一致的来源/资格口径（privatereflection.cpp 内是文件静态的，
 // 这里按同一语义复制一份，保证"提交"和旧"领取"对同一个联系意图的判断不会分叉）。
 const QString kActionContactSourceRows = QStringLiteral(
@@ -9377,6 +9384,14 @@ bool markOutboxDomainDispatching(const QSqlDatabase &db,const QString &actionKey
                   "WHERE kind='share' AND ref=? AND state='rejected'");
         q.addBindValue(ref);
         if (!q.exec()) return false;
+    } else if (kind==kActionKindOpenWakeContact) {
+        // R12-2b：新来源 contact 的领域行就是 delivery_ledger(kind=contact, ref=action_key)，
+        // 领取时只把"被渠道拒绝后的受控重试"拉回 claimed；action_key 已存在的幂等判断在提交层。
+        actionNoteDelivery(db,QStringLiteral("contact"),actionKey,channel,session,
+                           QString{},QStringLiteral("claimed"),0);
+    } else if (kind==kActionKindInternalShare) {
+        actionNoteDelivery(db,QStringLiteral("share"),actionKey,channel,session,
+                           QString{},QStringLiteral("claimed"),0);
     }
     return true;
 }
@@ -9439,6 +9454,52 @@ bool settleOutboxDomain(const QSqlDatabase &db,const QString &actionKey,const QS
         actionNoteDelivery(db,QStringLiteral("share"),
                            QStringLiteral("thought:%1:%2").arg(activityId).arg(version),
                            channel,session,QString{},outcome,failed ? 1 : 0);
+    } else if (kind==kActionKindOpenWakeContact) {
+        // R12-2b：新来源 contact 的 delivery_ledger.ref 就是 action_key（wake:<id>:<v>:contact）。
+        // 成功回执额外把 open_wake_state.last_outcome 更新成 contact_<outcome>，供调度/审计读取；
+        // unknown/rejected/withheld 只落账本终态，不写成"她说过"。
+        actionNoteDelivery(db,QStringLiteral("contact"),actionKey,channel,session,
+                           QString{},outcome,failed ? 1 : 0);
+        if (outcome==QStringLiteral("handed_off")
+            || outcome==QStringLiteral("protocol_accepted")) {
+            if (parts.size()>=2) {
+                QSqlQuery scope(db);
+                scope.prepare(QStringLiteral("SELECT scope_key FROM open_wake WHERE id=?"));
+                scope.addBindValue(parts[1].toLongLong());
+                if (scope.exec() && scope.next()) {
+                    QSqlQuery stateUpdate(db);
+                    stateUpdate.prepare(QStringLiteral(
+                        "UPDATE open_wake_state SET last_outcome=?,updated_at=unixepoch() "
+                        "WHERE scope_key=?"));
+                    stateUpdate.addBindValue(QStringLiteral("contact_%1").arg(outcome));
+                    stateUpdate.addBindValue(scope.value(0).toString());
+                    if (!stateUpdate.exec()) return false;
+                }
+            }
+        }
+    } else if (kind==kActionKindInternalShare) {
+        // R12-2b：internal share 的账本 ref=action_key（activity:<id>:<artifact_version>:share）。
+        // 成功回执只 patch result_json 的分享结果，**不改变活动 status/version**（完成状态保留）。
+        actionNoteDelivery(db,QStringLiteral("share"),actionKey,channel,session,
+                           QString{},outcome,failed ? 1 : 0);
+        if (outcome==QStringLiteral("handed_off")
+            || outcome==QStringLiteral("protocol_accepted")) {
+            if (parts.size()>=3) {
+                QSqlQuery patch(db);
+                patch.prepare(QStringLiteral(
+                    "UPDATE internal_activity SET result_json="
+                    "json_patch(coalesce(result_json,'{}'),?) WHERE id=?"));
+                patch.addBindValue(QString::fromUtf8(QJsonDocument(QJsonObject{
+                    {QStringLiteral("share_outcome"),outcome},
+                    {QStringLiteral("share_version"),parts[2].toInt()},
+                    {QStringLiteral("share_channel"),channel},
+                    {QStringLiteral("share_at"),
+                     QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)}})
+                    .toJson(QJsonDocument::Compact)));
+                patch.addBindValue(parts[1].toLongLong());
+                if (!patch.exec()) return false;
+            }
+        }
     }
     return true;
 }
@@ -9470,6 +9531,58 @@ void recoverOutboxDomain(const QSqlDatabase &db,const QString &actionKey,const Q
                   "updated_at=CURRENT_TIMESTAMP WHERE kind='share' AND ref=? AND state='claimed'");
         q.addBindValue(QStringLiteral("thought:%1:%2").arg(parts[1]).arg(parts[2]));
         if (!q.exec()) qWarning()<<"[Outbox] 恢复 share 失败"<<q.lastError();
+        return;
+    }
+    if (kind==kActionKindOpenWakeContact) {
+        // R12-2b：进程崩溃遗留的新来源 contact 一律冻结 unknown（at-most-once，绝不重发）。
+        q.prepare("UPDATE delivery_ledger SET state='unknown',last_error='dispatch_abandoned',"
+                  "updated_at=CURRENT_TIMESTAMP WHERE kind='contact' AND ref=? "
+                  "AND state NOT IN ('unknown','withheld')");
+        q.addBindValue(actionKey);
+        if (!q.exec()) {
+            qWarning()<<"[Outbox] 恢复 open_wake contact 失败"<<q.lastError();
+            return;
+        }
+        if (parts.size()>=2) {
+            QSqlQuery scope(db);
+            scope.prepare(QStringLiteral("SELECT scope_key FROM open_wake WHERE id=?"));
+            scope.addBindValue(parts[1].toLongLong());
+            if (scope.exec() && scope.next()) {
+                QSqlQuery stateUpdate(db);
+                stateUpdate.prepare(QStringLiteral(
+                    "UPDATE open_wake_state SET last_outcome='contact_unknown',"
+                    "updated_at=unixepoch() WHERE scope_key=?"));
+                stateUpdate.addBindValue(scope.value(0).toString());
+                if (!stateUpdate.exec())
+                    qWarning()<<"[Outbox] 恢复 open_wake_state 失败"<<stateUpdate.lastError();
+            }
+        }
+        return;
+    }
+    if (kind==kActionKindInternalShare) {
+        q.prepare("UPDATE delivery_ledger SET state='unknown',last_error='dispatch_abandoned',"
+                  "updated_at=CURRENT_TIMESTAMP WHERE kind='share' AND ref=? "
+                  "AND state NOT IN ('unknown','withheld')");
+        q.addBindValue(actionKey);
+        if (!q.exec()) {
+            qWarning()<<"[Outbox] 恢复 internal share 失败"<<q.lastError();
+            return;
+        }
+        if (parts.size()>=3) {
+            QSqlQuery patch(db);
+            patch.prepare(QStringLiteral(
+                "UPDATE internal_activity SET result_json="
+                "json_patch(coalesce(result_json,'{}'),?) WHERE id=?"));
+            patch.addBindValue(QString::fromUtf8(QJsonDocument(QJsonObject{
+                {QStringLiteral("share_outcome"),QStringLiteral("unknown")},
+                {QStringLiteral("share_version"),parts[2].toInt()},
+                {QStringLiteral("share_at"),
+                 QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)}})
+                .toJson(QJsonDocument::Compact)));
+            patch.addBindValue(parts[1].toLongLong());
+            if (!patch.exec())
+                qWarning()<<"[Outbox] 恢复 internal share 结果失败"<<patch.lastError();
+        }
     }
 }
 
@@ -10439,4 +10552,659 @@ bool MemoryManager::markProposalCommitted(const QString &actionKey,
     qInfo() << "[Proposal] committed key=" << key
             << "committed_action_key=" << committed;
     return true;
+}
+
+
+
+// ============================ R12-2b：verified 提案提交（复用车/箱/回执） ============================
+// 这一片把 R12-2a 的 verified ActionProposal 接到既有 cognitive_action + action_outbox +
+// delivery_ledger 唯一提交路径上：仍然只入 Outbox（发送只由 ActionOutboxDispatcher 做），
+// 不写 reflection_contact/private_reflection，不伪造 chat_history/reflection。
+// 提交前再次用 ActionPolicy::validateActionProposal 复核来源/版本/runId/scope/epoch/target/
+// 成果新鲜度/开关/权限/coverage，并复核安静时段、可达目标与共享 contact 每日额度。
+namespace {
+
+// 不可恢复（策略/来源/成果/重复）失败 → 提案落 withheld；可恢复（安静/额度/不可达/DB）失败
+// → 保留 verified，交给下一次 drain。见 memorymanager.h 的错误码约定。
+bool actionProposalHardReject(const QString &code)
+{
+    static const QSet<QString> hard{
+        QStringLiteral("allow_contact_disabled"),
+        QStringLiteral("stale_origin"),
+        QStringLiteral("artifact_mismatch"),
+        QStringLiteral("duplicate"),
+        QStringLiteral("policy_rejected"),
+        QStringLiteral("origin_kind_not_allowed"),
+        QStringLiteral("invalid_kind"),
+        QStringLiteral("not_verified"),
+        QStringLiteral("invalid_state")};
+    return hard.contains(code);
+}
+
+// ActionPolicy 的细粒度原因 → R12-2b 对外错误码（提交层只暴露稳定错误码）。
+QString actionProposalErrorCode(const QString &reason)
+{
+    const QString trimmed = reason.trimmed();
+    if (trimmed == QStringLiteral("open_wake_contact_disabled"))
+        return QStringLiteral("allow_contact_disabled");
+    if (trimmed.startsWith(QStringLiteral("origin_")))
+        return QStringLiteral("stale_origin");
+    if (trimmed.contains(QStringLiteral("artifact")))
+        return QStringLiteral("artifact_mismatch");
+    if (trimmed.contains(QStringLiteral("target")))
+        return QStringLiteral("target_unreachable");
+    return QStringLiteral("policy_rejected");
+}
+
+// 安静时段：与既有主动联系执行端口径一致（start==end 视为不设安静时段）。
+bool actionQuietNow(const ProactiveConfig &options)
+{
+    const QTime now = QTime::currentTime();
+    const QTime start = QTime::fromString(options.quietStart, QStringLiteral("HH:mm"));
+    const QTime end = QTime::fromString(options.quietEnd, QStringLiteral("HH:mm"));
+    if (!start.isValid() || !end.isValid() || start == end) return false;
+    return start < end ? (now >= start && now < end) : (now >= start || now < end);
+}
+
+} // namespace
+
+QJsonObject MemoryManager::commitVerifiedActionProposal(const QString &actionKey, QString *error)
+{
+    if (error) error->clear();
+    const auto fail = [error](const QString &code, const QString &detail = QString()) {
+        if (error) *error = code;
+        QJsonObject result{{QStringLiteral("error"), code}};
+        if (!detail.isEmpty()) result[QStringLiteral("detail")] = detail;
+        return result;
+    };
+    const QString key = actionKey.trimmed();
+    if (!m_db.isOpen()) return fail(QStringLiteral("db_error"));
+    if (key.isEmpty()) return fail(QStringLiteral("invalid_action_key"));
+    const QJsonObject proposal = actionProposal(key);
+    if (proposal.isEmpty()) return fail(QStringLiteral("not_found"));
+    const QString kind = proposal.value(QStringLiteral("kind")).toString();
+    const QString originKind = proposal.value(QStringLiteral("origin_kind")).toString();
+    if (kind == QStringLiteral("contact")) {
+        // 本片新来源只接 wake（reflection/concern 仍走 legacy commitReflectionContact 语义）。
+        if (originKind != QStringLiteral("wake"))
+            return fail(QStringLiteral("origin_kind_not_allowed"));
+    } else if (kind == QStringLiteral("activity_share")) {
+        if (originKind != QStringLiteral("thought") && originKind != QStringLiteral("activity"))
+            return fail(QStringLiteral("origin_kind_not_allowed"));
+    } else {
+        return fail(QStringLiteral("invalid_kind"));
+    }
+    // 幂等：已经有动作行时不重复建 outbox；若提案停在 verified，补一次 committed 回写。
+    // 同 key 不同 kind/来源版本视为 conflict/duplicate（不能静默复用另一条主动动作）。
+    const QString expectedActionKind = kind == QStringLiteral("contact")
+        ? kActionKindOpenWakeContact : kActionKindInternalShare;
+    const QJsonObject existing = existingAction(m_db, key);
+    if (!existing.isEmpty()) {
+        QJsonObject existingPayload;
+        {
+            QSqlQuery row(m_db);
+            row.prepare(QStringLiteral(
+                "SELECT kind,payload_json FROM cognitive_action WHERE action_key=?"));
+            row.addBindValue(key);
+            if (row.exec() && row.next()) {
+                if (row.value(0).toString() != expectedActionKind) {
+                    if (error) *error = QStringLiteral("duplicate");
+                    return QJsonObject{{QStringLiteral("error"), QStringLiteral("duplicate")}};
+                }
+                existingPayload = QJsonDocument::fromJson(
+                    row.value(1).toString().toUtf8()).object();
+            }
+        }
+        if (!existingPayload.isEmpty()
+            && (existingPayload.value(QStringLiteral("origin_ref")).toString()
+                    != proposal.value(QStringLiteral("origin_ref")).toString()
+                || existingPayload.value(QStringLiteral("origin_version")).toInt()
+                    != proposal.value(QStringLiteral("origin_version")).toInt())) {
+            if (error) *error = QStringLiteral("duplicate");
+            return QJsonObject{{QStringLiteral("error"), QStringLiteral("duplicate")}};
+        }
+        if (proposal.value(QStringLiteral("state")).toString() == QStringLiteral("verified")) {
+            QString markError;
+            markProposalCommitted(key, key, &markError);
+        }
+        QJsonObject result = existing;
+        result[QStringLiteral("proposal_state")] = QStringLiteral("committed");
+        return result;
+    }
+    if (proposal.value(QStringLiteral("state")).toString() != QStringLiteral("verified")) {
+        return fail(proposal.value(QStringLiteral("state")).toString() == QStringLiteral("committed")
+                        ? QStringLiteral("invalid_state")
+                        : QStringLiteral("not_verified"));
+    }
+    const qint64 expiresAt = proposal.value(QStringLiteral("expires_at")).toInteger();
+    if (expiresAt > 0 && expiresAt <= QDateTime::currentSecsSinceEpoch()) {
+        updateActionProposalState(key, QStringLiteral("verified"), QStringLiteral("expired"),
+                                  QString(), QStringLiteral("expired"));
+        return fail(QStringLiteral("stale_origin"), QStringLiteral("expired"));
+    }
+    auto &cfg = ConfigManager::instance();
+    const ProactiveConfig opts = cfg.getProactiveConfig();
+    if (!opts.enabled || !cfg.getMemoryPolicyConfig().longTermMemoryEnabled) {
+        updateActionProposalState(key, QStringLiteral("verified"), QStringLiteral("withheld"),
+                                  QStringLiteral("withheld"), QStringLiteral("proactive_disabled"));
+        return fail(QStringLiteral("policy_rejected"), QStringLiteral("proactive_disabled"));
+    }
+    const QString targetChannel = proposal.value(QStringLiteral("target_channel")).toString();
+    const QString targetSession = proposal.value(QStringLiteral("target_session")).toString();
+    // 统一核验：来源真实身份（wake/成果）、版本/runId/scope/epoch、target 可见性、claims 用途、
+    // 成果 hash/版本、coverage（claims=[] 也跑确定性 coverage）。
+    ActionPolicy policy(this);
+    const QJsonObject validationInput{
+        {QStringLiteral("origin"), proposal.value(QStringLiteral("origin"))},
+        {QStringLiteral("kind"), kind},
+        {QStringLiteral("action_key"), key},
+        {QStringLiteral("target"),
+         QJsonObject{{QStringLiteral("channel"), targetChannel},
+                     {QStringLiteral("session_id"), targetSession}}},
+        {QStringLiteral("payload"), proposal.value(QStringLiteral("payload"))},
+        {QStringLiteral("claims"), proposal.value(QStringLiteral("claims"))},
+        {QStringLiteral("expires_at"), expiresAt}};
+    QString policyError;
+    const QJsonObject validation = policy.validateActionProposal(validationInput, &policyError);
+    if (!validation.value(QStringLiteral("allowed")).toBool()) {
+        const QString reason = validation.value(QStringLiteral("reason")).toString(policyError);
+        const QString code = actionProposalErrorCode(reason);
+        if (actionProposalHardReject(code)) {
+            updateActionProposalState(key, QStringLiteral("verified"), QStringLiteral("withheld"),
+                                      QStringLiteral("withheld"), code);
+        }
+        return fail(code, reason);
+    }
+    // 目标可达性 / 权限（提交层粗门控；真实渠道可达性仍由建连状态与 dispatcher sender 决定）。
+    if (!actionReminderAllowed(targetChannel, targetSession))
+        return fail(QStringLiteral("target_unreachable"));
+    // 安静时段：只影响 contact；轮询/恢复稍后再试，提案保持 verified 不丢。
+    if (kind == QStringLiteral("contact") && actionQuietNow(opts))
+        return fail(QStringLiteral("quiet"));
+    // 共享 contact 每日额度：所有来源统一统计 delivery_ledger(kind=contact) 的当日非 withheld 行。
+    if (kind == QStringLiteral("contact") && opts.contactDailyLimit > 0) {
+        QSqlQuery used(m_db);
+        if (used.exec(QStringLiteral(
+                "SELECT count(*) FROM delivery_ledger WHERE kind='contact' "
+                "AND date(created_at,'localtime')=date('now','localtime') "
+                "AND state<>'withheld'"))
+            && used.next() && used.value(0).toInt() >= opts.contactDailyLimit)
+            return fail(QStringLiteral("limit"));
+    }
+
+    // 服务端组装最终 payload：只接受提案行的权威来源字段，模型原文元数据不进入动作行。
+    const QJsonObject origin = proposal.value(QStringLiteral("origin")).toObject();
+    const QJsonObject payloadIn = proposal.value(QStringLiteral("payload")).toObject();
+    const QJsonArray claims = proposal.value(QStringLiteral("claims")).toArray();
+    const QString semanticStatus = proposal.value(QStringLiteral("semantic_status")).toString();
+    QJsonObject payload;
+    QJsonObject outboxPayload;
+    QString actionKind;
+    QString ledgerKind;
+    QString text;
+    QString triggerRef;
+    QString motivationType;
+    QString motivationRef;
+    QString contextRefsJson;
+    qlonglong artifactId = 0;
+    if (kind == QStringLiteral("contact")) {
+        const QString message = payloadIn.value(QStringLiteral("message")).toString().trimmed();
+        if (message.isEmpty())
+            return fail(QStringLiteral("policy_rejected"), QStringLiteral("missing_message"));
+        actionKind = kActionKindOpenWakeContact;
+        ledgerKind = QStringLiteral("contact");
+        text = message;
+        const QString wakeRef = origin.value(QStringLiteral("ref")).toString();
+        triggerRef = QStringLiteral("%1:%2").arg(wakeRef)
+                         .arg(origin.value(QStringLiteral("version")).toInt());
+        const QJsonObject motivation = payloadIn.value(QStringLiteral("motivation")).toObject();
+        motivationType = motivation.value(QStringLiteral("type")).toString();
+        motivationRef = motivation.value(QStringLiteral("ref")).toString();
+        QJsonArray refs;
+        for (const auto &value : claims)
+            for (const auto &ref : value.toObject().value(QStringLiteral("refs")).toArray())
+                refs.append(ref);
+        if (refs.isEmpty() && !motivationRef.isEmpty()) refs.append(motivationRef);
+        if (!refs.isEmpty())
+            contextRefsJson = QString::fromUtf8(QJsonDocument(refs).toJson(QJsonDocument::Compact));
+        payload = QJsonObject{
+            {QStringLiteral("action_key"), key},
+            {QStringLiteral("kind"), QStringLiteral("contact")},
+            {QStringLiteral("origin_kind"), originKind},
+            {QStringLiteral("origin_ref"), wakeRef},
+            {QStringLiteral("origin_version"), origin.value(QStringLiteral("version"))},
+            {QStringLiteral("run_id"), origin.value(QStringLiteral("run_id"))},
+            {QStringLiteral("scope"), origin.value(QStringLiteral("scope"))},
+            {QStringLiteral("context_epoch"), origin.value(QStringLiteral("context_epoch"))},
+            {QStringLiteral("channel"), targetChannel},
+            {QStringLiteral("session"), targetSession},
+            {QStringLiteral("sentences"),
+             QJsonArray{QJsonObject{{QStringLiteral("zh_text"), message}}}},
+            {QStringLiteral("message"), message},
+            {QStringLiteral("contact_draft"), message},
+            {QStringLiteral("reason"), payloadIn.value(QStringLiteral("reason"))},
+            {QStringLiteral("motivation"), motivation},
+            {QStringLiteral("core_claim_ids"), payloadIn.value(QStringLiteral("core_claim_ids"))},
+            {QStringLiteral("claims"), claims}};
+        outboxPayload = QJsonObject{
+            {QStringLiteral("sentences"),
+             QJsonArray{QJsonObject{{QStringLiteral("zh_text"), message}}}},
+            {QStringLiteral("channel"), targetChannel},
+            {QStringLiteral("session"), targetSession},
+            {QStringLiteral("message"), message}};
+    } else {
+        const QString draft = payloadIn.value(QStringLiteral("draft")).toString().trimmed();
+        if (draft.isEmpty())
+            return fail(QStringLiteral("policy_rejected"), QStringLiteral("missing_artifact_draft"));
+        artifactId = origin.value(QStringLiteral("id")).toInteger();
+        const QJsonObject view = activityByRef(origin.value(QStringLiteral("ref")).toString());
+        if (view.isEmpty()) {
+            updateActionProposalState(key, QStringLiteral("verified"), QStringLiteral("withheld"),
+                                      QStringLiteral("withheld"),
+                                      QStringLiteral("artifact_mismatch"));
+            return fail(QStringLiteral("artifact_mismatch"), QStringLiteral("artifact_not_found"));
+        }
+        const QString artifactRef = view.value(QStringLiteral("artifact_ref")).toString().trimmed();
+        int artifactVersion = view.value(QStringLiteral("artifact_version")).toInt(0);
+        if (artifactVersion <= 0) artifactVersion = view.value(QStringLiteral("version")).toInt(0);
+        const QString artifactHash = view.value(QStringLiteral("artifact_hash")).toString().trimmed();
+        const QString storedDraft = view.value(QStringLiteral("draft")).toString().trimmed();
+        if (view.value(QStringLiteral("status")).toString() != QStringLiteral("completed")
+            || artifactRef.isEmpty()
+            || artifactRef != view.value(QStringLiteral("ref")).toString()
+            || storedDraft.isEmpty()
+            || artifactVersion != origin.value(QStringLiteral("version")).toInt()) {
+            updateActionProposalState(key, QStringLiteral("verified"), QStringLiteral("withheld"),
+                                      QStringLiteral("withheld"),
+                                      QStringLiteral("artifact_mismatch"));
+            return fail(QStringLiteral("artifact_mismatch"), QStringLiteral("version_or_status"));
+        }
+        // 正文只能来自服务端已持久化成果；提交时按哈希再核对一次（防撤回/换稿）。
+        if (!artifactHash.isEmpty() && activityContentHash(draft) != artifactHash) {
+            updateActionProposalState(key, QStringLiteral("verified"), QStringLiteral("withheld"),
+                                      QStringLiteral("withheld"),
+                                      QStringLiteral("artifact_mismatch"));
+            return fail(QStringLiteral("artifact_mismatch"), QStringLiteral("draft_hash"));
+        }
+        // internal 活动必须绑定同一份 share_intent（版本/哈希一致；撤回的不再发送）。
+        if (originKind == QStringLiteral("activity")) {
+            const QJsonObject intent = view.value(QStringLiteral("share_intent")).toObject();
+            if (intent.isEmpty()) {
+                updateActionProposalState(key, QStringLiteral("verified"),
+                                          QStringLiteral("withheld"),
+                                          QStringLiteral("withheld"),
+                                          QStringLiteral("artifact_mismatch"));
+                return fail(QStringLiteral("artifact_mismatch"),
+                            QStringLiteral("share_intent_missing"));
+            }
+            if (intent.value(QStringLiteral("state")).toString() == QStringLiteral("withdrawn")) {
+                updateActionProposalState(key, QStringLiteral("verified"),
+                                          QStringLiteral("withheld"),
+                                          QStringLiteral("withheld"),
+                                          QStringLiteral("artifact_mismatch"));
+                return fail(QStringLiteral("artifact_mismatch"), QStringLiteral("share_withdrawn"));
+            }
+            if (intent.value(QStringLiteral("artifact_version")).toInt() != artifactVersion) {
+                updateActionProposalState(key, QStringLiteral("verified"),
+                                          QStringLiteral("withheld"),
+                                          QStringLiteral("withheld"),
+                                          QStringLiteral("artifact_mismatch"));
+                return fail(QStringLiteral("artifact_mismatch"),
+                            QStringLiteral("share_version_mismatch"));
+            }
+            const QString intentHash = intent.value(QStringLiteral("content_hash")).toString();
+            if (!intentHash.isEmpty() && !artifactHash.isEmpty() && intentHash != artifactHash) {
+                updateActionProposalState(key, QStringLiteral("verified"),
+                                          QStringLiteral("withheld"),
+                                          QStringLiteral("withheld"),
+                                          QStringLiteral("artifact_mismatch"));
+                return fail(QStringLiteral("artifact_mismatch"), QStringLiteral("share_hash"));
+            }
+        }
+        actionKind = kActionKindInternalShare;
+        ledgerKind = QStringLiteral("share");
+        text = draft;
+        triggerRef = QStringLiteral("%1:%2").arg(origin.value(QStringLiteral("ref")).toString())
+                         .arg(artifactVersion);
+        payload = QJsonObject{
+            {QStringLiteral("action_key"), key},
+            {QStringLiteral("kind"), QStringLiteral("share")},
+            {QStringLiteral("origin_kind"), originKind},
+            {QStringLiteral("origin_ref"), origin.value(QStringLiteral("ref"))},
+            {QStringLiteral("origin_version"), origin.value(QStringLiteral("version"))},
+            {QStringLiteral("activity_ref"), view.value(QStringLiteral("ref"))},
+            {QStringLiteral("artifact_ref"), artifactRef},
+            {QStringLiteral("artifact_version"), artifactVersion},
+            {QStringLiteral("artifact_hash"), artifactHash},
+            {QStringLiteral("run_id"), origin.value(QStringLiteral("run_id"))},
+            {QStringLiteral("scope"), origin.value(QStringLiteral("scope"))},
+            {QStringLiteral("context_epoch"), origin.value(QStringLiteral("context_epoch"))},
+            {QStringLiteral("channel"), targetChannel},
+            {QStringLiteral("session"), targetSession},
+            {QStringLiteral("sentences"),
+             QJsonArray{QJsonObject{{QStringLiteral("zh_text"), draft}}}},
+            {QStringLiteral("draft"), draft},
+            {QStringLiteral("claims"), claims}};
+        outboxPayload = QJsonObject{
+            {QStringLiteral("sentences"),
+             QJsonArray{QJsonObject{{QStringLiteral("zh_text"), draft}}}},
+            {QStringLiteral("channel"), targetChannel},
+            {QStringLiteral("session"), targetSession},
+            {QStringLiteral("draft"), draft}};
+    }
+
+    // 单事务：动作 + Outbox + 账本 + 提案 CAS 一起落库（失败整体回滚）。
+    if (!m_db.transaction()) return fail(QStringLiteral("db_error"));
+    auto rollback = qScopeGuard([this] { m_db.rollback(); });
+    // 并发兜底：进入事务后再查一次动作行（唯一约束仍是最后防线）。
+    const QJsonObject raced = existingAction(m_db, key);
+    if (!raced.isEmpty()) {
+        m_db.rollback();
+        rollback.dismiss();
+        QString markError;
+        markProposalCommitted(key, key, &markError);
+        QJsonObject result = raced;
+        result[QStringLiteral("proposal_state")] = QStringLiteral("committed");
+        return result;
+    }
+    const QString payloadJson = canonicalJson(payload);
+    const QString outboxPayloadJson = canonicalJson(outboxPayload);
+    qlonglong actionId = 0;
+    if (!insertActionWithOutbox(m_db, key, actionKind, triggerRef, targetChannel, targetSession,
+                                payloadJson,
+                                QStringLiteral("proposal:%1").arg(semanticStatus),
+                                &actionId, canonicalJson(claims), motivationType, motivationRef,
+                                semanticStatus, contextRefsJson, outboxPayloadJson))
+        return fail(QStringLiteral("db_error"), QStringLiteral("insert_failed"));
+    {
+        // 来源 runId/动机只做审计可观测（发送路由仍来自 target）。
+        QSqlQuery touch(m_db);
+        touch.prepare(QStringLiteral(
+            "UPDATE cognitive_action SET run_id=?,motivation_type=?,motivation_ref=? WHERE id=?"));
+        const QString runId = origin.value(QStringLiteral("run_id")).toString();
+        touch.addBindValue(runId.isEmpty() ? QVariant() : QVariant(runId));
+        touch.addBindValue(motivationType.isEmpty() ? QVariant() : QVariant(motivationType));
+        touch.addBindValue(motivationRef.isEmpty() ? QVariant() : QVariant(motivationRef));
+        touch.addBindValue(actionId);
+        if (!touch.exec()) return fail(QStringLiteral("db_error"), QStringLiteral("action_touch"));
+    }
+    // 账本：kind=contact/share，ref=action_key（与 settle/回执/共享额度同一口径）。
+    actionNoteDelivery(m_db, ledgerKind, key, targetChannel, targetSession, text,
+                       QStringLiteral("claimed"), 0);
+    {
+        QSqlQuery proposalUpdate(m_db);
+        proposalUpdate.prepare(QStringLiteral(
+            "UPDATE action_proposal SET state='committed',committed_action_key=?,error_code=NULL,"
+            "updated_at=unixepoch() WHERE action_key=? AND state='verified'"));
+        proposalUpdate.addBindValue(key);
+        proposalUpdate.addBindValue(key);
+        if (!proposalUpdate.exec() || proposalUpdate.numRowsAffected() != 1) {
+            m_db.rollback();
+            rollback.dismiss();
+            return fail(QStringLiteral("db_error"), QStringLiteral("proposal_cas"));
+        }
+    }
+    if (!m_db.commit()) return fail(QStringLiteral("db_error"), QStringLiteral("commit_failed"));
+    rollback.dismiss();
+    qInfo().noquote()
+        << QStringLiteral("[Proposal] committed key=%1 kind=%2 channel=%3 session=%4"
+                          " artifact=%5")
+               .arg(key, actionKind, targetChannel, targetSession)
+               .arg(artifactId > 0 ? QString::number(artifactId) : QStringLiteral("-"));
+    QJsonObject result = actionCommittedResult(key, actionId, actionKind, targetChannel, targetSession);
+    result[QStringLiteral("proposal_state")] = QStringLiteral("committed");
+    result[QStringLiteral("kind")] = kind;
+    return result;
+}
+
+QJsonObject MemoryManager::commitVerifiedOpenWakeContact(const QString &actionKey, QString *error)
+{
+    if (error) error->clear();
+    const QJsonObject proposal = actionProposal(actionKey.trimmed());
+    if (proposal.isEmpty()) {
+        if (error) *error = QStringLiteral("not_found");
+        return QJsonObject{{QStringLiteral("error"), QStringLiteral("not_found")}};
+    }
+    if (proposal.value(QStringLiteral("kind")).toString() != QStringLiteral("contact")
+        || proposal.value(QStringLiteral("origin_kind")).toString() != QStringLiteral("wake")) {
+        if (error) *error = QStringLiteral("origin_kind_not_allowed");
+        return QJsonObject{{QStringLiteral("error"), QStringLiteral("origin_kind_not_allowed")}};
+    }
+    return commitVerifiedActionProposal(actionKey, error);
+}
+
+QJsonObject MemoryManager::commitVerifiedInternalActivityShare(const QString &actionKey,
+                                                               QString *error)
+{
+    if (error) error->clear();
+    const QJsonObject proposal = actionProposal(actionKey.trimmed());
+    if (proposal.isEmpty()) {
+        if (error) *error = QStringLiteral("not_found");
+        return QJsonObject{{QStringLiteral("error"), QStringLiteral("not_found")}};
+    }
+    if (proposal.value(QStringLiteral("kind")).toString() != QStringLiteral("activity_share")
+        || proposal.value(QStringLiteral("origin_kind")).toString() != QStringLiteral("activity")) {
+        if (error) *error = QStringLiteral("origin_kind_not_allowed");
+        return QJsonObject{{QStringLiteral("error"), QStringLiteral("origin_kind_not_allowed")}};
+    }
+    return commitVerifiedActionProposal(actionKey, error);
+}
+
+QJsonObject MemoryManager::drainVerifiedActionProposals(int limit)
+{
+    QJsonObject result{{QStringLiteral("scanned"), 0},
+                       {QStringLiteral("committed"), 0},
+                       {QStringLiteral("withheld"), 0},
+                       {QStringLiteral("failed"), 0},
+                       {QStringLiteral("results"), QJsonArray{}}};
+    if (!m_db.isOpen() || limit <= 0) return result;
+    // 顺手把已过期的提案落终态：过期的 verified 不应被反复尝试。
+    expireActionProposals();
+    QStringList keys;
+    {
+        QSqlQuery query(m_db);
+        query.prepare(QStringLiteral(
+            "SELECT action_key FROM action_proposal WHERE state='verified' ORDER BY id LIMIT ?"));
+        query.addBindValue(qBound(1, limit, 32));
+        if (!query.exec()) return result;
+        while (query.next()) keys.append(query.value(0).toString());
+    }
+    QJsonArray results;
+    int committed = 0, withheld = 0, failed = 0;
+    for (const auto &key : keys) {
+        QString commitError;
+        const QJsonObject outcome = commitVerifiedActionProposal(key, &commitError);
+        QJsonObject row{{QStringLiteral("action_key"), key}};
+        if (outcome.contains(QStringLiteral("error"))) {
+            row[QStringLiteral("error")] = commitError;
+            const QJsonObject after = actionProposal(key);
+            const QString state = after.value(QStringLiteral("state")).toString();
+            row[QStringLiteral("state")] = state;
+            if (state == QStringLiteral("withheld")) ++withheld;
+            else ++failed;
+        } else {
+            ++committed;
+            row[QStringLiteral("state")] = QStringLiteral("committed");
+        }
+        results.append(row);
+    }
+    result[QStringLiteral("scanned")] = keys.size();
+    result[QStringLiteral("committed")] = committed;
+    result[QStringLiteral("withheld")] = withheld;
+    result[QStringLiteral("failed")] = failed;
+    result[QStringLiteral("results")] = results;
+    if (committed > 0 || withheld > 0 || failed > 0)
+        qInfo() << "[Proposal] drain scanned=" << keys.size() << "committed=" << committed
+                << "withheld=" << withheld << "failed=" << failed;
+    return result;
+}
+
+QJsonObject MemoryManager::chooseProactiveTarget(const QString &draftLikeText,
+                                                 bool requireShareable) const
+{
+    const ActionTarget target = actionChooseTarget(
+        ConfigManager::instance().getProactiveConfig().targets, draftLikeText, requireShareable);
+    return QJsonObject{{QStringLiteral("found"), target.found},
+                       {QStringLiteral("channel"), target.channel},
+                       {QStringLiteral("session"), target.session}};
+}
+
+bool MemoryManager::recordActionReceipt(const QString &actionKey, const QString &outcome,
+                                        const QString &detail)
+{
+    // 只处理 R12-2b 新来源；legacy reflection:/reminder:/thought: 回执仍由既有
+    // settleOutboxAction 的领域回写处理，避免同一条语义被写两次。
+    static const QSet<QString> outcomes{
+        QStringLiteral("protocol_accepted"), QStringLiteral("handed_off"),
+        QStringLiteral("rejected"), QStringLiteral("unknown"), QStringLiteral("withheld")};
+    const QString key = actionKey.trimmed();
+    if (!m_db.isOpen() || key.isEmpty() || !outcomes.contains(outcome)) return false;
+    const bool wakeContact = key.startsWith(QStringLiteral("wake:"));
+    const bool internalShare = key.startsWith(QStringLiteral("activity:"));
+    if (!wakeContact && !internalShare) return true;
+    const bool success = outcome == QStringLiteral("handed_off")
+        || outcome == QStringLiteral("protocol_accepted");
+    const QString ledgerKind = wakeContact ? QStringLiteral("contact") : QStringLiteral("share");
+    const QString ledgerRef = key;
+    // 动作行的路由/文本只从库内权威行读取。
+    QJsonObject actionRow;
+    {
+        QSqlQuery row(m_db);
+        row.prepare(QStringLiteral(
+            "SELECT channel,session_id,payload_json,coalesce(last_outcome,'') FROM cognitive_action "
+            "WHERE action_key=?"));
+        row.addBindValue(key);
+        if (row.exec() && row.next()) {
+            actionRow.insert(QStringLiteral("channel"), row.value(0).toString());
+            actionRow.insert(QStringLiteral("session"), row.value(1).toString());
+            actionRow.insert(QStringLiteral("payload"), QJsonDocument::fromJson(
+                row.value(2).toString().toUtf8()).object());
+            actionRow.insert(QStringLiteral("last_outcome"), row.value(3).toString());
+        }
+    }
+    const QString channel = actionRow.value(QStringLiteral("channel")).toString();
+    const QString session = actionRow.value(QStringLiteral("session")).toString();
+    const QJsonObject payload = actionRow.value(QStringLiteral("payload")).toObject();
+    QString text = payload.value(wakeContact ? QStringLiteral("message")
+                                             : QStringLiteral("draft")).toString();
+    if (text.trimmed().isEmpty()) {
+        const auto sentences = payload.value(QStringLiteral("sentences")).toArray();
+        if (!sentences.isEmpty())
+            text = sentences.first().toObject().value(QStringLiteral("zh_text")).toString();
+    }
+    if (!m_db.transaction()) return false;
+    auto rollback = qScopeGuard([this] { m_db.rollback(); });
+    // 幂等/终态保护：同结果重复回执不重复累加；unknown/withheld 冻结；
+    // 已确认送达后迟到的 rejected/unknown 不回退（at-most-once 语义）。
+    QString current;
+    {
+        QSqlQuery row(m_db);
+        row.prepare(QStringLiteral("SELECT state FROM delivery_ledger WHERE kind=? AND ref=?"));
+        row.addBindValue(ledgerKind);
+        row.addBindValue(ledgerRef);
+        if (row.exec() && row.next()) current = row.value(0).toString();
+    }
+    const bool currentSuccess = current == QStringLiteral("handed_off")
+        || current == QStringLiteral("protocol_accepted");
+    if (current == outcome) {
+        m_db.rollback();
+        rollback.dismiss();
+        return true;
+    }
+    if (current == QStringLiteral("unknown") || current == QStringLiteral("withheld")) {
+        m_db.rollback();
+        rollback.dismiss();
+        return true;
+    }
+    if (currentSuccess && !success) {
+        m_db.rollback();
+        rollback.dismiss();
+        return true;
+    }
+    const bool failedReceipt = outcome == QStringLiteral("rejected")
+        || outcome == QStringLiteral("unknown");
+    actionNoteDelivery(m_db, ledgerKind, ledgerRef, channel, session, text, outcome,
+                       failedReceipt ? 1 : 0);
+    if (!success) {
+        if (!m_db.commit()) return false;
+        rollback.dismiss();
+        return true;
+    }
+    // 成功回执：提案补 committed（正常情况下提交时已写；这里同事务幂等兜底，
+    // 不能调用会自开事务的 markProposalCommitted），并回写领域行。
+    {
+        QSqlQuery proposalMark(m_db);
+        proposalMark.prepare(QStringLiteral(
+            "UPDATE action_proposal SET state='committed',committed_action_key=?,"
+            "error_code=NULL,updated_at=unixepoch() WHERE action_key=? AND state='verified'"));
+        proposalMark.addBindValue(key);
+        proposalMark.addBindValue(key);
+        if (!proposalMark.exec()) return false;
+    }
+    if (wakeContact) {
+        const auto parts = key.split(QLatin1Char(':'));
+        if (parts.size() >= 2) {
+            QSqlQuery scope(m_db);
+            scope.prepare(QStringLiteral("SELECT scope_key FROM open_wake WHERE id=?"));
+            scope.addBindValue(parts[1].toLongLong());
+            if (scope.exec() && scope.next()) {
+                QSqlQuery stateUpdate(m_db);
+                stateUpdate.prepare(QStringLiteral(
+                    "UPDATE open_wake_state SET last_outcome=?,updated_at=unixepoch() "
+                    "WHERE scope_key=?"));
+                stateUpdate.addBindValue(QStringLiteral("contact_%1").arg(outcome));
+                stateUpdate.addBindValue(scope.value(0).toString());
+                if (!stateUpdate.exec()) return false;
+            }
+        }
+    } else {
+        const auto parts = key.split(QLatin1Char(':'));
+        if (parts.size() >= 3) {
+            QSqlQuery patch(m_db);
+            patch.prepare(QStringLiteral(
+                "UPDATE internal_activity SET result_json=json_patch(coalesce(result_json,'{}'),?) "
+                "WHERE id=? AND json_extract(result_json,'$.artifact_version')=?"));
+            patch.addBindValue(QString::fromUtf8(QJsonDocument(QJsonObject{
+                {QStringLiteral("share_outcome"), outcome},
+                {QStringLiteral("share_version"), parts[2].toInt()},
+                {QStringLiteral("share_channel"), channel},
+                {QStringLiteral("share_at"),
+                 QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)}})
+                .toJson(QJsonDocument::Compact)));
+            patch.addBindValue(parts[1].toLongLong());
+            patch.addBindValue(parts[2].toInt());
+            if (!patch.exec()) return false;
+        }
+    }
+    if (!m_db.commit()) return false;
+    rollback.dismiss();
+    qInfo() << "[Receipt] action" << key << outcome << "history=eligible";
+    return true;
+}
+
+int MemoryManager::reconcileActionReceipts()
+{
+    if (!m_db.isOpen()) return 0;
+    // outbox/action 已落终态、但领域回写可能因为进程在 emit 后崩溃而缺失：幂等补一次。
+    QSqlQuery query(m_db);
+    query.prepare(QStringLiteral(
+        "SELECT a.action_key,coalesce(a.last_outcome,''),coalesce(o.last_error,'') "
+        "FROM cognitive_action a JOIN action_outbox o ON o.action_id=a.id "
+        "WHERE a.kind IN (?,?) AND a.last_outcome IS NOT NULL "
+        "AND a.state IN ('handed_off','rejected','unknown','withheld') ORDER BY a.id LIMIT 64"));
+    query.addBindValue(kActionKindOpenWakeContact);
+    query.addBindValue(kActionKindInternalShare);
+    if (!query.exec()) return 0;
+    QList<QPair<QString, QPair<QString, QString>>> rows;
+    while (query.next()) {
+        rows.append(qMakePair(query.value(0).toString(),
+                              qMakePair(query.value(1).toString(), query.value(2).toString())));
+    }
+    int processed = 0;
+    for (const auto &row : rows) {
+        if (recordActionReceipt(row.first, row.second.first, row.second.second))
+            ++processed;
+    }
+    if (processed > 0) qInfo() << "[Receipt] reconciled=" << processed;
+    return processed;
 }

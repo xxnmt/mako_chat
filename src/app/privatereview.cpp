@@ -1,4 +1,6 @@
 #include "privatereview.h"
+#include "actioncommitter.h"
+#include "actionorigin.h"
 #include "configmanager.h"
 #include "memorymanager.h"
 
@@ -184,6 +186,62 @@ QJsonObject openWakeTimeContext(MemoryManager &store, const ProactiveConfig &opt
         {QStringLiteral("quiet_hours"),
          QJsonObject{{QStringLiteral("start"), options.quietStart},
                      {QStringLiteral("end"), options.quietEnd}}}};
+}
+
+// R12-2b：OpenWake contact 的模型输出结构校验（只检查形状/长度；事实由服务端再核验）。
+bool wakeContactShapeValid(const QJsonObject &contact)
+{
+    if (contact.isEmpty()) return false;
+    const QString message = contact.value(QStringLiteral("message")).toString().trimmed();
+    if (message.isEmpty() || message.size() > 1000) return false;
+    if (!contact.value(QStringLiteral("reason")).isString()) return false;
+    if (!contact.value(QStringLiteral("motivation")).isObject()) return false;
+    if (!contact.value(QStringLiteral("claims")).isArray()) return false;
+    if (contact.contains(QStringLiteral("core_claim_ids"))
+        && !contact.value(QStringLiteral("core_claim_ids")).isArray())
+        return false;
+    return true;
+}
+
+// R12-2b：internal 活动分享的服务端提案请求。origin/target/payload 全部由服务端组装：
+// 模型只提供 draft（已持久化成果），不提供版本/哈希/目标/元数据。
+QJsonObject buildInternalShareRequest(MemoryManager &store, const QString &activityRef,
+                                      const QJsonObject &intent, const QString &draft)
+{
+    if (!activityRef.startsWith(QStringLiteral("activity/"))) return {};
+    bool ok = false;
+    const qlonglong activityId =
+        activityRef.mid(QStringLiteral("activity/").size()).toLongLong(&ok);
+    const int artifactVersion = intent.value(QStringLiteral("artifact_version")).toInt();
+    if (!ok || activityId <= 0 || artifactVersion <= 0 || draft.trimmed().isEmpty()) return {};
+    QJsonObject target = store.chooseProactiveTarget(draft, true);
+    QString channel = target.value(QStringLiteral("channel")).toString();
+    QString session = target.value(QStringLiteral("session")).toString();
+    if (!target.value(QStringLiteral("found")).toBool()) {
+        // 提案需要 target 才能持久化；没有可达目标时用主人桌宠默认域占位，
+        // 提交层会返回 target_unreachable 并保留 verified 等下一次恢复。
+        channel = Channel::kPet;
+        session = Channel::kDefaultSession;
+    }
+    const ActionOrigin origin = ActionOrigin::forActivity(activityId, artifactVersion,
+                                                          QStringLiteral("owner"),
+                                                          channel, session);
+    if (!origin.isValid()) return {};
+    const QJsonObject payload{
+        {QStringLiteral("draft"), draft},
+        {QStringLiteral("artifact_ref"), activityRef},
+        {QStringLiteral("artifact_version"), artifactVersion},
+        {QStringLiteral("artifact_hash"), intent.value(QStringLiteral("content_hash"))}};
+    return QJsonObject{
+        {QStringLiteral("kind"), QStringLiteral("activity_share")},
+        {QStringLiteral("action_key"), origin.actionKey(QStringLiteral("activity_share"))},
+        {QStringLiteral("origin"), origin.toJson()},
+        {QStringLiteral("target"),
+         QJsonObject{{QStringLiteral("channel"), channel},
+                     {QStringLiteral("session_id"), session}}},
+        {QStringLiteral("payload"), payload},
+        {QStringLiteral("claims"), QJsonArray{}},
+        {QStringLiteral("expires_at"), QDateTime::currentSecsSinceEpoch() + 3600}};
 }
 
 } // namespace
@@ -622,15 +680,24 @@ WakeResult PrivateReview::wakeOpenWake(const OpenWakeConfig &openWake, int daily
         return result;
     }
     // 模型上下文：内部唤醒没有用户输入；带服务端时间/触发原因/最近内部记录，
-    // R12-1b 起 allow_contact 仍恒为 false；private_writing=true 时可选 start_activity
-    // （只创建内部活动并安排回顾，不产生 contact/发送/分享）。
+    // R12-2b 起 allow_contact 来自独立配置（默认 false）：false 时 contact 一律不发送，
+    // true 时才允许模型输出 contact 提案（仍要经过确定性+语义核验与提交层复核）。
     context.insert(QStringLiteral("kind"), QStringLiteral("open_wake"));
     context.insert(QStringLiteral("origin"), origin.toJson());
     context.insert(QStringLiteral("current_input"), QJsonValue::Null);
-    context.insert(QStringLiteral("allow_contact"), false);
-    // R12-1b：allow_contact 本片恒为 false；start_activity 还要求 private_writing=true。
+    const bool allowContact = ConfigManager::instance().openWakeAllowContact();
+    context.insert(QStringLiteral("allow_contact"), allowContact);
+    // R12-1b：start_activity 还要求 private_writing=true。
     context.insert(QStringLiteral("private_writing"),
                    ConfigManager::instance().getProactiveConfig().privateWriting);
+    // 目标由服务端选：只给模型可读的授权摘要，模型不能自己指定 channel/session。
+    if (allowContact) {
+        QJsonArray targets;
+        for (const auto &pair : options.targets)
+            targets.append(QJsonObject{{QStringLiteral("channel"), pair.first},
+                                       {QStringLiteral("session_id"), pair.second}});
+        context.insert(QStringLiteral("contact_targets"), targets);
+    }
     context.insert(QStringLiteral("trigger"), QStringLiteral("due"));
     context.insert(QStringLiteral("time_context"), openWakeTimeContext(store, options));
     context.insert(QStringLiteral("recent_open_wake_notes"),
@@ -848,6 +915,36 @@ void PrivateReview::receive(qlonglong id, int version, const QJsonObject &propos
                    .arg(ref)
                    .arg(newVersion)
                    .arg(finished.value(QStringLiteral("artifact_version")).toInt());
+        // R12-2b：internal 活动走统一的 action_proposal 核验/提交链（确定性+coverage+
+        // 一次语义 verifier/repair → Outbox），不再有第二条发送路径；legacy thought 分享
+        // 仍走下面的 shareRequested 旧链，语义不变。
+        if (ref.startsWith(QStringLiteral("activity/"))) {
+            const auto intent = finished.value(QStringLiteral("share_intent")).toObject();
+            QString draft = proposal.value(QStringLiteral("draft")).toString().trimmed();
+            if (draft.isEmpty()) {
+                draft = store.activityByRef(ref).value(QStringLiteral("draft")).toString().trimmed();
+            }
+            const auto request = buildInternalShareRequest(store, ref, intent, draft);
+            if (request.isEmpty()) {
+                qInfo().noquote()
+                    << QStringLiteral("[Activity] share_proposal_skipped ref=%1 reason=invalid")
+                           .arg(ref);
+                return;
+            }
+            const QString shareKey = request.value(QStringLiteral("action_key")).toString();
+            const auto existing = store.actionProposal(shareKey);
+            if (!existing.isEmpty()) {
+                // 同一个成果版本只发一次：已提交/已核验的提案不重复生成，等待 drain/回执即可。
+                qInfo().noquote()
+                    << QStringLiteral("[Activity] share_proposal_exists ref=%1 state=%2")
+                           .arg(ref, existing.value(QStringLiteral("state")).toString());
+                return;
+            }
+            qInfo().noquote()
+                << QStringLiteral("[Activity] share_proposal_requested ref=%1 key=%2")
+                       .arg(ref, shareKey);
+            emit internalShareProposalReady(request);
+        }
         return;
     }
     // legacy 分享链完全保留：canShareThought + shareRequested → Outbox 唯一发送。
@@ -856,6 +953,95 @@ void PrivateReview::receive(qlonglong id, int version, const QJsonObject &propos
     if (!draft.isEmpty() && proposal[QStringLiteral("share_with_owner")].toBool()
         && store.canShareThought(attempt.origin.id, newVersion))
         emit shareRequested(ref, newVersion, draft);
+}
+
+// R12-2b：内部活动分享提案的终态接线。LLMService 已完成确定性+coverage+一次语义核验、
+// 至多一次约束修复；这里只做持久化与状态 CAS，然后交给 ActionCommitter 的唯一提交入口。
+// 通过 → proposed→verified→committed（入 Outbox，等待 dispatcher 发送）；
+// 拒绝 → proposed→withheld（活动完成状态保留，不发消息）。
+void PrivateReview::receiveShareProposalResult(const QJsonObject &result)
+{
+    const QString actionKey = result.value(QStringLiteral("action_key")).toString().trimmed();
+    if (actionKey.isEmpty()) return;
+    const QString kind = result.value(QStringLiteral("kind")).toString();
+    if (kind != QStringLiteral("activity_share")) {
+        qWarning() << "[ShareProposal] unexpected kind" << kind << actionKey;
+        return;
+    }
+    ActionOrigin origin;
+    QString originError;
+    if (!ActionOrigin::fromJson(result.value(QStringLiteral("origin")).toObject(),
+                                &origin, &originError)
+        || origin.kind != ActionOrigin::Activity
+        || origin.actionKey(QStringLiteral("activity_share")) != actionKey) {
+        qWarning() << "[ShareProposal] invalid origin" << actionKey << originError;
+        return;
+    }
+    QJsonObject persistProposal{
+        {QStringLiteral("kind"), kind},
+        {QStringLiteral("origin"), origin.toJson()},
+        {QStringLiteral("action_key"), actionKey},
+        {QStringLiteral("target"), result.value(QStringLiteral("target"))},
+        {QStringLiteral("payload"), result.value(QStringLiteral("payload"))},
+        {QStringLiteral("claims"), result.value(QStringLiteral("claims"))},
+        {QStringLiteral("expires_at"), result.value(QStringLiteral("expires_at"))}};
+    QString persistError;
+    const QJsonObject stored = store.persistActionProposal(persistProposal, &persistError);
+    if (stored.contains(QStringLiteral("error"))) {
+        // 同 key 不同 payload 的冲突不能覆盖已落库提案；保持既有版本等待人工/后续版本。
+        qWarning() << "[ShareProposal] persist rejected" << actionKey << persistError;
+        return;
+    }
+    const bool verified = result.value(QStringLiteral("state")).toString()
+        == QStringLiteral("verified");
+    const QString semanticStatus = result.value(QStringLiteral("semantic_status")).toString();
+    const QString withholdReason = result.value(QStringLiteral("withhold_reason")).toString();
+    if (!verified) {
+        QString stateError;
+        store.updateActionProposalState(actionKey, QStringLiteral("proposed"),
+                                        QStringLiteral("withheld"),
+                                        QStringLiteral("withheld"),
+                                        withholdReason.isEmpty()
+                                            ? QStringLiteral("policy_rejected")
+                                            : withholdReason,
+                                        &stateError);
+        qInfo().noquote()
+            << QStringLiteral("[ShareProposal] withheld key=%1 reason=%2")
+                   .arg(actionKey, withholdReason);
+        return;
+    }
+    QString stateError;
+    const bool promoted = store.updateActionProposalState(
+        actionKey, QStringLiteral("proposed"), QStringLiteral("verified"),
+        semanticStatus.isEmpty() ? QStringLiteral("unverified") : semanticStatus, QString(),
+        &stateError);
+    if (!promoted) {
+        // CAS 失败（可能已被 drain 并发推进）：只要最终状态不是 verified/committed 就放弃。
+        const QJsonObject now = store.actionProposal(actionKey);
+        const QString state = now.value(QStringLiteral("state")).toString();
+        if (state != QStringLiteral("verified") && state != QStringLiteral("committed")) {
+            qWarning() << "[ShareProposal] verify CAS failed" << actionKey << stateError << state;
+            return;
+        }
+    }
+    ActionCommitter committer(&store);
+    const auto committed = committer.commitInternalActivityShare(actionKey);
+    if (committed.contains(QStringLiteral("error"))) {
+        const QJsonObject now = store.actionProposal(actionKey);
+        const QString state = now.value(QStringLiteral("state")).toString();
+        if (state == QStringLiteral("withheld"))
+            qInfo().noquote()
+                << QStringLiteral("[ShareProposal] commit_withheld key=%1 error=%2")
+                       .arg(actionKey, committed.value(QStringLiteral("error")).toString());
+        else
+            qInfo().noquote()
+                << QStringLiteral("[ShareProposal] commit_pending key=%1 error=%2 state=%3")
+                       .arg(actionKey, committed.value(QStringLiteral("error")).toString(), state);
+        return;
+    }
+    qInfo().noquote()
+        << QStringLiteral("[ShareProposal] committed key=%1 action=%2")
+               .arg(actionKey, committed.value(QStringLiteral("action_key")).toString());
 }
 
 void PrivateReview::receiveOpenWake(const Attempt &attempt, const QJsonObject &proposal,
@@ -888,6 +1074,7 @@ void PrivateReview::receiveOpenWake(const Attempt &attempt, const QJsonObject &p
     QString decision;
     QString note;
     QJsonObject startActivityProposal;
+    QJsonObject openWakeContact;
     if (rejectReason.isEmpty()) {
         const int schemaVersion = proposal.contains(QStringLiteral("schema_version"))
             ? proposal.value(QStringLiteral("schema_version")).toInt(-1)
@@ -896,15 +1083,59 @@ void PrivateReview::receiveOpenWake(const Attempt &attempt, const QJsonObject &p
             rejectReason = QStringLiteral("json_parse");
         } else if (schemaVersion != 1) {
             rejectReason = QStringLiteral("schema");
-        } else if (proposal.contains(QStringLiteral("contact"))
-                   || proposal.contains(QStringLiteral("activity"))) {
-            // 本片 open wake 没有联系能力；"activity" 是旧外部动作键，仍按越界 schema 拒绝。
+        } else if (proposal.contains(QStringLiteral("activity"))) {
+            // "activity" 是旧外部动作键，仍按越界 schema 拒绝。
             rejectReason = QStringLiteral("schema");
         } else {
+            const QJsonObject contact = proposal.value(QStringLiteral("contact")).toObject();
+            const bool hasContact = proposal.contains(QStringLiteral("contact"));
+            const bool allowContact =
+                ConfigManager::instance().openWakeAllowContact();
+            // R12-2b：LLMService 在确定性/语义核验或策略拒绝时会带回 state=withheld 的
+            // 服务端计划；这类联系不是模型 schema 错误，只保留内部记录并落 withheld 提案。
+            const QJsonObject serverPlan = proposal.value(QStringLiteral("_action")).toObject();
+            const bool rejectedPlan = !serverPlan.isEmpty()
+                && serverPlan.value(QStringLiteral("state")).toString()
+                       == QStringLiteral("withheld");
             decision = proposal.value(QStringLiteral("decision")).toString();
-            if (decision != QStringLiteral("rest") && decision != QStringLiteral("reflect")
-                && decision != QStringLiteral("start_activity")) {
+            // note 是所有决策共享的内部记录；contact 被拒绝/降级为 reflect 时也要保留。
+            if (proposal.contains(QStringLiteral("note"))
+                && !proposal.value(QStringLiteral("note")).isNull()
+                && !proposal.value(QStringLiteral("note")).isString()) {
                 rejectReason = QStringLiteral("schema");
+            } else {
+                note = proposal.value(QStringLiteral("note")).toString().trimmed();
+                if (note.size() > 240) rejectReason = QStringLiteral("schema");
+            }
+            if (hasContact && !allowContact) {
+                // R12-2b：allow_contact=false 时任何 contact 都不发送，但也不把一次合法的
+                // 内部唤醒当认知失败：记录 contact_rejected，按内部记录（reflect）提交。
+                qInfo().noquote()
+                    << QStringLiteral("[OpenWake] contact_rejected"
+                                      " reason=allow_contact_disabled wake=%1 version=%2")
+                           .arg(id)
+                           .arg(version);
+                if (decision == QStringLiteral("contact"))
+                    decision = QStringLiteral("reflect");
+            }
+            if (decision != QStringLiteral("rest") && decision != QStringLiteral("reflect")
+                && decision != QStringLiteral("start_activity")
+                && decision != QStringLiteral("contact")) {
+                rejectReason = QStringLiteral("schema");
+            } else if (decision == QStringLiteral("contact")) {
+                if (!hasContact || !wakeContactShapeValid(contact))
+                    rejectReason = QStringLiteral("schema");
+                else
+                    openWakeContact = contact;
+            } else if (hasContact && allowContact) {
+                if (rejectedPlan && decision == QStringLiteral("reflect")) {
+                    // 服务端已拒绝的联系：保留 contact 以便持久化 withheld 提案，
+                    // 不按 schema 失败处理（合法内部记录仍然保存）。
+                    openWakeContact = contact;
+                } else {
+                    // 只有 decision=contact 才能携带 contact，避免"顺带联系"的歧义。
+                    rejectReason = QStringLiteral("schema");
+                }
             } else if (decision != QStringLiteral("start_activity")
                        && proposal.contains(QStringLiteral("start_activity"))) {
                 // 只有 decision=start_activity 才能携带活动提案。
@@ -1002,6 +1233,110 @@ void PrivateReview::receiveOpenWake(const Attempt &attempt, const QJsonObject &p
                .arg(effectiveMinutes)
                .arg(minMinutes)
                .arg(maxMinutes);
+    // R12-2b：contact 提案的持久化/状态 CAS/唯一提交入口。服务端计划（_action）由
+    // LLMService 统一核验链产出；这里只接受与本次 wake 身份完全一致的计划，避免伪造/串线。
+    // 通过后：persistActionProposal → proposed→verified(CAS) → commitVerifiedActionProposal；
+    // 拒绝/无计划：落 withheld（可持久化时）并保留本次内部记录，仍按 reflect 完成 wake。
+    bool contactVerified = false;
+    if (!openWakeContact.isEmpty()) {
+        const QJsonObject plan = proposal.value(QStringLiteral("_action")).toObject();
+        QString planError;
+        ActionOrigin planOrigin;
+        const bool planOriginOk =
+            !plan.isEmpty()
+            && ActionOrigin::fromJson(plan.value(QStringLiteral("origin")).toObject(),
+                                      &planOrigin, &planError)
+            && planOrigin.kind == ActionOrigin::Wake
+            && planOrigin.id == id
+            && planOrigin.version == version
+            && planOrigin.runId == attempt.origin.runId
+            && planOrigin.scope == attempt.origin.scope
+            && planOrigin.contextEpoch == attempt.origin.epoch
+            && planOrigin.actionKey(QStringLiteral("contact"))
+                   == plan.value(QStringLiteral("action_key")).toString();
+        const QString planState = plan.value(QStringLiteral("state")).toString();
+        const QString actionKey = plan.value(QStringLiteral("action_key")).toString();
+        if (!planOriginOk) {
+            qInfo().noquote()
+                << QStringLiteral("[OpenWake] contact_rejected reason=contact_plan_missing"
+                                  " wake=%1 version=%2 detail=%3")
+                       .arg(id)
+                       .arg(version)
+                       .arg(planError.isEmpty() ? QStringLiteral("mismatch") : planError);
+            decision = QStringLiteral("reflect");
+        } else {
+            const QJsonObject persistProposal{
+                {QStringLiteral("kind"), QStringLiteral("contact")},
+                {QStringLiteral("origin"), plan.value(QStringLiteral("origin"))},
+                {QStringLiteral("action_key"), actionKey},
+                {QStringLiteral("target"), plan.value(QStringLiteral("target"))},
+                {QStringLiteral("payload"), plan.value(QStringLiteral("payload"))},
+                {QStringLiteral("claims"), plan.value(QStringLiteral("claims"))},
+                {QStringLiteral("expires_at"), plan.value(QStringLiteral("expires_at"))}};
+            QString persistError;
+            store.persistActionProposal(persistProposal, &persistError);
+            const bool persistOk = persistError.isEmpty()
+                || persistError == QStringLiteral("conflict");
+            if (planState != QStringLiteral("verified")) {
+                const QString reason =
+                    plan.value(QStringLiteral("withhold_reason")).toString().trimmed();
+                if (persistOk) {
+                    store.updateActionProposalState(
+                        actionKey, QStringLiteral("proposed"), QStringLiteral("withheld"),
+                        QStringLiteral("withheld"),
+                        reason.isEmpty() ? QStringLiteral("policy_rejected") : reason);
+                }
+                qInfo().noquote()
+                    << QStringLiteral("[OpenWake] contact_rejected reason=%1 key=%2")
+                           .arg(reason.isEmpty() ? QStringLiteral("withheld") : reason, actionKey);
+                decision = QStringLiteral("reflect");
+            } else if (!persistOk) {
+                qInfo().noquote()
+                    << QStringLiteral("[OpenWake] contact_rejected"
+                                      " reason=proposal_persist_failed key=%1 error=%2")
+                           .arg(actionKey, persistError);
+                decision = QStringLiteral("reflect");
+            } else {
+                const QString semantic = plan.value(QStringLiteral("semantic_status")).toString();
+                QString stateError;
+                store.updateActionProposalState(
+                    actionKey, QStringLiteral("proposed"), QStringLiteral("verified"),
+                    semantic.isEmpty() ? QStringLiteral("unverified") : semantic, QString(),
+                    &stateError);
+                ActionCommitter committer(&store);
+                const auto committed = committer.commitOpenWakeContact(actionKey);
+                if (committed.contains(QStringLiteral("error"))) {
+                    const QString commitErrorCode =
+                        committed.value(QStringLiteral("error")).toString();
+                    const QJsonObject now = store.actionProposal(actionKey);
+                    if (now.value(QStringLiteral("state")).toString()
+                        == QStringLiteral("withheld")) {
+                        qInfo().noquote()
+                            << QStringLiteral("[OpenWake] contact_rejected reason=%1 key=%2")
+                                   .arg(commitErrorCode, actionKey);
+                        decision = QStringLiteral("reflect");
+                    } else {
+                        // 可恢复失败（安静/额度/目标/DB）：提案保持 verified 供 drain 恢复，
+                        // wake 本身仍按 contact 完成（不重复回顾、不无限重试）。
+                        contactVerified = true;
+                        qInfo().noquote()
+                            << QStringLiteral("[OpenWake] contact_commit_pending key=%1"
+                                              " reason=%2")
+                                   .arg(actionKey, commitErrorCode);
+                    }
+                } else {
+                    contactVerified = true;
+                    qInfo().noquote()
+                        << QStringLiteral("[OpenWake] contact_committed key=%1 state=%2")
+                               .arg(actionKey,
+                                    committed.value(QStringLiteral("state")).toString());
+                }
+            }
+        }
+    }
+    if (decision == QStringLiteral("contact") && !contactVerified)
+        decision = QStringLiteral("reflect");
+
     const QJsonObject intent{{QStringLiteral("mode"), QStringLiteral("after")},
                              {QStringLiteral("requested_after_minutes"), requestedMinutes},
                              {QStringLiteral("after_minutes"), effectiveMinutes}};

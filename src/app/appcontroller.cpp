@@ -234,9 +234,18 @@ AppController::AppController(QObject *parent)
         return false;
     });
     connect(m_actionOutbox, &ActionOutboxDispatcher::actionSettled, this,
-            [recordProactive](const QString &actionKey,const QString &outcome,
+            [this, recordProactive](const QString &actionKey,const QString &outcome,
                               const QJsonObject &payload) {
         qInfo() << "[Outbox] settled" << actionKey << outcome;
+        // R12-2b：新来源（wake:/activity:）的回执统一写回 delivery_ledger + 领域行。
+        // recordActionReceipt 幂等：重复回执不重复历史/版本；unknown/rejected/withheld 不写成功；
+        // legacy reflection:/reminder:/thought: 回执仍由既有 settleOutboxAction 领域回写处理。
+        if (m_memoryManager
+            && (actionKey.startsWith(QStringLiteral("wake:"))
+                || actionKey.startsWith(QStringLiteral("activity:")))) {
+            m_memoryManager->recordActionReceipt(actionKey, outcome,
+                                                 payload.value(QStringLiteral("detail")).toString());
+        }
         // "她说过"只能回写至少已经交给渠道的结果：rejected/withheld 明确未发送，绝不写；
         // unknown 只是"可能已送达但无法确认"，也不能写成她说过（执行层仍冻结不重发）。
         // pet 没有协议层回执，handed_off 即气泡已显示；QQ 以 protocol_accepted 为准。
@@ -251,6 +260,10 @@ AppController::AppController(QObject *parent)
         if (actionKey.startsWith(QStringLiteral("reflection:"))) {
             recordProactive(channel, session, text, QStringLiteral("contact"),
                             actionKey.section(QLatin1Char(':'), 0, 2));
+        } else if (actionKey.startsWith(QStringLiteral("wake:"))) {
+            // R12-2b：OpenWake contact 的主动历史用 wake/<id>:<version> 作为回认引用。
+            recordProactive(channel, session, text, QStringLiteral("contact"),
+                            actionKey.section(QLatin1Char(':'), 0, 2));
         } else if (actionKey.startsWith(QStringLiteral("reminder:"))) {
             recordProactive(channel, session, text, QStringLiteral("reminder"),
                             actionKey.section(QLatin1Char(':'), 1, 1));
@@ -259,6 +272,11 @@ AppController::AppController(QObject *parent)
             if (parts.size() >= 3)
                 recordProactive(channel, session, text, QStringLiteral("share"),
                                 QStringLiteral("%1:%2").arg(parts[1]).arg(parts[2]));
+        } else if (actionKey.startsWith(QStringLiteral("activity:"))) {
+            // R12-2b：internal 活动分享的主动历史引用 activity/<id>:<artifact_version>；
+            // 只写"她说过"的历史行，不改变活动完成状态（result_json 由 recordActionReceipt 写）。
+            recordProactive(channel, session, text, QStringLiteral("share"),
+                            actionKey.section(QLatin1Char(':'), 0, 2));
         }
     });
     // 普通回复的有限补发：只补"已经决定要发、且被渠道明确拒绝"的话，
@@ -474,6 +492,24 @@ void AppController::startApp()
         const int recovered = m_actionOutbox->recoverStale(600);
         if (recovered > 0)
             qInfo() << "[Outbox] stale actions frozen as unknown:" << recovered;
+        // R12-2b：启动恢复的第二个显式入口。
+        // 1) 回执对账：outbox 已 settle 但领域行可能没回写（进程在 emit 后崩溃），幂等补齐；
+        // 2) drain verified 提案：逐条复核后入 Outbox（已 committed 的不重发）；
+        // 3) 最后才启动唯一发送轮询。
+        if (m_memoryManager) {
+            const int reconciled = m_memoryManager->reconcileActionReceipts();
+            if (reconciled > 0)
+                qInfo() << "[Receipt] startup reconciled:" << reconciled;
+            const auto drained = m_memoryManager->drainVerifiedActionProposals(8);
+            if (drained.value(QStringLiteral("scanned")).toInt() > 0) {
+                qInfo().noquote()
+                    << QStringLiteral("[Proposal] startup drain committed=%1 withheld=%2"
+                                      " failed=%3")
+                           .arg(drained.value(QStringLiteral("committed")).toInt())
+                           .arg(drained.value(QStringLiteral("withheld")).toInt())
+                           .arg(drained.value(QStringLiteral("failed")).toInt());
+            }
+        }
         m_actionOutbox->start(1000);
     }
     m_character->show();

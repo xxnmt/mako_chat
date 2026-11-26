@@ -9,6 +9,7 @@
 #include <QScopedPointer>
 #include <QPointer>
 #include <QSet>
+#include <functional>
 #include <memory>
 
 #include "sentencedata.h"
@@ -46,6 +47,11 @@ public:
     // 前台提示词与私下回顾共用同一份数据源，避免两处各说一套。
     QJsonObject capabilityManifest(const RequestMeta &meta) const;
     void requestPrivateReview(qlonglong id, int version, const QJsonObject &thread);
+    // R12-2b：内部活动分享等通用动作提案的统一语义核验入口。request 由服务端组装
+    // （origin/target/payload/claims）；核验链：确定性 validateActionProposal →（一次）
+    // coverage/entailment verifier → ≤1 次约束修复。终态通过 actionProposalVerificationFinished
+    // 发出；不写库、不发送。
+    void requestActionProposalVerification(const QJsonObject &request);
     void cancelPrivateReview();
     bool hasWritingProvider() const { return !m_apiKey.isEmpty(); }
     void processObservation();
@@ -67,6 +73,9 @@ signals:
     void sentencesReady(const QList<SentenceText> &sentences, const QString &rawReply,
                         const QString &userInput, const RequestMeta &meta);
     void privateReviewFinished(qlonglong id, int version, const QJsonObject &proposal, const QString &error);
+    // R12-2b：通用 action proposal 核验终态（state=verified|withheld + semantic_status/
+    // withhold_reason）。订阅方（PrivateReview）负责 persist/state CAS/commit。
+    void actionProposalVerificationFinished(const QJsonObject &result);
     void internetErrorSignal(const QString &errorMessage);
     //chat 回复内容异常（空/乱码/缺中文/缺日文/缺标签），不入库不走TTS
     void replyAbnormal(const QString &reason);
@@ -134,6 +143,20 @@ private:
     static QJsonObject withholdContactProposal(QJsonObject proposal, QJsonObject contact,
                                                const QString &reason);
     QPointer<QNetworkReply> m_contactVerificationReply;
+    // ===== R12-2b：通用行动提案核验链（OpenWake contact / internal activity share）=====
+    using ActionVerificationCallback = std::function<void(const QJsonObject &result)>;
+    // OpenWake contact：构建服务端 ActionOrigin/计划，走统一核验链后把 _action 附到 proposal。
+    void verifyOpenWakeContactProposal(qlonglong id, int version, const QJsonObject &thread,
+                                       const QJsonObject &proposal);
+    void verifyActionProposal(const QJsonObject &request, ActionVerificationCallback done);
+    void verifyActionProposalSemantics(const QJsonObject &request,
+                                       const QJsonObject &deterministic,
+                                       ActionVerificationCallback done);
+    void repairActionProposalSemantics(const QJsonObject &request,
+                                       const QJsonObject &verdict,
+                                       const QJsonArray &sources,
+                                       ActionVerificationCallback done);
+    QPointer<QNetworkReply> m_actionVerificationReply;
     void retrieveMemory(const RetrievalRequest &request, std::function<void(const RetrievalResult &)> done);
     ImagePerception m_imagePerception;
     void finishRetrieval(const RetrievalResult &result);

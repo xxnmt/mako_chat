@@ -497,6 +497,40 @@ public:
     bool markProposalCommitted(const QString &actionKey, const QString &committedActionKey,
                                QString *error = nullptr);
 
+    // ===== R12-2b：verified 提案的原子提交 / 回执 / 恢复（v32 表足够，无新 schema）=====
+    // 从 action_proposal 读 state='verified' 的提案，再次用 ActionPolicy::validateActionProposal
+    // 复核来源/版本/runId/scope/epoch/target/成果新鲜度/功能开关/权限/coverage，再复核安静时段、
+    // 可达目标与共享 contact 额度；通过后在**单事务**内写 cognitive_action + action_outbox +
+    // delivery_ledger，并把提案 CAS verified→committed。**只入 Outbox，绝不直接调 QQ/pet 发送。**
+    // 返回 {action_key,action_id,kind,channel,session,state,proposal_state}；失败返回
+    // {error:<code>}。幂等：同 action_key 已有动作行 → 返回既有一行（idempotent=true），
+    // 同 key 不同 payload/来源 → error=duplicate，不重复建 outbox。
+    // 错误码：invalid_action_key/not_found/not_verified/invalid_state/invalid_kind/
+    //         allow_contact_disabled/target_unreachable/quiet/limit/duplicate/stale_origin/
+    //         artifact_mismatch/policy_rejected/db_error。
+    // 不可恢复的失败（来源失效/成果不符/allow_contact 关闭/重复）把提案落 withheld；
+    // 可恢复的失败（quiet/limit/target_unreachable/db_error）保留 verified，交由
+    // drainVerifiedActionProposals 在之后的启动/定时点重试，不丢提案。
+    QJsonObject commitVerifiedActionProposal(const QString &actionKey,QString *error = nullptr);
+    // 便捷入口：先确认 kind/origin 再提交（wake→contact、activity→share）。
+    QJsonObject commitVerifiedOpenWakeContact(const QString &actionKey,QString *error = nullptr);
+    QJsonObject commitVerifiedInternalActivityShare(const QString &actionKey,QString *error = nullptr);
+    // 启动/定时恢复：有界扫描 verified 且未过期的提案并逐条提交；已 committed 不重发，
+    // 已在 outbox 的由 dispatcher 恢复。返回 {scanned,committed,withheld,failed,results:[]}。
+    QJsonObject drainVerifiedActionProposals(int limit = 8);
+    // actionSettled 回执回写（幂等，只处理新来源 wake:/activity:；legacy 回执仍走既有
+    // settleOutboxAction 语义）。写 delivery_ledger 终态；handed_off/protocol_accepted 时
+    // 回写 open_wake_state.last_outcome / internal_activity.result_json.share_outcome/share_version；
+    // unknown/rejected/withheld 不写成功、不重发。重复回执不重复累加。
+    bool recordActionReceipt(const QString &actionKey,const QString &outcome,
+                             const QString &detail = QString());
+    // 启动对账：把 outbox 已 settle 但领域行未回写的新来源动作幂等补一次回执，返回处理条数。
+    int reconcileActionReceipts();
+
+    // R12-2b：服务端选择主动投递目标（按配置顺序、宠物优先、跳过盲区/不可读文本）。
+    // 返回 {found,channel,session}；仅用于提案 origin 的 target，真实可达性由 dispatcher 决定。
+    QJsonObject chooseProactiveTarget(const QString &draftLikeText,bool requireShareable) const;
+
 //历史对话crud
     QList<HistoryTurn> getHistoryTurn(int N, const QString &channel = Channel::kPet, const QString &sessionId = Channel::kDefaultSession, qint64 beforeTurn = 0);
     QList<HistoryTurn> getHistoryTurn(int offset,int limit); // 管理界面分页，跨渠道浏览

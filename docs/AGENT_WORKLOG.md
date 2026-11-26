@@ -498,3 +498,13 @@ B5 节奏按报告修正：固定提交基线 → 2–4h 受控冒烟（self_des
 - **R12-2a**：v32 `action_proposal`；ActionOrigin；EvidencePurpose 七类（HistoricalFact 不因早于 wake stale；NewEvidence 唯一 stale_ref；UserCommitment/ExecutionResult/ArtifactResult/InternalState 严格）；统一 validateActionProposal + coverage（claims=[] 也跑）；allow_contact=false 拒绝 OpenWake contact。未接 Outbox/发送；生产库仍 v31。
 - 验证：`ctest 23/23`；`tst_memorymanager 146/1 skipped`、`tst_memoryagent 93`、`tst_actionpolicy 17`、`tst_cognitivesnapshot 15`、`tst_actionoutbox 15`。
 - **暂停点**：用户要求 R12-2a 后暂停，R12-2b（Outbox/回执/真实投递）未开始。
+
+---
+
+## 2026-11-26 · R12-2b 新来源提交、Outbox 与回执
+
+- ActionCommitter 通用 verified 提案提交 + OpenWake contact/internal share；复用 action/outbox/ledger，单事务/幂等/共享额度；无新 sender。
+- allow_contact 默认 false；false 拒绝 contact 但保留内部记录/不记认知失败；true 时确定性+coverage（claims=[] 也跑）+1 verifier+≤1 repair，persist→verified→commit。
+- internal share 绑定真实 completed artifact/version/hash，只入 Outbox；legacy 分享保留。
+- actionSettled 支持 wake/activity，recordActionReceipt 幂等回写；unknown 不重发；启动 drain/对账。
+- 验证：`ctest 23/23`；`tst_memorymanager 146/1 skipped`、`tst_memoryagent 94`、`tst_actionoutbox 20`、`tst_actionpolicy 17`、`tst_cognitivesnapshot 15`。生产 v31→v32 迁移，行数不变，默认零新发送。未做真实目标发送/R12-3/后台 tool loop。

@@ -14,8 +14,13 @@
 #include "configmanager.h"
 #include "memorymanager.h"
 #include "utterance.h"
+#include "actionorigin.h"
 #include "actioncommitter.h"
 #include "actionoutboxdispatcher.h"
+
+#include <QCryptographicHash>
+#include <QDateTime>
+#include <QUuid>
 
 // 独立于 MemoryManager 的原始连接：建测试库、直接验表结构、模拟租约过期/并发写入。
 class RawDb
@@ -127,12 +132,169 @@ public:
             QStringLiteral("identity.json"),
             QJsonDocument(root).toJson(QJsonDocument::Compact), nullptr);
     }
+    // R12-2b：可提交的 OpenWake contact 配置。allow_contact 是独立开关（默认 false）；
+    // 安静时段缺省 00:00-00:00（不设），可传覆盖值验证 quiet 拦截；目标始终主人桌宠域。
+    bool enableOpenWakeContact(bool allowContact, int contactDailyLimit = -1,
+                               const QString &quietStart = QStringLiteral("00:00"),
+                               const QString &quietEnd = QStringLiteral("00:00"))
+    {
+        QJsonObject target{{"channel", Channel::kPet},
+                           {"session_id", Channel::kDefaultSession}};
+        QJsonObject proactive{{"enabled", true},
+                              {"private_writing", false},
+                              {"cooldown_seconds", 0},
+                              {"quiet_hours",
+                               QJsonObject{{"start", quietStart}, {"end", quietEnd}}},
+                              {"targets", QJsonArray{target}}};
+        if (contactDailyLimit >= 0)
+            proactive.insert("contact_daily_limit", contactDailyLimit);
+        const QJsonObject openWake{{"enabled", true},
+                                   {"allow_contact", allowContact},
+                                   {"initial_delay_seconds", 60},
+                                   {"min_interval_seconds", 300},
+                                   {"default_interval_seconds", 300},
+                                   {"max_interval_seconds", 86400},
+                                   {"max_non_open_jobs_when_due", 0},
+                                   {"max_model_steps_per_wake", 3},
+                                   {"max_per_day", 12},
+                                   {"shared_budget_percent", 30}};
+        const QJsonObject root{{"proactive", proactive},
+                               {"cognition", QJsonObject{{"open_wake", openWake}}}};
+        return ConfigManager::instance().writeConfigDocument(
+            QStringLiteral("identity.json"),
+            QJsonDocument(root).toJson(QJsonDocument::Compact), nullptr);
+    }
 
 private:
     QString m_path;
     QByteArray m_original;
     bool m_existed = false;
 };
+
+// ===== R12-2b：verified proposal 提交 / 共享额度 / 回执 / 恢复的测试夹具 =====
+
+// 造一条 open_wake 行（R12-2b 的 contact 来源）。state 用 deferred 以免撞
+// open_wake_running_unique（同一 scope 只允许一个 running）；来源核验只读版本/run/scope/epoch。
+static qlonglong seedOpenWakeRow(const QString &dbPath, const QString &tag,
+                                 const QString &runId, qint64 epoch = 0)
+{
+    RawDb raw(dbPath, tag);
+    if (!raw.open()) return 0;
+    if (!raw.execPrepared(
+            QStringLiteral("INSERT INTO open_wake(scope_key,run_id,version,state,trigger_reason,"
+                           "created_at,started_at,current_context_epoch) "
+                           "VALUES('owner',?,1,'deferred','test',unixepoch(),unixepoch(),?)"),
+            {runId, epoch}))
+        return 0;
+    return raw.scalar(QStringLiteral("SELECT last_insert_rowid()")).toLongLong();
+}
+
+// 服务端组装一条 wake contact 提案（claims 为空=纯 self_desire/问候）。
+static QJsonObject wakeContactProposal(qlonglong wakeId, int version, const QString &runId,
+                                       const QString &message, qint64 epoch = 0)
+{
+    const ActionOrigin origin = ActionOrigin::forWake(
+        wakeId, version, runId, QStringLiteral("owner"), epoch,
+        Channel::kPet, Channel::kDefaultSession);
+    return QJsonObject{
+        {QStringLiteral("kind"), QStringLiteral("contact")},
+        {QStringLiteral("origin"), origin.toJson()},
+        {QStringLiteral("target"),
+         QJsonObject{{QStringLiteral("channel"), Channel::kPet},
+                     {QStringLiteral("session_id"), Channel::kDefaultSession}}},
+        {QStringLiteral("payload"),
+         QJsonObject{{QStringLiteral("message"), message},
+                     {QStringLiteral("reason"), QStringLiteral("想问候")},
+                     {QStringLiteral("motivation"),
+                      QJsonObject{{QStringLiteral("type"), QStringLiteral("self_desire")},
+                                  {QStringLiteral("summary"), QStringLiteral("想问候主人")}}},
+                     {QStringLiteral("contact_draft"), message}}},
+        {QStringLiteral("claims"), QJsonArray{}},
+        {QStringLiteral("expires_at"), 0}};
+}
+
+// 造一条 completed 且带真实成果 + share_intent 的 internal 活动（artifact_version=2）。
+static qlonglong seedInternalCompletedActivity(const QString &dbPath, const QString &tag,
+                                               const QString &draft, QString *hash = nullptr)
+{
+    RawDb raw(dbPath, tag);
+    if (!raw.open()) return 0;
+    if (!raw.execPrepared(
+            QStringLiteral("INSERT INTO internal_activity(scope_key,origin_kind,origin_ref,"
+                           "run_id,subject,channel,session_id,interest,status,version,result_json,"
+                           "artifact_ref,review_after,created_at,updated_at) "
+                           "VALUES('owner','foreground',NULL,NULL,'user','pet','default',"
+                           "'写雨声','completed',2,'{}',NULL,0,unixepoch(),unixepoch())"),
+            QVariantList{}))
+        return 0;
+    const qlonglong id = raw.scalar(QStringLiteral("SELECT last_insert_rowid()")).toLongLong();
+    if (id <= 0) return 0;
+    const QString ref = QStringLiteral("activity/%1").arg(id);
+    const QString computedHash = QString::fromLatin1(
+        QCryptographicHash::hash(draft.trimmed().toUtf8(), QCryptographicHash::Sha256)
+            .toHex()
+            .left(16));
+    const QJsonObject intent{
+        {QStringLiteral("state"), QStringLiteral("saved")},
+        {QStringLiteral("artifact_ref"), ref},
+        {QStringLiteral("artifact_version"), 2},
+        {QStringLiteral("content_hash"), computedHash},
+        {QStringLiteral("requested_at"), QDateTime::currentSecsSinceEpoch()},
+        {QStringLiteral("version"), 1}};
+    const QJsonObject result{
+        {QStringLiteral("status"), QStringLiteral("completed")},
+        {QStringLiteral("draft"), draft},
+        {QStringLiteral("artifact_ref"), ref},
+        {QStringLiteral("artifact_version"), 2},
+        {QStringLiteral("artifact_hash"), computedHash},
+        {QStringLiteral("completed_at"), QDateTime::currentSecsSinceEpoch()},
+        {QStringLiteral("reflection"), QStringLiteral("写好了两句")},
+        {QStringLiteral("share_intent"), intent}};
+    if (!raw.execPrepared(
+            QStringLiteral("UPDATE internal_activity SET result_json=?,artifact_ref=? WHERE id=?"),
+            {QString::fromUtf8(QJsonDocument(result).toJson(QJsonDocument::Compact)), ref, id}))
+        return 0;
+    if (hash) *hash = computedHash;
+    return id;
+}
+
+static QJsonObject internalShareProposal(qlonglong activityId, int artifactVersion,
+                                         const QString &draft)
+{
+    const ActionOrigin origin = ActionOrigin::forActivity(
+        activityId, artifactVersion, QStringLiteral("owner"),
+        Channel::kPet, Channel::kDefaultSession);
+    return QJsonObject{
+        {QStringLiteral("kind"), QStringLiteral("activity_share")},
+        {QStringLiteral("origin"), origin.toJson()},
+        {QStringLiteral("target"),
+         QJsonObject{{QStringLiteral("channel"), Channel::kPet},
+                     {QStringLiteral("session_id"), Channel::kDefaultSession}}},
+        {QStringLiteral("payload"),
+         QJsonObject{{QStringLiteral("draft"), draft}}},
+        {QStringLiteral("claims"), QJsonArray{}},
+        {QStringLiteral("expires_at"), 0}};
+}
+
+// persist(proposed) → CAS(verified)；返回 action_key，失败返回空串。
+static QString persistVerifiedProposal(MemoryManager &db, const QJsonObject &proposal,
+                                       const QString &semanticStatus = QStringLiteral("not_required"))
+{
+    QString error;
+    const auto stored = db.persistActionProposal(proposal, &error);
+    if (stored.contains(QStringLiteral("error"))) {
+        qWarning() << "persistActionProposal failed" << error;
+        return {};
+    }
+    const QString key = stored.value(QStringLiteral("action_key")).toString();
+    if (!db.updateActionProposalState(key, QStringLiteral("proposed"),
+                                      QStringLiteral("verified"), semanticStatus, QString(),
+                                      &error)) {
+        qWarning() << "verified CAS failed" << key << error;
+        return {};
+    }
+    return key;
+}
 
 static void rewindReviewCooldown(const QString &dbPath, const QString &tag)
 {
@@ -941,6 +1103,345 @@ private slots:
         QVERIFY(!ActionOutboxDispatcher::proactiveHistoryEligible(
             QStringLiteral("withheld"), Channel::kPet));
     }
+    // 14. R12-2b：verified 提案提交一次动作/Outbox/账本；重复 action_key 幂等不重复 outbox。
+    void verifiedProposalCommitsOnce()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableOpenWakeContact(true));
+        const QString path = dir.filePath("verified-commit.db");
+        MemoryManager db(path);
+        ActionCommitter committer(&db);
+        const QString runId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        const qlonglong wakeId = seedOpenWakeRow(path, QStringLiteral("vc-wake"), runId);
+        QVERIFY(wakeId > 0);
+        const QString key = persistVerifiedProposal(
+            db, wakeContactProposal(wakeId, 1, runId, QStringLiteral("在忙吗？")));
+        QVERIFY(!key.isEmpty());
+        QCOMPARE(key, QStringLiteral("wake:%1:1:contact").arg(wakeId));
+        {
+            RawDb raw(path, QStringLiteral("vc-pre"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM action_proposal")).toString(),
+                     QStringLiteral("verified"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_outbox")).toInt(), 0);
+        }
+        const auto committed = committer.commitOpenWakeContact(key);
+        QVERIFY2(!committed.contains(QStringLiteral("error")),
+                 qPrintable(committed.value(QStringLiteral("error")).toString()));
+        QCOMPARE(committed.value(QStringLiteral("proposal_state")).toString(),
+                 QStringLiteral("committed"));
+        QCOMPARE(committed.value(QStringLiteral("action_key")).toString(), key);
+        {
+            RawDb raw(path, QStringLiteral("vc-post"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM cognitive_action")).toInt(), 1);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_outbox")).toInt(), 1);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM delivery_ledger "
+                                               "WHERE kind='contact'")).toInt(), 1);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM action_proposal")).toString(),
+                     QStringLiteral("committed"));
+            // 不写 legacy contact/reflection，不伪造聊天历史。
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM reflection_contact")).toInt(), 0);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM chat_history")).toInt(), 0);
+        }
+        // 重复提交：返回既有一行（idempotent=true），不重复建动作/Outbox。
+        const auto again = committer.commitVerifiedActionProposal(key);
+        QCOMPARE(again.value(QStringLiteral("idempotent")).toBool(), true);
+        QCOMPARE(again.value(QStringLiteral("action_key")).toString(), key);
+        {
+            RawDb raw(path, QStringLiteral("vc-idem"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM cognitive_action")).toInt(), 1);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_outbox")).toInt(), 1);
+        }
+    }
+
+    // 15. R12-2b：allow_contact 独立开关。false 时任何 contact 都不入 outbox，提案落 withheld；
+    //     true + 安静时段 → quiet（保留 verified 供恢复，不发送）；共享 contact 每日额度对
+    //     wake 来源同样生效（所有来源统一统计 delivery_ledger）。
+    void verifiedContactHonorsSwitchesAndGate()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        const QString path = dir.filePath("verified-gates.db");
+        MemoryManager db(path);
+        ActionCommitter committer(&db);
+
+        // (1) allow_contact=false：提交层拒绝并落 withheld，不发送、不写动作行。
+        QVERIFY(identity.enableOpenWakeContact(false));
+        const QString runA = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        const qlonglong wakeA = seedOpenWakeRow(path, QStringLiteral("vg-disabled"), runA);
+        QVERIFY(wakeA > 0);
+        const QString keyA = persistVerifiedProposal(
+            db, wakeContactProposal(wakeA, 1, runA, QStringLiteral("在吗")));
+        QVERIFY(!keyA.isEmpty());
+        const auto disabled = committer.commitOpenWakeContact(keyA);
+        QCOMPARE(disabled.value(QStringLiteral("error")).toString(),
+                 QStringLiteral("allow_contact_disabled"));
+        {
+            RawDb raw(path, QStringLiteral("vg-disabled-post"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_outbox")).toInt(), 0);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM action_proposal")).toString(),
+                     QStringLiteral("withheld"));
+        }
+
+        // (2) allow_contact=true 但当前处于安静时段：quiet 是可恢复失败，提案保持 verified。
+        QVERIFY(identity.enableOpenWakeContact(true, -1, QStringLiteral("00:00"),
+                                               QStringLiteral("23:59")));
+        const QString runB = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        const qlonglong wakeB = seedOpenWakeRow(path, QStringLiteral("vg-quiet"), runB);
+        const QString keyB = persistVerifiedProposal(
+            db, wakeContactProposal(wakeB, 1, runB, QStringLiteral("在吗")));
+        QVERIFY(!keyB.isEmpty());
+        const auto quiet = committer.commitOpenWakeContact(keyB);
+        QCOMPARE(quiet.value(QStringLiteral("error")).toString(), QStringLiteral("quiet"));
+        {
+            RawDb raw(path, QStringLiteral("vg-quiet-post"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_outbox")).toInt(), 0);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM action_proposal WHERE action_key='"
+                                               "wake:%1:1:contact'").arg(wakeB)).toString(),
+                     QStringLiteral("verified"));
+        }
+        // 恢复：安静时段解除后，定时 drain 会把保留的 verified 提案补提交一次。
+        QVERIFY(identity.enableOpenWakeContact(true));
+        const auto resumed = db.drainVerifiedActionProposals(8);
+        QCOMPARE(resumed.value(QStringLiteral("committed")).toInt(), 1);
+        {
+            RawDb raw(path, QStringLiteral("vg-quiet-resumed"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_outbox")).toInt(), 1);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM delivery_ledger "
+                                               "WHERE kind='contact'")).toInt(), 1);
+        }
+
+        // (3) 共享额度：contact_daily_limit=2，第一条提交成功，第二条被 limit 挡住。
+        QVERIFY(identity.enableOpenWakeContact(true, 2));
+        const QString runC = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        const qlonglong wakeC = seedOpenWakeRow(path, QStringLiteral("vg-limit-a"), runC);
+        const QString keyC = persistVerifiedProposal(
+            db, wakeContactProposal(wakeC, 1, runC, QStringLiteral("早安")));
+        QVERIFY(!committer.commitOpenWakeContact(keyC).contains(QStringLiteral("error")));
+        const QString runD = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        const qlonglong wakeD = seedOpenWakeRow(path, QStringLiteral("vg-limit-b"), runD);
+        const QString keyD = persistVerifiedProposal(
+            db, wakeContactProposal(wakeD, 1, runD, QStringLiteral("午安")));
+        const auto limited = committer.commitOpenWakeContact(keyD);
+        QCOMPARE(limited.value(QStringLiteral("error")).toString(), QStringLiteral("limit"));
+        {
+            RawDb raw(path, QStringLiteral("vg-limit-post"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_outbox")).toInt(), 2);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM delivery_ledger "
+                                               "WHERE kind='contact'")).toInt(), 2);
+        }
+
+        // (4) 来源失效（open_wake 版本已变）：stale_origin，提案落 withheld，不发送。
+        const QString runE = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        const qlonglong wakeE = seedOpenWakeRow(path, QStringLiteral("vg-stale"), runE);
+        const QString keyE = persistVerifiedProposal(
+            db, wakeContactProposal(wakeE, 1, runE, QStringLiteral("晚安")));
+        {
+            RawDb raw(path, QStringLiteral("vg-stale-bump"));
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral("UPDATE open_wake SET version=2 WHERE id=%1").arg(wakeE)));
+        }
+        const auto stale = committer.commitOpenWakeContact(keyE);
+        QCOMPARE(stale.value(QStringLiteral("error")).toString(), QStringLiteral("stale_origin"));
+        {
+            RawDb raw(path, QStringLiteral("vg-stale-post"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_outbox")).toInt(), 2);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM action_proposal WHERE action_key='"
+                                               "wake:%1:1:contact'").arg(wakeE)).toString(),
+                     QStringLiteral("withheld"));
+        }
+    }
+
+    // 16. R12-2b：internal 活动分享提交只入 Outbox；settle/回执回写 share_outcome，
+    //     不改变活动完成状态、不伪造 chat/reflection；未知/撤回/成果版本不符都拒绝或冻结。
+    void internalShareCommitAndReceipt()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableOpenWakeContact(true));
+        const QString path = dir.filePath("internal-share.db");
+        MemoryManager db(path);
+        ActionCommitter committer(&db);
+        QString hash;
+        const QString draft = QStringLiteral("屋檐轻响。");
+        const qlonglong activityId = seedInternalCompletedActivity(
+            path, QStringLiteral("is-seed"), draft, &hash);
+        QVERIFY(activityId > 0);
+        const QString key = persistVerifiedProposal(
+            db, internalShareProposal(activityId, 2, draft));
+        QVERIFY(!key.isEmpty());
+        QCOMPARE(key, QStringLiteral("activity:%1:2:share").arg(activityId));
+        const auto committed = committer.commitInternalActivityShare(key);
+        QVERIFY2(!committed.contains(QStringLiteral("error")),
+                 qPrintable(committed.value(QStringLiteral("error")).toString()));
+        {
+            RawDb raw(path, QStringLiteral("is-post"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM cognitive_action")).toInt(), 1);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_outbox")).toInt(), 1);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM delivery_ledger "
+                                               "WHERE kind='share'")).toInt(), 1);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT status FROM internal_activity WHERE id=%1")
+                                    .arg(activityId)).toString(),
+                     QStringLiteral("completed"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM chat_history")).toInt(), 0);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM reflection_contact")).toInt(), 0);
+        }
+        // 协议接受回执：账本终态 + 活动 result_json.share_outcome/share_version，状态仍 completed。
+        const auto job = db.claimOutbox(QStringLiteral("test"), 60);
+        QCOMPARE(job.value(QStringLiteral("action_key")).toString(), key);
+        QVERIFY(db.settleOutboxAction(key, QStringLiteral("protocol_accepted")));
+        {
+            RawDb raw(path, QStringLiteral("is-settled"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT status FROM internal_activity WHERE id=%1")
+                                    .arg(activityId)).toString(),
+                     QStringLiteral("completed"));
+            QCOMPARE(raw.scalar(QStringLiteral(
+                                    "SELECT json_extract(result_json,'$.share_outcome') "
+                                    "FROM internal_activity WHERE id=%1").arg(activityId)).toString(),
+                     QStringLiteral("protocol_accepted"));
+            QCOMPARE(raw.scalar(QStringLiteral(
+                                    "SELECT json_extract(result_json,'$.share_version') "
+                                    "FROM internal_activity WHERE id=%1").arg(activityId)).toInt(),
+                     2);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM delivery_ledger "
+                                               "WHERE kind='share' AND ref='")
+                                    + key + QStringLiteral("'")).toString(),
+                     QStringLiteral("protocol_accepted"));
+        }
+        // 回执幂等：重复成功回执/迟到的 unknown 都不回退成功字段。
+        QVERIFY(db.recordActionReceipt(key, QStringLiteral("protocol_accepted")));
+        QVERIFY(db.recordActionReceipt(key, QStringLiteral("unknown")));
+        {
+            RawDb raw(path, QStringLiteral("is-idem"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral(
+                                    "SELECT json_extract(result_json,'$.share_outcome') "
+                                    "FROM internal_activity WHERE id=%1").arg(activityId)).toString(),
+                     QStringLiteral("protocol_accepted"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM delivery_ledger "
+                                               "WHERE kind='share' AND ref='")
+                                    + key + QStringLiteral("'")).toString(),
+                     QStringLiteral("protocol_accepted"));
+        }
+
+        // 撤回：share_intent 被置 withdrawn 后，同成果版本的新提案提交失败（artifact_mismatch）。
+        const QString draft2 = QStringLiteral("风从窗缝里钻进来。");
+        const qlonglong withdrawnId = seedInternalCompletedActivity(
+            path, QStringLiteral("is-withdraw-seed"), draft2);
+        QVERIFY(withdrawnId > 0);
+        {
+            RawDb raw(path, QStringLiteral("is-withdraw"));
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral(
+                "UPDATE internal_activity SET result_json=json_set(result_json,"
+                "'$.share_intent.state','withdrawn') WHERE id=%1").arg(withdrawnId)));
+        }
+        const QString withdrawnKey = persistVerifiedProposal(
+            db, internalShareProposal(withdrawnId, 2, draft2));
+        const auto withdrawn = committer.commitInternalActivityShare(withdrawnKey);
+        QCOMPARE(withdrawn.value(QStringLiteral("error")).toString(),
+                 QStringLiteral("artifact_mismatch"));
+        {
+            RawDb raw(path, QStringLiteral("is-withdraw-post"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_outbox")).toInt(), 1);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM action_proposal WHERE action_key='")
+                                    + withdrawnKey + QStringLiteral("'")).toString(),
+                     QStringLiteral("withheld"));
+        }
+    }
+
+    // 17. R12-2b：internal 分享的成果版本不符 → artifact_mismatch；过期 → expired（不发送）。
+    void internalShareRejectsStaleArtifactAndExpiry()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableOpenWakeContact(true));
+        const QString path = dir.filePath("share-stale.db");
+        MemoryManager db(path);
+        ActionCommitter committer(&db);
+        const QString draft = QStringLiteral("雨声落在瓦上。");
+        const qlonglong activityId = seedInternalCompletedActivity(
+            path, QStringLiteral("ss-seed"), draft);
+        QVERIFY(activityId > 0);
+
+        // 错误版本（1 ≠ 成果版本 2）：persist 层不校验，提交层必须 artifact_mismatch。
+        QJsonObject wrongVersion = internalShareProposal(activityId, 1, draft);
+        const QString wrongKey = persistVerifiedProposal(db, wrongVersion);
+        QVERIFY(!wrongKey.isEmpty());
+        const auto mismatch = committer.commitInternalActivityShare(wrongKey);
+        QCOMPARE(mismatch.value(QStringLiteral("error")).toString(),
+                 QStringLiteral("artifact_mismatch"));
+
+        // 过期提案：verified 但 expires_at 已过 → 提交拒绝并落 expired。
+        QJsonObject expiring = internalShareProposal(activityId, 2, draft);
+        expiring[QStringLiteral("expires_at")] = QDateTime::currentSecsSinceEpoch() - 5;
+        const QString expiringKey = persistVerifiedProposal(db, expiring);
+        QVERIFY(!expiringKey.isEmpty());
+        const auto expired = committer.commitInternalActivityShare(expiringKey);
+        QCOMPARE(expired.value(QStringLiteral("error")).toString(), QStringLiteral("stale_origin"));
+        {
+            RawDb raw(path, QStringLiteral("ss-post"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_outbox")).toInt(), 0);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM action_proposal WHERE action_key='")
+                                    + expiringKey + QStringLiteral("'")).toString(),
+                     QStringLiteral("expired"));
+        }
+    }
+
+    // 18. R12-2b：启动/定时 drain verified 提案；已 committed 不重发，outbox 只建一次。
+    void drainVerifiedProposalsIsIdempotent()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableOpenWakeContact(true));
+        const QString path = dir.filePath("drain.db");
+        MemoryManager db(path);
+        ActionCommitter committer(&db);
+        const QString runA = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        const QString runB = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        const qlonglong wakeA = seedOpenWakeRow(path, QStringLiteral("dr-a"), runA);
+        const qlonglong wakeB = seedOpenWakeRow(path, QStringLiteral("dr-b"), runB);
+        QVERIFY(wakeA > 0 && wakeB > 0);
+        QVERIFY(!persistVerifiedProposal(db, wakeContactProposal(wakeA, 1, runA,
+                                                                 QStringLiteral("早安"))).isEmpty());
+        QVERIFY(!persistVerifiedProposal(db, wakeContactProposal(wakeB, 1, runB,
+                                                                 QStringLiteral("午安"))).isEmpty());
+        const auto first = db.drainVerifiedActionProposals(8);
+        QCOMPARE(first.value(QStringLiteral("scanned")).toInt(), 2);
+        QCOMPARE(first.value(QStringLiteral("committed")).toInt(), 2);
+        {
+            RawDb raw(path, QStringLiteral("dr-post"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_outbox")).toInt(), 2);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_proposal "
+                                               "WHERE state='committed'")).toInt(), 2);
+        }
+        // 第二次 drain：没有 verified 提案可做，不会重复建 outbox。
+        QCOMPARE(committer.drainVerifiedActionProposals(8).value(QStringLiteral("scanned")).toInt(), 0);
+        {
+            RawDb raw(path, QStringLiteral("dr-idem"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_outbox")).toInt(), 2);
+        }
+    }
+
 };
 
 QTEST_GUILESS_MAIN(TestActionOutbox)

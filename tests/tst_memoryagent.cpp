@@ -2336,7 +2336,9 @@ private slots:
         }
     }
 
-    // 4) 模型给出 contact/activity：按 schema 违规扣除，不提交、不产生 outbox/外部动作。
+    // 4) R12-2b：allow_contact=false 时模型给出 contact 不发送，但也不把内部唤醒当失败；
+    //    只记录 contact_rejected reason=allow_contact_disabled 并按内部记录（reflect）提交。
+    //    旧 activity 外部动作键仍按 schema 违规扣除。
     void openWakeRejectsContactOrActivity()
     {
         OpenWakeConfigGuard config;
@@ -2354,24 +2356,33 @@ private slots:
         QVERIFY(wake.started);
         auto context = requested.last().at(2).toJsonObject();
         auto origin = context.value(QStringLiteral("origin")).toObject();
+        QCOMPARE(context.value(QStringLiteral("allow_contact")).toBool(), false);
         auto proposal = openWakeProposal(origin, QStringLiteral("reflect"),
                                          QStringLiteral("想继续写下去"), 20);
         proposal.insert(QStringLiteral("contact"),
                         QJsonObject{{QStringLiteral("timing"), QStringLiteral("now")},
                                     {QStringLiteral("message"), QStringLiteral("在吗")}});
+        MessageCapture capture;
         review.receive(requested.last().at(0).toLongLong(),
                        requested.last().at(1).toInt(), proposal, {});
         QCOMPARE(contactSpy.size(), 0);
         QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM action_outbox")), qint64(0));
         QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM chat_history")), qint64(0));
         QCOMPARE(scalarMemorySql(QStringLiteral(
-                     "SELECT count(*) FROM open_wake WHERE state='committed'")), qint64(0));
-        QCOMPARE(textMemorySql(QStringLiteral("SELECT state FROM open_wake ORDER BY id DESC LIMIT 1")),
-                 QStringLiteral("deferred"));
+                     "SELECT count(*) FROM open_wake WHERE state='committed'")), qint64(1));
+        QCOMPARE(textMemorySql(QStringLiteral("SELECT decision FROM open_wake ORDER BY id DESC LIMIT 1")),
+                 QStringLiteral("reflect"));
+        // 合法内部决策不是认知失败：不写 review_failure，且日志明确 contact_rejected。
         QCOMPARE(scalarMemorySql(QStringLiteral(
-                     "SELECT count(*) FROM review_failure WHERE source_kind='open_wake'")), qint64(1));
+                     "SELECT count(*) FROM review_failure WHERE source_kind='open_wake'")), qint64(0));
+        bool rejectedLogged = false;
+        for (const auto &line : capture.lines())
+            if (line.message.contains(QStringLiteral("[OpenWake] contact_rejected"))
+                && line.message.contains(QStringLiteral("allow_contact_disabled")))
+                rejectedLogged = true;
+        QVERIFY(rejectedLogged);
 
-        // 第二次：activity 字段同样越界；仍需可领取的第二次尝试。
+        // 第二次：旧 activity 字段仍属越界 schema，计一次失败且不提交。
         QVERIFY(rewindOpenWakeClock());
         wake = review.wake(12, 60, openWake);
         QVERIFY(wake.started);
@@ -2384,9 +2395,110 @@ private slots:
                        requested.last().at(1).toInt(), proposal, {});
         QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM action_outbox")), qint64(0));
         QCOMPARE(scalarMemorySql(QStringLiteral(
-                     "SELECT count(*) FROM open_wake WHERE state='committed'")), qint64(0));
+                     "SELECT count(*) FROM open_wake WHERE state='committed'")), qint64(1));
         QCOMPARE(scalarMemorySql(QStringLiteral(
-                     "SELECT count(*) FROM review_failure WHERE source_kind='open_wake'")), qint64(2));
+                     "SELECT count(*) FROM review_failure WHERE source_kind='open_wake'")), qint64(1));
+    }
+
+    // R12-2b：allow_contact=true 时，OpenWake contact 必须先经服务端确定性核验 + 恰好一次
+    // semantic verifier（coverage+entailment）通过，再 persist→proposed→verified→commit；
+    // 提交只入 Outbox（不直接发送），wake 决策=contact，更不伪造 reflection/chat 行。
+    void openWakeContactVerifiedAndCommitted()
+    {
+        OpenWakeConfigGuard config;
+        auto openWakeConfig = openWakeTestJson(true, 12, 3);
+        openWakeConfig.insert(QStringLiteral("allow_contact"), true);
+        QVERIFY(config.write(
+            openWakeConfig,
+            QJsonObject{{QStringLiteral("enabled"), true},
+                        {QStringLiteral("private_writing"), false},
+                        {QStringLiteral("cooldown_seconds"), 0},
+                        {QStringLiteral("quiet_hours"),
+                         QJsonObject{{QStringLiteral("start"), QStringLiteral("00:00")},
+                                     {QStringLiteral("end"), QStringLiteral("00:00")}}},
+                        {QStringLiteral("targets"),
+                         QJsonArray{QJsonObject{{QStringLiteral("channel"), Channel::kPet},
+                                                {QStringLiteral("session_id"),
+                                                 Channel::kDefaultSession}}}},
+                        {QStringLiteral("contact_daily_limit"), 3}}));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath("openwake-contact.db");
+        MemoryManager db(path);
+        QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QByteArray> bodies;
+        int verifierCalls = 0;
+        serveCompletions(server, bodies, [&](int round) -> QString {
+            Q_UNUSED(round);
+            const QByteArray body = bodies.last();
+            if (body.contains("【语义核验】")) {
+                ++verifierCalls;
+                return QStringLiteral(R"({"claim_coverage":"complete","missing_claims":[],)"
+                                      R"("result":"entailed","supporting_refs":[],)"
+                                      R"("reason_code":"pure_self_desire"})");
+            }
+            return QStringLiteral(
+                R"({"schema_version":1,"decision":"contact","note":"想问候一下",)"
+                R"("next_wake":{"mode":"after","after_minutes":30},)"
+                R"("contact":{"reason":"突然想到你","message":"在忙吗？",)"
+                R"("motivation":{"type":"self_desire","summary":"想问候主人"},)"
+                R"("claims":[],"core_claim_ids":[]}})");
+        });
+        LLMService model(QStringLiteral("test"), nullptr,
+                         QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.serverPort())));
+        model.setMemoryManager(&db);
+        QSignalSpy finished(&model, &LLMService::privateReviewFinished);
+        PrivateReview review(db);
+        QSignalSpy requested(&review, &PrivateReview::requested);
+
+        const auto openWake = ConfigManager::instance().getOpenWakeConfig();
+        const auto wake = review.wake(12, 60, openWake);
+        QVERIFY2(wake.started, qPrintable(wake.reason));
+        const qlonglong wakeId = requested.last().at(0).toLongLong();
+        const int wakeVersion = requested.last().at(1).toInt();
+        const auto context = requested.last().at(2).toJsonObject();
+        QCOMPARE(context.value(QStringLiteral("allow_contact")).toBool(), true);
+        model.requestPrivateReview(wakeId, wakeVersion, context);
+        QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 1, 8000);
+        const auto proposal = finished.takeFirst().at(2).toJsonObject();
+        QCOMPARE(proposal.value(QStringLiteral("decision")).toString(), QStringLiteral("contact"));
+        QCOMPARE(verifierCalls, 1);
+        const auto action = proposal.value(QStringLiteral("_action")).toObject();
+        QCOMPARE(action.value(QStringLiteral("state")).toString(), QStringLiteral("verified"));
+        QCOMPARE(action.value(QStringLiteral("action_key")).toString(),
+                 QStringLiteral("wake:%1:%2:contact").arg(wakeId).arg(wakeVersion));
+        QCOMPARE(action.value(QStringLiteral("semantic_status")).toString(),
+                 QStringLiteral("entailed_coverage"));
+
+        // PrivateReview 接线：persist → proposed→verified → commit（只入 Outbox）。
+        review.receive(wakeId, wakeVersion, proposal, {});
+        const QString actionKey = QStringLiteral("wake:%1:%2:contact").arg(wakeId).arg(wakeVersion);
+        QCOMPARE(textMemorySql(QStringLiteral("SELECT state FROM action_proposal WHERE action_key='")
+                                   + actionKey + QStringLiteral("'")),
+                 QStringLiteral("committed"));
+        QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM cognitive_action")), qint64(1));
+        QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM action_outbox")), qint64(1));
+        QCOMPARE(scalarMemorySql(QStringLiteral(
+                     "SELECT count(*) FROM delivery_ledger WHERE kind='contact'")), qint64(1));
+        QCOMPARE(textMemorySql(QStringLiteral("SELECT decision FROM open_wake WHERE id=")
+                                   + QString::number(wakeId)),
+                 QStringLiteral("contact"));
+        // 新来源 contact 不写 legacy 域行，也不伪造聊天历史（尚未发送）。
+        QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM reflection_contact")), qint64(0));
+        QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM chat_history")), qint64(0));
+
+        // 唯一发送者语义：outbox 领取/结算与回执回写都由既有路径完成。
+        const auto job = db.claimOutbox(QStringLiteral("test"), 60);
+        QCOMPARE(job.value(QStringLiteral("action_key")).toString(), actionKey);
+        QVERIFY(db.settleOutboxAction(actionKey, QStringLiteral("handed_off")));
+        QVERIFY(db.recordActionReceipt(actionKey, QStringLiteral("handed_off"),
+                                       QStringLiteral("ok")));
+        QCOMPARE(textMemorySql(QStringLiteral(
+                     "SELECT last_outcome FROM open_wake_state WHERE scope_key='owner'")),
+                 QStringLiteral("contact_handed_off"));
     }
 
     // R12-1b：OpenWake 可以 start_activity。只在 private_writing=true 时接受；同一事务创建

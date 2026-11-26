@@ -72,6 +72,8 @@ add_phase0_test(tst_memorymanager
     ${PROJECT_SOURCE_DIR}/src/cognition/actionorigin.h
     ${PROJECT_SOURCE_DIR}/src/cognition/actionpolicy.h
     ${PROJECT_SOURCE_DIR}/src/cognition/actionpolicy.cpp
+    ${PROJECT_SOURCE_DIR}/src/cognition/actioncommitter.h
+    ${PROJECT_SOURCE_DIR}/src/cognition/actioncommitter.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/recentcontext.h
     ${PROJECT_SOURCE_DIR}/src/memory/recentcontext.cpp
     ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.h
@@ -186,6 +188,8 @@ add_phase0_test(tst_memoryagent
     ${PROJECT_SOURCE_DIR}/src/memory/matterstore.cpp ${PROJECT_SOURCE_DIR}/src/memory/privatereflection.cpp
     ${PROJECT_SOURCE_DIR}/src/cognition/actionpolicy.h
     ${PROJECT_SOURCE_DIR}/src/cognition/actionpolicy.cpp
+    ${PROJECT_SOURCE_DIR}/src/cognition/actioncommitter.h
+    ${PROJECT_SOURCE_DIR}/src/cognition/actioncommitter.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/memoryaccesspolicy.h
     ${PROJECT_SOURCE_DIR}/src/memory/memoryaccesspolicy.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/memorytimerange.h
@@ -327,6 +331,8 @@ add_phase0_test(tst_concern
     ${PROJECT_SOURCE_DIR}/src/memory/matterstore.cpp ${PROJECT_SOURCE_DIR}/src/memory/privatereflection.cpp
     ${PROJECT_SOURCE_DIR}/src/cognition/actionpolicy.h
     ${PROJECT_SOURCE_DIR}/src/cognition/actionpolicy.cpp
+    ${PROJECT_SOURCE_DIR}/src/cognition/actioncommitter.h
+    ${PROJECT_SOURCE_DIR}/src/cognition/actioncommitter.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/recentcontext.h
     ${PROJECT_SOURCE_DIR}/src/memory/recentcontext.cpp
     ${PROJECT_SOURCE_DIR}/src/channels/qq/qqmessageparser.h
