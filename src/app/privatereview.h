@@ -32,15 +32,17 @@ struct WakeResult {
 //   2) 否则走原有 到期活动 → 到期关注 → 新来源回顾；
 //   3) 前三步都没有候选/被预算挡住时，若 OpenWake 到期再尝试领取。
 //
-// 每次领取都生成一个 CognitiveOrigin 并随 requested context 下发；模型层原样回显到
-// proposal["_origin"]，receive 逐字段校验 kind/ref/id/version/runId/scope/epoch，
-// 不一致的迟到回调直接丢弃（[Review] stale_callback），不提交、不发送。
+// 每次领取都生成一个 CognitiveOrigin 并随 requested context 下发；四类来源（reflection/
+// concern/activity/open_wake）的 runId 必填：OpenWake 用 open_wake.run_id，其余来源在领取时
+// 生成独立 UUID。模型层原样回显到 proposal["_origin"]，receive 逐字段校验
+// kind/ref/id/version/runId/scope/epoch；缺失或不一致的回调一律按 stale_callback 丢弃，
+// 不提交、不记失败（不再保留"只校验 id/version"的旧兼容分支）。
 class PrivateReview final : public QObject {
     Q_OBJECT
 public:
     explicit PrivateReview(MemoryManager &memory, QObject *parent = nullptr);
     // R12-0：返回类型化结果，reason 见 WakeResult；原有调用方可忽略返回值。
-    // 两参数重载保持旧行为：默认 OpenWake disabled，与 R12-0 调用/测试兼容。
+    // 两参数重载保持旧行为：默认 OpenWake disabled。
     WakeResult wake(int dailyLimit, int cooldownSeconds);
     // R12-1a：带 OpenWake 配置的调度。仅当 openWake.enabled 且 dailyLimit>0 时才会领取
     // 内部唤醒；allowContact 本片不产生任何联系。
@@ -57,7 +59,7 @@ signals:
 private:
     // Activity=自己的文字活动；Reflection=新来源回顾；Concern=到期关注；OpenWake=内部唤醒。
     struct Attempt {
-        CognitiveOrigin origin;
+        CognitiveOrigin origin;      // runId 在领取时生成/来自 open_wake.run_id，必填
         bool contactAllowed = false;
     };
 
@@ -79,10 +81,10 @@ private:
     WakeResult wakeOpenWake(const OpenWakeConfig &openWake, int dailyLimit, int cooldownSeconds);
     // OpenWake 的 rest/reflect 回调处理（schema 校验 + 提交/失败接线）。
     void receiveOpenWake(const Attempt &attempt, const QJsonObject &proposal, const QString &error);
-    // proposal["_origin"] 与 active origin 的比对。缺 _origin 时只允许两类兼容：
-    //   1) 非 OpenWake 的旧路径（按 id/version 校验，兼容 R12-0 测试）；
-    //   2) OpenWake 且带非空 error 的失败回调（LLMService 早期错误路径不解析 proposal）。
-    // OpenWake 的成功 proposal 必须严格携带 _origin。
+    // proposal["_origin"] 必须存在且与 active origin 逐字段一致（kind/ref/id/version/runId/
+    // scope/epoch）。缺失/解析失败/不匹配都返回 false；不再有"非 OpenWake 只校验 id/version"
+    // 或"失败回调可缺 origin"的兼容分支。epoch 目前只做占位比对（OpenWake 用 claim 返回的
+    // current_context_epoch，其它来源为 0），不宣称完整的 epoch fence。
     bool originMatches(const Attempt &attempt, const QJsonObject &proposal,
                        const QString &error) const;
     // R12-1a 持久失败：写 review_failure 并记录 [Review] backoff/suspended；

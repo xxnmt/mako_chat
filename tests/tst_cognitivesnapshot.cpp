@@ -837,6 +837,99 @@ private slots:
                               QStringLiteral("group_projection:")));
     }
 
+    // 8b. R12-1a：OpenWake 内部记录/调度按 scope 隔离：默认只读 owner scope；
+    //     其他 scope、第三方会话、群聊、盲区都不可见；owner 前台/回顾快照可见。
+    void snapshotOpenWakeNotesScopeAndBlindZone()
+    {
+        IdentityFileGuard identityGuard;
+        QVERIFY(identityGuard.write(QByteArray(
+            R"({"cognition":{"snapshot_budget_bytes":4096},)"
+            R"("memory":{"blind_zones":[{"channel":"pet","session_id":"quiet-place"}]}})")));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager db(dir.filePath(QStringLiteral("openwake-scope.db")));
+        QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+        {
+            RawDb raw(db.databasePath());
+            QVERIFY(raw.open());
+            const qint64 now = QDateTime::currentSecsSinceEpoch();
+            const auto insertWake = [&raw, now](const QString &scope, const QString &runId,
+                                                const QString &note, int offset) {
+                return raw.exec(
+                    QStringLiteral(
+                        "INSERT INTO open_wake(scope_key,run_id,version,state,trigger_reason,"
+                        "created_at,finished_at,decision,note) "
+                        "VALUES(?,?,1,'committed','schedule',?,?,?,?)"),
+                    {scope, runId, now - 100, now - 10 + offset,
+                     QStringLiteral("reflect"), note});
+            };
+            QVERIFY(insertWake(QStringLiteral("owner"), QStringLiteral("scope-owner-run"),
+                               QStringLiteral("主人私聊域内部记录"), 0));
+            QVERIFY(insertWake(QStringLiteral("qq_group:30001"), QStringLiteral("scope-group-run"),
+                               QStringLiteral("群聊域内部记录"), 1));
+            QVERIFY(insertWake(QStringLiteral("qq_private:2014366825"),
+                               QStringLiteral("scope-third-run"),
+                               QStringLiteral("第三方私聊域内部记录"), 2));
+        }
+        // 直接接口：默认 owner scope 只返回 owner 行，其它 scope 不泄漏到默认读取。
+        QCOMPARE(db.recentOpenWakeNotes(20).size(), 1);
+        QCOMPARE(db.recentOpenWakeNotes(20).first().toObject()
+                     .value(QStringLiteral("note")).toString(),
+                 QStringLiteral("主人私聊域内部记录"));
+
+        CognitiveSnapshotBuilder builder(&db);
+        // owner 前台/回顾快照都可见 owner scope 的 note 与调度；其他 scope 不可见。
+        for (const auto &purpose : {QStringLiteral("foreground_reply"),
+                                    QStringLiteral("private_review")}) {
+            const auto snapshot = builder.build(ownerMeta(9), QStringLiteral("run-scope"),
+                                                QStringLiteral("wake/1"), purpose);
+            QVERIFY(anyFactText(snapshot.inferences, QStringLiteral("主人私聊域内部记录")));
+            QVERIFY(!anyFactText(snapshot.inferences, QStringLiteral("群聊域内部记录")));
+            QVERIFY(!anyFactText(snapshot.inferences, QStringLiteral("第三方私聊域内部记录")));
+            bool ownerMotivation = false;
+            for (const auto &motivation : snapshot.motivations) {
+                if (!motivation.ref.startsWith(QStringLiteral("wake/"))) continue;
+                ownerMotivation = true;
+                QCOMPARE(motivation.kind, QStringLiteral("open_wake"));
+                QVERIFY(!motivation.summary.contains(QStringLiteral("群聊域")));
+                QVERIFY(!motivation.summary.contains(QStringLiteral("第三方")));
+            }
+            QVERIFY(ownerMotivation);
+            QVERIFY(!findJsonObjectByRef(snapshot.internalWakes,
+                                         QStringLiteral("wake_schedule/owner")).isEmpty());
+        }
+        // 群聊投影：不读取 OpenWake note/调度。
+        RequestMeta groupMeta = ownerMeta(10, Channel::kQQGroup, QStringLiteral("30001"));
+        groupMeta.actorId = QStringLiteral("10001");
+        const auto groupSnapshot = builder.build(groupMeta, QStringLiteral("run-scope-group"),
+                                                 QStringLiteral("wake/1"),
+                                                 QStringLiteral("foreground_reply"));
+        for (const auto &fact : groupSnapshot.inferences)
+            QVERIFY(!fact.ref.startsWith(QStringLiteral("wake/")));
+        QVERIFY(groupSnapshot.internalWakes.isEmpty());
+        QVERIFY(anyNotePrefix(builder.stats().notes, QStringLiteral("group_projection:")));
+        // 第三方（subject 非主人）：即使走 qq_private 也不读取 OpenWake note/调度。
+        RequestMeta thirdMeta = ownerMeta(11, Channel::kQQPrivate,
+                                          QStringLiteral("2014366825"));
+        thirdMeta.subject = QStringLiteral("qq:10001");
+        thirdMeta.actorId = QStringLiteral("10001");
+        const auto thirdSnapshot = builder.build(thirdMeta, QStringLiteral("run-scope-third"),
+                                                 QStringLiteral("wake/1"),
+                                                 QStringLiteral("foreground_reply"));
+        for (const auto &fact : thirdSnapshot.inferences)
+            QVERIFY(!fact.ref.startsWith(QStringLiteral("wake/")));
+        QVERIFY(thirdSnapshot.internalWakes.isEmpty());
+        // 盲区（owner 私聊渠道命中 blind_zone）：不读取 OpenWake note/调度。
+        RequestMeta blindMeta = ownerMeta(12, Channel::kPet, QStringLiteral("quiet-place"));
+        const auto blindSnapshot = builder.build(blindMeta, QStringLiteral("run-scope-blind"),
+                                                 QStringLiteral("wake/1"),
+                                                 QStringLiteral("private_review"));
+        QVERIFY(blindSnapshot.policyView.value(QStringLiteral("blind_zone")).toBool());
+        for (const auto &fact : blindSnapshot.inferences)
+            QVERIFY(!fact.ref.startsWith(QStringLiteral("wake/")));
+        QVERIFY(blindSnapshot.internalWakes.isEmpty());
+    }
+
     // 9. R12-1a：快照字节预算读 ConfigManager（默认 4096，2048/8192 边界）；
     //    非法值夹紧由 tst_configmanager 覆盖。
     void snapshotBudgetConfigurable()

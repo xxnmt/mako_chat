@@ -72,7 +72,7 @@ struct OpenWakeConfig {
     bool enabled = false;             // cognition.open_wake.enabled
     bool allowContact = false;        // 本片仅解析，运行时不产生 contact
     int initialDelaySeconds = 900;    // 首次调度延迟（60..86400）
-    int minIntervalSeconds = 600;     // 模型可提议的最小间隔（300..86400，内部秒）
+    int minIntervalSeconds = 300;     // 模型可提议的最小间隔（300..86400，内部秒）
     int defaultIntervalSeconds = 1800;// 模型没给 next_wake 时的默认间隔（300..86400）
     int maxIntervalSeconds = 86400;   // 模型可提议的最大间隔（300..86400）
     int maxNonOpenJobsWhenDue = 3;    // 到期后先让出的普通回顾次数（0..20）

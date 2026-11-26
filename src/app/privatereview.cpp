@@ -5,6 +5,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonValue>
+#include <QUuid>
 
 namespace {
 
@@ -120,15 +121,11 @@ bool PrivateReview::errorCountsAsFailure(const QString &error)
 bool PrivateReview::originMatches(const Attempt &attempt, const QJsonObject &proposal,
                                   const QString &error) const
 {
+    // R12-1a 严格来源校验：所有真实回顾来源（含失败回调）都必须携带合法 _origin。
+    // error 只用于日志/失败分类，不再放宽来源校验；缺失 _origin 的旧 proposal 一律拒绝。
+    Q_UNUSED(error);
     const auto originJson = proposal.value(QStringLiteral("_origin")).toObject();
-    if (originJson.isEmpty()) {
-        // OpenWake 成功 proposal 必须严格携带 _origin；只有非空的失败回调（网络/策略等，
-        // LLMService 不解析 proposal）允许缺省，此时仍由 active 的 id/version 定位。
-        if (attempt.origin.kind == CognitiveOrigin::OpenWake)
-            return !error.isEmpty();
-        // 其它来源：旧路径（R12-0 及更早的测试/调用方）只按 id/version 校验。
-        return true;
-    }
+    if (originJson.isEmpty()) return false;
     CognitiveOrigin echoed;
     if (!CognitiveOrigin::fromJson(originJson, &echoed)) return false;
     return attempt.origin.sameIdentity(echoed);
@@ -372,6 +369,16 @@ WakeResult PrivateReview::wakeNonOpen(int dailyLimit, int cooldownSeconds)
         result.reason = QStringLiteral("storage_error");
         return result;
     }
+    // R12-1a：非 OpenWake 来源没有服务端持久 runId，领取时生成独立 UUID；
+    // 该 runId 随 requested context 下发并要求模型原样回显，迟到/伪造回调无法通过校验。
+    if (origin.runId.isEmpty())
+        origin.runId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    if (origin.runId.isEmpty()) {
+        // 理论上不会发生（UUID 生成失败）；仍按存储错误处理，绝不进入无身份的在途状态。
+        result.kind = kindName(kind);
+        result.reason = QStringLiteral("storage_error");
+        return result;
+    }
     context.insert(QStringLiteral("origin"), origin.toJson());
     active = Attempt{origin, options.enabled && !options.targets.isEmpty()};
     // B1：当前活动（仅活动回顾有"活动"语义；关注/新来源回顾/OpenWake 不写入 current_activity）。
@@ -444,7 +451,8 @@ WakeResult PrivateReview::wakeOpenWake(const OpenWakeConfig &openWake, int daily
     context.insert(QStringLiteral("allow_contact"), false);
     context.insert(QStringLiteral("trigger"), QStringLiteral("due"));
     context.insert(QStringLiteral("time_context"), openWakeTimeContext(store, options));
-    context.insert(QStringLiteral("recent_open_wake_notes"), store.recentOpenWakeNotes(2));
+    context.insert(QStringLiteral("recent_open_wake_notes"),
+                   store.recentOpenWakeNotes(2, QStringLiteral("owner")));
     active = Attempt{origin, false};
     qInfo() << "[OpenWake] reviewing" << id << version << "run=" << runId
             << "scope=" << origin.scope;
@@ -638,14 +646,14 @@ void PrivateReview::receiveOpenWake(const Attempt &attempt, const QJsonObject &p
                         reason.trimmed().isEmpty() ? QStringLiteral("-") : reason);
     };
 
-    // 默认下一次间隔：模型没给 next_wake 时用配置的 default_interval_seconds（并按配置
-    // min/max 归一）。模型显式给出的 after_minutes 只要在协议 5..1440 内就按原值执行，
-    // 不在协议范围时按 schema 违规处理（记忆层最终仍会夹在 5..1440）。
+    // R12-1a：间隔配置在提交边界生效。协议层仍只校验 after_minutes 在 5..1440；
+    // 协议合法后再按配置 [minMinutes,maxMinutes] 夹紧得到 effective（夹紧不是失败，
+    // 只有协议非法/commit 失败才计失败）。模型没给 next_wake 时用 default_interval_seconds，
+    // 并走同一套 effective 夹紧；requested/effective 都写进日志与 intent 供审计。
     const int minMinutes = qBound(5, openWake.minIntervalSeconds / 60, 1440);
     const int maxMinutes = qBound(minMinutes, openWake.maxIntervalSeconds / 60, 1440);
-    const int defaultMinutes = qBound(
-        5, qBound(minMinutes, openWake.defaultIntervalSeconds / 60, maxMinutes), 1440);
-    int nextMinutes = defaultMinutes;
+    int requestedMinutes = qBound(5, openWake.defaultIntervalSeconds / 60, 1440);
+    int effectiveMinutes = qBound(minMinutes, requestedMinutes, maxMinutes);
 
     QString rejectReason = error;
     QString decision;
@@ -689,10 +697,13 @@ void PrivateReview::receiveOpenWake(const Attempt &attempt, const QJsonObject &p
                 } else if (nextWakeObj.contains(QStringLiteral("after_minutes"))) {
                     const auto minutesValue = nextWakeObj.value(QStringLiteral("after_minutes"));
                     const int minutes = minutesValue.isDouble() ? minutesValue.toInt(-1) : -1;
-                    if (minutes < 5 || minutes > 1440)
+                    if (minutes < 5 || minutes > 1440) {
+                        // 协议 5..1440 之外才是 schema 失败；配置夹紧不在此处判定。
                         rejectReason = QStringLiteral("schema");
-                    else
-                        nextMinutes = minutes;
+                    } else {
+                        requestedMinutes = minutes;
+                        effectiveMinutes = qBound(minMinutes, requestedMinutes, maxMinutes);
+                    }
                 }
             }
         }
@@ -706,12 +717,20 @@ void PrivateReview::receiveOpenWake(const Attempt &attempt, const QJsonObject &p
         return;
     }
 
+    // 合法间隔的审计日志：requested 是模型/默认请求值，effective 是按配置夹紧后实际提交值。
+    qInfo().noquote()
+        << QStringLiteral("[OpenWake] interval requested=%1 effective=%2 min=%3 max=%4")
+               .arg(requestedMinutes)
+               .arg(effectiveMinutes)
+               .arg(minMinutes)
+               .arg(maxMinutes);
     const QJsonObject intent{{QStringLiteral("mode"), QStringLiteral("after")},
-                             {QStringLiteral("after_minutes"), nextMinutes}};
+                             {QStringLiteral("requested_after_minutes"), requestedMinutes},
+                             {QStringLiteral("after_minutes"), effectiveMinutes}};
     QString commitError;
-    if (store.finishOpenWake(id, version, decision, note, intent, nextMinutes, &commitError)) {
+    if (store.finishOpenWake(id, version, decision, note, intent, effectiveMinutes, &commitError)) {
         store.clearReviewFailure(QStringLiteral("open_wake"), ref);
-        const qint64 nextDue = QDateTime::currentSecsSinceEpoch() + qint64(nextMinutes) * 60;
+        const qint64 nextDue = QDateTime::currentSecsSinceEpoch() + qint64(effectiveMinutes) * 60;
         qInfo().noquote()
             << QStringLiteral("[OpenWake] committed decision=%1 next_due=%2 note_len=%3")
                    .arg(decision, reviewIsoFromEpoch(nextDue))

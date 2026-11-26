@@ -953,8 +953,10 @@ void ConfigManager::ensureIdentityLoaded() const
             openWake.allowContact = openWakeObj.value("allow_contact").toBool(false);
             openWake.initialDelaySeconds =
                 qBound(60, openWakeObj.value("initial_delay_seconds").toInt(900), 86400);
+            // 默认最小间隔 300 秒：模型仍可在协议 5..1440 分钟内提议，提交边界再按
+            // [min,max] 夹紧（夹紧不是失败）；缺省时也用同一套 effective 规则。
             int minInterval =
-                qBound(300, openWakeObj.value("min_interval_seconds").toInt(600), 86400);
+                qBound(300, openWakeObj.value("min_interval_seconds").toInt(300), 86400);
             int maxInterval =
                 qBound(300, openWakeObj.value("max_interval_seconds").toInt(86400), 86400);
             if (maxInterval < minInterval) maxInterval = minInterval;

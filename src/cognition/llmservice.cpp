@@ -127,6 +127,9 @@ QJsonObject cognitiveSnapshotMessage(MemoryManager *memory, const RequestMeta &m
                                      const QString &triggerRef, const QString &purpose)
 {
     if (!memory) return {};
+    // R12-1a：盲区不注入任何认知快照。前台入口已在调用前过滤；回顾/其它调用路径
+    // 在这里再守一次，避免盲区会话的上下文被送进模型（不扩大任何读取权限）。
+    if (ConfigManager::instance().isBlindZone(meta.channel, meta.sessionId)) return {};
     CognitiveSnapshotBuilder builder(memory);
     const auto snapshot=builder.build(meta,meta.runId,triggerRef,purpose);
     const auto prompt=builder.toPromptJson(snapshot);
@@ -1511,8 +1514,8 @@ void LLMService::generatePrivateReview(qlonglong id, int version, const QJsonObj
             "服务端会逐条做确定性核验，并对事实声称做一次 semantic entailed/contradicted/insufficient 判定；"
             "编造\"你约好了\"、把 assistant 自己说过的话当 user commitment、用真实但无关的资料支持具体声称，都会被拒绝；"
             "不可靠内容若只是夹带的事实，可能被要求删掉或改成不确定表达。\n"
-            "兼容说明：旧契约 contact.basis 仍被接受（type=new_owner_evidence 引 chat/<turn>，或 "
-            "type=activity_result 引 thought/<id>），但新契约 contact.motivation+claims 优先。"
+            "兼容说明：contact.basis 仅用于兼容旧数据/旧调用，不应在新提案中使用；"
+            "新提案统一用 contact.motivation+claims；self_desire 不需要主人有任何新证据。"
             "时间委托（提醒）由提醒链独立执行：即使 basis.reminders 里有 pending 提醒，也不能用"
             "explicit_time_delegation 作为现在联系的依据，否则同一件事会被提醒和回顾各发一次。"
             "concern.own_next_review_at 是你自己决定何时再看一眼的时间，不是与主人的约定，"
@@ -1554,15 +1557,19 @@ void LLMService::generatePrivateReview(qlonglong id, int version, const QJsonObj
             "最多200字；next_check_after_minutes 为 0 至 10080，0 表示只在新证据时再看。");
     }
     // R12-0 契约统一：reflection 与 concern 共用同一段后台规则（R12-1a 的 OpenWake 复用），
-    // 不再要求"必须有新的主人证据/活动结果，且必须写 contact.basis"。legacy basis 的
-    // 服务端兼容读取保留，但新提示不把 basis 作为硬性要求。
+    // 不再要求"必须有新的主人证据/活动结果，且必须写 contact.basis"。legacy basis 只在
+    // 服务端读取层兼容旧数据/旧调用，提示词明确要求新提案用 motivation+claims。
     if (kind == QStringLiteral("reflection") || kind == QStringLiteral("concern")
         || kind == QStringLiteral("open_wake"))
         instruction += QStringLiteral("\n") + sharedReviewContract();
     if (kind == QStringLiteral("open_wake")) {
         instruction += QStringLiteral(
             " 再次说明：这是内部唤醒，没有新的用户消息，current_input 为 null；"
-            "scope 为 %1，trigger 为 %2。")
+            "scope 为 %1，trigger 为 %2。"
+            // 与上面的共享规则/self_desire 规则消歧：本片 OpenWake 没有 contact 能力，
+            // self_desire 等联系动机只能作为内部记录，不会产生任何联系或外部动作。
+            "本片 open wake 没有 contact 能力：self_desire 等联系动机仅作为内部记录，"
+            "不产生联系、发送或分享；上文关于询问/分享的通用规则不适用于本片。")
             .arg(thread.value(QStringLiteral("scope")).toString(QStringLiteral("owner")),
                  thread.value(QStringLiteral("trigger")).toString(QStringLiteral("due")));
     }
@@ -1591,8 +1598,8 @@ void LLMService::generatePrivateReview(qlonglong id, int version, const QJsonObj
             "inference 引 reflection/<turn>/matter/<名称>，不能当 reported_fact。"
             "reason/message 依赖的事实声称把其 id 放进 contact.core_claim_ids。"
             "服务端会逐条核验，并对事实声称做一次 semantic 判定；编造约定会被拒绝。"
-            "兼容说明：旧契约 contact.basis 仍被接受（type=new_owner_evidence 引 chat/<turn>，"
-            "或 type=activity_result 引 thought/<id>），但新契约优先。"
+            "兼容说明：contact.basis 仅用于兼容旧数据/旧调用，不应在新提案中使用；"
+            "新提案统一用 contact.motivation+claims；self_desire 不需要主人有任何新证据。"
             "时间委托（提醒）由提醒链到期时独立执行，不能用 explicit_time_delegation 作为现在联系的依据，"
             "否则同一件事会被提醒和回顾各发一次。"
             "助手过去说过的话、你自己的 concern、你自己的主动消息都不能当作主人委托；"
@@ -1940,21 +1947,26 @@ void LLMService::emitPrivateReviewResult(qlonglong id, int version, const QJsonO
 void LLMService::finalizePrivateReview(qlonglong id, int version, const QJsonObject &thread,
                                        const QJsonObject &proposal, const QString &error)
 {
+    // R12-1a：来源身份是服务端权威。所有终态（成功/错误/核验/修复/consult 失败）都从
+    // thread 的 origin 覆盖写入 proposal["_origin"]，模型自填同名字段不会生效。
+    QJsonObject guardedProposal = proposal;
+    guardedProposal[QStringLiteral("_origin")] =
+        thread.value(QStringLiteral("origin")).toObject();
     if (!error.isEmpty()) {
-        emitPrivateReviewResult(id, version, proposal, error);
+        emitPrivateReviewResult(id, version, guardedProposal, error);
         return;
     }
     // R12-1a：OpenWake 本片只做 rest/reflect。这里直接放行，绝不进入 contact 确定性复核/
     // 语义核验/修复/Outbox，也不让模型自填 semantic_status 生效（PrivateReview 会拒绝任何
-    // contact/activity 字段并按 schema 失败处理）。proposal 已带服务端回显的 _origin。
+    // contact/activity 字段并按 schema 失败处理）。guardedProposal 已带服务端权威 _origin。
     if (thread.value(QStringLiteral("kind")).toString() == QStringLiteral("open_wake")) {
-        emitPrivateReviewResult(id, version, proposal, error);
+        emitPrivateReviewResult(id, version, guardedProposal, error);
         return;
     }
-    QJsonObject contact = proposal.value(QStringLiteral("contact")).toObject();
+    QJsonObject contact = guardedProposal.value(QStringLiteral("contact")).toObject();
     // 旧 basis 契约完全走原来的路径（v29 行为不变）；纯 rest/consider 或没有 contact 也直接放行。
     if (contact.isEmpty() || !contactHasNewContract(contact)) {
-        emitPrivateReviewResult(id, version, proposal, error);
+        emitPrivateReviewResult(id, version, guardedProposal, error);
         return;
     }
     const auto timing = contact.value(QStringLiteral("timing")).toString();
@@ -1962,13 +1974,14 @@ void LLMService::finalizePrivateReview(qlonglong id, int version, const QJsonObj
         // private/next_chat 只是保留意图，不真正打扰；标记 retained 供记忆层审计。
         if (contact.value(QStringLiteral("semantic_status")).toString().isEmpty())
             contact[QStringLiteral("semantic_status")] = QStringLiteral("retained");
-        auto updated = proposal;
+        auto updated = guardedProposal;
         updated[QStringLiteral("contact")] = contact;
         emitPrivateReviewResult(id, version, updated, QString());
         return;
     }
     if (!m_memoryManager) {
-        auto updated = withholdContactProposal(proposal, contact, QStringLiteral("source_unavailable"));
+        auto updated = withholdContactProposal(guardedProposal, contact,
+                                               QStringLiteral("source_unavailable"));
         emitPrivateReviewResult(id, version, updated, QString());
         return;
     }
@@ -1980,7 +1993,7 @@ void LLMService::finalizePrivateReview(qlonglong id, int version, const QJsonObj
     const auto deterministic = policy.evaluateSpontaneousContactDeterministic(
         channel, session, id, contact);
     if (!deterministic.value(QStringLiteral("allowed")).toBool()) {
-        auto updated = withholdContactProposal(proposal, contact,
+        auto updated = withholdContactProposal(guardedProposal, contact,
             deterministic.value(QStringLiteral("reason")).toString());
         emitPrivateReviewResult(id, version, updated, QString());
         return;
@@ -1991,12 +2004,12 @@ void LLMService::finalizePrivateReview(qlonglong id, int version, const QJsonObj
     // 只核验"模型自己声明的 claims"无法发现这种遗漏。
     const auto verifierConfig = ConfigManager::instance().getSemanticVerifierConfig();
     if (!verifierConfig.enabled || !hasWritingProvider() || verifierConfig.maxVerifierCalls < 1) {
-        auto updated = withholdContactProposal(proposal, contact,
+        auto updated = withholdContactProposal(guardedProposal, contact,
                                                QStringLiteral("verifier_unavailable"));
         emitPrivateReviewResult(id, version, updated, QString());
         return;
     }
-    auto updated = proposal;
+    auto updated = guardedProposal;
     updated[QStringLiteral("contact")] = contact;
     verifyPrivateReviewContact(id, version, thread, updated);
 }

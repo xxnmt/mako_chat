@@ -5694,6 +5694,67 @@ QString reviewClaimabilityError(const QString &kind, const ReviewSourceSnapshot 
                                                        : QStringLiteral("source_inactive");
 }
 
+// R12-1a：关注保留期截止（epoch 秒）= 源 reported + retentionDays。reported 用 SQLite
+// strftime 解析，兼容 ISO 'T' 与 'YYYY-MM-DD HH:MM:SS' 两种存量格式；解析失败时
+// deadlineEpoch=0，不触发终止（保留原有领取过滤作为兜底）。
+struct ConcernRetentionDeadline
+{
+    bool found = false;
+    QString reported;
+    qint64 deadlineEpoch = 0;
+};
+
+ConcernRetentionDeadline concernRetentionDeadline(const QSqlDatabase &db, qlonglong turn,
+                                                  int retentionDays)
+{
+    ConcernRetentionDeadline deadline;
+    if (!db.isOpen() || turn <= 0) return deadline;
+    QSqlQuery q(db);
+    q.prepare(QStringLiteral(
+        "SELECT coalesce(s.reported,h.timestamp),"
+        "CAST(strftime('%s',coalesce(s.reported,h.timestamp)) AS INTEGER) "
+        "FROM chat_history h LEFT JOIN cognitive_source s ON s.event=h.cognitive_event "
+        "AND s.channel=h.channel AND s.session=h.session_id AND s.subject=h.subject "
+        "AND s.input=h.user_input WHERE h.id=?"));
+    q.addBindValue(turn);
+    if (!q.exec() || !q.next()) return deadline;
+    deadline.found = true;
+    deadline.reported = q.value(0).toString();
+    const qint64 reportedEpoch = q.value(1).toLongLong();
+    if (reportedEpoch > 0)
+        deadline.deadlineEpoch = reportedEpoch + qint64(qMax(1, retentionDays)) * 86400;
+    return deadline;
+}
+
+QString retentionReportedText(const ConcernRetentionDeadline &deadline)
+{
+    const QString reported = deadline.reported.trimmed();
+    return reported.isEmpty() ? QStringLiteral("-") : reported;
+}
+
+// recordReviewFailure 内（已有事务）使用：终止一条已经越过保留期的关注失败重试。
+// 源当前是领取后的 pending：回到 consider、next_check_at=0，保留 note/topic/watch 与记忆
+// 事实；同时清掉该来源的 review_failure 行。返回 false 表示 SQL/影响行数异常（调用方回滚）。
+bool terminatePendingConcernRetry(const QSqlDatabase &db, qlonglong turn, int expectedVersion,
+                                  const QString &ref, qlonglong now)
+{
+    QSqlQuery del(db);
+    del.prepare(QStringLiteral(
+        "DELETE FROM review_failure WHERE source_kind='concern' AND source_ref=?"));
+    del.addBindValue(ref);
+    if (!del.exec()) return false;
+    QSqlQuery update(db);
+    update.prepare(QStringLiteral(
+        "UPDATE private_reflection SET state='consider',claimed_by=NULL,next_check_at=0,"
+        "updated_at=? WHERE turn_id=? AND version=? AND state='pending'"));
+    update.addBindValue(now);
+    update.addBindValue(turn);
+    update.addBindValue(expectedVersion);
+    if (!update.exec()) return false;
+    // 必须精确命中一行：并发/迟到回执不能把已变化的关注再写坏。
+    return update.numRowsAffected() == 1;
+}
+
 } // namespace
 
 QString MemoryManager::classifyReviewError(const QString &error) const
@@ -5848,6 +5909,34 @@ bool MemoryManager::recordReviewFailure(const QString &sourceKind, const QString
             suspended = 0;
         }
         contentHash = snapshot.contentHash;
+    }
+    // R12-1a：关注保留期终止定时重试。失败会把 next_retry_at 写回 next_check_at；如果
+    // 该重试已越过 reported+retention（或当前时间已越过），就不再保留定时重试资格：
+    // 单事务清 failure 行 + next_check_at=0，state 保持 consider，note/topic/fact 不动。
+    // 后续合法新证据仍可按 matchedConcerns 命中/更新。返回 false + error=retry_expired
+    // 作为可审计结果（不是普通认知失败，不保留失败行）。
+    if (countsAsFailure && kind == kReviewKindConcern) {
+        const int retentionDays = qBound(
+            1, ConfigManager::instance().getProactiveConfig().concernRetentionDays, 365);
+        const auto deadline = concernRetentionDeadline(m_db, sourceId, retentionDays);
+        // 同时检查本次计划的重试时间与既有失败行（可能已被上一次失败排到截止之后）。
+        const bool retryBeyondDeadline = deadline.deadlineEpoch > 0
+            && (now >= deadline.deadlineEpoch
+                || nextRetry >= deadline.deadlineEpoch
+                || existingNext >= deadline.deadlineEpoch
+                || existingSuspended >= deadline.deadlineEpoch);
+        if (retryBeyondDeadline) {
+            if (!terminatePendingConcernRetry(m_db, sourceId, snapshot.version, ref, now))
+                return fail(QStringLiteral("db_error"));
+            if (!m_db.commit()) return fail(QStringLiteral("db_error"));
+            rollback.dismiss();
+            qInfo().noquote()
+                << QStringLiteral("[Review] retry_expired kind=concern ref=%1 reported=%2"
+                                  " retention_days=%3")
+                       .arg(ref, retentionReportedText(deadline))
+                       .arg(retentionDays);
+            return fail(QStringLiteral("retry_expired"));
+        }
     }
     QSqlQuery upsert(m_db);
     upsert.prepare(QStringLiteral(
@@ -6006,6 +6095,96 @@ bool MemoryManager::resetReviewFailure(const QString &sourceKind, const QString 
     if (!m_db.commit()) return false;
     rollback.dismiss();
     return true;
+}
+
+int MemoryManager::expireConcernScheduledRetries(int retentionDays)
+{
+    if (!m_db.isOpen()) return -1;
+    const int days = qBound(1, retentionDays, 365);
+    const qint64 retentionSeconds = qint64(days) * 86400;
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    // 与 claimDueConcern 相同的来源资格口径；只扫描 state='consider' 且仍有定时检查
+    // （next_check_at>0）的关注。两类越过保留期的情况都终止：
+    //   1) 当前时间已越过 reported+retention；
+    //   2) 失败行把 next_retry_at / suspended_until 排到了 reported+retention 之后
+    //      （即使还没到期，也没有再等的意义）。
+    QSqlQuery scan(m_db);
+    scan.prepare(QStringLiteral(
+        "SELECT r.turn_id,coalesce(s.reported,h.timestamp),r.version "
+        "FROM chat_history h JOIN cognitive_source s ON s.event=h.cognitive_event "
+        "AND s.channel=h.channel AND s.session=h.session_id AND s.subject=h.subject "
+        "AND s.input=h.user_input "
+        "JOIN private_reflection r ON r.turn_id=h.id "
+        "WHERE h.subject='user' AND h.sensitive=0 AND h.channel IN ('pet','qq_private') "
+        "AND h.turn_state IN ('handed_off','quiet') AND h.turn_kind='reply' "
+        "AND r.state='consider' AND r.next_check_at>0 "
+        "AND NOT EXISTS (SELECT 1 FROM reflection_change WHERE prior_turn=r.turn_id) "
+        "AND (julianday(coalesce(s.reported,h.timestamp)) < julianday('now', ?) "
+        "  OR EXISTS (SELECT 1 FROM review_failure f WHERE f.source_kind='concern' "
+        "     AND f.source_ref='concern/' || r.turn_id "
+        "     AND ((f.next_retry_at IS NOT NULL AND f.next_retry_at > "
+        "           CAST(strftime('%s',coalesce(s.reported,h.timestamp)) AS INTEGER) + ?) "
+        "       OR (f.suspended_until IS NOT NULL AND f.suspended_until > "
+        "           CAST(strftime('%s',coalesce(s.reported,h.timestamp)) AS INTEGER) + ?)))) "
+        "ORDER BY r.next_check_at,r.turn_id LIMIT 64"));
+    scan.addBindValue(QStringLiteral("-%1 day").arg(days));
+    scan.addBindValue(retentionSeconds);
+    scan.addBindValue(retentionSeconds);
+    if (!scan.exec()) {
+        qWarning() << "[Review] retry_expired_scan_failed" << scan.lastError();
+        return -1;
+    }
+    struct Expired
+    {
+        qlonglong turn = 0;
+        QString reported;
+        int version = 0;
+    };
+    QList<Expired> rows;
+    while (scan.next()) {
+        Expired row;
+        row.turn = scan.value(0).toLongLong();
+        row.reported = scan.value(1).toString();
+        row.version = scan.value(2).toInt();
+        rows.append(row);
+    }
+    scan.finish();
+    if (rows.isEmpty()) return 0;
+    if (!m_db.transaction()) return -1;
+    auto rollback = qScopeGuard([this] { m_db.rollback(); });
+    int expired = 0;
+    for (const auto &row : rows) {
+        // 单事务：先清失败行，再把定时检查终止为"只在新证据时再看"。
+        // 只改 next_check_at/updated_at，state 保持 consider，note/topic/watch 与事实不动。
+        QSqlQuery del(m_db);
+        del.prepare(QStringLiteral(
+            "DELETE FROM review_failure WHERE source_kind='concern' AND source_ref=?"));
+        del.addBindValue(QStringLiteral("concern/%1").arg(row.turn));
+        if (!del.exec()) return -1;
+        QSqlQuery update(m_db);
+        update.prepare(QStringLiteral(
+            "UPDATE private_reflection SET next_check_at=0,updated_at=? "
+            "WHERE turn_id=? AND version=? AND state='consider' AND next_check_at>0"));
+        update.addBindValue(now);
+        update.addBindValue(row.turn);
+        update.addBindValue(row.version);
+        if (!update.exec()) return -1;
+        // 并发变化（已被别的路径领取/修订）：跳过，不写坏；下次扫描再判断。
+        if (update.numRowsAffected() != 1) continue;
+        ++expired;
+        const QString reported = row.reported.trimmed();
+        qInfo().noquote()
+            << QStringLiteral("[Review] retry_expired kind=concern ref=concern/%1 reported=%2"
+                              " retention_days=%3")
+                   .arg(row.turn)
+                   .arg(reported.isEmpty() ? QStringLiteral("-") : reported)
+                   .arg(days);
+    }
+    if (!m_db.commit()) return -1;
+    rollback.dismiss();
+    if (expired > 0)
+        qInfo() << "[Review] retry_expired_count kind=concern count=" << expired;
+    return expired;
 }
 
 QJsonObject MemoryManager::reviewBudgetUsage() const
@@ -6446,17 +6625,22 @@ int MemoryManager::recoverOpenWakeLeases(int staleSeconds)
     return recovered;
 }
 
-QJsonArray MemoryManager::recentOpenWakeNotes(int limit) const
+QJsonArray MemoryManager::recentOpenWakeNotes(int limit, const QString &scopeKey) const
 {
     QJsonArray result;
     if (!m_db.isOpen() || limit <= 0) return result;
+    const QString scope = scopeKey.trimmed().isEmpty() ? QStringLiteral("owner")
+                                                       : scopeKey.trimmed();
     const int capped = qMin(limit, 20);
     QSqlQuery q(m_db);
+    // R12-1a：按 scope_key 过滤，默认只读 owner 私聊域；其它 scope（群聊/第三方/其它会话）
+    // 的内部记录不会被带进前台或回顾快照，也不扩大现有读取范围。
     q.prepare(QStringLiteral(
         "SELECT id,version,decision,note,finished_at FROM open_wake "
-        "WHERE state='committed' AND decision IN ('rest','reflect') "
+        "WHERE scope_key=? AND state='committed' AND decision IN ('rest','reflect') "
         "AND note IS NOT NULL AND trim(note)<>'' "
         "ORDER BY coalesce(finished_at,0) DESC,id DESC LIMIT ?"));
+    q.addBindValue(scope);
     q.addBindValue(capped);
     if (!q.exec()) return result;
     while (q.next()) {

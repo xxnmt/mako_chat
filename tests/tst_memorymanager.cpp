@@ -129,6 +129,21 @@ private:
 };
 MessageCapture *MessageCapture::s_active = nullptr;
 
+// R12-1a：从 PrivateReview::requested 的 context 取服务端 origin，注入测试 proposal。
+// 生产路径要求所有 proposal（含失败回调）都带合法 _origin；测试不得降低该校验。
+static QJsonObject proposalWithOrigin(const QJsonObject &requestedContext, QJsonObject proposal)
+{
+    proposal.insert(QStringLiteral("_origin"),
+                    requestedContext.value(QStringLiteral("origin")).toObject());
+    return proposal;
+}
+
+static QJsonObject originProposal(const QJsonObject &requestedContext)
+{
+    return QJsonObject{{QStringLiteral("_origin"),
+                        requestedContext.value(QStringLiteral("origin")).toObject()}};
+}
+
 // 构造与 Phase 0 改造前一致的 v1 库，并写入存量数据
 static bool createLegacyV1Db(const QString &path)
 {
@@ -1091,15 +1106,16 @@ private slots:
                 if (!wake.started || wake.kind != QStringLiteral("reflection")) return false;
                 const auto id = requested.last()[0].toLongLong();
                 const int version = requested.last()[1].toInt();
+                const auto origin = originProposal(requested.last()[2].toJsonObject());
                 const bool lastAttempt = attempt == backoffExpectations.size();
                 if (lastAttempt) {
                     MessageCapture capture;
-                    review.receive(id, version, {}, QStringLiteral("network_error"));
+                    review.receive(id, version, origin, QStringLiteral("network_error"));
                     for (const auto &line : capture.lines())
                         if (line.message.contains(QStringLiteral("[Review] suspended")))
                             sawSuspended = true;
                 } else {
-                    review.receive(id, version, {}, QStringLiteral("network_error"));
+                    review.receive(id, version, origin, QStringLiteral("network_error"));
                 }
                 const auto wait = deferredSeconds(
                     path, turn,
@@ -1151,15 +1167,16 @@ private slots:
         QVERIFY(rewindReviewCooldown(path, QStringLiteral("yield-clock")));
         wake = review.wake(12, 60);
         QVERIFY(wake.started);
-        review.receive(requested.last()[0].toLongLong(), requested.last()[1].toInt(), {},
+        review.receive(requested.last()[0].toLongLong(), requested.last()[1].toInt(),
+                       originProposal(requested.last()[2].toJsonObject()),
                        QStringLiteral("network_error"));
         const auto wait = deferredSeconds(path, turn, QStringLiteral("deferred-yield-fail"));
         QVERIFY2(wait >= 115 && wait <= 125, qPrintable(QString::number(wait)));
     }
 
-    // R12-0：超期关注日志聚合为一次 claim 最多一条 INFO，逐 turn 明细为 DEBUG；
-    // 进程内 QSet 去重相同 turn；关注数据不被修改。
-    void expiredRetentionAggregated()
+    // R12-1a：关注保留期结束后终止定时重试：清 failure 行、next_check_at=0、state 仍 consider，
+    // note/topic/fact 保留；日志可审计；后续合法新证据仍能匹配/更新。
+    void concernRetentionTerminationAudited()
     {
         // 固定保留期，避免依赖测试目录里可能残留的 identity.json。
         ProactiveIdentityGuard guard;
@@ -1167,76 +1184,241 @@ private slots:
             QByteArray(R"({"proactive":{"concern_retention_days":14}})")));
         QTemporaryDir dir;
         QVERIFY(dir.isValid());
-        const auto path = dir.filePath("expired-retention.db");
+        const auto path = dir.filePath("concern-retention-terminated.db");
         MemoryManager db(path);
-        QList<qlonglong> turns;
-        for (int index = 0; index < 3; ++index) {
-            const auto turn = seedOpenConcern(
-                db, concernTurnMeta(QStringLiteral("expired-%1").arg(index)),
-                QStringLiteral("周末想去看一场电影"),
-                QStringLiteral("电影好不好看"),
-                QJsonObject{{QStringLiteral("topic"), QStringLiteral("电影")},
-                            {QStringLiteral("watch"), QStringLiteral("评价如何")},
-                            {QStringLiteral("next_check_after_minutes"), 60}});
-            QVERIFY(turn > 0);
-            turns.append(turn);
-            QVERIFY(rewindReviewCooldown(path, QStringLiteral("expired-seed-clock-%1").arg(index)));
-        }
-        // 把来源时间拨到保留期（默认 14 天）之外，并让关注到期。
+        const qlonglong turn = seedOpenConcern(
+            db, concernTurnMeta(QStringLiteral("retention-terminated")),
+            QStringLiteral("周末想去看一场电影"), QStringLiteral("电影好不好看"),
+            QJsonObject{{QStringLiteral("topic"), QStringLiteral("电影")},
+                        {QStringLiteral("watch"), QStringLiteral("评价如何")},
+                        {QStringLiteral("next_check_after_minutes"), 60}});
+        QVERIFY(turn > 0);
+        const QString ref = QStringLiteral("concern/%1").arg(turn);
+        // 先把关注按到期领取并制造一次失败，确认存在 failure 行 + next_check_at=next_retry。
         {
-            RawDb raw(path, "expired-retention-backdate");
+            RawDb raw(path, "retention-terminated-mark");
             QVERIFY(raw.open());
-            for (const auto turn : turns) {
-                QVERIFY(raw.exec(QStringLiteral(
-                    "UPDATE cognitive_source SET reported=datetime('now','-30 day') "
-                    "WHERE event=(SELECT cognitive_event FROM chat_history WHERE id=%1)").arg(turn)));
-                QVERIFY(raw.exec(QStringLiteral(
-                    "UPDATE chat_history SET timestamp=datetime('now','-30 day') WHERE id=%1").arg(turn)));
-                QVERIFY(raw.exec(QStringLiteral(
-                    "UPDATE private_reflection SET next_check_at=unixepoch()-1 WHERE turn_id=%1").arg(turn)));
-            }
+            QVERIFY(raw.exec(QStringLiteral(
+                "UPDATE private_reflection SET next_check_at=unixepoch()-1 "
+                "WHERE turn_id=%1").arg(turn)));
         }
-        QVERIFY(rewindReviewCooldown(path, QStringLiteral("expired-retention-clock")));
-        int infoCount = 0;
-        int detailCount = 0;
+        QVERIFY(rewindReviewCooldown(path, QStringLiteral("retention-terminated-clock")));
+        const auto claim = db.claimDueConcern(12, 60);
+        QCOMPARE(claim.value(QStringLiteral("id")).toInteger(), turn);
+        QVERIFY(db.recordReviewFailure(QStringLiteral("concern"), ref,
+                                       QStringLiteral("generate"),
+                                       QStringLiteral("network_error"), true));
         {
-            MessageCapture capture;
-            const auto claimed = db.claimDueConcern(12, 60);
-            QVERIFY(claimed.isEmpty());
-            for (const auto &line : capture.lines()) {
-                if (!line.message.contains(QStringLiteral("expired_by_retention"))) continue;
-                if (line.type == QtInfoMsg) ++infoCount;
-                else if (line.type == QtDebugMsg) ++detailCount;
-            }
+            RawDb raw(path, "retention-terminated-before");
+            QVERIFY(raw.open());
+            QVERIFY(raw.scalar(QStringLiteral(
+                        "SELECT next_check_at FROM private_reflection WHERE turn_id=%1")
+                        .arg(turn)).toLongLong() > 0);
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT count(*) FROM review_failure "
+                         "WHERE source_kind='concern' AND source_ref='%1'").arg(ref)).toInt(), 1);
         }
-        QCOMPARE(infoCount, 1);
-        // 逐 turn 明细应当是 DEBUG；若构建关闭了 qDebug 输出，则不强制条数。
-        QVERIFY(detailCount == 0 || detailCount >= 3);
-        // 同一个 turn 重复 claim：INFO 去重后不再出现（明细 DEBUG 仍可有）。
-        QVERIFY(rewindReviewCooldown(path, QStringLiteral("expired-retention-clock-2")));
+        // 把来源时间回拨到 30 天前（超过保留期 14 天）；claim 前应先终止定时重试。
+        {
+            RawDb raw(path, "retention-terminated-backdate");
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral(
+                "UPDATE cognitive_source SET reported=datetime('now','-30 day') "
+                "WHERE event=(SELECT cognitive_event FROM chat_history WHERE id=%1)").arg(turn)));
+            QVERIFY(raw.exec(QStringLiteral(
+                "UPDATE chat_history SET timestamp=datetime('now','-30 day') "
+                "WHERE id=%1").arg(turn)));
+            // 即便 next_check_at 已被失败行排到未来，也按 ended 保留期终止。
+            QVERIFY(raw.exec(QStringLiteral(
+                "UPDATE private_reflection SET next_check_at=unixepoch()+3600 "
+                "WHERE turn_id=%1").arg(turn)));
+        }
+        QVERIFY(rewindReviewCooldown(path, QStringLiteral("retention-terminated-clock-2")));
+        int expiredLogs = 0;
         {
             MessageCapture capture;
             QVERIFY(db.claimDueConcern(12, 60).isEmpty());
-            int repeatedInfo = 0;
-            for (const auto &line : capture.lines())
-                if (line.type == QtInfoMsg
-                    && line.message.contains(QStringLiteral("expired_by_retention")))
-                    ++repeatedInfo;
-            QCOMPARE(repeatedInfo, 0);
-        }
-        // 关注数据未被修改：仍然是 consider、next_check_at 仍为到期值（>0）。
-        {
-            RawDb raw(path, "expired-retention-verify");
-            QVERIFY(raw.open());
-            for (const auto turn : turns) {
-                QCOMPARE(raw.scalar(QStringLiteral(
-                             "SELECT state FROM private_reflection WHERE turn_id=%1").arg(turn))
-                             .toString(),
-                         QStringLiteral("consider"));
-                QVERIFY(raw.scalar(QStringLiteral(
-                            "SELECT next_check_at FROM private_reflection WHERE turn_id=%1").arg(turn))
-                            .toLongLong() > 0);
+            for (const auto &line : capture.lines()) {
+                if (!line.message.contains(QStringLiteral("[Review] retry_expired kind=concern")))
+                    continue;
+                ++expiredLogs;
+                QVERIFY2(line.message.contains(QStringLiteral("ref=%1").arg(ref)),
+                         qPrintable(line.message));
+                QVERIFY2(line.message.contains(QStringLiteral("retention_days=14")),
+                         qPrintable(line.message));
+                QVERIFY2(line.message.contains(QStringLiteral("reported=")),
+                         qPrintable(line.message));
             }
+        }
+        QVERIFY(expiredLogs >= 1);
+        // 终止结果：failure 行清除、next_check_at=0、state 仍 consider、note/topic 保留。
+        {
+            RawDb raw(path, "retention-terminated-verify");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT count(*) FROM review_failure "
+                         "WHERE source_kind='concern' AND source_ref='%1'").arg(ref)).toInt(), 0);
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT state FROM private_reflection WHERE turn_id=%1").arg(turn))
+                         .toString(), QStringLiteral("consider"));
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT next_check_at FROM private_reflection WHERE turn_id=%1")
+                         .arg(turn)).toLongLong(), qlonglong(0));
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT note FROM private_reflection WHERE turn_id=%1").arg(turn))
+                         .toString(), QStringLiteral("电影好不好看"));
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT topic FROM private_reflection WHERE turn_id=%1").arg(turn))
+                         .toString(), QStringLiteral("电影"));
+        }
+        // 已终止的关注不再重复打终止日志（不具备定时重试资格）。
+        QVERIFY(rewindReviewCooldown(path, QStringLiteral("retention-terminated-clock-3")));
+        {
+            MessageCapture capture;
+            QVERIFY(db.claimDueConcern(12, 60).isEmpty());
+            int repeated = 0;
+            for (const auto &line : capture.lines())
+                if (line.message.contains(QStringLiteral("[Review] retry_expired")))
+                    ++repeated;
+            QCOMPARE(repeated, 0);
+        }
+        // 后续合法新证据仍能命中（state=consider，note/topic 未被删除）。
+        const auto matched = db.matchedConcerns(
+            concernTurnMeta(QStringLiteral("retention-viewer")), {},
+            QStringLiteral("电影好不好看"), 0, 2);
+        QVERIFY(!matched.isEmpty());
+        QCOMPARE(matched.first().toObject().value(QStringLiteral("ref")).toString(),
+                 QStringLiteral("reflection/%1").arg(turn));
+    }
+
+    // R12-1a：失败回调时（领取后、失败回执前）源时间已越过保留期 -> 立即终止重试，
+    // 返回 error=retry_expired，不写 failure 行；关注本身与记忆事实保留。
+    void concernFailureAfterRetentionTerminatesRetry()
+    {
+        ProactiveIdentityGuard guard;
+        QVERIFY(guard.writeIdentity(
+            QByteArray(R"({"proactive":{"concern_retention_days":1}})")));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath("concern-failure-expired.db");
+        MemoryManager db(path);
+        const qlonglong turn = seedOpenConcern(
+            db, concernTurnMeta(QStringLiteral("failure-expired")),
+            QStringLiteral("想知道他明天几点出门"), QStringLiteral("他几点出门"),
+            QJsonObject{{QStringLiteral("topic"), QStringLiteral("出门")},
+                        {QStringLiteral("next_check_after_minutes"), 60}});
+        QVERIFY(turn > 0);
+        const QString ref = QStringLiteral("concern/%1").arg(turn);
+        {
+            RawDb raw(path, "failure-expired-mark");
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral(
+                "UPDATE private_reflection SET next_check_at=unixepoch()-1 "
+                "WHERE turn_id=%1").arg(turn)));
+        }
+        QVERIFY(rewindReviewCooldown(path, QStringLiteral("failure-expired-clock")));
+        const auto claim = db.claimDueConcern(12, 60);
+        QCOMPARE(claim.value(QStringLiteral("id")).toInteger(), turn);
+        // 领取之后把源 reported 回拨到保留期之外，再送失败回执：应终止而不是写重试。
+        {
+            RawDb raw(path, "failure-expired-backdate");
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral(
+                "UPDATE cognitive_source SET reported=datetime('now','-3 day') "
+                "WHERE event=(SELECT cognitive_event FROM chat_history WHERE id=%1)").arg(turn)));
+            QVERIFY(raw.exec(QStringLiteral(
+                "UPDATE chat_history SET timestamp=datetime('now','-3 day') "
+                "WHERE id=%1").arg(turn)));
+        }
+        QString recordError;
+        int expiredLogs = 0;
+        {
+            MessageCapture capture;
+            QVERIFY(!db.recordReviewFailure(QStringLiteral("concern"), ref,
+                                            QStringLiteral("generate"),
+                                            QStringLiteral("network_error"), true,
+                                            &recordError));
+            for (const auto &line : capture.lines())
+                if (line.message.contains(QStringLiteral("[Review] retry_expired kind=concern")))
+                    ++expiredLogs;
+        }
+        QCOMPARE(recordError, QStringLiteral("retry_expired"));
+        QVERIFY(expiredLogs >= 1);
+        {
+            RawDb raw(path, "failure-expired-verify");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT count(*) FROM review_failure WHERE source_kind='concern' "
+                         "AND source_ref='%1'").arg(ref)).toInt(), 0);
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT state FROM private_reflection WHERE turn_id=%1").arg(turn))
+                         .toString(), QStringLiteral("consider"));
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT next_check_at FROM private_reflection WHERE turn_id=%1")
+                         .arg(turn)).toLongLong(), qlonglong(0));
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT note FROM private_reflection WHERE turn_id=%1").arg(turn))
+                         .toString(), QStringLiteral("他几点出门"));
+        }
+    }
+
+    // R12-1a：失败行 next_retry_at 已越过保留期（当前时间还没越过）也终止：不必等下一个
+    // 重试到点，直接清 failure 行 + next_check_at=0，保留关注与事实。
+    void concernScheduledRetryBeyondRetentionTerminated()
+    {
+        ProactiveIdentityGuard guard;
+        QVERIFY(guard.writeIdentity(
+            QByteArray(R"({"proactive":{"concern_retention_days":1}})")));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath("concern-retry-beyond-retention.db");
+        MemoryManager db(path);
+        const qlonglong turn = seedOpenConcern(
+            db, concernTurnMeta(QStringLiteral("retry-beyond-retention")),
+            QStringLiteral("展览下周还开不开"), QStringLiteral("展览还开不开"),
+            QJsonObject{{QStringLiteral("topic"), QStringLiteral("展览")},
+                        {QStringLiteral("next_check_after_minutes"), 60}});
+        QVERIFY(turn > 0);
+        const QString ref = QStringLiteral("concern/%1").arg(turn);
+        // 直接构造失败行：next_retry_at 在保留期截止之后（reported≈now，保留期 1 天，
+        // next_retry=now+2 天），但 next_check_at 仍在未来 2 天，当前时间并未越过截止。
+        {
+            RawDb raw(path, "retry-beyond-retention-setup");
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral(
+                "UPDATE private_reflection SET state='consider',claimed_by=NULL,"
+                "next_check_at=unixepoch()+172800 WHERE turn_id=%1").arg(turn)));
+            QVERIFY(raw.exec(QStringLiteral(
+                "INSERT INTO review_failure(source_kind,source_ref,consecutive_failures,"
+                "next_retry_at,suspended_until,last_stage,last_reason,last_attempt_at,updated_at) "
+                "VALUES('concern','%1',4,unixepoch()+172800,unixepoch()+172800,"
+                "'generate','network_error',unixepoch(),unixepoch())").arg(ref)));
+        }
+        QVERIFY(rewindReviewCooldown(path, QStringLiteral("retry-beyond-retention-clock")));
+        int expiredLogs = 0;
+        {
+            MessageCapture capture;
+            QVERIFY(db.claimDueConcern(12, 60).isEmpty());
+            for (const auto &line : capture.lines())
+                if (line.message.contains(QStringLiteral("[Review] retry_expired kind=concern")))
+                    ++expiredLogs;
+        }
+        QVERIFY(expiredLogs >= 1);
+        {
+            RawDb raw(path, "retry-beyond-retention-verify");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT count(*) FROM review_failure WHERE source_kind='concern' "
+                         "AND source_ref='%1'").arg(ref)).toInt(), 0);
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT state FROM private_reflection WHERE turn_id=%1").arg(turn))
+                         .toString(), QStringLiteral("consider"));
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT next_check_at FROM private_reflection WHERE turn_id=%1")
+                         .arg(turn)).toLongLong(), qlonglong(0));
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT note FROM private_reflection WHERE turn_id=%1").arg(turn))
+                         .toString(), QStringLiteral("展览还开不开"));
         }
     }
 
@@ -1258,7 +1440,8 @@ private slots:
             writing.wake(5,60);
             QCOMPARE(requests.size(),1);
             id = requests.first()[0].toLongLong();
-            writing.receive(id,requests.first()[1].toInt(),chapter,{});
+            writing.receive(id,requests.first()[1].toInt(),
+                            proposalWithOrigin(requests.first()[2].toJsonObject(), chapter),{});
             // Advance only the stored due time and budget clock in this isolated fixture.
             RawDb clock(path,"advance-review");
             QVERIFY(clock.open());
@@ -1291,7 +1474,8 @@ private slots:
         restored.receive(id,interruptedVersion,finalDraft,{});
         QVERIFY(!db.finishThoughtReview(id,interruptedVersion,finalDraft));
         QCOMPARE(shares.size(),0);
-        restored.receive(id,attempt[1].toInt(),finalDraft,{});
+        restored.receive(id,attempt[1].toInt(),
+                         proposalWithOrigin(attempt[2].toJsonObject(), finalDraft),{});
         QCOMPARE(shares.size(),1);
         QCOMPARE(db.nextThought(false)["last_review"].toObject()["draft"],finalDraft["draft"]);
         QVERIFY(db.nextThought(true).isEmpty());
@@ -1328,7 +1512,11 @@ private slots:
         const int newVersion = requests.first()[1].toInt();
         QVERIFY(newVersion > version);
         QVERIFY(!db.deferThoughtReview(id,version,"stale"));
-        writing.receive(id,newVersion,{{"status","active"},{"reflection","edited"},{"draft",QString(801,'x')}},{});
+        writing.receive(id,newVersion,
+                        proposalWithOrigin(requests.first()[2].toJsonObject(),
+                                           QJsonObject{{"status","active"},
+                                                       {"reflection","edited"},
+                                                       {"draft",QString(801,'x')}}),{});
         QCOMPARE(db.nextThought(true)["last_review"].toObject()["deferred_reason"].toString(),
                  QString("invalid_or_stale_proposal"));
         QVERIFY(!db.nextThought(true)["last_review"].toObject().contains("draft"));
@@ -1349,7 +1537,12 @@ private slots:
             const auto version = requests.first()[1].toInt();
             if (remove) QVERIFY(db.deleteTurnByID(id));
             else QVERIFY(db.applyThoughtAction(id,version,"abandon"));
-            writing.receive(id,version,{{"status","active"},{"reflection","late"},{"draft","late"},{"share_with_owner",true}},{});
+            writing.receive(id,version,
+                            proposalWithOrigin(requests.first()[2].toJsonObject(),
+                                               QJsonObject{{"status","active"},
+                                                           {"reflection","late"},
+                                                           {"draft","late"},
+                                                           {"share_with_owner",true}}),{});
             QCOMPARE(shares.size(),0);
             QVERIFY(db.nextThought(true).isEmpty());
         }
@@ -3710,8 +3903,10 @@ private slots:
         QCOMPARE(context["kind"].toString(), QStringLiteral("concern"));
         QCOMPARE(context["concern"].toObject()["topic"].toString(), QStringLiteral("荷包蛋"));
         review.receive(requested.first()[0].toLongLong(), requested.first()[1].toInt(),
-                       QJsonObject{{"concern_action", "keep"},
-                                   {"forget", QJsonObject{{"next_check_after_minutes", 0}}}}, {});
+                       proposalWithOrigin(context,
+                                          QJsonObject{{"concern_action", "keep"},
+                                                      {"forget", QJsonObject{{"next_check_after_minutes", 0}}}}),
+                       {});
         RawDb raw(path, "concern-review-state");
         QVERIFY(raw.open());
         QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM private_reflection WHERE turn_id=%1").arg(turn)).toString(),
@@ -4613,7 +4808,9 @@ private slots:
         }
     }
 
-    // 保留期：来源 reported 超过 concern_retention_days 的关注不再按时间到期领取。
+    // 保留期：来源 reported 超过 concern_retention_days 后，定时到期回顾不再领取；
+    // R12-1a 起同时终止定时重试（next_check_at=0），但关注本身与 note/topic/事实保留，
+    // 后续合法新证据仍可命中/更新。
     void dueConcernRespectsRetention()
     {
         QTemporaryDir dir;
@@ -4640,17 +4837,27 @@ private slots:
         }
         QVERIFY(rewindReviewCooldown(path, QStringLiteral("concern-retention-clock")));
         QVERIFY(db.claimDueConcern(12, 60).isEmpty());
-
-        // 保留期只拦"按时间到期"；来源恢复为近期后同一条关注仍可领取。
+        // 定时重试资格被终止：state 仍 consider、next_check_at=0、note/topic 保留。
         {
-            RawDb raw(path, "concern-retention-restore");
+            RawDb raw(path, "concern-retention-terminated");
             QVERIFY(raw.open());
-            QVERIFY(raw.exec(QStringLiteral("UPDATE cognitive_source SET reported=datetime('now')")));
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT state FROM private_reflection WHERE turn_id=%1").arg(turn))
+                         .toString(), QStringLiteral("consider"));
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT next_check_at FROM private_reflection WHERE turn_id=%1").arg(turn))
+                         .toLongLong(), qlonglong(0));
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT note FROM private_reflection WHERE turn_id=%1").arg(turn))
+                         .toString(), QStringLiteral("展览怎么样"));
         }
-        QVERIFY(rewindReviewCooldown(path, QStringLiteral("concern-retention-clock2")));
-        const auto claimed = db.claimDueConcern(12, 60);
-        QCOMPARE(claimed["id"].toInteger(), turn);
-        QCOMPARE(claimed["kind"].toString(), QStringLiteral("concern"));
+        // 合法新证据仍能命中同一个关注（不因保留期终止丢失关注/事实）。
+        const auto matched = db.matchedConcerns(
+            concernTurnMeta(QStringLiteral("concern-retention-viewer")), {},
+            QStringLiteral("展览怎么样"), 0, 2);
+        QVERIFY(!matched.isEmpty());
+        QCOMPARE(matched.first().toObject().value(QStringLiteral("ref")).toString(),
+                 QStringLiteral("reflection/%1").arg(turn));
     }
 
     // 启动恢复：租约过期仍 pending 的回顾要放回可重领状态，不能一直卡住。

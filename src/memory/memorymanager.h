@@ -305,6 +305,13 @@ public:
                              bool countsAsFailure,QString *error=nullptr);
     bool clearReviewFailure(const QString &sourceKind,const QString &sourceRef);
     bool resetReviewFailure(const QString &sourceKind,const QString &sourceRef);
+    // R12-1a：关注保留期终止定时重试。扫描 state='consider' 且仍有定时检查
+    // （next_check_at>0）的关注：若当前时间已越过 reported+retention，或失败行的
+    // next_retry_at/suspended_until 已越过该截止，则在同一事务里清 failure 行并把
+    // next_check_at 置 0（state 保持 consider，note/topic/fact 不动，后续合法新证据
+    // 仍可按 matchedConcerns 命中/更新）。返回终止条数；-1 表示数据库错误。
+    // 日志：[Review] retry_expired kind=concern ref=... reported=... retention_days=...
+    int expireConcernScheduledRetries(int retentionDays);
     // 今日回顾预算诊断（只读）：total + 各 source 次数。
     QJsonObject reviewBudgetUsage() const;
 
@@ -325,8 +332,11 @@ public:
     bool deferOpenWake(qlonglong id,int version,int retrySeconds,const QString &reason);
     bool cancelOpenWake(qlonglong id,int version,const QString &reason);
     int recoverOpenWakeLeases(int staleSeconds=1800);
-    QJsonArray recentOpenWakeNotes(int limit=2) const;   // R12-1a：最近 committed rest/reflect 非空 note
-    //                                                      （ref/version/decision/note/at），上限 20；只读。
+    // R12-1a：最近 committed rest/reflect 非空 note（ref/version/decision/note/at），
+    // 上限 20；只读。scopeKey 过滤 open_wake.scope_key，默认只读主人私聊域 owner；
+    // 调用方（快照 builder/PrivateReview）只传 owner，不扩大任何读取范围。
+    QJsonArray recentOpenWakeNotes(int limit=2,
+                                   const QString &scopeKey=QStringLiteral("owner")) const;
     // 统一活动访问骨架（只读）：legacy=chat_history thought，internal=internal_activity。
     // hasActiveInternalActivity 合并检查两种来源的 active/paused；currentActivitiesUnified
     // 返回带 origin 字段的合并列表，不改变既有 currentActivities 的返回形状。
@@ -535,9 +545,6 @@ private:
     QSqlDatabase m_db;
     QString m_databasePath;
     QSet<QString> m_masterUserIds;
-    // R12-0：进程内已打过 INFO 的"超出保留期关注"轮次，避免每次 claim 重复刷屏。
-    // 只做日志去重，不影响任何关注/事实数据。
-    QSet<qlonglong> m_expiredRetentionLogged;
 };
 
 #endif // MEMORYMANAGER_H

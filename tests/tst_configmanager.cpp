@@ -483,7 +483,7 @@ private slots:
         QVERIFY(!openWake.enabled);
         QVERIFY(!openWake.allowContact);
         QCOMPARE(openWake.initialDelaySeconds, 900);
-        QCOMPARE(openWake.minIntervalSeconds, 600);
+        QCOMPARE(openWake.minIntervalSeconds, 300);
         QCOMPARE(openWake.defaultIntervalSeconds, 1800);
         QCOMPARE(openWake.maxIntervalSeconds, 86400);
         QCOMPARE(openWake.maxNonOpenJobsWhenDue, 3);

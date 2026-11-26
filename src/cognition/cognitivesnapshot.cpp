@@ -203,8 +203,13 @@ CognitiveSnapshot CognitiveSnapshotBuilder::build(const RequestMeta &meta, const
     const bool groupAudience = meta.channel == Channel::kQQGroup;
     // R12-1a：OpenWake 内部状态只在“主人私聊域”注入：群聊/第三方会话不携带；
     // 回顾上下文可能没有显式渠道（只知道是主人私聊来源），按既有约定视为主人私聊域。
+    // 盲区不注入：盲区会话的上下文不读取/不携带任何 OpenWake 内部记录或调度状态
+    // （不扩大任何现有权限；盲区的 policy_view.blind_zone=true 仅作只读说明）。
+    const bool blindZone =
+        ConfigManager::instance().isBlindZone(meta.channel, meta.sessionId);
     const bool ownerPrivateAudience =
-        (meta.subject.isEmpty() || meta.subject == QStringLiteral("user"))
+        !blindZone
+        && (meta.subject.isEmpty() || meta.subject == QStringLiteral("user"))
         && (meta.channel == Channel::kPet || meta.channel == Channel::kQQPrivate
             || meta.channel.isEmpty());
 
@@ -213,7 +218,8 @@ CognitiveSnapshot CognitiveSnapshotBuilder::build(const RequestMeta &meta, const
     // 读取有上限（≤2 条），避免跨轮无界累积。
     QList<QJsonObject> wakeNoteRows;
     if (ownerPrivateAudience) {
-        for (const auto &value : m_memory->recentOpenWakeNotes(2))
+        // 只读 owner 私聊域的 OpenWake note；非 owner scope/第三方行不进入任何视图。
+        for (const auto &value : m_memory->recentOpenWakeNotes(2, QStringLiteral("owner")))
             wakeNoteRows.append(value.toObject());
     }
     const int wakeNoteQueried = int(wakeNoteRows.size());

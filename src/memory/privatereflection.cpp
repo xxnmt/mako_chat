@@ -636,50 +636,24 @@ QJsonObject MemoryManager::claimDueConcern(int dailyLimit,int cooldownSeconds,
         if (reason) *reason = QStringLiteral("daily_limit");
         return {};
     }
+    // 保留期只约束"按时间到期"的回顾；新证据命中走 matchedConcerns，不受这里影响。
+    const int retentionDays=qBound(1,
+        ConfigManager::instance().getProactiveConfig().concernRetentionDays,365);
+    // R12-1a：领取前先终止已越过保留期的定时重试（单事务清 failure 行 + next_check_at=0，
+    // 保留 consider/note/topic/fact）。这一步在领取事务之前执行，失败按 db_error 上报。
+    if (expireConcernScheduledRetries(retentionDays) < 0) {
+        if (reason) *reason = QStringLiteral("db_error");
+        return {};
+    }
     if (!m_db.transaction()) {
         if (reason) *reason = QStringLiteral("db_error");
         return {};
     }
     auto rollback=qScopeGuard([this]{ m_db.rollback(); });
-    // 保留期只约束"按时间到期"的回顾；新证据命中走 matchedConcerns，不受这里影响。
-    const int retentionDays=qBound(1,
-        ConfigManager::instance().getProactiveConfig().concernRetentionDays,365);
     QSqlQuery q(m_db);
-    // 到期但已超出保留期的关注不再领取；R12-0：一次 claim 聚合一条 INFO，逐 turn 明细降为
-    // DEBUG，并用进程内 QSet 对相同 turn 去重（只影响日志，不删除/修改任何关注或事实）。
-    {
-        QSqlQuery expired(m_db);
-        expired.prepare(QStringLiteral(
-            "SELECT r.turn_id") + sourceRows +
-            "JOIN private_reflection r ON r.turn_id=h.id WHERE " + eligible +
-            " AND r.state='consider' AND NOT EXISTS (SELECT 1 FROM reflection_change WHERE prior_turn=r.turn_id)"
-            " AND r.next_check_at>0 AND r.next_check_at<=unixepoch()"
-            " AND julianday(s.reported)<julianday('now','-" + QString::number(retentionDays) + " day')"
-            " ORDER BY r.next_check_at,r.turn_id LIMIT 24");
-        if (!expired.exec()) {
-            if (reason) *reason = QStringLiteral("db_error");
-            return {};
-        }
-        QList<qlonglong> expiredTurns;
-        while (expired.next()) expiredTurns.append(expired.value(0).toLongLong());
-        if (!expiredTurns.isEmpty()) {
-            int freshCount = 0;
-            qlonglong firstTurn = 0;
-            for (const qlonglong turn : expiredTurns) {
-                const bool firstInfo = !m_expiredRetentionLogged.contains(turn);
-                if (firstInfo) {
-                    m_expiredRetentionLogged.insert(turn);
-                    ++freshCount;
-                    if (firstTurn == 0) firstTurn = turn;
-                }
-                qDebug()<<"[Concern] expired_by_retention turn="<<turn<<"first_info="<<firstInfo;
-            }
-            // 同一次 claim 最多一条 INFO；已打过 INFO 的 turn 不再重复。
-            if (freshCount > 0)
-                qInfo()<<"[Concern] expired_by_retention count="<<freshCount
-                       <<"first_turn="<<firstTurn;
-        }
-    }
+    // 保留期外/定时重试越界的关注已在 expireConcernScheduledRetries 里终止（next_check_at=0、
+    // 清 failure 行、保留 consider/note/topic/fact 与日志），这里只领取仍在保留期内、
+    // 尚未被终止的到期关注。
     // 只领"按时间到期"的开放关注；被回顾链修订过的旧行不再作为 head。
     q.prepare("SELECT r.turn_id,r.version,r.note,h.channel,h.session_id,s.input" + sourceRows +
               "JOIN private_reflection r ON r.turn_id=h.id WHERE " + eligible +
