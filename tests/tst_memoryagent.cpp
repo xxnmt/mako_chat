@@ -2774,7 +2774,7 @@ private slots:
             review.receive(id, version,
                            QJsonObject{{QStringLiteral("status"), QStringLiteral("completed")},
                                        {QStringLiteral("reflection"), QStringLiteral("done")},
-                                       {QStringLiteral("draft"), QString()},
+                                       {QStringLiteral("draft"), QStringLiteral("写好的段落")},
                                        {QStringLiteral("_origin"), activityOrigin}}, {});
             QVERIFY(execMemorySql(QStringLiteral(
                 "UPDATE thought_review_log SET started_at=started_at-120")));
@@ -2959,6 +2959,7 @@ private slots:
         QVERIFY(db.reviewFailure(QStringLiteral("activity"), activityRef).isEmpty());
         receiveAtLast(QJsonObject{{QStringLiteral("status"), QStringLiteral("completed")},
                                   {QStringLiteral("reflection"), QStringLiteral("done")},
+                                  {QStringLiteral("draft"), QStringLiteral("写下来的成果")},
                                   {QStringLiteral("_origin"), activityOrigin}});
         QCOMPARE(activityStatus(), QStringLiteral("completed"));
 
@@ -4887,6 +4888,114 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(timeoutFailed.count(), 1, 2000);
         QVERIFY(timeoutAgent.metrics().timeoutRuns >= 1);
     }
+    // R12-1b 补充：ActivityReview 输出协议与前台 sentences JSON 分离；最终 schema 明确，
+    // 回顾专用字段（成果/分享）出现，前台能力清单/句子标签协议不进入回顾请求。
+    void activityReviewProtocolSeparatedFromForeground()
+    {
+        SemanticReviewConfigGuard guard;
+        QVERIFY(guard.enable());
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager db(dir.filePath(QStringLiteral("activity-review-protocol.db")));
+        QString error;
+        const auto created = db.createActivity(
+            QStringLiteral("owner"), Channel::kPet, Channel::kDefaultSession,
+            QStringLiteral("写一段雨声"), QStringLiteral("先写开头"),
+            QStringLiteral("foreground"), QStringLiteral("chat/301"),
+            QStringLiteral("run-review-protocol"), &error);
+        QVERIFY2(!created.isEmpty(), qPrintable(error));
+        const QString ref = created.value(QStringLiteral("ref")).toString();
+        QVERIFY(execMemorySql(QStringLiteral(
+            "UPDATE internal_activity SET review_after=unixepoch()-1 WHERE status='active'")));
+        QVERIFY(execMemorySql(QStringLiteral(
+            "UPDATE thought_review_log SET started_at=started_at-120")));
+        PrivateReview review(db);
+        QSignalSpy requested(&review, &PrivateReview::requested);
+        const auto wake = review.wake(12, 60);
+        QVERIFY2(wake.started, qPrintable(wake.reason));
+        QCOMPARE(wake.kind, QStringLiteral("activity"));
+        const qlonglong activityId = requested.last().at(0).toLongLong();
+        const int version = requested.last().at(1).toInt();
+        const auto context = requested.last().at(2).toJsonObject();
+
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QByteArray> bodies;
+        serveCompletions(server, bodies, [](int) -> QString {
+            return QStringLiteral(
+                R"({"status":"completed","reflection":"写完了","draft":"雨声落在窗台。"})");
+        });
+        LLMService model(QStringLiteral("test"), nullptr,
+                         QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.serverPort())));
+        model.setMemoryManager(&db);
+        QSignalSpy finished(&model, &LLMService::privateReviewFinished);
+        model.requestPrivateReview(activityId, version, context);
+        QTRY_COMPARE_WITH_TIMEOUT(bodies.size(), 1, 8000);
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 8000);
+        const QByteArray body = bodies.first();
+        // 共享人格设定仍在（角色名），但前台 sentences/标签协议被显式覆盖。
+        QVERIFY(body.contains(QStringLiteral("茉子").toUtf8()));
+        QVERIFY(body.contains(QStringLiteral("【回顾输出协议｜与前台分离】").toUtf8()));
+        QVERIFY(body.contains(QStringLiteral("前台输出协议不适用于本次").toUtf8()));
+        QVERIFY(!body.contains("\"zh_text\""));
+        QVERIFY(!body.contains("\"tags\""));
+        QVERIFY(!body.contains(QStringLiteral("【你当前被授予的能力").toUtf8()));
+        // ActivityReview 最终 schema：status/成果/分享字段齐全。
+        QVERIFY(body.contains("completion_condition"));
+        QVERIFY(body.contains("share_request"));
+        QVERIFY(body.contains("artifact_ref"));
+        // 完成成果目录域也进入回顾快照（合法后台可读取）。
+        QVERIFY(body.contains("recent_activity_results"));
+        const auto proposal = finished.takeFirst().at(2).toJsonObject();
+        review.receive(activityId, version, proposal, {});
+        QCOMPARE(db.activityByRef(ref).value(QStringLiteral("status")).toString(),
+                 QStringLiteral("completed"));
+        QVERIFY(db.recentActivityResultsForModel(8, Channel::kPet,
+                                                 Channel::kDefaultSession,
+                                                 QStringLiteral("user"), true).size() >= 1);
+    }
+
+    // R12-1b 补充：Concern prompt 不再与 self_desire 冲突——自己想起来可以作为
+    // self_desire 的动机，但不能声称用户的新证据/委托；授权/安静时段/证据核验边界保留。
+    void concernPromptSelfDesireMotivationConsistent()
+    {
+        SemanticReviewConfigGuard guard;
+        QVERIFY(guard.enable());
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath(QStringLiteral("concern-prompt.db"));
+        MemoryManager db(path);
+        int version = 0;
+        const qlonglong turn = seedDueConcernForSemanticReview(
+            db, path, QStringLiteral("self-desire"), &version);
+        QVERIFY(turn > 0);
+        QVERIFY(version > 0);
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QByteArray> bodies;
+        serveCompletions(server, bodies, [](int) -> QString {
+            return QStringLiteral(
+                R"({"concern_action":"keep","forget":{"next_check_after_minutes":0}})");
+        });
+        LLMService model(QStringLiteral("test"), nullptr,
+                         QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.serverPort())));
+        model.setMemoryManager(&db);
+        QSignalSpy finished(&model, &LLMService::privateReviewFinished);
+        model.requestPrivateReview(turn, version,
+                                   QJsonObject{{QStringLiteral("kind"), QStringLiteral("concern")}});
+        QTRY_COMPARE_WITH_TIMEOUT(bodies.size(), 1, 8000);
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 8000);
+        const QString body = QString::fromUtf8(bodies.first());
+        // 旧矛盾句删除；新表述允许"自己想起来"作为 self_desire 动机。
+        QVERIFY(!body.contains(QStringLiteral("只是想起来不构成现在打扰的理由")));
+        QVERIFY(body.contains(QStringLiteral("自己想起来可以作为 self_desire 的动机")));
+        QVERIFY(body.contains(QStringLiteral("但不能声称这是用户的新证据或委托")));
+        // 确定性授权/安静时段/证据核验边界仍在。
+        QVERIFY(body.contains(QStringLiteral("服务端会逐条做确定性核验")));
+        QVERIFY(body.contains(QStringLiteral("安静时段")));
+        QVERIFY(body.contains(QStringLiteral("前台输出协议不适用于本次")));
+    }
+
 };
 
 QTEST_GUILESS_MAIN(TestMemoryAgent)

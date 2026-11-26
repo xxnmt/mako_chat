@@ -14,17 +14,32 @@ namespace {
 // policy=授权/隐私过滤；verify=联系核验未通过；cancel=让出注意力；commit=提交/CAS/来源失效。
 QString reviewErrorStage(const QString &error)
 {
+    // R12-1b 补充：ActivityReview 的成果/结构诊断码单独归到 schema/commit 阶段，
+    // 便于从失败日志直接区分"模型输出格式错"与"存储/并发失败"。
     if (error == QStringLiteral("network_error") || error == QStringLiteral("truncated")
-        || error == QStringLiteral("json_parse"))
+        || error == QStringLiteral("json_parse") || error == QStringLiteral("json_parse_failed"))
         return QStringLiteral("parse");
-    if (error == QStringLiteral("filtered") || error == QStringLiteral("writing_disabled"))
+    if (error == QStringLiteral("filtered") || error == QStringLiteral("writing_disabled")
+        || error == QStringLiteral("not_visible"))
         return QStringLiteral("policy");
     if (error == QStringLiteral("invalid_or_stale_proposal")
-        || error == QStringLiteral("schema"))
+        || error == QStringLiteral("schema")
+        || error == QStringLiteral("status_missing")
+        || error == QStringLiteral("status_type_invalid")
+        || error == QStringLiteral("status_enum_invalid")
+        || error == QStringLiteral("missing_artifact")
+        || error == QStringLiteral("missing_completion_condition")
+        || error == QStringLiteral("missing_reflection")
+        || error == QStringLiteral("share_intent_invalid")
+        || error == QStringLiteral("invalid_activity_kind")
+        || error == QStringLiteral("unsupported_external_activity")
+        || error == QStringLiteral("artifact_ref_invalid")
+        || error == QStringLiteral("artifact_mismatch")
+        || error == QStringLiteral("draft_too_long"))
         return QStringLiteral("schema");
     if (error == QStringLiteral("cancelled") || error == QStringLiteral("cancel"))
         return QStringLiteral("cancel");
-    // source_unavailable / evidence_changed / db_error 等：提交前来源或状态失效。
+    // source_unavailable / evidence_changed / db_error / commit_conflict 等：提交前来源或状态失效。
     return QStringLiteral("commit");
 }
 
@@ -33,6 +48,85 @@ QString reviewIsoFromEpoch(qint64 seconds)
     return seconds > 0
         ? QDateTime::fromSecsSinceEpoch(seconds).toUTC().toString(Qt::ISODateWithMs)
         : QString{};
+}
+
+// R12-1b：ActivityReview 结构化诊断。只记录字段形状/类型/枚举值/长度/阶段，
+// 不记录模型输出或私聊正文，便于真实模型排查而不泄漏内容。
+QString activityJsonTypeName(const QJsonValue &value)
+{
+    switch (value.type()) {
+    case QJsonValue::Null: return QStringLiteral("null");
+    case QJsonValue::Bool: return QStringLiteral("bool");
+    case QJsonValue::Double: return QStringLiteral("number");
+    case QJsonValue::String: return QStringLiteral("string");
+    case QJsonValue::Array: return QStringLiteral("array");
+    case QJsonValue::Object: return QStringLiteral("object");
+    case QJsonValue::Undefined: break;
+    }
+    return QStringLiteral("missing");
+}
+
+// ActivityReview proposal 的提交前结构诊断码（与 finishActivity 的成果校验互补）。
+QString activityProposalError(const QJsonObject &proposal)
+{
+    if (!proposal.contains(QStringLiteral("status")))
+        return QStringLiteral("status_missing");
+    if (!proposal.value(QStringLiteral("status")).isString())
+        return QStringLiteral("status_type_invalid");
+    static const QStringList allowedStatuses{QStringLiteral("active"), QStringLiteral("paused"),
+                                             QStringLiteral("completed"),
+                                             QStringLiteral("abandoned")};
+    if (!allowedStatuses.contains(proposal.value(QStringLiteral("status")).toString()))
+        return QStringLiteral("status_enum_invalid");
+    if (proposal.contains(QStringLiteral("share_with_owner"))
+        && !proposal.value(QStringLiteral("share_with_owner")).isBool())
+        return QStringLiteral("share_intent_invalid");
+    if (proposal.contains(QStringLiteral("share_request"))) {
+        const QJsonValue shareRequest = proposal.value(QStringLiteral("share_request"));
+        if (shareRequest.isString()) {
+            if (shareRequest.toString().trimmed().size() > 120)
+                return QStringLiteral("share_intent_invalid");
+        } else if (!shareRequest.isBool()) {
+            return QStringLiteral("share_intent_invalid");
+        }
+    }
+    if (proposal.contains(QStringLiteral("share_with_owner"))
+        && proposal.value(QStringLiteral("share_with_owner")).toBool()
+        && proposal.value(QStringLiteral("status")).toString() != QStringLiteral("completed"))
+        return QStringLiteral("share_intent_invalid");
+    return {};
+}
+
+void logActivityProposalFailure(const QString &ref, int version, const QString &reason,
+                                const QJsonObject &proposal, const QString &transportError)
+{
+    const QJsonValue status = proposal.value(QStringLiteral("status"));
+    const QJsonValue draft = proposal.value(QStringLiteral("draft"));
+    const QJsonValue condition = proposal.value(QStringLiteral("completion_condition"));
+    const QJsonValue shareRequest = proposal.value(QStringLiteral("share_request"));
+    const QJsonValue shareWithOwner = proposal.value(QStringLiteral("share_with_owner"));
+    const QString activityKind =
+        proposal.value(QStringLiteral("activity_kind")).toString().trimmed().left(16);
+    const int draftLength = draft.isString() ? draft.toString().trimmed().size() : -1;
+    const int conditionLength =
+        condition.isString() ? condition.toString().trimmed().size() : -1;
+    qInfo().noquote()
+        << QStringLiteral("[Activity] review_failed ref=%1 version=%2 stage=%3 code=%4"
+                          " status_present=%5 status_type=%6 status_enum=%7"
+                          " activity_kind=%8 draft_len=%9 completion_condition_len=%10"
+                          " share_with_owner_type=%11 share_request_type=%12 transport=%13")
+               .arg(ref)
+               .arg(version)
+               .arg(reviewErrorStage(reason), reason)
+               .arg(proposal.contains(QStringLiteral("status")) ? 1 : 0)
+               .arg(activityJsonTypeName(status))
+               .arg(status.isString() ? status.toString().left(24) : QStringLiteral("-"))
+               .arg(activityKind.isEmpty() ? QStringLiteral("-") : activityKind)
+               .arg(draftLength)
+               .arg(conditionLength)
+               .arg(activityJsonTypeName(shareWithOwner))
+               .arg(activityJsonTypeName(shareRequest))
+               .arg(transportError.isEmpty() ? QStringLiteral("-") : transportError);
 }
 
 // R12-1b：ActivityReview 的统一上下文。同时提供旧字段（id/interest/last_review）和统一字段
@@ -140,15 +234,17 @@ bool PrivateReview::errorCountsAsFailure(const QString &error)
     if (text.isEmpty()) return true;
     // 策略/权限拦截：不计入认知失败，但调用方仍按原语义 defer。
     if (text == QStringLiteral("filtered") || text == QStringLiteral("writing_disabled")
-        || text == QStringLiteral("permission_denied"))
+        || text == QStringLiteral("permission_denied")
+        || text == QStringLiteral("not_visible"))
         return false;
     // 来源已变/CAS 冲突不是"她想错了"，记录诊断但不累计连续失败。
     if (text == QStringLiteral("invalid_or_stale_proposal")
         || text == QStringLiteral("evidence_changed")
         || text == QStringLiteral("source_unavailable")
+        || text == QStringLiteral("commit_conflict")
         || text == QStringLiteral("cas_conflict"))
         return false;
-    // 网络/截断/JSON 解析/schema/提交失败/DB 错误都算一次真实失败。
+    // 网络/截断/JSON 解析/schema/成果真实性/提交失败/DB 错误都算一次真实失败。
     return true;
 }
 
@@ -357,12 +453,27 @@ WakeResult PrivateReview::wakeNonOpen(int dailyLimit, int cooldownSeconds)
             const int currentVersion = claim.value(QStringLiteral("version")).toInt();
             const auto activity = claim.value(QStringLiteral("activity")).toObject();
             const QString claimOriginKind = claim.value(QStringLiteral("origin_kind")).toString();
+            // R12-1b 补充：ActivityReview 的模型上下文只能来自可见投影，
+            // 不可见活动（盲区/敏感/越界渠道/长记忆关闭）不进入回顾，直接放回队列。
+            const QJsonObject visibleActivity = store.activityForModel(
+                activityRef, activity.value(QStringLiteral("channel")).toString(),
+                activity.value(QStringLiteral("session")).toString(), QStringLiteral("user"),
+                true);
+            if (visibleActivity.isEmpty()) {
+                store.deferActivity(activityRef, currentVersion, 0,
+                                    QStringLiteral("not_visible"));
+                result.kind = QStringLiteral("activity");
+                result.reason = QStringLiteral("not_visible");
+                result.sourceRef = activityRef;
+                result.version = currentVersion;
+                return result;
+            }
             // origin_kind 对模型是存储来源（legacy/internal）；具体产生方（foreground/open_wake）
             // 单独放 source_origin_kind，避免把 activity 的来源类型和存储类型混为一谈。
             const QString storageKind = activityRef.startsWith(QStringLiteral("activity/"))
                 ? QStringLiteral("internal") : QStringLiteral("legacy");
             context = activityReviewContext(activityRef, activityId, currentVersion,
-                                            storageKind, activity);
+                                            storageKind, visibleActivity);
             if (!claimOriginKind.isEmpty())
                 context.insert(QStringLiteral("source_origin_kind"), claimOriginKind);
             kind = CognitiveOrigin::Activity;
@@ -679,22 +790,33 @@ void PrivateReview::receive(qlonglong id, int version, const QJsonObject &propos
         logResult(QStringLiteral("none"), QStringLiteral("policy"), QStringLiteral("writing_disabled"));
         return;
     }
+    // R12-1b 补充：提交前先做结构诊断（status 缺失/类型/枚举、分享请求形状）；
+    // 所有失败日志只记录诊断码/字段形状/长度，不记录模型输出或私聊正文。
+    QString proposalError;
+    if (error.isEmpty()) proposalError = activityProposalError(proposal);
     QString finishError;
     QJsonObject finished;
-    if (error.isEmpty())
+    if (error.isEmpty() && proposalError.isEmpty())
         finished = store.finishActivity(ref, version, proposal, &finishError);
     const QString reason = !error.isEmpty()
         ? error
-        : (finished.isEmpty()
-               ? (finishError.isEmpty() ? QStringLiteral("invalid_or_stale_proposal") : finishError)
-               : QString{});
+        : (!proposalError.isEmpty()
+               ? proposalError
+               : (finished.isEmpty()
+                      ? (finishError.isEmpty() ? QStringLiteral("invalid_or_stale_proposal")
+                                               : finishError)
+                      : QString{}));
     if (!reason.isEmpty()) {
         // 领取已经计入冷却与每日预算；失败走统一 review_failure（legacy/internal 同一接口）。
-        recordFailure(attempt, reason, reviewStage(proposal, error, false),
-                      errorCountsAsFailure(reason));
+        // R12-1b 补充：ActivityReview 的阶段必须体现具体错误码（schema/commit/parse），
+        // 不能一律归为 commit；日志/失败行只记录诊断码与长度。
+        const QString stage = error.isEmpty() ? reviewErrorStage(reason)
+                                              : reviewStage(proposal, error, false);
+        recordFailure(attempt, reason, stage, errorCountsAsFailure(reason));
+        logActivityProposalFailure(ref, version, reason, proposal, error);
         logResult(proposal["status"].toString().isEmpty() ? QStringLiteral("none")
-                                                         : proposal["status"].toString(),
-                  reviewStage(proposal, error, false), reason);
+                                                          : proposal["status"].toString(),
+                  stage, reason);
         return;
     }
     const int newVersion = finished.value(QStringLiteral("version")).toInt();
@@ -717,27 +839,23 @@ void PrivateReview::receive(qlonglong id, int version, const QJsonObject &propos
     store.clearReviewFailure(kindName(attempt.origin.kind), ref);
     logResult(resultStatus.isEmpty() ? QStringLiteral("none") : resultStatus,
               QStringLiteral("commit"), QString());
-    const auto draft = proposal["draft"].toString().trimmed();
-    if (draft.isEmpty() || !proposal[QStringLiteral("share_with_owner")].toBool()) return;
-    if (ref.startsWith(QStringLiteral("thought/"))) {
-        // legacy 分享链完全保留：canShareThought + shareRequested → Outbox 唯一发送。
-        if (store.canShareThought(attempt.origin.id, newVersion))
-            emit shareRequested(ref, newVersion, draft);
-    } else {
-        // internal 活动：分享意愿只落 internal_activity.result_json.share_intent，
-        // 不发 shareRequested、不写 delivery_ledger/action_outbox/chat_history、不发消息。
-        QString shareError;
-        if (store.setActivityShareIntent(ref, newVersion, draft, &shareError)) {
-            qInfo().noquote()
-                << QStringLiteral("[Activity] share_intent_stored ref=%1 version=%2")
-                       .arg(ref).arg(newVersion);
-        } else {
-            qWarning().noquote()
-                << QStringLiteral("[Activity] share_intent_failed ref=%1 version=%2 error=%3")
-                       .arg(ref).arg(newVersion)
-                       .arg(shareError.isEmpty() ? QStringLiteral("unknown") : shareError);
-        }
+    // 分享意愿：internal 活动已在 finishActivity 的同一事务里原子写入 share_intent
+    // （绑定服务端实际成果 ref/版本/哈希），这里只记录日志，不再二次写库、不发送。
+    if (finished.contains(QStringLiteral("share_intent"))) {
+        qInfo().noquote()
+            << QStringLiteral("[Activity] share_intent_stored ref=%1 version=%2"
+                              " artifact_version=%3")
+                   .arg(ref)
+                   .arg(newVersion)
+                   .arg(finished.value(QStringLiteral("artifact_version")).toInt());
+        return;
     }
+    // legacy 分享链完全保留：canShareThought + shareRequested → Outbox 唯一发送。
+    if (!ref.startsWith(QStringLiteral("thought/"))) return;
+    const auto draft = proposal["draft"].toString().trimmed();
+    if (!draft.isEmpty() && proposal[QStringLiteral("share_with_owner")].toBool()
+        && store.canShareThought(attempt.origin.id, newVersion))
+        emit shareRequested(ref, newVersion, draft);
 }
 
 void PrivateReview::receiveOpenWake(const Attempt &attempt, const QJsonObject &proposal,

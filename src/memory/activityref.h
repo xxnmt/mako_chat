@@ -87,6 +87,20 @@ struct ActivityRef
         return true;
     }
 
+    // R12-1b 补充：产物引用（artifact_ref）只允许指回活动成果自身：
+    // activity/<id> 或 thought/<id>。前端/模型不能写入任意路径或指向别的活动。
+    bool isArtifactRefFor(const ActivityRef &activity) const
+    {
+        return isValid() && kind == activity.kind && id == activity.id;
+    }
+
+    // 解析产物引用文本；非法/裸 id 返回 false。语义与 parse 一致，单独命名便于读代码。
+    static bool parseArtifactRef(const QString &refText, ActivityRef *out,
+                                 QString *error = nullptr)
+    {
+        return parse(refText, out, error);
+    }
+
     bool operator==(const ActivityRef &other) const
     {
         return kind == other.kind && id == other.id;

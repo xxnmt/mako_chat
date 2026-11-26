@@ -1,6 +1,7 @@
 #include <QtTest>
 #include <QTemporaryDir>
 #include <QDateTime>
+#include <QCryptographicHash>
 #include "benchmarksnapshot.h"
 #include <QSqlDatabase>
 #include <QSqlQuery>
@@ -6873,7 +6874,7 @@ private slots:
         error.clear();
         QVERIFY(db.applyActivityAction(secondRef, 1, QStringLiteral("complete"), -1,
                                        QStringLiteral("完成"), &error).isEmpty());
-        QCOMPARE(error, QStringLiteral("missing_result"));
+        QCOMPARE(error, QStringLiteral("missing_artifact"));
         QVERIFY(!db.finishActivity(secondRef, 1,
             QJsonObject{{QStringLiteral("status"), QStringLiteral("active")},
                         {QStringLiteral("reflection"), QStringLiteral("开始收尾")},
@@ -6957,27 +6958,98 @@ private slots:
             QStringLiteral("chat/31"), QStringLiteral("run-share-1"), &error);
         QVERIFY2(!created.isEmpty(), qPrintable(error));
         const QString ref = created.value("ref").toString();
-        // finish 携带分享意图：只保存 share_offered，不发送。
-        const auto finished = db.finishActivity(ref, 1,
+        // 先写一版草稿（未完成，不带分享），再带成果与分享意愿完成。
+        auto finished = db.finishActivity(ref, 1,
             QJsonObject{{QStringLiteral("status"), QStringLiteral("active")},
                         {QStringLiteral("reflection"), QStringLiteral("写了开头")},
-                        {QStringLiteral("draft"), QStringLiteral("光落在桌角")},
-                        {QStringLiteral("share_with_owner"), true}}, &error);
+                        {QStringLiteral("draft"), QStringLiteral("光落在桌角")}}, &error);
+        QVERIFY2(!finished.isEmpty(), qPrintable(error));
+        finished = db.finishActivity(ref, finished.value("version").toInt(),
+            QJsonObject{{QStringLiteral("status"), QStringLiteral("completed")},
+                        {QStringLiteral("reflection"), QStringLiteral("写完了")},
+                        {QStringLiteral("draft"), QStringLiteral("光落在桌角的完整段落")},
+                        {QStringLiteral("share_with_owner"), true},
+                        {QStringLiteral("share_request"), QStringLiteral("想给你看这段")}},
+            &error);
         QVERIFY2(!finished.isEmpty(), qPrintable(error));
         const int version = finished.value("version").toInt();
-        QCOMPARE(db.activityByRef(ref).value("share_offered").toBool(), true);
-        QVERIFY(db.setActivityShareIntent(ref, version,
-                                          QStringLiteral("想给你看这段"), &error));
-        const auto intent = db.activityByRef(ref).value("share_intent").toObject();
-        QCOMPARE(intent.value("requested").toBool(), true);
-        QCOMPARE(intent.value("draft").toString(), QStringLiteral("想给你看这段"));
-        QCOMPARE(intent.value("version").toInt(), version);
-        QVERIFY(intent.contains(QStringLiteral("at")));
-        // 版本 CAS 仍生效。
+        auto view = db.activityByRef(ref);
+        QCOMPARE(view.value("status").toString(), QStringLiteral("completed"));
+        QCOMPARE(view.value("artifact_ref").toString(), ref);
+        QCOMPARE(view.value("artifact_version").toInt(), version);
+        const QString artifactHash = view.value("artifact_hash").toString();
+        QCOMPARE(artifactHash.size(), 16);
+        // 分享意愿与完成同一事务：绑定实际成果 ref/版本/哈希，不保存任意 draft。
+        auto intent = view.value("share_intent").toObject();
+        QCOMPARE(intent.value("state").toString(), QStringLiteral("saved"));
+        QCOMPARE(intent.value("artifact_ref").toString(), ref);
+        QCOMPARE(intent.value("artifact_version").toInt(), version);
+        QCOMPARE(intent.value("content_hash").toString(), artifactHash);
+        QCOMPARE(intent.value("version").toInt(), 1);
+        QCOMPARE(intent.value("request").toString(), QStringLiteral("想给你看这段"));
+        QVERIFY(intent.contains(QStringLiteral("requested_at")));
+        QVERIFY(!intent.contains(QStringLiteral("draft")));
+
+        // 修改：显式 share 版本 2，历史保留旧版本。
         error.clear();
-        QVERIFY(!db.setActivityShareIntent(ref, version + 1, QStringLiteral("过期版本"),
-                                           &error));
+        QVERIFY2(db.setActivityShareIntent(ref, version, QStringLiteral("modify"),
+                                           QStringLiteral("再改一句请求"), 2, &error),
+                 qPrintable(error));
+        intent = db.activityByRef(ref).value("share_intent").toObject();
+        QCOMPARE(intent.value("state").toString(), QStringLiteral("saved"));
+        QCOMPARE(intent.value("version").toInt(), 2);
+        QCOMPARE(intent.value("request").toString(), QStringLiteral("再改一句请求"));
+        QCOMPARE(intent.value("history").toArray().size(), 1);
+        QCOMPARE(intent.value("history").toArray().first().toObject()
+                     .value("version").toInt(), 1);
+
+        // 撤回：state=withdrawn，保留历史；share_offered 变回 false。
+        error.clear();
+        QVERIFY2(db.setActivityShareIntent(ref, version, QStringLiteral("withdraw"),
+                                           QString(), 3, &error),
+                 qPrintable(error));
+        intent = db.activityByRef(ref).value("share_intent").toObject();
+        QCOMPARE(intent.value("state").toString(), QStringLiteral("withdrawn"));
+        QCOMPARE(intent.value("version").toInt(), 3);
+        QVERIFY(intent.contains(QStringLiteral("withdrawn_at")));
+        QCOMPARE(intent.value("history").toArray().size(), 2);
+        QCOMPARE(db.activityByRef(ref).value("share_offered").toBool(), false);
+
+        // share 版本必须严格递增；活动 CAS 仍生效。
+        error.clear();
+        QVERIFY(!db.setActivityShareIntent(ref, version, QStringLiteral("share"),
+                                           QStringLiteral("重复版本"), 3, &error));
+        QCOMPARE(error, QStringLiteral("share_version_conflict"));
+        error.clear();
+        QVERIFY(!db.setActivityShareIntent(ref, version + 1, QStringLiteral("share"),
+                                           QStringLiteral("过期版本"), 4, &error));
         QCOMPARE(error, QStringLiteral("cas_conflict"));
+        // 旧签名保留兼容：自动递增 share 版本。
+        error.clear();
+        QVERIFY2(db.setActivityShareIntent(ref, version, QStringLiteral("重新分享"), &error),
+                 qPrintable(error));
+        intent = db.activityByRef(ref).value("share_intent").toObject();
+        QCOMPARE(intent.value("version").toInt(), 4);
+        QCOMPARE(intent.value("state").toString(), QStringLiteral("saved"));
+
+        // 未完成、没有成果的活动不能产生分享意愿。
+        const auto second = db.createActivity(
+            QStringLiteral("owner"), Channel::kPet, Channel::kDefaultSession,
+            QStringLiteral("第二件"), QString(), QStringLiteral("foreground"),
+            QStringLiteral("chat/32"), QStringLiteral("run-share-2"), &error);
+        QVERIFY2(!second.isEmpty(), qPrintable(error));
+        const QString secondRef = second.value("ref").toString();
+        const auto secondActive = db.finishActivity(secondRef, 1,
+            QJsonObject{{QStringLiteral("status"), QStringLiteral("active")},
+                        {QStringLiteral("reflection"), QStringLiteral("写着")},
+                        {QStringLiteral("draft"), QStringLiteral("未完成稿")}}, &error);
+        QVERIFY2(!secondActive.isEmpty(), qPrintable(error));
+        error.clear();
+        QVERIFY(!db.setActivityShareIntent(secondRef,
+                                           secondActive.value("version").toInt(),
+                                           QStringLiteral("share"), QStringLiteral("提前分享"),
+                                           1, &error));
+        QCOMPARE(error, QStringLiteral("missing_artifact"));
         // 没有任何发送/账本/聊天行副作用。
         QCOMPARE(tableCount(path, QStringLiteral("delivery_ledger"), "share-ledger"), 0);
         QCOMPARE(tableCount(path, QStringLiteral("cognitive_action"), "share-action"), 0);
@@ -7388,10 +7460,16 @@ private slots:
         QCOMPARE(view.value(QStringLiteral("status")).toString(), QStringLiteral("completed"));
         QCOMPARE(view.value(QStringLiteral("artifact_ref")).toString(), ref);
         QCOMPARE(view.value(QStringLiteral("draft")).toString(), QStringLiteral("雨声落在窗台"));
-        QCOMPARE(view.value(QStringLiteral("share_intent")).toObject()
-                     .value(QStringLiteral("draft")).toString(),
-                 QStringLiteral("雨声落在窗台"));
         QCOMPARE(view.value(QStringLiteral("version")).toInt(), claimedVersion + 1);
+        // 分享意愿在 finishActivity 的同一事务原子写入，绑定成果 ref/版本/哈希。
+        const auto shareIntent = view.value(QStringLiteral("share_intent")).toObject();
+        QCOMPARE(shareIntent.value(QStringLiteral("state")).toString(), QStringLiteral("saved"));
+        QCOMPARE(shareIntent.value(QStringLiteral("artifact_ref")).toString(), ref);
+        QCOMPARE(shareIntent.value(QStringLiteral("artifact_version")).toInt(),
+                 claimedVersion + 1);
+        QCOMPARE(shareIntent.value(QStringLiteral("content_hash")).toString(),
+                 view.value(QStringLiteral("artifact_hash")).toString());
+        QCOMPARE(shareIntent.value(QStringLiteral("version")).toInt(), 1);
         // 分享意愿只落库：没有发送/账本/outbox/聊天行。
         QCOMPARE(tableCount(path, QStringLiteral("action_outbox"), "review-share-outbox"), 0);
         QCOMPARE(tableCount(path, QStringLiteral("delivery_ledger"), "review-share-ledger"), 0);
@@ -7570,6 +7648,528 @@ private slots:
         QCOMPARE(row.value("scope_key").toString(), QStringLiteral("owner"));
         QCOMPARE(row.value("origin").toString(), QStringLiteral("internal"));
         QCOMPARE(row.value("channel").toString(), Channel::kPet);
+    }
+
+    // R12-1b 补充：completed 必须能指向真实成果；reflection-only 不能完成；
+    // 纯思考必须有 completion_condition；外部活动不能伪造完成。
+    void activityCompletionRequiresRealArtifact()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath(QStringLiteral("activity-authenticity.db"));
+        MemoryManager db(path);
+        QString error;
+        const auto created = db.createActivity(
+            QStringLiteral("owner"), Channel::kPet, Channel::kDefaultSession,
+            QStringLiteral("整理旧照片"), QStringLiteral("按年份分组"),
+            QStringLiteral("foreground"), QStringLiteral("chat/61"),
+            QStringLiteral("run-authentic-1"), &error);
+        QVERIFY2(!created.isEmpty(), qPrintable(error));
+        const QString ref = created.value(QStringLiteral("ref")).toString();
+        // 只有内部认识（reflection/progress/mood）→ 不能完成，也不自动改完成。
+        QVERIFY(db.finishActivity(ref, 1,
+            QJsonObject{{QStringLiteral("status"), QStringLiteral("completed")},
+                        {QStringLiteral("reflection"), QStringLiteral("想了很多")},
+                        {QStringLiteral("progress"), QStringLiteral("看了一半")},
+                        {QStringLiteral("mood"), QStringLiteral("很安静")}},
+            &error).isEmpty());
+        QCOMPARE(error, QStringLiteral("missing_artifact"));
+        auto view = db.activityByRef(ref);
+        QCOMPARE(view.value(QStringLiteral("status")).toString(), QStringLiteral("active"));
+        QCOMPARE(view.value(QStringLiteral("version")).toInt(), 1);
+        QVERIFY(!view.contains(QStringLiteral("artifact_ref")));
+        // 纯思考：没有 completion_condition → 拒绝；有 completion_condition 但无 reflection → 拒绝。
+        error.clear();
+        QVERIFY(db.finishActivity(ref, 1,
+            QJsonObject{{QStringLiteral("status"), QStringLiteral("completed")},
+                        {QStringLiteral("activity_kind"), QStringLiteral("thought")},
+                        {QStringLiteral("reflection"), QStringLiteral("想清楚了")}},
+            &error).isEmpty());
+        QCOMPARE(error, QStringLiteral("missing_completion_condition"));
+        error.clear();
+        QVERIFY(db.finishActivity(ref, 1,
+            QJsonObject{{QStringLiteral("status"), QStringLiteral("completed")},
+                        {QStringLiteral("activity_kind"), QStringLiteral("thought")},
+                        {QStringLiteral("completion_condition"), QStringLiteral("能复述结论")}},
+            &error).isEmpty());
+        QCOMPARE(error, QStringLiteral("missing_reflection"));
+        // 纯思考带完成条件与认识：可完成，但不产生任何 artifact。
+        error.clear();
+        const auto thoughtDone = db.finishActivity(ref, 1,
+            QJsonObject{{QStringLiteral("status"), QStringLiteral("completed")},
+                        {QStringLiteral("activity_kind"), QStringLiteral("thought")},
+                        {QStringLiteral("completion_condition"), QStringLiteral("能复述结论")},
+                        {QStringLiteral("reflection"), QStringLiteral("想清楚了")}},
+            &error);
+        QVERIFY2(!thoughtDone.isEmpty(), qPrintable(error));
+        QVERIFY(!thoughtDone.contains(QStringLiteral("artifact_ref")));
+        view = db.activityByRef(ref);
+        QCOMPARE(view.value(QStringLiteral("status")).toString(), QStringLiteral("completed"));
+        QVERIFY(!view.contains(QStringLiteral("artifact_ref")));
+        QVERIFY(!view.contains(QStringLiteral("artifact_hash")));
+        // 状态诊断码：缺失 / 类型错误 / 枚举非法互不混淆。
+        error.clear();
+        QVERIFY(db.finishActivity(ref, 2, QJsonObject{}, &error).isEmpty());
+        QCOMPARE(error, QStringLiteral("status_missing"));
+        error.clear();
+        QVERIFY(db.finishActivity(ref, 2,
+            QJsonObject{{QStringLiteral("status"), 7}}, &error).isEmpty());
+        QCOMPARE(error, QStringLiteral("status_type_invalid"));
+        error.clear();
+        QVERIFY(db.finishActivity(ref, 2,
+            QJsonObject{{QStringLiteral("status"), QStringLiteral("exploded")}},
+            &error).isEmpty());
+        QCOMPARE(error, QStringLiteral("status_enum_invalid"));
+
+        // 外部活动（browser/painting 等）没有执行工具：不能 completed，也不能带外部结果。
+        const auto second = db.createActivity(
+            QStringLiteral("owner"), Channel::kPet, Channel::kDefaultSession,
+            QStringLiteral("看展"), QString(), QStringLiteral("foreground"),
+            QStringLiteral("chat/62"), QStringLiteral("run-authentic-2"), &error);
+        QVERIFY2(!second.isEmpty(), qPrintable(error));
+        const QString secondRef = second.value(QStringLiteral("ref")).toString();
+        error.clear();
+        QVERIFY(db.finishActivity(secondRef, 1,
+            QJsonObject{{QStringLiteral("status"), QStringLiteral("completed")},
+                        {QStringLiteral("activity_kind"), QStringLiteral("external")},
+                        {QStringLiteral("draft"), QStringLiteral("假装写完了")}},
+            &error).isEmpty());
+        QCOMPARE(error, QStringLiteral("unsupported_external_activity"));
+        error.clear();
+        QVERIFY(db.finishActivity(secondRef, 1,
+            QJsonObject{{QStringLiteral("status"), QStringLiteral("completed")},
+                        {QStringLiteral("external_action"), QStringLiteral("browser")},
+                        {QStringLiteral("draft"), QStringLiteral("假装写完了")}},
+            &error).isEmpty());
+        QCOMPARE(error, QStringLiteral("unsupported_external_activity"));
+        QCOMPARE(db.activityByRef(secondRef).value(QStringLiteral("status")).toString(),
+                 QStringLiteral("active"));
+        // 文字创作：draft 真实存在 → complete 并写 artifact_ref/版本/hash/completed_at。
+        error.clear();
+        const QString finalDraft = QStringLiteral("第一段写窗边的光。第二段写桌上的影子。");
+        const auto done = db.finishActivity(secondRef, 1,
+            QJsonObject{{QStringLiteral("status"), QStringLiteral("completed")},
+                        {QStringLiteral("reflection"), QStringLiteral("写完了")},
+                        {QStringLiteral("draft"), finalDraft}},
+            &error);
+        QVERIFY2(!done.isEmpty(), qPrintable(error));
+        QCOMPARE(done.value(QStringLiteral("artifact_ref")).toString(), secondRef);
+        QCOMPARE(done.value(QStringLiteral("artifact_version")).toInt(),
+                 done.value(QStringLiteral("version")).toInt());
+        const QString expectedHash = QString::fromLatin1(
+            QCryptographicHash::hash(finalDraft.toUtf8(), QCryptographicHash::Sha256)
+                .toHex().left(16));
+        QCOMPARE(done.value(QStringLiteral("artifact_hash")).toString(), expectedHash);
+        view = db.activityByRef(secondRef);
+        QCOMPARE(view.value(QStringLiteral("artifact_ref")).toString(), secondRef);
+        QCOMPARE(view.value(QStringLiteral("artifact_version")).toInt(),
+                 done.value(QStringLiteral("version")).toInt());
+        QCOMPARE(view.value(QStringLiteral("artifact_hash")).toString(), expectedHash);
+        QVERIFY(view.contains(QStringLiteral("completed_at")));
+        // 迟到/过期版本不能复活或改写已完成活动。
+        error.clear();
+        QVERIFY(db.finishActivity(secondRef, 1,
+            QJsonObject{{QStringLiteral("status"), QStringLiteral("active")}},
+            &error).isEmpty());
+        QCOMPARE(db.activityByRef(secondRef).value(QStringLiteral("status")).toString(),
+                 QStringLiteral("completed"));
+    }
+
+    // R12-1b 补充：已有完整 draft 可沿用完成（不要求每次重写全文）；完成目录有界可读。
+    void recentActivityResultsDirectoryAndExistingDraft()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath(QStringLiteral("activity-results.db"));
+        MemoryManager db(path);
+        QString error;
+        const auto created = db.createActivity(
+            QStringLiteral("owner"), Channel::kPet, Channel::kDefaultSession,
+            QStringLiteral("雨声段落"), QStringLiteral("写完这一段"),
+            QStringLiteral("foreground"), QStringLiteral("chat/71"),
+            QStringLiteral("run-results-1"), &error);
+        QVERIFY2(!created.isEmpty(), qPrintable(error));
+        const QString ref = created.value(QStringLiteral("ref")).toString();
+        const qlonglong id = created.value(QStringLiteral("id")).toInteger();
+        // 先保存一份完整草稿（本次创作成果）。
+        const QString draft = QStringLiteral("雨声落在窗台，灯还亮着。");
+        auto saved = db.finishActivity(ref, 1,
+            QJsonObject{{QStringLiteral("status"), QStringLiteral("active")},
+                        {QStringLiteral("reflection"), QStringLiteral("写了开头")},
+                        {QStringLiteral("draft"), draft},
+                        {QStringLiteral("next_step"), QStringLiteral("写第二段")}},
+            &error);
+        QVERIFY2(!saved.isEmpty(), qPrintable(error));
+        // 到期回顾时只补充认识、不重写全文：沿用已持久化 draft 完成。
+        QVERIFY(makeInternalActivityDue(path, id, "results-due"));
+        QVERIFY(rewindReviewCooldown(path, QStringLiteral("results-clock")));
+        QString claimReason;
+        const auto claim = db.claimActivity(ref, 2, 12, 60, &claimReason);
+        QVERIFY2(!claim.isEmpty(), qPrintable(claimReason));
+        const int claimedVersion = claim.value(QStringLiteral("version")).toInt();
+        error.clear();
+        const auto finished = db.finishActivity(ref, claimedVersion,
+            QJsonObject{{QStringLiteral("status"), QStringLiteral("completed")},
+                        {QStringLiteral("reflection"), QStringLiteral("收尾了")}},
+            &error);
+        QVERIFY2(!finished.isEmpty(), qPrintable(error));
+        const int completedVersion = finished.value(QStringLiteral("version")).toInt();
+        auto view = db.activityByRef(ref);
+        QCOMPARE(view.value(QStringLiteral("draft")).toString(), draft);
+        QCOMPARE(view.value(QStringLiteral("artifact_version")).toInt(), completedVersion);
+        QCOMPARE(view.value(QStringLiteral("artifact_hash")).toString(),
+                 QString::fromLatin1(
+                     QCryptographicHash::hash(draft.toUtf8(), QCryptographicHash::Sha256)
+                         .toHex().left(16)));
+        // 完成目录：完成时间倒序目录字段，不含过时 next_step；completed 不在 current/nextDue。
+        const auto recent = db.recentActivityResults(QStringLiteral("owner"), 8);
+        QCOMPARE(recent.size(), 1);
+        const auto row = recent.first().toObject();
+        QCOMPARE(row.value(QStringLiteral("ref")).toString(), ref);
+        QCOMPARE(row.value(QStringLiteral("status")).toString(), QStringLiteral("completed"));
+        QCOMPARE(row.value(QStringLiteral("artifact_ref")).toString(), ref);
+        QCOMPARE(row.value(QStringLiteral("artifact_version")).toInt(), completedVersion);
+        QCOMPARE(row.value(QStringLiteral("title")).toString(), QStringLiteral("雨声段落"));
+        QCOMPARE(row.value(QStringLiteral("summary")).toString(), QStringLiteral("收尾了"));
+        QVERIFY(row.contains(QStringLiteral("completed_at")));
+        QVERIFY(!row.contains(QStringLiteral("next_step")));
+        QVERIFY(db.nextDueActivity(QStringLiteral("owner")).isEmpty());
+        QVERIFY(db.currentActivitiesUnified(8).isEmpty());
+        // 模型可见目录：owner 私聊可见，群聊/第三方/长记忆关闭为空。
+        QCOMPARE(db.recentActivityResultsForModel(8, Channel::kPet,
+                                                  Channel::kDefaultSession,
+                                                  QStringLiteral("user"), true).size(), 1);
+        QVERIFY(db.recentActivityResultsForModel(8, Channel::kQQGroup,
+                                                 QStringLiteral("30001"),
+                                                 QStringLiteral("user"), true).isEmpty());
+        QVERIFY(db.recentActivityResultsForModel(8, Channel::kQQPrivate,
+                                                 QStringLiteral("2014366825"),
+                                                 QStringLiteral("qq:10001"), true).isEmpty());
+        QVERIFY(db.recentActivityResultsForModel(8, Channel::kPet,
+                                                 Channel::kDefaultSession,
+                                                 QStringLiteral("user"), false).isEmpty());
+        // 模拟后续持久化了一版更新的 draft/artifact_version：目录必须显示新版本，不冒充旧版本。
+        {
+            RawDb raw(path, "results-new-version");
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral(
+                "UPDATE internal_activity SET version=version+1,"
+                "result_json=json_set(result_json,'$.draft','雨声落下后的第二版完整稿',"
+                "'$.artifact_version',version+1) WHERE id=%1").arg(id)));
+        }
+        const auto updated = db.recentActivityResults(QStringLiteral("owner"), 8);
+        QCOMPARE(updated.size(), 1);
+        QCOMPARE(updated.first().toObject().value(QStringLiteral("version")).toInt(),
+                 completedVersion + 1);
+        QCOMPARE(updated.first().toObject().value(QStringLiteral("artifact_version")).toInt(),
+                 completedVersion + 1);
+        QVERIFY(!db.recentActivityResults(QStringLiteral("owner"), 8).first().toObject()
+                     .value(QStringLiteral("artifact_version")).isUndefined());
+
+        // legacy completed（只读兼容）：同样进入完成目录，缺哈希时按行版本兜底。
+        QTemporaryDir legacyDir;
+        QVERIFY(legacyDir.isValid());
+        const auto legacyPath = legacyDir.filePath(QStringLiteral("activity-results-legacy.db"));
+        MemoryManager legacy(legacyPath);
+        QVERIFY(seedLegacyThought(legacy, QStringLiteral("旧成果")) > 0);
+        const auto thought = legacy.nextThought(true);
+        QVERIFY(legacy.finishThoughtReview(thought.value("id").toInteger(),
+                                           thought.value("version").toInt(),
+            QJsonObject{{QStringLiteral("status"), QStringLiteral("completed")},
+                        {QStringLiteral("reflection"), QStringLiteral("旧成果写完了")},
+                        {QStringLiteral("draft"), QStringLiteral("旧成果正文")}}));
+        const auto legacyRecent = legacy.recentActivityResults(QStringLiteral("owner"), 8);
+        QCOMPARE(legacyRecent.size(), 1);
+        QCOMPARE(legacyRecent.first().toObject().value(QStringLiteral("ref")).toString(),
+                 QStringLiteral("thought/%1").arg(thought.value("id").toInteger()));
+        QVERIFY(!legacyRecent.first().toObject().value(QStringLiteral("artifact_version"))
+                     .isUndefined());
+    }
+
+    // R12-1b 补充：统一权限投影（sensitive/盲区/第三方/群聊/长记忆关闭）；嵌套字段不泄漏；
+    // 盲区活动不可见且不阻塞其它合法活动。
+    void activityProjectionVisibilityAndNestedFields()
+    {
+        auto &config = ConfigManager::instance();
+        QFile settingFile(config.getConfigFilePath());
+        const bool settingExisted = settingFile.open(QIODevice::ReadOnly);
+        const QByteArray settingOriginal = settingExisted ? settingFile.readAll() : QByteArray{};
+        settingFile.close();
+        auto restoreSetting = qScopeGuard([&] {
+            config.writeConfigDocument(QStringLiteral("setting.json"),
+                                       settingExisted ? settingOriginal : QByteArray("{}"),
+                                       nullptr);
+            if (!settingExisted) QFile::remove(config.getConfigFilePath());
+        });
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.writeIdentity(QByteArray(
+            R"({"memory":{"blind_zones":[{"channel":"pet","session_id":"quiet-room"}]}})")));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath(QStringLiteral("activity-projection.db"));
+        MemoryManager db(path);
+        QString error;
+        const auto created = db.createActivity(
+            QStringLiteral("owner"), Channel::kPet, Channel::kDefaultSession,
+            QStringLiteral("整理旧照片"), QStringLiteral("私人暗号目标"),
+            QStringLiteral("foreground"), QStringLiteral("chat/81"),
+            QStringLiteral("run-projection-1"), &error);
+        QVERIFY2(!created.isEmpty(), qPrintable(error));
+        const QString ref = created.value(QStringLiteral("ref")).toString();
+        const QString draftWithSecret = QStringLiteral("正文里提到了私人暗号但不该泄漏");
+        const auto finished = db.finishActivity(ref, 1,
+            QJsonObject{{QStringLiteral("status"), QStringLiteral("completed")},
+                        {QStringLiteral("reflection"), QStringLiteral("整理好了")},
+                        {QStringLiteral("draft"), draftWithSecret},
+                        {QStringLiteral("next_step"), QStringLiteral("过时步骤")},
+                        {QStringLiteral("share_with_owner"), true},
+                        {QStringLiteral("share_request"), QStringLiteral("私人暗号请求")}},
+            &error);
+        QVERIFY2(!finished.isEmpty(), qPrintable(error));
+        // owner 私聊可见；嵌套的 goal/draft/share_request 被隐私规则过滤，不泄漏。
+        const auto ownerView = db.activityForModel(
+            ref, Channel::kPet, Channel::kDefaultSession, QStringLiteral("user"), true);
+        QVERIFY(!ownerView.isEmpty());
+        QCOMPARE(ownerView.value(QStringLiteral("ref")).toString(), ref);
+        // owner 私聊可见自己的活动正文；completed 的过时 next_step 不进入投影。
+        QVERIFY(ownerView.contains(QStringLiteral("goal")));
+        QVERIFY(ownerView.contains(QStringLiteral("draft")));
+        QVERIFY(ownerView.contains(QStringLiteral("artifact_ref")));
+        QVERIFY(!ownerView.contains(QStringLiteral("next_step")));
+        const auto ownerShare = ownerView.value(QStringLiteral("share_intent")).toObject();
+        QVERIFY(ownerShare.contains(QStringLiteral("request")));
+        // 群聊/第三方/长记忆关闭：整活动不可见（current/nextDue/recent 也不含）。
+        QVERIFY(db.activityForModel(ref, Channel::kQQGroup, QStringLiteral("30001"),
+                                    QStringLiteral("user"), true).isEmpty());
+        QVERIFY(db.activityForModel(ref, Channel::kQQPrivate, QStringLiteral("2014366825"),
+                                    QStringLiteral("qq:10001"), true).isEmpty());
+        QVERIFY(db.activityForModel(ref, Channel::kPet, Channel::kDefaultSession,
+                                    QStringLiteral("user"), false).isEmpty());
+        QVERIFY(db.currentActivitiesForModel(8, Channel::kQQGroup,
+                                             QStringLiteral("30001"),
+                                             QStringLiteral("user"), true).isEmpty());
+        QVERIFY(db.recentActivityResultsForModel(8, Channel::kQQGroup,
+                                                 QStringLiteral("30001"),
+                                                 QStringLiteral("user"), true).isEmpty());
+        // 先建一个 clean active 活动，让"长记忆关闭时 nextDue 为空"有真实候选。
+        QString cleanError;
+        const auto clean = db.createActivity(
+            QStringLiteral("owner"), Channel::kPet, Channel::kDefaultSession,
+            QStringLiteral("整理书桌"), QString(), QStringLiteral("foreground"),
+            QStringLiteral("chat/83"), QStringLiteral("run-projection-clean"), &cleanError);
+        QVERIFY2(!clean.isEmpty(), qPrintable(cleanError));
+        const auto cleanRef = clean.value(QStringLiteral("ref")).toString();
+        QVERIFY(!cleanRef.isEmpty());
+        {
+            RawDb raw(path, "projection-clean-due");
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral("UPDATE internal_activity SET review_after=unixepoch()-1 WHERE id=%1")
+                                 .arg(clean.value(QStringLiteral("id")).toInteger())));
+        }
+        QVERIFY(!db.activityForModel(cleanRef, Channel::kPet, Channel::kDefaultSession,
+                                     QStringLiteral("user"), true).isEmpty());
+        // 长记忆服务端配置关闭：投影、current、recent、nextDue 全部为空。
+        QVERIFY(config.writeConfigDocument(QStringLiteral("setting.json"),
+            R"({"memory":{"long_term_memory_enabled":false}})", nullptr));
+        QVERIFY(db.activityForModel(ref, Channel::kPet, Channel::kDefaultSession,
+                                    QStringLiteral("user"), true).isEmpty());
+        QVERIFY(db.currentActivitiesForModel(8, Channel::kPet, Channel::kDefaultSession,
+                                             QStringLiteral("user"), true).isEmpty());
+        QVERIFY(db.recentActivityResultsForModel(8, Channel::kPet, Channel::kDefaultSession,
+                                                 QStringLiteral("user"), true).isEmpty());
+        QVERIFY(db.nextDueActivity(QStringLiteral("owner")).isEmpty());
+        QVERIFY(config.writeConfigDocument(QStringLiteral("setting.json"), QByteArray("{}"),
+                                           nullptr));
+
+        // 盲区活动：自身会话命中 blind_zone → 不可见；也不阻塞上面那个合法活动。
+        {
+            RawDb raw(path, "projection-blind-insert");
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral(
+                "INSERT INTO internal_activity(scope_key,origin_kind,origin_ref,run_id,subject,"
+                "channel,session_id,interest,status,version,result_json,artifact_ref,"
+                "review_after,created_at,updated_at) "
+                "VALUES('owner','foreground','chat/82','run-projection-blind','user','pet',"
+                "'quiet-room','盲区里的活动','active',1,'{}',NULL,unixepoch()-10,unixepoch(),unixepoch())")));
+        }
+        const QString blindRef = QStringLiteral("activity/%1").arg(
+            RawDb(path, "projection-blind-id").scalar(
+                QStringLiteral("SELECT max(id) FROM internal_activity")).toLongLong());
+        QVERIFY(db.activityForModel(blindRef, Channel::kPet, Channel::kDefaultSession,
+                                    QStringLiteral("user"), true).isEmpty());
+        QVERIFY(db.activityForModel(blindRef, Channel::kPet, QStringLiteral("quiet-room"),
+                                    QStringLiteral("user"), true).isEmpty());
+        const auto due = db.nextDueActivity(QStringLiteral("owner"));
+        QVERIFY(!due.isEmpty());
+        QVERIFY(due.value(QStringLiteral("ref")).toString() != blindRef);
+        QCOMPARE(due.value(QStringLiteral("ref")).toString(), cleanRef);
+        // legacy 敏感行：sensitive=1 不进入投影。
+        const qlonglong sensitiveId = seedLegacyThought(db, QStringLiteral("敏感旧活动"));
+        QVERIFY(sensitiveId > 0);
+        {
+            RawDb raw(path, "projection-sensitive");
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral(
+                "UPDATE chat_history SET sensitive=1 WHERE id=%1").arg(sensitiveId)));
+        }
+        QVERIFY(db.activityForModel(QStringLiteral("thought/%1").arg(sensitiveId),
+                                    Channel::kPet, Channel::kDefaultSession,
+                                    QStringLiteral("user"), true).isEmpty());
+    }
+
+    // R12-1b 补充：分享意愿与完成同事务原子失败（触发约束 / 存储错误）整体回滚，
+    // 不出现"半完成/半意愿"。
+    void shareIntentAtomicRollback()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath(QStringLiteral("activity-share-atomic.db"));
+        MemoryManager db(path);
+        QString error;
+        const auto created = db.createActivity(
+            QStringLiteral("owner"), Channel::kPet, Channel::kDefaultSession,
+            QStringLiteral("原子提交"), QString(), QStringLiteral("foreground"),
+            QStringLiteral("chat/91"), QStringLiteral("run-share-atomic"), &error);
+        QVERIFY2(!created.isEmpty(), qPrintable(error));
+        const QString ref = created.value(QStringLiteral("ref")).toString();
+        // 分享请求形状非法：整体拒绝，状态/版本不变。
+        error.clear();
+        QVERIFY(db.finishActivity(ref, 1,
+            QJsonObject{{QStringLiteral("status"), QStringLiteral("completed")},
+                        {QStringLiteral("reflection"), QStringLiteral("写完了")},
+                        {QStringLiteral("draft"), QStringLiteral("真实成果")},
+                        {QStringLiteral("share_request"), 42}},
+            &error).isEmpty());
+        QCOMPARE(error, QStringLiteral("share_intent_invalid"));
+        QCOMPARE(db.activityByRef(ref).value(QStringLiteral("version")).toInt(), 1);
+        // 未完成却请求分享：拒绝（无成果不能分享）。
+        error.clear();
+        QVERIFY(db.finishActivity(ref, 1,
+            QJsonObject{{QStringLiteral("status"), QStringLiteral("active")},
+                        {QStringLiteral("reflection"), QStringLiteral("继续")},
+                        {QStringLiteral("draft"), QStringLiteral("还没完成")},
+                        {QStringLiteral("share_with_owner"), true}},
+            &error).isEmpty());
+        QCOMPARE(error, QStringLiteral("share_intent_invalid"));
+        // 模拟提交阶段存储约束失败：触发 ABORT 让同事务的完成+分享整体回滚。
+        {
+            RawDb raw(path, "share-atomic-trigger");
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral(
+                "CREATE TRIGGER tst_share_abort BEFORE UPDATE ON internal_activity "
+                "WHEN NEW.status='completed' AND instr(NEW.result_json,'share_intent')>0 "
+                "BEGIN SELECT RAISE(ABORT,'tst_share_abort'); END")));
+        }
+        error.clear();
+        QVERIFY(db.finishActivity(ref, 1,
+            QJsonObject{{QStringLiteral("status"), QStringLiteral("completed")},
+                        {QStringLiteral("reflection"), QStringLiteral("写完了")},
+                        {QStringLiteral("draft"), QStringLiteral("真实成果")},
+                        {QStringLiteral("share_with_owner"), true}},
+            &error).isEmpty());
+        QCOMPARE(error, QStringLiteral("db_error"));
+        auto view = db.activityByRef(ref);
+        QCOMPARE(view.value(QStringLiteral("status")).toString(), QStringLiteral("active"));
+        QCOMPARE(view.value(QStringLiteral("version")).toInt(), 1);
+        QVERIFY(!view.contains(QStringLiteral("share_intent")));
+        QVERIFY(!view.value(QStringLiteral("share_offered")).toBool());
+        {
+            RawDb raw(path, "share-atomic-drop");
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral("DROP TRIGGER tst_share_abort")));
+        }
+        // 去掉故障后同一次完成+分享成功；share_intent 与成果版本/哈希一致。
+        error.clear();
+        const auto finished = db.finishActivity(ref, 1,
+            QJsonObject{{QStringLiteral("status"), QStringLiteral("completed")},
+                        {QStringLiteral("reflection"), QStringLiteral("写完了")},
+                        {QStringLiteral("draft"), QStringLiteral("真实成果")},
+                        {QStringLiteral("share_with_owner"), true}},
+            &error);
+        QVERIFY2(!finished.isEmpty(), qPrintable(error));
+        view = db.activityByRef(ref);
+        const auto shareIntent = view.value(QStringLiteral("share_intent")).toObject();
+        QCOMPARE(shareIntent.value(QStringLiteral("state")).toString(), QStringLiteral("saved"));
+        QCOMPARE(shareIntent.value(QStringLiteral("artifact_ref")).toString(), ref);
+        QCOMPARE(shareIntent.value(QStringLiteral("artifact_version")).toInt(),
+                 view.value(QStringLiteral("version")).toInt());
+        QCOMPARE(shareIntent.value(QStringLiteral("content_hash")).toString(),
+                 view.value(QStringLiteral("artifact_hash")).toString());
+        QCOMPARE(tableCount(path, QStringLiteral("action_outbox"), "share-atomic-outbox"), 0);
+        QCOMPARE(tableCount(path, QStringLiteral("delivery_ledger"), "share-atomic-ledger"), 0);
+        QCOMPARE(tableCount(path, QStringLiteral("chat_history"), "share-atomic-chat"), 0);
+    }
+
+    // R12-1b 补充：ActivityReview 失败日志必须给出阶段+具体诊断码，且不记录正文。
+    void activityReviewFailureDiagnostics()
+    {
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.writeIdentity(QByteArray(
+            R"({"proactive":{"private_writing":true}})")));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath(QStringLiteral("activity-diagnostics.db"));
+        MemoryManager db(path);
+        QString error;
+        const auto created = db.createActivity(
+            QStringLiteral("owner"), Channel::kPet, Channel::kDefaultSession,
+            QStringLiteral("诊断活动"), QString(), QStringLiteral("foreground"),
+            QStringLiteral("chat/101"), QStringLiteral("run-diag-1"), &error);
+        QVERIFY2(!created.isEmpty(), qPrintable(error));
+        const QString ref = created.value(QStringLiteral("ref")).toString();
+        const qlonglong id = created.value(QStringLiteral("id")).toInteger();
+        QVERIFY(makeInternalActivityDue(path, id, "diag-due-1"));
+        QVERIFY(rewindReviewCooldown(path, QStringLiteral("diag-clock-1")));
+        PrivateReview review(db);
+        QSignalSpy requested(&review, &PrivateReview::requested);
+        const auto wake = review.wake(12, 60);
+        QVERIFY2(wake.started, qPrintable(wake.reason));
+        const int version = requested.last().at(1).toInt();
+        const auto origin = requested.last().at(2).toJsonObject()
+                                .value(QStringLiteral("origin")).toObject();
+        const QString privateText = QStringLiteral("这句私聊正文不应出现在诊断日志里");
+        {
+            MessageCapture capture;
+            review.receive(id, version,
+                           QJsonObject{{QStringLiteral("status"), QStringLiteral("exploding")},
+                                       {QStringLiteral("reflection"), privateText},
+                                       {QStringLiteral("_origin"), origin}},
+                           {});
+            const auto failure = db.reviewFailure(QStringLiteral("activity"), ref);
+            QCOMPARE(failure.value(QStringLiteral("last_reason")).toString(),
+                     QStringLiteral("status_enum_invalid"));
+            QCOMPARE(failure.value(QStringLiteral("last_stage")).toString(),
+                     QStringLiteral("schema"));
+            bool sawDiagnostic = false;
+            for (const auto &line : capture.lines()) {
+                if (line.message.contains(QStringLiteral("[Activity] review_failed"))
+                    && line.message.contains(QStringLiteral("code=status_enum_invalid"))
+                    && line.message.contains(QStringLiteral("stage=schema"))
+                    && line.message.contains(QStringLiteral("status_enum=exploding")))
+                    sawDiagnostic = true;
+                QVERIFY2(!line.message.contains(privateText),
+                         "诊断日志不能记录私聊正文");
+            }
+            QVERIFY(sawDiagnostic);
+        }
+        // 失败后恢复到期并重新领取，成功提交合法 completed。
+        QVERIFY(db.resetReviewFailure(QStringLiteral("activity"), ref));
+        QVERIFY(makeInternalActivityDue(path, id, "diag-due-2"));
+        QVERIFY(rewindReviewCooldown(path, QStringLiteral("diag-clock-2")));
+        const auto wakeAgain = review.wake(12, 60);
+        QVERIFY2(wakeAgain.started, qPrintable(wakeAgain.reason));
+        const int retryVersion = requested.last().at(1).toInt();
+        const auto originAgain = requested.last().at(2).toJsonObject()
+                                     .value(QStringLiteral("origin")).toObject();
+        review.receive(id, retryVersion,
+                       QJsonObject{{QStringLiteral("status"), QStringLiteral("completed")},
+                                   {QStringLiteral("reflection"), QStringLiteral("写完了")},
+                                   {QStringLiteral("draft"), QStringLiteral("真实写下的成果")},
+                                   {QStringLiteral("_origin"), originAgain}},
+                       {});
+        QCOMPARE(db.activityByRef(ref).value(QStringLiteral("status")).toString(),
+                 QStringLiteral("completed"));
+        QVERIFY(db.reviewFailure(QStringLiteral("activity"), ref).isEmpty());
     }
 
 };

@@ -370,20 +370,69 @@ public:
         const QString &runId,QString *error=nullptr);
     // 统一视图：任何状态的 legacy/internal 活动；不存在返回 {}。字段含
     // ref/origin/kind/id/status/version/goal/progress/next_step/draft/artifact_ref/
-    // share_intent/review_after/channel/session/updated_at 等（按来源可用字段）。
+    // artifact_version/artifact_hash/share_intent/review_after/channel/session/updated_at 等
+    // （按来源可用字段）。
+    // R12-1b 补充：activityByRef 只作管理读取（内部/测试/核验），**不是模型入口**；
+    // 所有模型可见读取必须走 activityForModel / currentActivitiesForModel /
+    // recentActivityResultsForModel 的投影（只读、按 scope/subject/channel/session/盲区/
+    // 长期记忆/隐私规则过滤，嵌套字段同样过滤）。
     QJsonObject activityByRef(const QString &ref) const;
+    // 模型可见投影：不可见返回 {}。调用方传入模型本轮所在的 channel/session/subject
+    // 与长期记忆开关；投影要求 scope=owner、subject=user、channel 属于主人私聊域
+    // （pet/qq_private；空渠道表示"只知道是主人私聊来源"）、会话不在盲区、长期记忆开启，
+    // 且活动自身的渠道/会话也满足同一可见性；sensitive/privacy 命中的整活动不可见。
+    // 嵌套字段（goal/progress/next_step/draft/reflection/mood/paused_reason/
+    // artifact_ref/share_intent 等）逐项按读取策略过滤；completed 不返回过时 next_step。
+    QJsonObject activityForModel(const QString &ref,const QString &channel,
+                                 const QString &session,const QString &subject,
+                                 bool longTermMemoryEnabled) const;
+    // 当前 active/paused 活动的模型可见列表（limit 上限 8）；不可见活动直接跳过。
+    QJsonArray currentActivitiesForModel(int limit,const QString &channel,
+                                         const QString &session,const QString &subject,
+                                         bool longTermMemoryEnabled) const;
+    // 完成成果目录的模型可见投影（limit 上限 8）：只含真实有成果的 completed；
+    // 群聊/第三方/盲区/长期记忆关闭时为空。字段：ref/version/artifact_ref/
+    // artifact_version/status/goal/title/summary/completed_at，不含过时 next_step。
+    QJsonArray recentActivityResultsForModel(int limit,const QString &channel,
+                                             const QString &session,const QString &subject,
+                                             bool longTermMemoryEnabled) const;
+    // 有界完成成果目录（管理/快照内部读取；limit 上限 8）。只返回 status=completed 且
+    // artifact_ref 能指回真实成果（正文非空）的活动，按完成时间倒序；旧 completed 记录
+    // 只读兼容（缺少 artifact_version/hash 时按行版本兜底），不追溯改写。
+    QJsonArray recentActivityResults(const QString &scopeKey=QStringLiteral("owner"),
+                                     int limit=8) const;
     // 两存储 active/paused 统一判断（scope 隔离：legacy 只属于 owner）。
     bool hasActiveActivity(const QString &scopeKey=QStringLiteral("owner")) const;
     // 两存储中 status=active、review_after<=now、sensitive=0 的最早候选；
     // 返回 {ref,kind,version,activity}（kind=legacy|internal），无则 {}。
+    // R12-1b 补充：只有对 owner 私聊可见（activityForModel 非空）的活动才进入候选；
+    // 不可见候选在查询层跳过，不阻塞其它合法活动。
     QJsonObject nextDueActivity(const QString &scopeKey=QStringLiteral("owner")) const;
     // 统一领取：legacy 走 claimThoughtReview，internal 走 version CAS + 共享预算/冷却；
     // 成功返回 {ref,kind,id,version,activity,origin_kind,run_id,scope_key}。
-    // reason 输出与现有领取一致：daily_limit/cooldown/cas_conflict/db_error/not_due。
+    // reason 输出与现有领取一致：daily_limit/cooldown/cas_conflict/db_error/not_due；
+    // R12-1b 补充：提交前再次复核模型可见投影（scope/subject/渠道/会话/盲区/长期记忆/
+    // 隐私），不可见活动返回 not_visible，不进入 ActivityReview。
     QJsonObject claimActivity(const QString &ref,int expectedVersion,int dailyLimit,
         int cooldownSeconds,QString *reason=nullptr);
     // 统一提交：legacy 走 finishThoughtReview，internal 单事务 CAS 写 status/result_json/
-    // artifact_ref/review_after/version；返回 {status,version(新),ref[,artifact_ref]}。
+    // artifact_ref/artifact_version/artifact_hash/review_after/version；返回
+    // {status,version(新),ref[,artifact_ref/artifact_version/artifact_hash/completed_at]}。
+    // R12-1b 补充（成果真实性）：
+    //   * status 缺失/类型错误/枚举非法 → status_missing/status_type_invalid/status_enum_invalid；
+    //   * completed 的**文字创作**必须有本次或已持久化的完整 draft（可沿用已有草稿），
+    //     否则 missing_artifact，绝不自动改成 completed；
+    //   * completed 的**纯思考**必须已有/本次给出 completion_condition 且 reflection 非空，
+    //     否则 missing_completion_condition / missing_reflection；
+    //   * 未接入执行工具的外部活动（browser/painting 等）不能 completed；提案携带
+    //     external_action/external_result/execution_result 或 activity_kind 为外部类型时
+    //     返回 unsupported_external_activity/invalid_activity_kind；
+    //   * 保存成果时由服务端写 artifact_ref=activity/<id>、artifact_version=提交后版本、
+    //     artifact_hash（draft 的 SHA-256 前 16），模型自填 artifact_ref 不生效；
+    //   * 分享意愿（share_with_owner/share_request）与完成状态在同一事务提交，
+    //     share_intent 只绑定服务端成果 ref/版本/hash；请求不合法 → share_intent_invalid，
+    //     整体回滚。
+    // 旧 completed 记录只读兼容，不做追溯改写。
     QJsonObject finishActivity(const QString &ref,int version,const QJsonObject &proposal,
         QString *error=nullptr);
     // 统一延后：legacy 复用 deferThoughtReview；internal CAS 只推 review_after，不改 lifecycle。
@@ -391,12 +440,24 @@ public:
     // 统一动作：pause/resume/abandon/complete/reschedule。legacy 复用 applyThoughtAction
     // （complete 不支持，返回 unsupported_action）；internal 在单事务内做状态机 + CAS，
     // resume 会做跨存储 active/paused 检查（排除自身）。返回 {ref,status,version,origin}。
+    // R12-1b 补充：动作提交前同样复核模型可见投影（不可见返回 not_visible）；
+    // complete 与 finishActivity 使用同一套成果真实性校验（missing_artifact 等）。
     QJsonObject applyActivityAction(const QString &ref,int expectedVersion,const QString &action,
         int afterMinutes,const QString &reason,QString *error=nullptr);
     // 分享意愿只落 internal_activity.result_json.share_intent，不写 delivery_ledger/
     // action_outbox/chat_history、不发消息；legacy 返回 unsupported_legacy。
+    // 旧签名保留兼容：等价于 action=share、自动递增 share 版本、request 最多 120 字。
     bool setActivityShareIntent(const QString &ref,int version,const QString &draft,
         QString *error=nullptr);
+    // R12-1b 补充：显式分享版本语义（修改/撤回/重新分享）。
+    //   action=share|modify|withdraw；expectedVersion 是活动当前版本（CAS）；
+    //   shareVersion<=0 时自动=已有 share 版本+1，显式给值时必须严格大于旧版本；
+    //   只接受当前已完成成果的 artifact_ref/artifact_version/artifact_hash 匹配
+    //   （重新计算 draft 哈希核对），不接受任意 draft 冒充成果，也不允许无成果分享；
+    //   withdraw 置 state="withdrawn" 并保留历史；修改/重新分享产生新的 share 版本；
+    //   历史版本只保留有界最近几条。成功返回 true，失败写 error。
+    bool setActivityShareIntent(const QString &ref,int expectedVersion,const QString &action,
+        const QString &request,int shareVersion,QString *error=nullptr);
     // 启动恢复诊断（只读、幂等）：报告两存储 active/paused 的跨存储冲突与 internal 到期
     // 列表；不删除活动、不伪造完成。
     QJsonArray recoverActivities(const QString &scopeKey=QStringLiteral("owner"));

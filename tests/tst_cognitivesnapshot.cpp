@@ -941,7 +941,7 @@ private slots:
         QVERIFY(!QJsonDocument(thirdPrompt.value(QStringLiteral("activities")).toArray())
                      .toJson(QJsonDocument::Compact).contains(ref.toUtf8()));
 
-        // completed 后不再进入 current（即使还留着过时的 next_step）。
+        // completed 后不再进入 current（即使还留着过时的 next_step）；进入完成成果目录。
         const auto finished = db.finishActivity(
             ref, 1,
             QJsonObject{{QStringLiteral("status"), QStringLiteral("completed")},
@@ -958,6 +958,42 @@ private slots:
         QVERIFY(!QJsonDocument(afterBuilder.toPromptJson(afterSnapshot)
                                    .value(QStringLiteral("activities")).toArray())
                      .toJson(QJsonDocument::Compact).contains("过时步骤"));
+        // R12-1b 补充：完成成果目录进入快照/提示词，带 ref/成果版本且不含过时 next_step。
+        const auto resultRow = findJsonObjectByRef(afterSnapshot.recentActivityResults, ref);
+        QVERIFY(!resultRow.isEmpty());
+        QCOMPARE(resultRow.value(QStringLiteral("status")).toString(),
+                 QStringLiteral("completed"));
+        QCOMPARE(resultRow.value(QStringLiteral("artifact_ref")).toString(), ref);
+        QCOMPARE(resultRow.value(QStringLiteral("artifact_version")).toInt(),
+                 finished.value(QStringLiteral("version")).toInt());
+        QCOMPARE(resultRow.value(QStringLiteral("title")).toString(),
+                 QStringLiteral("整理旧照片"));
+        QVERIFY(!resultRow.contains(QStringLiteral("next_step")));
+        const auto afterPrompt = afterBuilder.toPromptJson(afterSnapshot);
+        QVERIFY(QJsonDocument(afterPrompt.value(QStringLiteral("recent_activity_results"))
+                                  .toArray())
+                    .toJson(QJsonDocument::Compact).contains(ref.toUtf8()));
+        QVERIFY(!QJsonDocument(afterPrompt.value(QStringLiteral("recent_activity_results"))
+                                   .toArray())
+                     .toJson(QJsonDocument::Compact).contains("过时步骤"));
+        // 群聊/第三方快照的完成目录必须为空。
+        CognitiveSnapshotBuilder groupAfterBuilder(&db);
+        const auto groupAfter = groupAfterBuilder.build(
+            groupMeta, QStringLiteral("run-activity-after-group"),
+            QStringLiteral("foreground"), QStringLiteral("foreground_reply"));
+        QVERIFY(groupAfter.recentActivityResults.isEmpty());
+        QVERIFY(anyNotePrefix(groupAfterBuilder.stats().notes,
+                              QStringLiteral("group_projection:")));
+        CognitiveSnapshotBuilder thirdAfterBuilder(&db);
+        const auto thirdAfter = thirdAfterBuilder.build(
+            thirdMeta, QStringLiteral("run-activity-after-third"),
+            QStringLiteral("foreground"), QStringLiteral("foreground_reply"));
+        QVERIFY(thirdAfter.recentActivityResults.isEmpty());
+        // stats 口径：完成目录 queried>=eligible，且序列化条数不超过预算域上限。
+        QVERIFY(afterBuilder.stats().domains.value(QStringLiteral("recent_activity_results"))
+                    .queried
+                >= afterBuilder.stats().domains.value(QStringLiteral("recent_activity_results"))
+                    .eligible);
     }
 
     // 8b. R12-1a：OpenWake 内部记录/调度按 scope 隔离：默认只读 owner scope；

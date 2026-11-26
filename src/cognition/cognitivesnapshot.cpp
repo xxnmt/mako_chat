@@ -90,6 +90,7 @@ QJsonObject canonicalContent(const CognitiveSnapshot &snapshot)
         {QStringLiteral("motivations"), motivations},
         {QStringLiteral("commitments"), commitments},
         {QStringLiteral("activities"), snapshot.activities},
+        {QStringLiteral("recent_activity_results"), snapshot.recentActivityResults},
         {QStringLiteral("internal_wakes"), snapshot.internalWakes},
         {QStringLiteral("policy_view"), snapshot.policyView}};
 }
@@ -378,15 +379,40 @@ CognitiveSnapshot CognitiveSnapshotBuilder::build(const RequestMeta &meta, const
     // 私人活动与内部唤醒只属于主人私聊域；群聊/第三方快照不读取，避免把私聊来源带出去。
     if (ownerPrivateAudience) {
         int activitiesQueried = 0;
-        int activitiesEligible = 0;
         // R12-1b：当前活动统一读取 legacy thought/<id> 与 internal activity/<id>；
         // completed/abandoned 不进入 current，过时 next_step 不会显示为未完成。
-        snapshot.activities = limitArray(
-            m_memory->currentActivitiesUnified(kDomainLimit, &activitiesQueried,
-                                               &activitiesEligible),
-            kDomainLimit);
+        // R12-1b 补充：模型可见视图必须走投影（scope/subject/渠道/会话/盲区/隐私过滤），
+        // 不可见活动在查询层跳过；queried 仍按统一查询命中行数记录，便于统计过滤。
+        const QJsonArray rawActivities =
+            m_memory->currentActivitiesUnified(kDomainLimit, &activitiesQueried, nullptr);
+        const bool longTermEnabled =
+            ConfigManager::instance().getMemoryPolicyConfig().longTermMemoryEnabled;
+        QJsonArray visibleActivities;
+        for (const auto &value : rawActivities) {
+            const QString ref = value.toObject().value(QStringLiteral("ref")).toString();
+            if (ref.isEmpty()) continue;
+            const QJsonObject projected = m_memory->activityForModel(
+                ref, meta.channel, meta.sessionId, snapshot.subjectId, longTermEnabled);
+            if (projected.isEmpty()) continue;
+            visibleActivities.append(projected);
+            if (visibleActivities.size() >= kDomainLimit) break;
+        }
+        snapshot.activities = visibleActivities;
+        const int activitiesEligible = int(snapshot.activities.size());
         recordDomain(domainName("activities"), activitiesQueried,
                      activitiesEligible, true);
+
+        // 完成成果目录：只读、有界，按完成时间倒序；同样只取模型可见投影。
+        int recentQueried = 0;
+        const QJsonArray rawRecent = m_memory->recentActivityResults(
+            QStringLiteral("owner"), kDomainLimit);
+        recentQueried = int(rawRecent.size());
+        snapshot.recentActivityResults = limitArray(
+            m_memory->recentActivityResultsForModel(kDomainLimit, meta.channel, meta.sessionId,
+                                                    snapshot.subjectId, longTermEnabled),
+            kDomainLimit);
+        recordDomain(domainName("recent_activity_results"), recentQueried,
+                     int(snapshot.recentActivityResults.size()), true);
 
         int wakesQueried = 0;
         const QJsonArray wakeRows =
@@ -413,6 +439,7 @@ CognitiveSnapshot CognitiveSnapshotBuilder::build(const RequestMeta &meta, const
                      int(snapshot.internalWakes.size()), true);
     } else {
         recordPrivateDomainNotQueried(domainName("activities"));
+        recordPrivateDomainNotQueried(domainName("recent_activity_results"));
         recordPrivateDomainNotQueried(domainName("internal_wakes"));
     }
 
@@ -459,6 +486,7 @@ QJsonObject CognitiveSnapshotBuilder::toPromptJson(const CognitiveSnapshot &snap
         QStringLiteral("observations"), QStringLiteral("self_expressions"),
         QStringLiteral("inferences"), QStringLiteral("motivations"),
         QStringLiteral("commitments"), QStringLiteral("activities"),
+        QStringLiteral("recent_activity_results"),
         QStringLiteral("internal_wakes")};
     // R12-1a：提示词 JSON 只放数据域和只读的 policy_view；固定说明已移到
     // LLMService::cognitiveSnapshotMessage 的 system content，不占本数据预算。
@@ -500,6 +528,8 @@ QJsonObject CognitiveSnapshotBuilder::toPromptJson(const CognitiveSnapshot &snap
     root.insert(QStringLiteral("commitments"), commitments);
 
     root.insert(QStringLiteral("activities"), limitArray(snapshot.activities, kDomainLimit));
+    root.insert(QStringLiteral("recent_activity_results"),
+                limitArray(snapshot.recentActivityResults, kDomainLimit));
     root.insert(QStringLiteral("internal_wakes"), limitArray(snapshot.internalWakes, kDomainLimit));
     root.insert(QStringLiteral("policy_view"), snapshot.policyView);
 
@@ -515,8 +545,9 @@ QJsonObject CognitiveSnapshotBuilder::toPromptJson(const CognitiveSnapshot &snap
     //   3) 最小集仍装不下才按同一顺序整域 overflow，并显式记录 budget:overflow:<domain>；
     //   4) 最终仍超预算时记录 budget:unresolved，绝不静默假装各域齐全。
     const QStringList trimPriority{
-        QStringLiteral("inferences"), QStringLiteral("activities"),
-        QStringLiteral("motivations"), QStringLiteral("self_expressions"),
+        QStringLiteral("inferences"), QStringLiteral("recent_activity_results"),
+        QStringLiteral("activities"), QStringLiteral("motivations"),
+        QStringLiteral("self_expressions"),
         QStringLiteral("internal_wakes"), QStringLiteral("commitments"),
         QStringLiteral("observations")};
     QStringList trimmedDomains;

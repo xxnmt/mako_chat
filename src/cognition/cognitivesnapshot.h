@@ -109,7 +109,11 @@ struct CognitiveSnapshot
     QList<CognitiveFactRef> inferences;        // 她的理解/猜测，不能当事实
     QList<SelfMotivation> motivations;         // concern / interest / activity 等自发动机
     QList<DelegatedCommitment> commitments;    // 真实 delegation（如 reminder）
-    QJsonArray activities;                     // 私人活动状态/产物
+    QJsonArray activities;                     // 私人活动状态/产物（active/paused 调度视图）
+    // R12-1b：有界完成成果目录（completed 且存在真实 artifact），按完成时间倒序；
+    // 只含 ref/version/artifact_ref/artifact_version/status/goal/title/summary/completed_at，
+    // 不含过时 next_step；群聊/第三方投影为空。
+    QJsonArray recentActivityResults;
     QJsonArray internalWakes;                  // own_next_review_at / idle / scheduled，永远不是主人委托
     QJsonObject policyView;                    // 读取边界（渠道/会话/长期记忆/盲区等）
     QString snapshotHash;                      // 可分类内容的 SHA-256 前 16 位

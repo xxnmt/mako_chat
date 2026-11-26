@@ -62,6 +62,23 @@ QString rawEventColumns()
         "visibility, processed");
 }
 
+// R12-1b：成果正文的 SHA-256 前 16 位（十六进制小写）。只对已持久化的实际 draft 计算，
+// 用于把分享意愿绑定到具体成果版本；不记录/输出正文。
+QString activityContentHash(const QString &text)
+{
+    return QString::fromLatin1(
+        QCryptographicHash::hash(text.trimmed().toUtf8(), QCryptographicHash::Sha256)
+            .toHex()
+            .left(16));
+}
+
+// R12-1b：活动渠道是否属于主人私聊域（pet/qq_private）。空渠道表示"只知道是主人私聊
+// 来源"（回顾上下文可能省略），仍按私聊域处理；群聊/其它渠道一律不是。
+bool isOwnerPrivateActivityChannel(const QString &channel)
+{
+    return channel.isEmpty() || channel == Channel::kPet || channel == Channel::kQQPrivate;
+}
+
 } // namespace
 
 MemoryManager::MemoryManager(const QString &dbFilePath,QObject *parent,
@@ -546,7 +563,10 @@ bool MemoryManager::finishThoughtReview(qlonglong id, int version, const QJsonOb
     if (proposal["draft"].toString().trimmed().size() > 800)
         return false;
     QJsonObject result{{"status",status},{"deferred_reason",QJsonValue::Null},{"paused_reason",QJsonValue::Null}};
-    for (const auto &key : {"reflection","goal","progress","next_step","draft","mood","paused_reason"}) {
+    // R12-1b 补充：completion_condition/activity_kind 是"纯思考类活动能否完成"的判据，
+    // 必须在 active/paused 阶段就能持久化，后续完成时才能沿用已有条件。
+    for (const auto &key : {"reflection","goal","progress","next_step","draft","mood",
+                            "paused_reason","completion_condition","activity_kind"}) {
         const int limit = (QString(key) == "draft") ? 800 : 200;
         const QString value = proposal[key].toString().trimmed().left(limit);
         if (!value.isEmpty())
@@ -558,8 +578,15 @@ bool MemoryManager::finishThoughtReview(qlonglong id, int version, const QJsonOb
     // thought_result 用 json_patch 合并（而不是整行覆盖），用户/调用方已有字段不会被清掉；
     // artifact_ref 只在确有草稿时写入，纯"继续思考"的回顾不会伪造产物。
     result[QStringLiteral("updated_at")] = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
-    if (!result.value(QStringLiteral("draft")).toString().isEmpty())
+    if (!result.value(QStringLiteral("draft")).toString().isEmpty()) {
         result[QStringLiteral("artifact_ref")] = QStringLiteral("thought/%1").arg(id);
+        // R12-1b：提交后版本 + 正文哈希，完成成果可被核验（旧记录缺这两个字段时只读兼容）。
+        result[QStringLiteral("artifact_version")] = version + 1;
+        result[QStringLiteral("artifact_hash")] =
+            activityContentHash(result.value(QStringLiteral("draft")).toString());
+    }
+    if (status == QStringLiteral("completed"))
+        result[QStringLiteral("completed_at")] = QDateTime::currentSecsSinceEpoch();
     const int hours = qBound(1, proposal["review_hours"].toInt(24), 168);
     QSqlQuery q(m_db);
     q.prepare("UPDATE chat_history SET thought_result=json_patch(coalesce(thought_result,'{}'),?),thought_version=thought_version+1,"
@@ -6860,11 +6887,27 @@ QJsonObject legacyActivityRecord(const QSqlQuery &query)
     for (const auto &key : {QStringLiteral("goal"), QStringLiteral("progress"),
                             QStringLiteral("next_step"), QStringLiteral("reflection"),
                             QStringLiteral("mood"), QStringLiteral("paused_reason"),
-                            QStringLiteral("deferred_reason")})
+                            QStringLiteral("deferred_reason"),
+                            QStringLiteral("completion_condition"),
+                            QStringLiteral("activity_kind")})
         insertActivityText(&row, key, stored.value(key), 240);
     insertActivityText(&row, QStringLiteral("draft"), stored.value(QStringLiteral("draft")), 800);
     insertActivityText(&row, QStringLiteral("artifact_ref"),
                        stored.value(QStringLiteral("artifact_ref")), 200);
+    // R12-1b：成果版本/哈希（新写入必有；旧 completed 只读兼容时按行版本兜底）。
+    if (stored.value(QStringLiteral("artifact_version")).isDouble())
+        row.insert(QStringLiteral("artifact_version"),
+                   stored.value(QStringLiteral("artifact_version")).toInt());
+    insertActivityText(&row, QStringLiteral("artifact_hash"),
+                       stored.value(QStringLiteral("artifact_hash")), 64);
+    if (stored.contains(QStringLiteral("completed_at"))) {
+        const QJsonValue completedAt = stored.value(QStringLiteral("completed_at"));
+        if (completedAt.isDouble())
+            row.insert(QStringLiteral("completed_at"),
+                       activityIsoFromEpoch(completedAt.toInteger()));
+        else
+            insertActivityText(&row, QStringLiteral("completed_at"), completedAt, 64);
+    }
     // 旧分享结果字段 share_outcome/share_version 映射为统一的 share_intent（只读，
     // 只表示"曾经/想要分享"，不代表已经发送）。
     QJsonObject shareIntent;
@@ -6922,7 +6965,9 @@ QJsonObject internalActivityRecord(const QSqlQuery &query)
     for (const auto &key : {QStringLiteral("goal"), QStringLiteral("progress"),
                             QStringLiteral("next_step"), QStringLiteral("reflection"),
                             QStringLiteral("mood"), QStringLiteral("paused_reason"),
-                            QStringLiteral("deferred_reason")})
+                            QStringLiteral("deferred_reason"),
+                            QStringLiteral("completion_condition"),
+                            QStringLiteral("activity_kind")})
         insertActivityText(&row, key, stored.value(key), 240);
     insertActivityText(&row, QStringLiteral("draft"), stored.value(QStringLiteral("draft")), 800);
     const QString artifactRef = query.value(QStringLiteral("artifact_ref")).toString();
@@ -6931,6 +6976,20 @@ QJsonObject internalActivityRecord(const QSqlQuery &query)
     else
         insertActivityText(&row, QStringLiteral("artifact_ref"),
                            stored.value(QStringLiteral("artifact_ref")), 200);
+    // R12-1b：成果版本/哈希/completed_at 来自同一份 result_json，用于核验与完成目录。
+    if (stored.value(QStringLiteral("artifact_version")).isDouble())
+        row.insert(QStringLiteral("artifact_version"),
+                   stored.value(QStringLiteral("artifact_version")).toInt());
+    insertActivityText(&row, QStringLiteral("artifact_hash"),
+                       stored.value(QStringLiteral("artifact_hash")), 64);
+    if (stored.contains(QStringLiteral("completed_at"))) {
+        const QJsonValue completedAt = stored.value(QStringLiteral("completed_at"));
+        if (completedAt.isDouble())
+            row.insert(QStringLiteral("completed_at"),
+                       activityIsoFromEpoch(completedAt.toInteger()));
+        else
+            insertActivityText(&row, QStringLiteral("completed_at"), completedAt, 64);
+    }
     const QJsonValue shareIntent = stored.value(QStringLiteral("share_intent"));
     if (shareIntent.isObject())
         row.insert(QStringLiteral("share_intent"), shareIntent.toObject());
@@ -7016,6 +7075,263 @@ QString normalizedActivityScope(const QString &scopeKey)
 {
     const QString trimmed = scopeKey.trimmed();
     return trimmed.isEmpty() ? QStringLiteral("owner") : trimmed;
+}
+
+// ===== R12-1b 补充：成果真实性 / 模型可见投影 / 完成成果目录 =====
+// 这些函数只读管理视图（activityByRef 的统一行形状）做确定性判断，不写库。
+
+// 成果是否真实存在且可核验：artifact_ref 必须指回活动自身，且 result_json 里有非空 draft；
+// 旧 completed 允许缺 artifact_version/hash（只读兼容），新写入必须带两者。
+bool activityArtifactPresent(const QJsonObject &raw)
+{
+    const QString ref = raw.value(QStringLiteral("ref")).toString();
+    const QString artifactRef = raw.value(QStringLiteral("artifact_ref")).toString().trimmed();
+    const QString draft = raw.value(QStringLiteral("draft")).toString().trimmed();
+    return !ref.isEmpty() && !artifactRef.isEmpty() && !draft.isEmpty()
+        && artifactRef == ref;
+}
+
+// completed 的确定性归属：文字创作（需要实际 draft）或纯思考（需要 completion_condition）。
+// 未显式声明时：有正文按文字创作，否则有完成条件按纯思考，两者都无仍按文字创作处理
+// （要求实际成果，绝不自动把"只有想法"的回顾改成完成）。
+struct ActivityCompletionPlan
+{
+    bool valid = false;
+    QString error;
+    QString kind;                    // writing / thought
+    QString draft;                   // 本次或已持久化的实际成果正文
+    QString completionCondition;     // 纯思考的完成条件
+    QString reflection;              // 本次或已有的认识
+};
+
+QString normalizedActivityKind(const QString &value)
+{
+    return value.trimmed().toLower();
+}
+
+bool isUnsupportedActivityKind(const QString &kind)
+{
+    static const QSet<QString> unsupported{
+        QStringLiteral("external"), QStringLiteral("browser"), QStringLiteral("painting"),
+        QStringLiteral("execution"), QStringLiteral("tool"), QStringLiteral("contact"),
+        QStringLiteral("share")};
+    return unsupported.contains(kind);
+}
+
+ActivityCompletionPlan planActivityCompletion(const QJsonObject &stored,
+                                             const QJsonObject &proposal)
+{
+    ActivityCompletionPlan plan;
+    // 当前实现没有任何执行工具：外部行为/执行结果只能写 intent/reflection，
+    // 不能作为 completed 或产物的依据。
+    static const QStringList externalKeys{
+        QStringLiteral("external_action"), QStringLiteral("external_result"),
+        QStringLiteral("execution_result"), QStringLiteral("executed")};
+    for (const auto &key : externalKeys) {
+        if (proposal.contains(key)) {
+            plan.error = QStringLiteral("unsupported_external_activity");
+            return plan;
+        }
+    }
+    QString kind = normalizedActivityKind(proposal.value(QStringLiteral("activity_kind")).toString());
+    if (!kind.isEmpty()
+        && kind != QStringLiteral("writing") && kind != QStringLiteral("thought")) {
+        plan.error = isUnsupportedActivityKind(kind)
+            ? QStringLiteral("unsupported_external_activity")
+            : QStringLiteral("invalid_activity_kind");
+        return plan;
+    }
+    if (kind.isEmpty()) {
+        const QString storedKind =
+            normalizedActivityKind(stored.value(QStringLiteral("activity_kind")).toString());
+        if (!storedKind.isEmpty()
+            && storedKind != QStringLiteral("writing") && storedKind != QStringLiteral("thought")) {
+            plan.error = isUnsupportedActivityKind(storedKind)
+                ? QStringLiteral("unsupported_external_activity")
+                : QStringLiteral("invalid_activity_kind");
+            return plan;
+        }
+        kind = storedKind;
+    }
+    // 引用已有成果正文：本次没有重写全文时沿用最近一次已持久化的 draft（不要求每次重写）。
+    plan.draft = proposal.value(QStringLiteral("draft")).toString().trimmed();
+    if (plan.draft.isEmpty())
+        plan.draft = stored.value(QStringLiteral("draft")).toString().trimmed();
+    plan.completionCondition =
+        proposal.value(QStringLiteral("completion_condition")).toString().trimmed();
+    if (plan.completionCondition.isEmpty())
+        plan.completionCondition =
+            stored.value(QStringLiteral("completion_condition")).toString().trimmed();
+    plan.reflection = proposal.value(QStringLiteral("reflection")).toString().trimmed();
+    if (plan.reflection.isEmpty())
+        plan.reflection = stored.value(QStringLiteral("reflection")).toString().trimmed();
+    if (kind.isEmpty()) {
+        if (!plan.draft.isEmpty())
+            kind = QStringLiteral("writing");
+        else if (!plan.completionCondition.isEmpty())
+            kind = QStringLiteral("thought");
+        else
+            kind = QStringLiteral("writing");
+    }
+    plan.kind = kind;
+    if (kind == QStringLiteral("writing")) {
+        if (plan.draft.isEmpty()) {
+            plan.error = QStringLiteral("missing_artifact");
+            return plan;
+        }
+    } else {
+        if (plan.completionCondition.isEmpty()) {
+            plan.error = QStringLiteral("missing_completion_condition");
+            return plan;
+        }
+        if (plan.reflection.isEmpty()) {
+            plan.error = QStringLiteral("missing_reflection");
+            return plan;
+        }
+    }
+    plan.valid = true;
+    return plan;
+}
+
+// 分享意愿的嵌套字段过滤：state/版本/哈希等服务端字段保留，request/正文类文本
+// 必须与活动其它字段走同一套读取策略（盲区 + 隐私规则），不可见就移除。
+void filterShareIntentForModel(QJsonObject *intent, const MemoryReadPolicy &policy,
+                               const QString &channel, const QString &session)
+{
+    if (!intent || intent->isEmpty()) return;
+    QJsonObject filtered;
+    for (const auto &key : {QStringLiteral("state"), QStringLiteral("artifact_ref"),
+                            QStringLiteral("artifact_version"), QStringLiteral("content_hash"),
+                            QStringLiteral("requested_at"), QStringLiteral("withdrawn_at"),
+                            QStringLiteral("version")}) {
+        if (intent->contains(key)) filtered.insert(key, intent->value(key));
+    }
+    const QString request = intent->value(QStringLiteral("request")).toString().trimmed();
+    if (!request.isEmpty() && policy.allows(channel, session, request))
+        filtered.insert(QStringLiteral("request"), request.left(120));
+    // 旧 legacy 映射可能把 draft 塞进 share_intent；只保留通过策略的文本。
+    const QString draft = intent->value(QStringLiteral("draft")).toString().trimmed();
+    if (!draft.isEmpty() && policy.allows(channel, session, draft))
+        filtered.insert(QStringLiteral("draft"), draft.left(800));
+    *intent = filtered;
+}
+
+// 统一行（activityByRef 形状）→ 模型可见投影。调用方已确认活动本身可见；
+// 文本字段逐项按读取策略过滤，嵌套 share_intent 同样过滤；completed 不返回过时 next_step。
+QJsonObject projectActivityForModel(const QJsonObject &raw, const QString &channel,
+                                    const QString &session, const MemoryReadPolicy &policy)
+{
+    QJsonObject row;
+    for (const auto &key : {QStringLiteral("ref"), QStringLiteral("origin"),
+                            QStringLiteral("kind"), QStringLiteral("id"),
+                            QStringLiteral("status"), QStringLiteral("version"),
+                            QStringLiteral("channel"), QStringLiteral("session"),
+                            QStringLiteral("scope_key"), QStringLiteral("origin_kind"),
+                            QStringLiteral("origin_ref"), QStringLiteral("run_id"),
+                            QStringLiteral("review_after"), QStringLiteral("created_at"),
+                            QStringLiteral("updated_at")}) {
+        if (raw.contains(key)) row.insert(key, raw.value(key));
+    }
+    const QString interest = raw.value(QStringLiteral("interest")).toString().trimmed();
+    if (!interest.isEmpty()) {
+        if (!policy.allows(channel, session, interest)) return {};
+        row.insert(QStringLiteral("interest"), interest.left(160));
+    }
+    for (const auto &key : {QStringLiteral("goal"), QStringLiteral("progress"),
+                            QStringLiteral("next_step"), QStringLiteral("reflection"),
+                            QStringLiteral("mood"), QStringLiteral("paused_reason"),
+                            QStringLiteral("deferred_reason"),
+                            QStringLiteral("completion_condition")}) {
+        const QString text = raw.value(key).toString().trimmed();
+        if (text.isEmpty()) continue;
+        if (!policy.allows(channel, session, text)) continue;
+        row.insert(key, text.left(key == QStringLiteral("completion_condition") ? 200 : 120));
+    }
+    const QString draft = raw.value(QStringLiteral("draft")).toString().trimmed();
+    bool draftVisible = false;
+    if (!draft.isEmpty() && policy.allows(channel, session, draft)) {
+        row.insert(QStringLiteral("draft"), draft.left(800));
+        draftVisible = true;
+    }
+    const QString status = raw.value(QStringLiteral("status")).toString();
+    // completed/abandoned 的 next_step 是过时调度信息，不能进入模型视图。
+    if (status == QStringLiteral("completed") || status == QStringLiteral("abandoned"))
+        row.remove(QStringLiteral("next_step"));
+    // 只有可核验且成果正文本身对本视图可见时才暴露 artifact_ref/版本/哈希；
+    // 悬空引用或不可见正文一律不出现（与嵌套字段同一可见性）。
+    if (draftVisible && activityArtifactPresent(raw)) {
+        row.insert(QStringLiteral("artifact_ref"),
+                   raw.value(QStringLiteral("artifact_ref")).toString().trimmed().left(200));
+        const int artifactVersion = raw.value(QStringLiteral("artifact_version")).toInt(0);
+        row.insert(QStringLiteral("artifact_version"),
+                   artifactVersion > 0 ? artifactVersion
+                                       : raw.value(QStringLiteral("version")).toInt());
+        const QString artifactHash =
+            raw.value(QStringLiteral("artifact_hash")).toString().trimmed();
+        if (!artifactHash.isEmpty()) row.insert(QStringLiteral("artifact_hash"), artifactHash.left(64));
+    }
+    if (raw.contains(QStringLiteral("completed_at")))
+        row.insert(QStringLiteral("completed_at"), raw.value(QStringLiteral("completed_at")));
+    if (raw.value(QStringLiteral("share_intent")).isObject()) {
+        QJsonObject intent = raw.value(QStringLiteral("share_intent")).toObject();
+        filterShareIntentForModel(&intent, policy, channel, session);
+        if (!intent.isEmpty()) row.insert(QStringLiteral("share_intent"), intent);
+    }
+    if (raw.value(QStringLiteral("share_offered")).toBool())
+        row.insert(QStringLiteral("share_offered"), true);
+    return row;
+}
+
+// 完成成果目录的一行：不包含过时 next_step，也不包含未持久化的正文。
+QJsonObject recentActivityResultRow(const QJsonObject &raw, const MemoryReadPolicy &policy)
+{
+    const QString channel = raw.value(QStringLiteral("channel")).toString();
+    const QString session = raw.value(QStringLiteral("session")).toString();
+    const QString draft = raw.value(QStringLiteral("draft")).toString().trimmed();
+    const bool artifactVisible =
+        !draft.isEmpty() && policy.allows(channel, session, draft);
+    QJsonObject row{
+        {QStringLiteral("ref"), raw.value(QStringLiteral("ref"))},
+        {QStringLiteral("version"), raw.value(QStringLiteral("version"))},
+        {QStringLiteral("status"), QStringLiteral("completed")}};
+    // 成果正文/引用按同一可见性处理：正文不可见时也不暴露 artifact_ref/版本/哈希。
+    if (artifactVisible) {
+        row.insert(QStringLiteral("artifact_ref"),
+                   raw.value(QStringLiteral("artifact_ref")).toString().trimmed());
+        const int artifactVersion = raw.value(QStringLiteral("artifact_version")).toInt(0);
+        row.insert(QStringLiteral("artifact_version"),
+                   artifactVersion > 0 ? artifactVersion
+                                       : raw.value(QStringLiteral("version")).toInt());
+        const QString artifactHash =
+            raw.value(QStringLiteral("artifact_hash")).toString().trimmed();
+        if (!artifactHash.isEmpty())
+            row.insert(QStringLiteral("artifact_hash"), artifactHash.left(64));
+    }
+    // title=活动本身（兴趣），goal=意图，summary=最近认识；全部按读取策略过滤。
+    const QString title = raw.value(QStringLiteral("interest")).toString().trimmed();
+    if (!title.isEmpty() && policy.allows(channel, session, title))
+        row.insert(QStringLiteral("title"), title.left(160));
+    const QString goal = raw.value(QStringLiteral("goal")).toString().trimmed();
+    if (!goal.isEmpty() && policy.allows(channel, session, goal))
+        row.insert(QStringLiteral("goal"), goal.left(120));
+    QString summary = raw.value(QStringLiteral("reflection")).toString().trimmed();
+    if (summary.isEmpty())
+        summary = raw.value(QStringLiteral("progress")).toString().trimmed();
+    if (!summary.isEmpty() && policy.allows(channel, session, summary))
+        row.insert(QStringLiteral("summary"), summary.left(120));
+    const QString completedAt = raw.value(QStringLiteral("completed_at")).toString().trimmed();
+    if (!completedAt.isEmpty())
+        row.insert(QStringLiteral("completed_at"), completedAt);
+    return row;
+}
+
+qlonglong activityCompletedEpoch(const QJsonObject &raw)
+{
+    const QString text = raw.value(QStringLiteral("completed_at")).toString().trimmed();
+    qlonglong epoch = activityEpochFromText(text);
+    if (epoch > 0) return epoch;
+    epoch = activityEpochFromText(raw.value(QStringLiteral("updated_at")).toString());
+    return epoch;
 }
 
 } // namespace
@@ -7378,6 +7694,152 @@ QJsonObject MemoryManager::activityByRef(const QString &ref) const
     return view;
 }
 
+// ===== R12-1b 补充：模型可见活动投影 =====
+// activityByRef 是管理读取；模型入口（capabilityManifest/自己的念头、ActivityReview context、
+// 快照 current/recent、未来行动核验）一律走这里。投影只读，不改变任何存储。
+QJsonObject MemoryManager::activityForModel(const QString &ref, const QString &channel,
+                                            const QString &session, const QString &subject,
+                                            bool longTermMemoryEnabled) const
+{
+    if (!m_db.isOpen()) return {};
+    // 长记忆关闭时不提供任何活动信息；参数与服务端配置必须同时开启。
+    if (!longTermMemoryEnabled) return {};
+    if (!ConfigManager::instance().getMemoryPolicyConfig().longTermMemoryEnabled) return {};
+    // 活动只属于主人私聊域；群聊/第三方一律不可见。
+    if (subject != QStringLiteral("user")) return {};
+    if (!isOwnerPrivateActivityChannel(channel)) return {};
+    if (ConfigManager::instance().isBlindZone(channel, session)) return {};
+    ActivityRef parsed;
+    if (!ActivityRef::parse(ref, &parsed)) return {};
+    const QJsonObject raw = activityByRef(ref);
+    if (raw.isEmpty()) return {};
+    if (raw.value(QStringLiteral("subject")).toString() != QStringLiteral("user")) return {};
+    if (parsed.kind == ActivityRef::InternalActivity
+        && raw.value(QStringLiteral("scope_key")).toString() != QStringLiteral("owner"))
+        return {};
+    // 活动自身的来源渠道/会话也必须属于私聊域且不在盲区（群聊来源的活动不进入投影）。
+    const QString rowChannel = raw.value(QStringLiteral("channel")).toString();
+    const QString rowSession = raw.value(QStringLiteral("session")).toString();
+    if (!isOwnerPrivateActivityChannel(rowChannel)) return {};
+    if (ConfigManager::instance().isBlindZone(rowChannel, rowSession)) return {};
+    MemoryReadPolicy policy;
+    if (!policy.allowsSession(rowChannel, rowSession)) return {};
+    return projectActivityForModel(raw, rowChannel, rowSession, policy);
+}
+
+QJsonArray MemoryManager::currentActivitiesForModel(int limit, const QString &channel,
+                                                    const QString &session,
+                                                    const QString &subject,
+                                                    bool longTermMemoryEnabled) const
+{
+    QJsonArray rows;
+    if (limit <= 0) return rows;
+    const int capped = qMin(limit, 8);
+    const QJsonArray rawRows = currentActivitiesUnified(capped);
+    for (const auto &value : rawRows) {
+        if (rows.size() >= capped) break;
+        const QString ref = value.toObject().value(QStringLiteral("ref")).toString();
+        if (ref.isEmpty()) continue;
+        const QJsonObject projected =
+            activityForModel(ref, channel, session, subject, longTermMemoryEnabled);
+        if (projected.isEmpty()) continue;
+        rows.append(projected);
+    }
+    return rows;
+}
+
+QJsonArray MemoryManager::recentActivityResults(const QString &scopeKey, int limit) const
+{
+    QJsonArray rows;
+    if (!m_db.isOpen() || limit <= 0) return rows;
+    const int capped = qMin(limit, 8);
+    const QString scope = normalizedActivityScope(scopeKey);
+    const MemoryReadPolicy policy;
+    struct Entry {
+        qlonglong completedAt = 0;
+        qlonglong tie = 0;
+        QJsonObject row;
+    };
+    QList<Entry> entries;
+    // legacy 完成目录：completed 且 artifact_ref/draft 真实存在；旧记录缺版本/哈希时兜底。
+    if (scope == QStringLiteral("owner")) {
+        QSqlQuery legacy(m_db);
+        legacy.prepare(QStringLiteral(
+            "SELECT id,thought,thought_version,coalesce(review_after,0) AS review_after,"
+            "thought_result,channel,session_id,subject,timestamp FROM chat_history "
+            "WHERE thought IS NOT NULL AND thought<>'' AND subject='user' AND sensitive=0 "
+            "AND coalesce(json_extract(thought_result,'$.status'),'active')='completed' "
+            "ORDER BY coalesce(json_extract(thought_result,'$.completed_at'),"
+            "json_extract(thought_result,'$.artifact_version'),id) DESC, id DESC "
+            "LIMIT ?"));
+        legacy.addBindValue(capped);
+        if (legacy.exec()) {
+            while (legacy.next()) {
+                const QJsonObject raw = legacyActivityRecord(legacy);
+                if (!activityArtifactPresent(raw)) continue;
+                entries.append({activityCompletedEpoch(raw),
+                                raw.value(QStringLiteral("version")).toInteger(),
+                                recentActivityResultRow(raw, policy)});
+            }
+        }
+    }
+    // internal 完成目录：同一 scope 内按完成时间倒序；无真实成果的 completed 不进入目录。
+    QSqlQuery internal(m_db);
+    internal.prepare(QStringLiteral(
+        "SELECT * FROM internal_activity WHERE scope_key=? AND status='completed' "
+        "ORDER BY coalesce(json_extract(result_json,'$.completed_at'),updated_at) DESC, id DESC "
+        "LIMIT ?"));
+    internal.addBindValue(scope);
+    internal.addBindValue(capped);
+    if (internal.exec()) {
+        while (internal.next()) {
+            const QJsonObject raw = internalActivityRecord(internal);
+            if (!activityArtifactPresent(raw)) continue;
+            entries.append({activityCompletedEpoch(raw),
+                            raw.value(QStringLiteral("version")).toInteger(),
+                            recentActivityResultRow(raw, policy)});
+        }
+    }
+    std::sort(entries.begin(), entries.end(), [](const Entry &left, const Entry &right) {
+        if (left.completedAt != right.completedAt) return left.completedAt > right.completedAt;
+        if (left.tie != right.tie) return left.tie > right.tie;
+        return left.row.value(QStringLiteral("ref")).toString()
+            > right.row.value(QStringLiteral("ref")).toString();
+    });
+    for (const auto &entry : entries) {
+        if (rows.size() >= capped) break;
+        rows.append(entry.row);
+    }
+    return rows;
+}
+
+QJsonArray MemoryManager::recentActivityResultsForModel(int limit, const QString &channel,
+                                                       const QString &session,
+                                                       const QString &subject,
+                                                       bool longTermMemoryEnabled) const
+{
+    QJsonArray rows;
+    if (limit <= 0) return rows;
+    if (!longTermMemoryEnabled) return rows;
+    if (!ConfigManager::instance().getMemoryPolicyConfig().longTermMemoryEnabled) return rows;
+    if (subject != QStringLiteral("user")) return rows;
+    if (!isOwnerPrivateActivityChannel(channel)) return rows;
+    if (ConfigManager::instance().isBlindZone(channel, session)) return rows;
+    const int capped = qMin(limit, 8);
+    // 完成目录本身已按读取策略过滤文本；这里再逐条复核活动投影（scope/渠道/盲区/敏感）。
+    for (const auto &value : recentActivityResults(QStringLiteral("owner"), capped)) {
+        if (rows.size() >= capped) break;
+        const QJsonObject row = value.toObject();
+        const QString ref = row.value(QStringLiteral("ref")).toString();
+        if (ref.isEmpty()) continue;
+        const QJsonObject projected =
+            activityForModel(ref, channel, session, subject, longTermMemoryEnabled);
+        if (projected.isEmpty()) continue;
+        rows.append(row);
+    }
+    return rows;
+}
+
 bool MemoryManager::hasActiveActivity(const QString &scopeKey) const
 {
     if (!m_db.isOpen()) return false;
@@ -7390,56 +7852,75 @@ bool MemoryManager::hasActiveActivity(const QString &scopeKey) const
 
 // 两存储中最早到期（active + review_after<=now）的候选。legacy 只属于 owner；
 // internal 要求 scope 匹配且 channel 是 pet/qq_private（与私人回顾一致）。
+// R12-1b 补充：候选必须通过模型可见投影；不可见候选在查询层跳过，不阻塞其它合法活动。
 QJsonObject MemoryManager::nextDueActivity(const QString &scopeKey) const
 {
     if (!m_db.isOpen()) return {};
     const QString scope = normalizedActivityScope(scopeKey);
+    // 长期记忆关闭时活动回顾整体不可用：没有任何合法候选。
+    if (!ConfigManager::instance().getMemoryPolicyConfig().longTermMemoryEnabled) return {};
     const qlonglong now = QDateTime::currentSecsSinceEpoch();
-    QString bestRef;
-    qlonglong bestDue = -1;
-    qlonglong bestId = 0;
+    struct Candidate {
+        qlonglong due = -1;
+        qlonglong id = 0;
+        QString ref;
+    };
+    QList<Candidate> candidates;
     if (scope == QStringLiteral("owner")) {
         QSqlQuery legacy(m_db);
         legacy.prepare(QStringLiteral(
             "SELECT id,coalesce(review_after,0) FROM chat_history "
             "WHERE thought IS NOT NULL AND thought<>'' AND subject='user' AND sensitive=0 "
             "AND coalesce(json_extract(thought_result,'$.status'),'active')='active' "
-            "AND coalesce(review_after,0)<=? ORDER BY coalesce(review_after,0),id LIMIT 1"));
+            "AND coalesce(review_after,0)<=? "
+            "ORDER BY coalesce(review_after,0),id LIMIT 8"));
         legacy.addBindValue(now);
-        if (legacy.exec() && legacy.next()) {
-            bestRef = QStringLiteral("thought/%1").arg(legacy.value(0).toLongLong());
-            bestDue = legacy.value(1).toLongLong();
-            bestId = legacy.value(0).toLongLong();
+        if (legacy.exec()) {
+            while (legacy.next()) {
+                const qlonglong id = legacy.value(0).toLongLong();
+                candidates.append({legacy.value(1).toLongLong(), id,
+                                   QStringLiteral("thought/%1").arg(id)});
+            }
         }
     }
     QSqlQuery internal(m_db);
     internal.prepare(QStringLiteral(
         "SELECT id,review_after FROM internal_activity WHERE scope_key=? AND status='active' "
-        "AND channel IN ('pet','qq_private') AND review_after<=? "
-        "ORDER BY review_after,id LIMIT 1"));
+        "AND channel IN ('pet','qq_private') AND subject='user' AND review_after<=? "
+        "ORDER BY review_after,id LIMIT 8"));
     internal.addBindValue(scope);
     internal.addBindValue(now);
-    if (internal.exec() && internal.next()) {
-        const qlonglong id = internal.value(0).toLongLong();
-        const qlonglong due = internal.value(1).toLongLong();
-        const bool earlier = bestRef.isEmpty() || due < bestDue
-            || (due == bestDue && id < bestId);
-        if (earlier) {
-            bestRef = QStringLiteral("activity/%1").arg(id);
-            bestDue = due;
+    if (internal.exec()) {
+        while (internal.next()) {
+            const qlonglong id = internal.value(0).toLongLong();
+            candidates.append({internal.value(1).toLongLong(), id,
+                               QStringLiteral("activity/%1").arg(id)});
         }
     }
-    if (bestRef.isEmpty()) return {};
-    ActivityRef parsed;
-    if (!ActivityRef::parse(bestRef, &parsed)) return {};
-    const QJsonObject view = activityByRef(bestRef);
-    if (view.isEmpty()) return {};
-    return QJsonObject{{QStringLiteral("ref"), bestRef},
-                       {QStringLiteral("kind"), parsed.originKind()},
-                       {QStringLiteral("origin"), parsed.originKind()},
-                       {QStringLiteral("version"), view.value(QStringLiteral("version")).toInt()},
-                       {QStringLiteral("review_after"), bestDue},
-                       {QStringLiteral("activity"), view}};
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate &left, const Candidate &right) {
+        if (left.due != right.due) return left.due < right.due;
+        if (left.id != right.id) return left.id < right.id;
+        return left.ref < right.ref;
+    });
+    for (const auto &candidate : candidates) {
+        ActivityRef parsed;
+        if (!ActivityRef::parse(candidate.ref, &parsed)) continue;
+        const QJsonObject raw = activityByRef(candidate.ref);
+        if (raw.isEmpty()) continue;
+        // 投影不可见的活动不进入 ActivityReview 队列。
+        const QJsonObject projected = activityForModel(
+            candidate.ref, raw.value(QStringLiteral("channel")).toString(),
+            raw.value(QStringLiteral("session")).toString(), QStringLiteral("user"), true);
+        if (projected.isEmpty()) continue;
+        return QJsonObject{{QStringLiteral("ref"), candidate.ref},
+                           {QStringLiteral("kind"), parsed.originKind()},
+                           {QStringLiteral("origin"), parsed.originKind()},
+                           {QStringLiteral("version"),
+                            projected.value(QStringLiteral("version")).toInt()},
+                           {QStringLiteral("review_after"), candidate.due},
+                           {QStringLiteral("activity"), projected}};
+    }
+    return {};
 }
 
 // 统一领取。legacy 复用 claimThoughtReview（预算/冷却/失败恢复都在原实现里）；
@@ -7456,6 +7937,13 @@ QJsonObject MemoryManager::claimActivity(const QString &ref, int expectedVersion
     if (!ActivityRef::parse(ref, &parsed)) return fail(QStringLiteral("invalid_ref"));
     if (!m_db.isOpen()) return fail(QStringLiteral("db_error"));
     if (parsed.kind == ActivityRef::LegacyThought) {
+        // R12-1b 补充：提交前复核模型可见投影，不可见活动不能被领取。
+        const QJsonObject before = activityByRef(parsed.ref());
+        if (before.isEmpty()) return fail(QStringLiteral("invalid_ref"));
+        if (activityForModel(parsed.ref(), before.value(QStringLiteral("channel")).toString(),
+                             before.value(QStringLiteral("session")).toString(),
+                             QStringLiteral("user"), true).isEmpty())
+            return fail(QStringLiteral("not_visible"));
         QString claimReason;
         QDateTime next;
         if (!claimThoughtReview(parsed.id, expectedVersion, dailyLimit, cooldownSeconds,
@@ -7482,10 +7970,17 @@ QJsonObject MemoryManager::claimActivity(const QString &ref, int expectedVersion
     const qlonglong currentDue = current.value(QStringLiteral("review_after")).toLongLong();
     const QString runId = current.value(QStringLiteral("run_id")).toString();
     const QString scopeKey = current.value(QStringLiteral("scope_key")).toString();
+    const QString rowChannel = current.value(QStringLiteral("channel")).toString();
+    const QString rowSession = current.value(QStringLiteral("session_id")).toString();
     current.finish();
     if (currentVersion != expectedVersion || currentStatus != QStringLiteral("active"))
         return fail(QStringLiteral("cas_conflict"));
     if (currentDue > now) return fail(QStringLiteral("not_due"));
+    // 提交前再次复核投影/来源/状态/版本：不可见活动不进入在途回顾。
+    if (scopeKey != QStringLiteral("owner")
+        || activityForModel(parsed.ref(), rowChannel, rowSession,
+                            QStringLiteral("user"), true).isEmpty())
+        return fail(QStringLiteral("not_visible"));
     QSqlQuery update(m_db);
     update.prepare(QStringLiteral(
         "UPDATE internal_activity SET review_after=unixepoch()+1800,version=version+1,"
@@ -7520,8 +8015,10 @@ QJsonObject MemoryManager::claimActivity(const QString &ref, int expectedVersion
                        {QStringLiteral("activity"), view}};
 }
 
-// 统一提交。internal 单事务 CAS：状态、正文 patch、artifact_ref、review_after、version
-// 一次性写入；失败（并发/版本过期/缺产物）整体拒绝。
+// 统一提交。internal 单事务 CAS：状态、正文 patch、artifact_ref/版本/哈希、review_after、
+// version、share_intent 一次性写入；失败（并发/版本过期/缺真实成果/分享请求非法）整体回滚。
+// R12-1b 补充：completed 必须能指向真实成果——文字创作要求已持久化 draft（可沿用），
+// 纯思考要求 completion_condition + reflection；外部行为/未执行结果不能写 completed。
 QJsonObject MemoryManager::finishActivity(const QString &ref, int version,
                                           const QJsonObject &proposal, QString *error)
 {
@@ -7533,68 +8030,233 @@ QJsonObject MemoryManager::finishActivity(const QString &ref, int version,
     ActivityRef parsed;
     if (!ActivityRef::parse(ref, &parsed)) return fail(QStringLiteral("invalid_ref"));
     if (!m_db.isOpen()) return fail(QStringLiteral("db_error"));
+    // 状态字段先做类型/枚举诊断，避免把缺失/类型错误混成同一个 schema 失败。
+    if (!proposal.contains(QStringLiteral("status"))) return fail(QStringLiteral("status_missing"));
+    if (!proposal.value(QStringLiteral("status")).isString())
+        return fail(QStringLiteral("status_type_invalid"));
+    const QString status = proposal.value(QStringLiteral("status")).toString();
+    static const QStringList allowedStatuses{QStringLiteral("active"), QStringLiteral("paused"),
+                                             QStringLiteral("completed"),
+                                             QStringLiteral("abandoned")};
+    if (!allowedStatuses.contains(status)) return fail(QStringLiteral("status_enum_invalid"));
+    // 分享请求只接受布尔或简短请求文本；不合法时整体拒绝（不与完成状态半写）。
+    bool shareRequested = false;
+    QString shareRequestText;
+    if (proposal.contains(QStringLiteral("share_with_owner"))) {
+        const QJsonValue value = proposal.value(QStringLiteral("share_with_owner"));
+        if (!value.isBool()) return fail(QStringLiteral("share_intent_invalid"));
+        shareRequested = value.toBool();
+    }
+    if (proposal.contains(QStringLiteral("share_request"))) {
+        const QJsonValue value = proposal.value(QStringLiteral("share_request"));
+        if (value.isBool()) {
+            shareRequested = shareRequested || value.toBool();
+        } else if (value.isString()) {
+            const QString text = value.toString().trimmed();
+            if (text.size() > 120) return fail(QStringLiteral("share_intent_invalid"));
+            if (!text.isEmpty()) {
+                shareRequested = true;
+                shareRequestText = text;
+            }
+        } else {
+            return fail(QStringLiteral("share_intent_invalid"));
+        }
+    }
+    if (shareRequested && status != QStringLiteral("completed"))
+        return fail(QStringLiteral("share_intent_invalid"));
+
     if (parsed.kind == ActivityRef::LegacyThought) {
+        // legacy 活动：只做适配与确定性校验，旧分享链（canShareThought → Outbox）保持不变。
+        const QJsonObject before = activityByRef(parsed.ref());
+        if (before.isEmpty()) return fail(QStringLiteral("invalid_or_stale_proposal"));
+        if (activityForModel(parsed.ref(), before.value(QStringLiteral("channel")).toString(),
+                             before.value(QStringLiteral("session")).toString(),
+                             QStringLiteral("user"), true).isEmpty())
+            return fail(QStringLiteral("not_visible"));
+        if (status == QStringLiteral("completed")) {
+            const ActivityCompletionPlan plan = planActivityCompletion(before, proposal);
+            if (!plan.valid) return fail(plan.error);
+        }
         if (!finishThoughtReview(parsed.id, version, proposal))
             return fail(QStringLiteral("invalid_or_stale_proposal"));
         const QJsonObject view = activityByRef(parsed.ref());
         QJsonObject result{{QStringLiteral("ref"), parsed.ref()},
                            {QStringLiteral("status"), view.value(QStringLiteral("status"))},
                            {QStringLiteral("version"), version + 1}};
-        const QString artifact = view.value(QStringLiteral("artifact_ref")).toString();
-        if (!artifact.isEmpty()) result.insert(QStringLiteral("artifact_ref"), artifact);
+        for (const auto &key : {QStringLiteral("artifact_ref"), QStringLiteral("artifact_version"),
+                                QStringLiteral("artifact_hash"),
+                                QStringLiteral("completed_at")}) {
+            if (view.contains(key)) result.insert(key, view.value(key));
+        }
+        qInfo().noquote()
+            << QStringLiteral("[Activity] finished ref=%1 status=%2 version=%3 artifact=%4")
+                   .arg(parsed.ref(), status)
+                   .arg(version + 1)
+                   .arg(view.value(QStringLiteral("artifact_ref")).toString().isEmpty()
+                            ? QStringLiteral("-") : view.value(QStringLiteral("artifact_ref")).toString());
         return result;
     }
-    const QString status = proposal.value(QStringLiteral("status")).toString();
-    if (status != QStringLiteral("active") && status != QStringLiteral("paused")
-        && status != QStringLiteral("completed") && status != QStringLiteral("abandoned"))
-        return fail(QStringLiteral("invalid_status"));
+
+    // internal 活动：draft 是"完整最新稿"，截断会静默丢稿，超长直接拒绝。
+    // legacy 仍交给 finishThoughtReview 的旧校验（保持 invalid_or_stale_proposal 兼容）。
     const QString draft = proposal.value(QStringLiteral("draft")).toString().trimmed();
     if (draft.size() > 800) return fail(QStringLiteral("draft_too_long"));
-    const QString reflection = proposal.value(QStringLiteral("reflection")).toString().trimmed();
-    // completed 必须有实际产物；不能把"没做成的外部行为"写成完成经历。
-    if (status == QStringLiteral("completed") && draft.isEmpty() && reflection.isEmpty())
-        return fail(QStringLiteral("missing_result"));
     const qlonglong now = QDateTime::currentSecsSinceEpoch();
     const int hours = qBound(1, proposal.value(QStringLiteral("review_hours")).toInt(24), 168);
     const qlonglong reviewAfter =
         (status == QStringLiteral("completed") || status == QStringLiteral("abandoned"))
         ? 0 : now + qlonglong(hours) * 3600;
+    const bool completed = status == QStringLiteral("completed");
+    if (!m_db.transaction()) return fail(QStringLiteral("db_error"));
+    auto rollback = qScopeGuard([this] { m_db.rollback(); });
+    QSqlQuery current(m_db);
+    current.prepare(QStringLiteral("SELECT * FROM internal_activity WHERE id=?"));
+    current.addBindValue(parsed.id);
+    if (!current.exec()) return fail(QStringLiteral("db_error"));
+    if (!current.next()) return fail(QStringLiteral("commit_conflict"));
+    const int currentVersion = current.value(QStringLiteral("version")).toInt();
+    const QString currentStatus = current.value(QStringLiteral("status")).toString();
+    const QString rowChannel = current.value(QStringLiteral("channel")).toString();
+    const QString rowSession = current.value(QStringLiteral("session_id")).toString();
+    const QJsonObject stored = QJsonDocument::fromJson(
+        current.value(QStringLiteral("result_json")).toString().toUtf8()).object();
+    current.finish();
+    if (currentVersion != version
+        || (currentStatus != QStringLiteral("active")
+            && currentStatus != QStringLiteral("paused")))
+        return fail(QStringLiteral("commit_conflict"));
+    // 提交前再次复核模型可见投影：不可见活动不能借提交写回状态/成果。
+    if (activityForModel(parsed.ref(), rowChannel, rowSession, QStringLiteral("user"), true)
+            .isEmpty())
+        return fail(QStringLiteral("not_visible"));
+    ActivityCompletionPlan plan;
+    if (completed) {
+        plan = planActivityCompletion(stored, proposal);
+        if (!plan.valid) return fail(plan.error);
+    }
     QJsonObject patch{{QStringLiteral("deferred_reason"), QJsonValue::Null},
                       {QStringLiteral("paused_reason"), QJsonValue::Null}};
     for (const auto &key : {QStringLiteral("reflection"), QStringLiteral("goal"),
                             QStringLiteral("progress"), QStringLiteral("next_step"),
                             QStringLiteral("mood"), QStringLiteral("paused_reason")})
         insertActivityText(&patch, key, proposal.value(key), 200);
-    insertActivityText(&patch, QStringLiteral("draft"), proposal.value(QStringLiteral("draft")), 800);
-    if (proposal.value(QStringLiteral("share_with_owner")).toBool())
+    // 创作中的实际草稿也必须在 active/paused 阶段持久化；否则后续只能引用“已存在成果”
+    // 完成时会误判 missing_artifact（draft 被静默丢掉）。
+    insertActivityText(&patch, QStringLiteral("draft"),
+                       proposal.value(QStringLiteral("draft")), 800);
+    // completion_condition/activity_kind 在 active/paused 阶段也要持久化，后续完成时沿用。
+    if (proposal.value(QStringLiteral("completion_condition")).isString())
+        insertActivityText(&patch, QStringLiteral("completion_condition"),
+                           proposal.value(QStringLiteral("completion_condition")), 200);
+    const QString requestedKind =
+        normalizedActivityKind(proposal.value(QStringLiteral("activity_kind")).toString());
+    if (!requestedKind.isEmpty()) {
+        if (requestedKind != QStringLiteral("writing")
+            && requestedKind != QStringLiteral("thought"))
+            return fail(isUnsupportedActivityKind(requestedKind)
+                            ? QStringLiteral("unsupported_external_activity")
+                            : QStringLiteral("invalid_activity_kind"));
+        patch.insert(QStringLiteral("activity_kind"), requestedKind);
+    }
+    const int newVersion = currentVersion + 1;
+    bool setArtifact = false;
+    bool clearArtifact = false;
+    QString artifactRef;
+    int artifactVersion = 0;
+    QString artifactHash;
+    if (completed) {
+        patch.insert(QStringLiteral("completed_at"), now);
+        if (plan.kind == QStringLiteral("writing")) {
+            // 实际成果正文：本次新稿或已持久化的完整稿；服务端写入权威产物引用/版本/哈希。
+            setArtifact = true;
+            artifactRef = parsed.ref();
+            artifactVersion = newVersion;
+            artifactHash = activityContentHash(plan.draft);
+            patch.insert(QStringLiteral("draft"), plan.draft.left(800));
+            patch.insert(QStringLiteral("activity_kind"), QStringLiteral("writing"));
+            patch.insert(QStringLiteral("artifact_ref"), artifactRef);
+            patch.insert(QStringLiteral("artifact_version"), artifactVersion);
+            patch.insert(QStringLiteral("artifact_hash"), artifactHash);
+            if (!plan.completionCondition.isEmpty())
+                patch.insert(QStringLiteral("completion_condition"),
+                             plan.completionCondition.left(200));
+        } else {
+            // 纯思考：不写产物，只保留完成条件与认识；不声称外部执行结果。
+            clearArtifact = true;
+            patch.insert(QStringLiteral("activity_kind"), QStringLiteral("thought"));
+            patch.insert(QStringLiteral("completion_condition"),
+                         plan.completionCondition.left(200));
+            patch.insert(QStringLiteral("artifact_ref"), QJsonValue::Null);
+            patch.insert(QStringLiteral("artifact_version"), QJsonValue::Null);
+            patch.insert(QStringLiteral("artifact_hash"), QJsonValue::Null);
+        }
+    }
+    if (shareRequested) {
+        // 分享意愿与完成状态同一事务：只能绑定服务端实际成果 ref/版本/哈希，
+        // 不接受模型传入的任意 draft；旧 intent 保留到有界历史。
+        if (!setArtifact) return fail(QStringLiteral("missing_artifact"));
+        const QJsonObject previousIntent = stored.value(QStringLiteral("share_intent")).toObject();
+        const int previousShareVersion =
+            previousIntent.value(QStringLiteral("version")).toInt(0);
+        QJsonArray history =
+            previousIntent.value(QStringLiteral("history")).toArray();
+        if (previousShareVersion > 0) {
+            QJsonObject previous = previousIntent;
+            previous.remove(QStringLiteral("history"));
+            history.append(previous);
+            while (history.size() > 4) history.removeFirst();
+        }
+        QJsonObject intent{
+            {QStringLiteral("state"), QStringLiteral("saved")},
+            {QStringLiteral("artifact_ref"), artifactRef},
+            {QStringLiteral("artifact_version"), artifactVersion},
+            {QStringLiteral("content_hash"), artifactHash},
+            {QStringLiteral("requested_at"), now},
+            {QStringLiteral("version"), previousShareVersion + 1}};
+        if (!shareRequestText.isEmpty())
+            intent.insert(QStringLiteral("request"), shareRequestText.left(120));
+        if (!history.isEmpty()) intent.insert(QStringLiteral("history"), history);
+        patch.insert(QStringLiteral("share_intent"), intent);
         patch.insert(QStringLiteral("share_offered"), true);
-    const bool completedWithDraft = status == QStringLiteral("completed") && !draft.isEmpty();
-    const QString artifactRef = completedWithDraft ? parsed.ref() : QString{};
-    if (!m_db.transaction()) return fail(QStringLiteral("db_error"));
-    auto rollback = qScopeGuard([this] { m_db.rollback(); });
+    }
     QSqlQuery update(m_db);
     update.prepare(QStringLiteral(
         "UPDATE internal_activity SET status=?,"
         "result_json=json_patch(coalesce(result_json,'{}'),?),"
         "version=version+1,review_after=?,updated_at=?,"
-        "artifact_ref=CASE WHEN ? THEN ? ELSE artifact_ref END "
+        "artifact_ref=CASE WHEN ?=1 THEN ? WHEN ?=1 THEN NULL ELSE artifact_ref END "
         "WHERE id=? AND version=? AND status IN ('active','paused')"));
     update.addBindValue(status);
     update.addBindValue(QString::fromUtf8(QJsonDocument(patch).toJson(QJsonDocument::Compact)));
     update.addBindValue(reviewAfter);
     update.addBindValue(now);
-    update.addBindValue(completedWithDraft ? 1 : 0);
+    update.addBindValue(setArtifact ? 1 : 0);
     update.addBindValue(artifactRef);
+    update.addBindValue(clearArtifact ? 1 : 0);
     update.addBindValue(parsed.id);
     update.addBindValue(version);
     if (!update.exec()) return fail(QStringLiteral("db_error"));
-    if (update.numRowsAffected() != 1) return fail(QStringLiteral("cas_conflict"));
-    if (!m_db.commit()) return fail(QStringLiteral("db_error"));
-    rollback.dismiss();
+    if (update.numRowsAffected() != 1) return fail(QStringLiteral("commit_conflict"));
     QJsonObject result{{QStringLiteral("ref"), parsed.ref()},
                        {QStringLiteral("status"), status},
-                       {QStringLiteral("version"), version + 1}};
-    if (completedWithDraft) result.insert(QStringLiteral("artifact_ref"), artifactRef);
+                       {QStringLiteral("version"), newVersion}};
+    if (setArtifact) {
+        result.insert(QStringLiteral("artifact_ref"), artifactRef);
+        result.insert(QStringLiteral("artifact_version"), artifactVersion);
+        result.insert(QStringLiteral("artifact_hash"), artifactHash);
+    }
+    if (completed) result.insert(QStringLiteral("completed_at"), now);
+    if (shareRequested) result.insert(QStringLiteral("share_intent"), patch.value(QStringLiteral("share_intent")));
+    if (!m_db.commit()) return fail(QStringLiteral("db_error"));
+    rollback.dismiss();
+    qInfo().noquote()
+        << QStringLiteral("[Activity] finished ref=%1 status=%2 version=%3 artifact=%4"
+                          " artifact_version=%5 share_intent=%6")
+               .arg(parsed.ref(), status)
+               .arg(newVersion)
+               .arg(setArtifact ? artifactRef : QStringLiteral("-"))
+               .arg(setArtifact ? artifactVersion : 0)
+               .arg(shareRequested ? QStringLiteral("saved") : QStringLiteral("-"));
     return result;
 }
 
@@ -7640,6 +8302,13 @@ QJsonObject MemoryManager::applyActivityAction(const QString &ref, int expectedV
         && trimmedAction != QStringLiteral("abandon") && trimmedAction != QStringLiteral("complete")
         && trimmedAction != QStringLiteral("reschedule"))
         return fail(QStringLiteral("invalid_action"));
+    // 动作提交前复核模型可见投影：不可见活动不能被前台/回顾借动作改状态。
+    const QJsonObject visibilityView = activityByRef(parsed.ref());
+    if (visibilityView.isEmpty()) return fail(QStringLiteral("invalid_ref"));
+    if (activityForModel(parsed.ref(), visibilityView.value(QStringLiteral("channel")).toString(),
+                         visibilityView.value(QStringLiteral("session")).toString(),
+                         QStringLiteral("user"), true).isEmpty())
+        return fail(QStringLiteral("not_visible"));
     if (parsed.kind == ActivityRef::LegacyThought) {
         // legacy 的 applyThoughtAction 只支持 pause/resume/abandon/reschedule；
         // "complete" 必须带产物走 finishActivity，不能在这里伪造完成。
@@ -7684,7 +8353,10 @@ QJsonObject MemoryManager::applyActivityAction(const QString &ref, int expectedV
     QString newStatus = currentStatus;
     qlonglong newReviewAfter = currentReviewAfter;
     bool setArtifact = false;
+    bool clearArtifact = false;
     QString artifactRef;
+    int artifactVersion = 0;
+    QString artifactHash;
     const QString trimmedReason = reason.trimmed().left(200);
     QJsonObject patch{{QStringLiteral("last_action"), trimmedAction}};
     if (trimmedAction == QStringLiteral("pause")) {
@@ -7711,18 +8383,38 @@ QJsonObject MemoryManager::applyActivityAction(const QString &ref, int expectedV
         if (!trimmedReason.isEmpty())
             patch.insert(QStringLiteral("reason"), trimmedReason);
     } else if (trimmedAction == QStringLiteral("complete")) {
-        const QString storedDraft = stored.value(QStringLiteral("draft")).toString().trimmed();
-        const QString storedReflection =
-            stored.value(QStringLiteral("reflection")).toString().trimmed();
-        if (storedDraft.isEmpty() && storedReflection.isEmpty())
-            return fail(QStringLiteral("missing_result"));
+        // 与 finishActivity 使用同一套成果真实性规则：文字创作要有实际 draft，
+        // 纯思考要有 completion_condition + reflection；仅有想法/进度不能完成。
+        QJsonObject storedView = stored;
+        storedView.insert(QStringLiteral("ref"), parsed.ref());
+        const ActivityCompletionPlan plan = planActivityCompletion(storedView, QJsonObject{});
+        if (!plan.valid) return fail(plan.error);
         newStatus = QStringLiteral("completed");
         newReviewAfter = 0;
         if (!trimmedReason.isEmpty())
             patch.insert(QStringLiteral("reason"), trimmedReason);
-        if (!storedDraft.isEmpty()) {
+        patch.insert(QStringLiteral("completed_at"), now);
+        if (plan.kind == QStringLiteral("writing")) {
             setArtifact = true;
             artifactRef = parsed.ref();
+            artifactVersion = expectedVersion + 1;
+            artifactHash = activityContentHash(plan.draft);
+            patch.insert(QStringLiteral("draft"), plan.draft.left(800));
+            patch.insert(QStringLiteral("activity_kind"), QStringLiteral("writing"));
+            patch.insert(QStringLiteral("artifact_ref"), artifactRef);
+            patch.insert(QStringLiteral("artifact_version"), artifactVersion);
+            patch.insert(QStringLiteral("artifact_hash"), artifactHash);
+            if (!plan.completionCondition.isEmpty())
+                patch.insert(QStringLiteral("completion_condition"),
+                             plan.completionCondition.left(200));
+        } else {
+            clearArtifact = true;
+            patch.insert(QStringLiteral("activity_kind"), QStringLiteral("thought"));
+            patch.insert(QStringLiteral("completion_condition"),
+                         plan.completionCondition.left(200));
+            patch.insert(QStringLiteral("artifact_ref"), QJsonValue::Null);
+            patch.insert(QStringLiteral("artifact_version"), QJsonValue::Null);
+            patch.insert(QStringLiteral("artifact_hash"), QJsonValue::Null);
         }
     } else { // reschedule
         if (afterMinutes < 0 || afterMinutes > 10080)
@@ -7735,7 +8427,7 @@ QJsonObject MemoryManager::applyActivityAction(const QString &ref, int expectedV
     update.prepare(QStringLiteral(
         "UPDATE internal_activity SET status=?,review_after=?,"
         "result_json=json_patch(coalesce(result_json,'{}'),?),version=version+1,updated_at=?,"
-        "artifact_ref=CASE WHEN ? THEN ? ELSE artifact_ref END "
+        "artifact_ref=CASE WHEN ?=1 THEN ? WHEN ?=1 THEN NULL ELSE artifact_ref END "
         "WHERE id=? AND version=? AND status IN ('active','paused')"));
     update.addBindValue(newStatus);
     update.addBindValue(newReviewAfter);
@@ -7743,22 +8435,40 @@ QJsonObject MemoryManager::applyActivityAction(const QString &ref, int expectedV
     update.addBindValue(now);
     update.addBindValue(setArtifact ? 1 : 0);
     update.addBindValue(artifactRef);
+    update.addBindValue(clearArtifact ? 1 : 0);
     update.addBindValue(parsed.id);
     update.addBindValue(expectedVersion);
     if (!update.exec()) return fail(QStringLiteral("db_error"));
     if (update.numRowsAffected() != 1) return fail(QStringLiteral("cas_conflict"));
     if (!m_db.commit()) return fail(QStringLiteral("db_error"));
     rollback.dismiss();
-    return QJsonObject{{QStringLiteral("ref"), parsed.ref()},
+    QJsonObject result{{QStringLiteral("ref"), parsed.ref()},
                        {QStringLiteral("origin"), QStringLiteral("internal")},
                        {QStringLiteral("scope_key"), scopeKey},
                        {QStringLiteral("status"), newStatus},
                        {QStringLiteral("version"), expectedVersion + 1}};
+    if (setArtifact) {
+        result.insert(QStringLiteral("artifact_ref"), artifactRef);
+        result.insert(QStringLiteral("artifact_version"), artifactVersion);
+        result.insert(QStringLiteral("artifact_hash"), artifactHash);
+    }
+    return result;
 }
 
-// 分享意愿：只写 internal_activity.result_json.share_intent（不发送、不建账本）。
+// 分享意愿：只写 internal_activity.result_json.share_intent（不发送、不建账本/outbox/聊天行）。
+// 旧签名保留兼容：等价于 action=share、自动递增 share 版本、request 最多 120 字。
 bool MemoryManager::setActivityShareIntent(const QString &ref, int version,
                                            const QString &draft, QString *error)
+{
+    return setActivityShareIntent(ref, version, QStringLiteral("share"), draft, -1, error);
+}
+
+// R12-1b 补充：显式分享版本语义（修改/撤回/重新分享）。只接受当前已完成成果的
+// artifact_ref/artifact_version/artifact_hash 匹配（重新计算正文哈希核对），
+// 不接受任意 draft 冒充成果，也不允许无成果分享；withdraw 保留历史并置 withdrawn。
+bool MemoryManager::setActivityShareIntent(const QString &ref, int expectedVersion,
+                                           const QString &action, const QString &request,
+                                           int shareVersion, QString *error)
 {
     if (error) error->clear();
     const auto fail = [error](const QString &code) {
@@ -7770,29 +8480,92 @@ bool MemoryManager::setActivityShareIntent(const QString &ref, int version,
     if (!m_db.isOpen()) return fail(QStringLiteral("db_error"));
     if (parsed.kind == ActivityRef::LegacyThought)
         return fail(QStringLiteral("unsupported_legacy"));
-    const QString trimmedDraft = draft.trimmed();
-    if (trimmedDraft.isEmpty() || trimmedDraft.size() > 800)
-        return fail(QStringLiteral("invalid_draft"));
-    const qlonglong now = QDateTime::currentSecsSinceEpoch();
-    const QJsonObject intent{{QStringLiteral("requested"), true},
-                             {QStringLiteral("draft"), trimmedDraft},
-                             {QStringLiteral("version"), version},
-                             {QStringLiteral("at"), now}};
+    const QString trimmedAction = action.trimmed();
+    if (trimmedAction != QStringLiteral("share") && trimmedAction != QStringLiteral("modify")
+        && trimmedAction != QStringLiteral("withdraw"))
+        return fail(QStringLiteral("invalid_action"));
+    const QString trimmedRequest = request.trimmed();
+    if (trimmedRequest.size() > 120) return fail(QStringLiteral("invalid_request"));
+    if (trimmedAction != QStringLiteral("withdraw") && trimmedRequest.isEmpty())
+        return fail(QStringLiteral("invalid_request"));
     if (!m_db.transaction()) return fail(QStringLiteral("db_error"));
     auto rollback = qScopeGuard([this] { m_db.rollback(); });
+    QSqlQuery current(m_db);
+    current.prepare(QStringLiteral("SELECT * FROM internal_activity WHERE id=?"));
+    current.addBindValue(parsed.id);
+    if (!current.exec()) return fail(QStringLiteral("db_error"));
+    if (!current.next()) return fail(QStringLiteral("missing_artifact"));
+    const int currentVersion = current.value(QStringLiteral("version")).toInt();
+    const QString currentStatus = current.value(QStringLiteral("status")).toString();
+    const QJsonObject stored = QJsonDocument::fromJson(
+        current.value(QStringLiteral("result_json")).toString().toUtf8()).object();
+    current.finish();
+    if (currentVersion != expectedVersion) return fail(QStringLiteral("cas_conflict"));
+    // 没有完成、没有真实成果的活动不能产生分享意愿。
+    if (currentStatus != QStringLiteral("completed")) return fail(QStringLiteral("missing_artifact"));
+    const QString storedDraft = stored.value(QStringLiteral("draft")).toString().trimmed();
+    const QString storedArtifactRef =
+        stored.value(QStringLiteral("artifact_ref")).toString().trimmed();
+    const int storedArtifactVersion =
+        stored.value(QStringLiteral("artifact_version")).toInt(0);
+    const QString storedHash = stored.value(QStringLiteral("artifact_hash")).toString().trimmed();
+    if (storedDraft.isEmpty() || storedArtifactRef != parsed.ref()
+        || storedArtifactVersion <= 0 || storedHash.size() != 16)
+        return fail(QStringLiteral("missing_artifact"));
+    // 只能绑定当前成果版本：正文哈希必须与持久化哈希一致，旧版本/任意 draft 不能冒充。
+    if (activityContentHash(storedDraft) != storedHash)
+        return fail(QStringLiteral("artifact_mismatch"));
+    const QJsonObject previousIntent = stored.value(QStringLiteral("share_intent")).toObject();
+    const int previousShareVersion = previousIntent.value(QStringLiteral("version")).toInt(0);
+    if (trimmedAction == QStringLiteral("modify")
+        && previousIntent.value(QStringLiteral("state")).toString() != QStringLiteral("saved"))
+        return fail(QStringLiteral("invalid_transition"));
+    const int newShareVersion =
+        shareVersion > 0 ? shareVersion : previousShareVersion + 1;
+    if (newShareVersion <= previousShareVersion)
+        return fail(QStringLiteral("share_version_conflict"));
+    QJsonArray history = previousIntent.value(QStringLiteral("history")).toArray();
+    if (previousShareVersion > 0) {
+        QJsonObject previous = previousIntent;
+        previous.remove(QStringLiteral("history"));
+        history.append(previous);
+        while (history.size() > 4) history.removeFirst();
+    }
+    const qlonglong now = QDateTime::currentSecsSinceEpoch();
+    QJsonObject intent{
+        {QStringLiteral("state"), trimmedAction == QStringLiteral("withdraw")
+             ? QStringLiteral("withdrawn") : QStringLiteral("saved")},
+        {QStringLiteral("artifact_ref"), storedArtifactRef},
+        {QStringLiteral("artifact_version"), storedArtifactVersion},
+        {QStringLiteral("content_hash"), storedHash},
+        {QStringLiteral("version"), newShareVersion},
+        {QStringLiteral("requested_at"), now}};
+    if (trimmedAction == QStringLiteral("withdraw"))
+        intent.insert(QStringLiteral("withdrawn_at"), now);
+    else
+        intent.insert(QStringLiteral("request"), trimmedRequest.left(120));
+    if (!history.isEmpty()) intent.insert(QStringLiteral("history"), history);
     QSqlQuery update(m_db);
     update.prepare(QStringLiteral(
         "UPDATE internal_activity SET result_json=json_set(coalesce(result_json,'{}'),"
-        "'$.share_intent',json(?),'$.share_offered',json('true')),updated_at=unixepoch() "
-        "WHERE id=? AND version=? AND status IN ('active','completed')"));
+        "'$.share_intent',json(?),'$.share_offered',json(?)),updated_at=unixepoch() "
+        "WHERE id=? AND version=? AND status='completed'"));
     update.addBindValue(QString::fromUtf8(
         QJsonDocument(intent).toJson(QJsonDocument::Compact)));
+    update.addBindValue(trimmedAction == QStringLiteral("withdraw") ? QStringLiteral("false")
+                                                                   : QStringLiteral("true"));
     update.addBindValue(parsed.id);
-    update.addBindValue(version);
+    update.addBindValue(expectedVersion);
     if (!update.exec()) return fail(QStringLiteral("db_error"));
     if (update.numRowsAffected() != 1) return fail(QStringLiteral("cas_conflict"));
     if (!m_db.commit()) return fail(QStringLiteral("db_error"));
     rollback.dismiss();
+    qInfo().noquote()
+        << QStringLiteral("[Activity] share_intent action=%1 ref=%2 share_version=%3"
+                          " artifact_version=%4")
+               .arg(trimmedAction, parsed.ref())
+               .arg(newShareVersion)
+               .arg(storedArtifactVersion);
     return true;
 }
 
