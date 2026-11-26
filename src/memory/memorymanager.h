@@ -462,6 +462,41 @@ public:
     // 列表；不删除活动、不伪造完成。
     QJsonArray recoverActivities(const QString &scopeKey=QStringLiteral("owner"));
 
+    // ===== R12-2a：通用 ActionOrigin / ActionProposal 持久化（v32）=====
+    // 提案（proposal）只记录"准备做什么"，本片**不发送**、不建 Outbox、不写 cognitive_action：
+    //   proposed（持久化）→ verified（统一核验通过）→ committed（R12-2b 才接发送）
+    //                      ↘ withheld / expired / unknown（任一态终态，不再自动推进）
+    // 身份/target 由 ActionOrigin 派生：输入 proposal 必须包含
+    //   {origin:{...ActionOrigin...}, kind:"contact"|"activity_share",
+    //    target:{channel,session_id}（可选，必须与 origin 一致）,
+    //    payload:{...}, claims:[...], expires_at:0}
+    // action_key 由 origin+kind 唯一确定（见 actionorigin.h）；库里 action_key UNIQUE。
+    // 服务端字段（state/semantic_status/origin*/target*/时间戳）不接受调用方伪造。
+    // 本入口只校验身份"结构/派生一致性"；来源行在库内是否真实存在、版本/runId/scope
+    // 是否对得上，由 ActionPolicy::validateActionProposal 统一核验后再进入本持久化层。
+    //
+    // 幂等：同 action_key 且 kind/target/payload/claims/expires_at 完全一致时返回已存在行
+    //（result["idempotent"]=true，绝不覆盖成新 payload）；不一致返回
+    // {"error":"conflict","action_key":...}。非法输入返回 {"error":<原因码>}。
+    QJsonObject persistActionProposal(const QJsonObject &proposal, QString *error = nullptr);
+    // 只读回读：行转 JSON（origin/target/payload/claims 解析为对象/数组）；不存在返回 {}。
+    QJsonObject actionProposal(const QString &actionKey) const;
+    // 状态 CAS：仅当当前 state==fromState 时推进；非法状态/非法迁移/0 行返回 false。
+    // semanticStatus 只能由服务端（本接口调用方）写入；空串表示保持 NULL。
+    // 允许的迁移：proposed→verified|withheld|expired|unknown；
+    //             verified→committed（仅 markProposalCommitted）|withheld|expired|unknown；
+    //             committed/withheld/expired/unknown 为终态。
+    bool updateActionProposalState(const QString &actionKey, const QString &fromState,
+                                   const QString &toState, const QString &semanticStatus,
+                                   const QString &errorCode = QString(), QString *error = nullptr);
+    // 扫描 proposed/verified 且 expires_at>0 且已过期的提案 → expired；返回更新行数（幂等）。
+    // now=0 表示使用数据库当前时间（unixepoch）。
+    int expireActionProposals(qint64 now = 0);
+    // verified→committed，并记录实际提交的 cognitive_action.action_key（R12-2b 使用）。
+    // 只接受非空 committedActionKey；0 行/状态不是 verified 返回 false 并写原因。
+    bool markProposalCommitted(const QString &actionKey, const QString &committedActionKey,
+                               QString *error = nullptr);
+
 //历史对话crud
     QList<HistoryTurn> getHistoryTurn(int N, const QString &channel = Channel::kPet, const QString &sessionId = Channel::kDefaultSession, qint64 beforeTurn = 0);
     QList<HistoryTurn> getHistoryTurn(int offset,int limit); // 管理界面分页，跨渠道浏览

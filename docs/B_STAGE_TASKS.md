@@ -277,3 +277,19 @@ R12（自主认知入口）开工基线为 `c28d23d`、schema v30；R12-0 是唯
 | 感知 | 快照/前台统一活动视图；completed 不显示过时 next_step；群聊/第三方隔离 |
 
 验证：全量 `ctest 23/23`；`tst_memorymanager 139/1 skipped`、`tst_memoryagent 91`、`tst_cognitivesnapshot 15`、`tst_actionoutbox 15`、`tst_actionpolicy 9`。无 schema 变更。真实运行 ActivityReview 实际领取 internal activity，但模型返回契约外 status，服务端拒绝并持久退避，无 chat/outbox；成功路径由单测覆盖。**未做**：R12-2 contact/outbox、R12-3 快照连续性、后台 tool loop。
+
+## 16. R12-1b 补充修正 + R12-2a（2026-11-26，R12-2a 后暂停）
+
+### R12-1b 补充
+- finish 完成需真实持久化成果：写作必须有 draft/artifact_ref/version/hash；纯思考需 completion_condition+reflection；无执行工具的外部活动拒绝；reflection-only 不得完成。
+- 模型可见投影与原始管理读取分离：scope/subject/channel/session/长记忆/盲区/隐私嵌套字段全部过滤；不可见活动不阻塞其他任务。
+- 已完成成果目录（有界 `recent_activity_results`）可被前台/后台读取；completed 不进回顾队列、不显示过时 next_step。
+- 分享意愿与成果原子提交，绑定 artifact_ref/version/hash；撤回/修改有版本语义；保存不发送。
+- 回顾/前台输出协议分离，ActivityReview schema 明确；结构化诊断码；Concern self_desire 矛盾句修正。
+- 真实模型验证：受控 internal activity 合法 completed，draft/artifact_version/hash 保存，`share_intent=saved`，无 Outbox/chat/ledger 增量。
+
+### R12-2a
+- v32 `action_proposal` 持久化；ActionOrigin 严格身份；EvidencePurpose 七类；统一 `validateActionProposal` + coverage（claims=[] 也跑）；`allow_contact=false` 拒绝 OpenWake contact。
+- 不接 Outbox/发送；生产库保持 v31，待 R12-2b 受控迁移。
+
+验证：`ctest 23/23`；`tst_memorymanager 146/1 skipped`、`tst_memoryagent 93`、`tst_actionpolicy 17`、`tst_cognitivesnapshot 15`、`tst_actionoutbox 15`。**暂停点**：R12-2b 未开始。

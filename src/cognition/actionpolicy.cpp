@@ -1,13 +1,16 @@
 #include "actionpolicy.h"
 
+#include "activityref.h"
 #include "configmanager.h"
 #include "memorymanager.h"
 #include "memoryreadpolicy.h"
 #include "utterance.h"
 
+#include <QCryptographicHash>
 #include <QDateTime>
 #include <QDebug>
 #include <QJsonDocument>
+#include <QRegularExpression>
 #include <QSet>
 #include <QSqlDatabase>
 #include <QSqlQuery>
@@ -21,10 +24,17 @@ const QString kReportedFact = QStringLiteral("reported_fact");
 const QString kUserCommitment = QStringLiteral("user_commitment");
 const QString kExecutionResult = QStringLiteral("execution_result");
 const QString kInference = QStringLiteral("inference");
+const QString kArtifactResult = QStringLiteral("artifact_result");
 
 const QString kSelfDesire = QStringLiteral("self_desire");
 const QString kConcernFollowup = QStringLiteral("concern_followup");
 const QString kActivityShare = QStringLiteral("activity_share");
+
+const QString kProposalKindContact = QStringLiteral("contact");
+const QString kProposalKindActivityShare = QStringLiteral("activity_share");
+
+// R12-2a：CurrentState 在没有来源时序基准时要求证据落在最近 N 小时内（"当前/较新"）。
+const int kCurrentStateFreshHours = 6;
 
 // 纯时间比较（与收口语义无关）：later 是否严格晚于 earlier。
 // 用于"证据必须晚于关注来源"的来源时序检查。
@@ -38,16 +48,35 @@ bool timeAfter(const QSqlDatabase &db,const QString &later,const QString &earlie
     return compare.exec() && compare.next() && compare.value(0).toInt()==1;
 }
 
-bool isFactClaimType(const QString &type)
+// 证据是否落在最近 hours 小时内（用于没有来源时序基准时的 CurrentState）。
+bool withinFreshWindow(const QSqlDatabase &db, const QString &reported, int hours)
 {
-    return type == kReportedFact || type == kUserCommitment || type == kExecutionResult;
+    if (reported.isEmpty()) return false;
+    QSqlQuery compare(db);
+    compare.prepare(QStringLiteral("SELECT julianday(?)>=julianday('now',?)"));
+    compare.addBindValue(reported);
+    compare.addBindValue(QStringLiteral("-%1 hours").arg(hours));
+    return compare.exec() && compare.next() && compare.value(0).toInt()==1;
 }
 
-// 动作核心：用户承诺/执行结果本身就是对外动作的事实核心；
+// claim 类型 → 用途。模型不能自定义用途：服务端按 type 判定。
+// 旧类型映射保持兼容：reported_fact 是"相对本次关注来源的新证据"（保留 stale_ref 语义），
+// 新类型可以显式表达历史事实/当前状态/成果/内部状态。
+// （映射的唯一实现是 ActionPolicy::purposeForClaimType，static 入口供所有推断复用。）
+
+// 事实类别（需要语义蕴含核验的 claim）；内部状态只证明"她内部有过记录"，不算事实声称。
+bool isFactClaimType(const QString &type)
+{
+    EvidencePurpose purpose = EvidencePurpose::HistoricalFact;
+    if (!ActionPolicy::purposeForClaimType(type, &purpose)) return false;
+    return purpose != EvidencePurpose::InternalState;
+}
+
+// 动作核心：用户承诺/执行结果/成果本身就是对外动作的事实核心；
 // reported_fact/inference 只有被标成 core（reason/message 依赖它）时才算核心。
 bool claimIsCoreByType(const QString &type)
 {
-    return type == kUserCommitment || type == kExecutionResult;
+    return type == kUserCommitment || type == kExecutionResult || type == kArtifactResult;
 }
 
 bool claimMarkedCore(const QJsonObject &claim, const QJsonObject &contact)
@@ -219,6 +248,502 @@ private:
     QString m_originReason;
 };
 
+// ===== R12-2a：按 purpose 的确定性证据读取 =====
+// 这里只做"引用是否存在 + authority/可见性/时序/成果真实性"，不做语义蕴含判断。
+struct RefEvidence
+{
+    bool ok = false;
+    QString reason;
+    QString text;
+    QString reported;
+    int artifactVersion = 0;
+    QString artifactHash;
+};
+
+// 成果正文哈希：与 memorymanager.cpp 的 activityContentHash 同一算法（SHA-256 前 16 hex）。
+QString artifactDraftHash(const QString &text)
+{
+    return QString::fromLatin1(
+        QCryptographicHash::hash(text.trimmed().toUtf8(), QCryptographicHash::Sha256)
+            .toHex()
+            .left(16));
+}
+
+bool containsAny(const QString &text, const QStringList &markers)
+{
+    for (const auto &marker : markers)
+        if (text.contains(marker)) return true;
+    return false;
+}
+
+// 明确的不确定表达（CurrentState 允许 unknown，而不是把历史相似记录当成当前事实）。
+bool uncertainExpression(const QString &text)
+{
+    static const QStringList markers{
+        QStringLiteral("不确定"), QStringLiteral("可能"), QStringLiteral("好像"),
+        QStringLiteral("也许"), QStringLiteral("或许"), QStringLiteral("记不清"),
+        QStringLiteral("不知道"), QStringLiteral("无法确认"), QStringLiteral("不清楚")};
+    return containsAny(text, markers);
+}
+
+// message/reason 中的"外部事实/用户承诺"断言（确定性近似；真实语义 coverage 由注入器判定）。
+QStringList externalFactAssertions(const QString &text)
+{
+    static const QRegularExpression pattern(QStringLiteral(
+        "(你(?:之前|上次|昨天|前天|上周|以前|曾经)?(?:说过|答应过|答应|告诉过我|提过|让我)"
+        "|你(?:已经|刚刚)?(?:答应|承诺)"
+        "|(?:上次|之前|昨天|前天|上周)(?:你|主人|我们)"
+        "|(?:我们|咱俩)(?:上次|之前|说好|约定)"
+        "|主人(?:说过|告诉过我|答应过|提过)"
+        "|我(?:已经|刚刚)?(?:把|给)你(?:发|送|做|写)过)"));
+    QStringList hits;
+    if (text.trimmed().isEmpty()) return hits;
+    auto it = pattern.globalMatch(text);
+    while (it.hasNext()) {
+        const auto match = it.next();
+        const QString fragment = match.captured(0).trimmed();
+        if (!fragment.isEmpty() && !hits.contains(fragment)) hits.append(fragment);
+        if (hits.size() >= 4) break;
+    }
+    return hits;
+}
+
+// 普通"主人原话/真实历史来源"类 ref：chat/、source/、raw_event/。
+// requireFresh=true 时，证据时间必须严格晚于 originReported；
+// originReported 为空时（旧入口 concernTurn<=0），若 requireRecentWhenNoOrigin=true
+// 则要求证据落在最近 kCurrentStateFreshHours 小时内，否则跳过时序检查。
+RefEvidence readOwnerSourceRef(const QSqlDatabase &db, const QString &ref,
+                               const QString &originReported, const QString &staleReason,
+                               bool requireFresh, bool requireRecentWhenNoOrigin)
+{
+    RefEvidence out;
+    const auto timingReason = [&](const QString &reported) -> QString {
+        if (!requireFresh) return {};
+        if (!originReported.isEmpty())
+            return timeAfter(db, reported, originReported) ? QString() : staleReason;
+        if (requireRecentWhenNoOrigin
+            && !withinFreshWindow(db, reported, kCurrentStateFreshHours))
+            return staleReason;
+        return {};
+    };
+    if (ref.startsWith(QStringLiteral("chat/"))) {
+        const qlonglong turn = ref.mid(5).section(':', 0, 0).toLongLong();
+        EvidenceReader reader(db, QString(), QString(), 0);
+        const RefText row = reader.chatRef(turn, 1);
+        if (!row.reason.isEmpty()) {
+            out.reason = row.reason;
+            return out;
+        }
+        out.reported = row.reported;
+        const QString reason = timingReason(row.reported);
+        if (!reason.isEmpty()) {
+            out.reason = reason;
+            return out;
+        }
+        out.ok = true;
+        out.text = row.text;
+        return out;
+    }
+    if (ref.startsWith(QStringLiteral("source/"))) {
+        const qlonglong sourceId = ref.mid(QStringLiteral("source/").size()).section(':', 0, 0).toLongLong();
+        QSqlQuery row(db);
+        row.prepare("SELECT subject,channel,session,input,reported FROM cognitive_source WHERE id=?");
+        row.addBindValue(sourceId);
+        if (!row.exec() || !row.next()) {
+            out.reason = QStringLiteral("invalid_ref");
+            return out;
+        }
+        const QString subject = row.value(0).toString();
+        const QString channel = row.value(1).toString();
+        const QString session = row.value(2).toString();
+        const QString input = row.value(3).toString();
+        out.reported = row.value(4).toString();
+        row.finish();
+        if (subject != QStringLiteral("user") || input.trimmed().isEmpty()) {
+            out.reason = QStringLiteral("not_owner_statement");
+            return out;
+        }
+        if (!channelVisibleFromOwnerPrivate(channel, session)) {
+            out.reason = QStringLiteral("invisible_ref");
+            return out;
+        }
+        const QString reason = timingReason(out.reported);
+        if (!reason.isEmpty()) {
+            out.reason = reason;
+            return out;
+        }
+        out.ok = true;
+        out.text = input.left(512);
+        return out;
+    }
+    if (ref.startsWith(QStringLiteral("raw_event/"))) {
+        const qlonglong eventId = ref.mid(QStringLiteral("raw_event/").size()).section(':', 0, 0).toLongLong();
+        QSqlQuery row(db);
+        row.prepare("SELECT channel,session_id,direction,sensitive,content,visibility,occurred_at "
+                    "FROM raw_events WHERE id=?");
+        row.addBindValue(eventId);
+        if (!row.exec() || !row.next()) {
+            out.reason = QStringLiteral("invalid_ref");
+            return out;
+        }
+        const QString channel = row.value(0).toString();
+        const QString session = row.value(1).toString();
+        const QString direction = row.value(2).toString();
+        const bool sensitive = row.value(3).toBool();
+        const QString content = row.value(4).toString();
+        out.reported = row.value(6).toString();
+        row.finish();
+        if (sensitive) {
+            out.reason = QStringLiteral("sensitive_ref");
+            return out;
+        }
+        if (direction != QStringLiteral("in")) {
+            out.reason = QStringLiteral("not_owner_statement");
+            return out;
+        }
+        if (!channelVisibleFromOwnerPrivate(channel, session)) {
+            out.reason = QStringLiteral("invisible_ref");
+            return out;
+        }
+        const QString reason = timingReason(out.reported);
+        if (!reason.isEmpty()) {
+            out.reason = reason;
+            return out;
+        }
+        out.ok = true;
+        out.text = content.left(512);
+        return out;
+    }
+    out.reason = QStringLiteral("invalid_ref");
+    return out;
+}
+
+// 执行结果 ref：delivery/<action_key>（handed_off）或 chat/<turn>（handed_off 的助手消息）。
+RefEvidence readExecutionRef(const QSqlDatabase &db, const QString &ref)
+{
+    RefEvidence out;
+    if (ref.startsWith(QStringLiteral("delivery/"))) {
+        const auto key = ref.mid(QStringLiteral("delivery/").size());
+        QString actionState, deliveryChannel, deliverySession;
+        bool found = false;
+        QSqlQuery row(db);
+        row.prepare("SELECT a.state,a.channel,a.session_id FROM cognitive_action a "
+                    "WHERE a.action_key=? LIMIT 1");
+        row.addBindValue(key);
+        if (row.exec() && row.next()) {
+            found = true;
+            actionState = row.value(0).toString();
+            deliveryChannel = row.value(1).toString();
+            deliverySession = row.value(2).toString();
+        }
+        if (!found && key.toLongLong() > 0) {
+            QSqlQuery byId(db);
+            byId.prepare("SELECT a.state,a.channel,a.session_id FROM action_outbox o "
+                         "JOIN cognitive_action a ON a.id=o.action_id WHERE o.id=? LIMIT 1");
+            byId.addBindValue(key.toLongLong());
+            if (byId.exec() && byId.next()) {
+                found = true;
+                actionState = byId.value(0).toString();
+                deliveryChannel = byId.value(1).toString();
+                deliverySession = byId.value(2).toString();
+            }
+        }
+        if (!found || actionState != QStringLiteral("handed_off")) {
+            out.reason = QStringLiteral("execution_result_not_found");
+            return out;
+        }
+        if (!channelVisibleFromOwnerPrivate(deliveryChannel, deliverySession)) {
+            out.reason = QStringLiteral("invisible_ref");
+            return out;
+        }
+        out.ok = true;
+        out.text = key;
+        return out;
+    }
+    if (ref.startsWith(QStringLiteral("chat/"))) {
+        const qlonglong turn = ref.mid(5).section(':', 0, 0).toLongLong();
+        EvidenceReader reader(db, QString(), QString(), 0);
+        const RefText row = reader.chatRef(turn, 2);
+        if (!row.reason.isEmpty()) {
+            out.reason = row.reason;
+            return out;
+        }
+        out.ok = true;
+        out.text = row.text;
+        out.reported = row.reported;
+        return out;
+    }
+    out.reason = QStringLiteral("invalid_ref");
+    return out;
+}
+
+// 内部状态 ref：reflection/<turn>、matter/<name>、revision/<name>、wake/<id>。
+// 只能证明"她内部有过这条记录"，不得当作用户事实/承诺（额外文本检查在 claim 层）。
+RefEvidence readInternalStateRef(const QSqlDatabase &db, const QString &ref)
+{
+    RefEvidence out;
+    if (ref.startsWith(QStringLiteral("reflection/"))) {
+        const auto turn = ref.mid(QStringLiteral("reflection/").size()).section(':', 0, 0).toLongLong();
+        QSqlQuery row(db);
+        row.prepare("SELECT h.channel,h.session_id FROM private_reflection r "
+                    "JOIN chat_history h ON h.id=r.turn_id WHERE r.turn_id=? AND h.subject='user' LIMIT 1");
+        row.addBindValue(turn);
+        if (!row.exec() || !row.next()
+            || !channelVisibleFromOwnerPrivate(row.value(0).toString(), row.value(1).toString())) {
+            out.reason = QStringLiteral("internal_ref_not_found");
+            return out;
+        }
+        out.ok = true;
+        return out;
+    }
+    if (ref.startsWith(QStringLiteral("matter/")) || ref.startsWith(QStringLiteral("revision/"))) {
+        const auto matter = ref.startsWith(QStringLiteral("matter/"))
+            ? ref.mid(QStringLiteral("matter/").size()).section(':', 0, 0)
+            : ref.mid(QStringLiteral("revision/").size()).section('/', 0, 0);
+        QSqlQuery row(db);
+        row.prepare("SELECT s.channel,s.session FROM matter_revision r "
+                    "JOIN cognitive_source s ON s.id=r.source "
+                    "WHERE r.matter=? AND s.subject='user' ORDER BY r.version DESC LIMIT 1");
+        row.addBindValue(matter);
+        if (!row.exec() || !row.next()
+            || !channelVisibleFromOwnerPrivate(row.value(0).toString(), row.value(1).toString())) {
+            out.reason = QStringLiteral("internal_ref_not_found");
+            return out;
+        }
+        out.ok = true;
+        return out;
+    }
+    if (ref.startsWith(QStringLiteral("wake/"))) {
+        const auto wakeId = ref.mid(QStringLiteral("wake/").size()).section(':', 0, 0).toLongLong();
+        QSqlQuery row(db);
+        row.prepare("SELECT 1 FROM open_wake WHERE id=? LIMIT 1");
+        row.addBindValue(wakeId);
+        if (!row.exec() || !row.next()) {
+            out.reason = QStringLiteral("internal_ref_not_found");
+            return out;
+        }
+        out.ok = true;
+        return out;
+    }
+    out.reason = QStringLiteral("invalid_ref");
+    return out;
+}
+
+// 成果 ref：thought/<id>（legacy）或 activity/<id>（internal）。
+// 要求 completed、artifact_ref 指回成果自身、正文 draft 非空；internal 还必须带成果版本/哈希。
+// legacy 旧 completed 允许缺 artifact_version/hash（只读兼容），版本按行版本兜底。
+RefEvidence readArtifactRef(const QSqlDatabase &db, const QString &ref)
+{
+    RefEvidence out;
+    ActivityRef activity;
+    QString parseError;
+    if (!ActivityRef::parse(ref, &activity, &parseError)) {
+        out.reason = QStringLiteral("invalid_ref");
+        return out;
+    }
+    const QString canonical = activity.ref();
+    if (activity.kind == ActivityRef::LegacyThought) {
+        QSqlQuery row(db);
+        row.prepare("SELECT channel,session_id,sensitive,thought_version,"
+                    "coalesce(json_extract(thought_result,'$.status'),'active'),"
+                    "coalesce(json_extract(thought_result,'$.artifact_ref'),''),"
+                    "coalesce(json_extract(thought_result,'$.draft'),''),"
+                    "coalesce(json_extract(thought_result,'$.artifact_version'),0),"
+                    "coalesce(json_extract(thought_result,'$.artifact_hash'),'') "
+                    "FROM chat_history WHERE id=? AND thought IS NOT NULL AND thought<>''");
+        row.addBindValue(activity.id);
+        if (!row.exec() || !row.next()) {
+            out.reason = QStringLiteral("artifact_not_found");
+            return out;
+        }
+        const QString channel = row.value(0).toString();
+        const QString session = row.value(1).toString();
+        const bool sensitive = row.value(2).toBool();
+        const int rowVersion = row.value(3).toInt();
+        const QString status = row.value(4).toString();
+        const QString artifactRef = row.value(5).toString().trimmed();
+        const QString draft = row.value(6).toString().trimmed();
+        int artifactVersion = row.value(7).toInt();
+        const QString artifactHash = row.value(8).toString().trimmed();
+        row.finish();
+        if (sensitive) {
+            out.reason = QStringLiteral("sensitive_ref");
+            return out;
+        }
+        if (!channelVisibleFromOwnerPrivate(channel, session)) {
+            out.reason = QStringLiteral("invisible_ref");
+            return out;
+        }
+        if (status != QStringLiteral("completed")) {
+            out.reason = QStringLiteral("artifact_not_completed");
+            return out;
+        }
+        if (artifactRef != canonical || draft.isEmpty()) {
+            out.reason = QStringLiteral("artifact_not_verifiable");
+            return out;
+        }
+        if (artifactVersion <= 0) artifactVersion = rowVersion; // 旧 completed 只读兼容
+        out.ok = true;
+        out.text = draft;
+        out.artifactVersion = artifactVersion;
+        out.artifactHash = artifactHash;
+        return out;
+    }
+    QSqlQuery row(db);
+    row.prepare("SELECT scope_key,channel,session_id,status,version,"
+                "coalesce(artifact_ref,''),coalesce(result_json,'{}') "
+                "FROM internal_activity WHERE id=?");
+    row.addBindValue(activity.id);
+    if (!row.exec() || !row.next()) {
+        out.reason = QStringLiteral("artifact_not_found");
+        return out;
+    }
+    const QString scopeKey = row.value(0).toString();
+    const QString channel = row.value(1).toString();
+    const QString session = row.value(2).toString();
+    const QString status = row.value(3).toString();
+    const QString artifactRefColumn = row.value(5).toString().trimmed();
+    const QJsonObject stored = QJsonDocument::fromJson(row.value(6).toString().toUtf8()).object();
+    row.finish();
+    if (scopeKey != QStringLiteral("owner")) {
+        out.reason = QStringLiteral("invisible_ref");
+        return out;
+    }
+    if (!channelVisibleFromOwnerPrivate(channel, session)) {
+        out.reason = QStringLiteral("invisible_ref");
+        return out;
+    }
+    if (status != QStringLiteral("completed")) {
+        out.reason = QStringLiteral("artifact_not_completed");
+        return out;
+    }
+    const QString artifactRef = artifactRefColumn.isEmpty()
+        ? stored.value(QStringLiteral("artifact_ref")).toString().trimmed()
+        : artifactRefColumn;
+    const QString draft = stored.value(QStringLiteral("draft")).toString().trimmed();
+    const int artifactVersion = stored.value(QStringLiteral("artifact_version")).toInt();
+    const QString artifactHash = stored.value(QStringLiteral("artifact_hash")).toString().trimmed();
+    // internal 新写入的成果必须可核验（ref/版本/正文齐全）；缺字段说明不是真实成果。
+    if (artifactRef != canonical || draft.isEmpty() || artifactVersion <= 0) {
+        out.reason = QStringLiteral("artifact_not_verifiable");
+        return out;
+    }
+    out.ok = true;
+    out.text = draft;
+    out.artifactVersion = artifactVersion;
+    out.artifactHash = artifactHash;
+    return out;
+}
+
+// purpose → 单条 ref 的确定性读取。失败 reason 即对外可审计的原因码。
+RefEvidence readPurposeRef(const QSqlDatabase &db, EvidencePurpose purpose, const QString &ref,
+                           const QString &originReported)
+{
+    switch (purpose) {
+    case EvidencePurpose::HistoricalFact:
+        // 真实历史来源：不因早于本次 wake/关注时间而 stale。
+        return readOwnerSourceRef(db, ref, QString(), QString(), false, false);
+    case EvidencePurpose::NewEvidence:
+        // 唯一保留 stale_ref 的路径：新证据必须晚于本次来源时间。
+        return readOwnerSourceRef(db, ref, originReported, QStringLiteral("stale_ref"), true, false);
+    case EvidencePurpose::CurrentState:
+        // 当前状态：必须有当前/较新证据；没有来源基准时要求落在最近窗口内。
+        return readOwnerSourceRef(db, ref, originReported,
+                                  QStringLiteral("current_state_not_current"), true, true);
+    case EvidencePurpose::UserCommitment:
+        // 承诺只能来自真实用户原话；提醒是"已安排的执行"，不是主人原话。
+        if (ref.startsWith(QStringLiteral("reminder/"))) {
+            RefEvidence reminder;
+            reminder.reason = QStringLiteral("reminder_not_owner_statement");
+            return reminder;
+        }
+        if (ref.startsWith(QStringLiteral("raw_event/"))) {
+            RefEvidence raw;
+            raw.reason = QStringLiteral("invalid_ref");
+            return raw;
+        }
+        return readOwnerSourceRef(db, ref, QString(), QString(), false, false);
+    case EvidencePurpose::ExecutionResult:
+        return readExecutionRef(db, ref);
+    case EvidencePurpose::ArtifactResult:
+        return readArtifactRef(db, ref);
+    case EvidencePurpose::InternalState:
+        return readInternalStateRef(db, ref);
+    }
+    RefEvidence out;
+    out.reason = QStringLiteral("invalid_purpose");
+    return out;
+}
+
+// 统一的 claim refs 确定性校验（purpose 已由服务端判定）。
+ClaimValidation validateClaimRefsWithOrigin(const QSqlDatabase &db, EvidencePurpose purpose,
+                                            const QJsonObject &claim,
+                                            const QString &originReported)
+{
+    const auto insufficient = [](const QString &reason) {
+        ClaimValidation validation;
+        validation.result = ClaimValidation::Insufficient;
+        validation.reason = reason;
+        return validation;
+    };
+    if (claim.value(QStringLiteral("text")).toString().trimmed().isEmpty())
+        return insufficient(QStringLiteral("missing_claim_text"));
+    const auto refsValue = claim.value(QStringLiteral("refs"));
+    if (!refsValue.isArray()) return insufficient(QStringLiteral("missing_refs"));
+    const auto refs = refsValue.toArray();
+    if (refs.size() > 4) return insufficient(QStringLiteral("too_many_refs"));
+    // CurrentState 允许明确 unknown：没有"当前证据"时不能把历史记录当现在的事实。
+    if (purpose == EvidencePurpose::CurrentState
+        && uncertainExpression(claim.value(QStringLiteral("text")).toString())) {
+        ClaimValidation unknown;
+        unknown.result = ClaimValidation::Insufficient;
+        unknown.unknown = true;
+        unknown.reason = QStringLiteral("explicit_unknown");
+        unknown.purpose = QStringLiteral("current_state");
+        return unknown;
+    }
+    if (refs.isEmpty()) {
+        // 内部状态（旧 inference）不需要外部来源；但不得把外部事实伪装成内部记录。
+        if (purpose == EvidencePurpose::InternalState) {
+            if (!externalFactAssertions(claim.value(QStringLiteral("text")).toString()).isEmpty())
+                return insufficient(QStringLiteral("internal_state_not_external"));
+            ClaimValidation validation;
+            validation.result = ClaimValidation::Entailed;
+            validation.purpose = QStringLiteral("internal_state");
+            return validation;
+        }
+        return insufficient(QStringLiteral("missing_refs"));
+    }
+    for (const auto &value : refs) {
+        if (!value.isString() || value.toString().trimmed().isEmpty())
+            return insufficient(QStringLiteral("invalid_ref"));
+    }
+    ClaimValidation validation;
+    validation.result = ClaimValidation::Entailed;
+    for (const auto &value : refs) {
+        const QString ref = value.toString().trimmed();
+        const RefEvidence evidence = readPurposeRef(db, purpose, ref, originReported);
+        if (!evidence.ok) return insufficient(evidence.reason);
+        if (purpose == EvidencePurpose::ArtifactResult) {
+            // 成果版本/哈希可由 claim 显式声明，但必须与真实成果一致（不是随机数）。
+            const QJsonValue versionValue = claim.value(QStringLiteral("artifact_version"));
+            if (versionValue.isDouble() && versionValue.toInt() != evidence.artifactVersion)
+                return insufficient(QStringLiteral("artifact_version_mismatch"));
+            const QString claimedHash = claim.value(QStringLiteral("artifact_hash")).toString().trimmed();
+            if (!claimedHash.isEmpty() && !evidence.artifactHash.isEmpty()
+                && claimedHash != evidence.artifactHash)
+                return insufficient(QStringLiteral("artifact_hash_mismatch"));
+        }
+        validation.supportingRefs.append(ref);
+    }
+    // 内部状态不能成为对外事实/承诺：即使带内部 refs，文本出现外部事实断言也拒绝。
+    if (purpose == EvidencePurpose::InternalState
+        && !externalFactAssertions(claim.value(QStringLiteral("text")).toString()).isEmpty())
+        return insufficient(QStringLiteral("internal_state_not_external"));
+    validation.purpose = evidencePurposeName(purpose);
+    return validation;
+}
+
 bool quietNow(const ProactiveConfig &options)
 {
     const auto start = QTime::fromString(options.quietStart, QStringLiteral("HH:mm"));
@@ -253,6 +778,34 @@ QJsonObject claimResultJson(const QJsonObject &claim, const QString &type, bool 
 
 } // namespace
 
+QString evidencePurposeName(EvidencePurpose purpose)
+{
+    switch (purpose) {
+    case EvidencePurpose::HistoricalFact: return QStringLiteral("historical_fact");
+    case EvidencePurpose::CurrentState: return QStringLiteral("current_state");
+    case EvidencePurpose::NewEvidence: return QStringLiteral("new_evidence");
+    case EvidencePurpose::UserCommitment: return QStringLiteral("user_commitment");
+    case EvidencePurpose::ExecutionResult: return QStringLiteral("execution_result");
+    case EvidencePurpose::ArtifactResult: return QStringLiteral("artifact_result");
+    case EvidencePurpose::InternalState: return QStringLiteral("internal_state");
+    }
+    return QStringLiteral("internal_state");
+}
+
+bool evidencePurposeFromName(const QString &name, EvidencePurpose *purpose)
+{
+    if (!purpose) return false;
+    const QString trimmed = name.trimmed();
+    if (trimmed == QStringLiteral("historical_fact")) { *purpose = EvidencePurpose::HistoricalFact; return true; }
+    if (trimmed == QStringLiteral("current_state")) { *purpose = EvidencePurpose::CurrentState; return true; }
+    if (trimmed == QStringLiteral("new_evidence")) { *purpose = EvidencePurpose::NewEvidence; return true; }
+    if (trimmed == QStringLiteral("user_commitment")) { *purpose = EvidencePurpose::UserCommitment; return true; }
+    if (trimmed == QStringLiteral("execution_result")) { *purpose = EvidencePurpose::ExecutionResult; return true; }
+    if (trimmed == QStringLiteral("artifact_result")) { *purpose = EvidencePurpose::ArtifactResult; return true; }
+    if (trimmed == QStringLiteral("internal_state")) { *purpose = EvidencePurpose::InternalState; return true; }
+    return false;
+}
+
 ActionPolicy::ActionPolicy(MemoryManager *memory)
     : m_memory(memory)
 {
@@ -261,6 +814,187 @@ ActionPolicy::ActionPolicy(MemoryManager *memory)
 void ActionPolicy::setSemanticVerifier(SemanticVerifier verifier)
 {
     m_verifier = std::move(verifier);
+}
+
+void ActionPolicy::setCoverageVerifier(CoverageVerifier verifier)
+{
+    m_coverageVerifier = std::move(verifier);
+}
+
+bool ActionPolicy::purposeForClaimType(const QString &type, EvidencePurpose *purpose)
+{
+    if (!purpose) return false;
+    const QString trimmed = type.trimmed();
+    if (trimmed == QStringLiteral("historical_fact")) { *purpose = EvidencePurpose::HistoricalFact; return true; }
+    if (trimmed == QStringLiteral("current_state")) { *purpose = EvidencePurpose::CurrentState; return true; }
+    if (trimmed == kReportedFact || trimmed == QStringLiteral("new_evidence")) {
+        *purpose = EvidencePurpose::NewEvidence;
+        return true;
+    }
+    if (trimmed == kUserCommitment) { *purpose = EvidencePurpose::UserCommitment; return true; }
+    if (trimmed == kExecutionResult) { *purpose = EvidencePurpose::ExecutionResult; return true; }
+    if (trimmed == kArtifactResult) { *purpose = EvidencePurpose::ArtifactResult; return true; }
+    if (trimmed == kInference || trimmed == QStringLiteral("internal_state")) {
+        *purpose = EvidencePurpose::InternalState;
+        return true;
+    }
+    return false;
+}
+
+QString ActionPolicy::claimTypeForPurpose(EvidencePurpose purpose)
+{
+    switch (purpose) {
+    case EvidencePurpose::HistoricalFact: return QStringLiteral("historical_fact");
+    case EvidencePurpose::CurrentState: return QStringLiteral("current_state");
+    case EvidencePurpose::NewEvidence: return QStringLiteral("new_evidence");
+    case EvidencePurpose::UserCommitment: return QStringLiteral("user_commitment");
+    case EvidencePurpose::ExecutionResult: return QStringLiteral("execution_result");
+    case EvidencePurpose::ArtifactResult: return QStringLiteral("artifact_result");
+    case EvidencePurpose::InternalState: return QStringLiteral("internal_state");
+    }
+    return QStringLiteral("internal_state");
+}
+
+QString ActionPolicy::originReportedText(const ActionOrigin &origin) const
+{
+    if (!m_memory || origin.id <= 0) return {};
+    QSqlQuery row(m_memory->m_db);
+    if (origin.kind == ActionOrigin::Wake) {
+        // 唤醒时间：优先 started_at，其次 created_at（都是 unixepoch 秒）。
+        row.prepare(QStringLiteral(
+            "SELECT coalesce(datetime(started_at,'unixepoch'),datetime(created_at,'unixepoch')) "
+            "FROM open_wake WHERE id=?"));
+    } else if (origin.kind == ActionOrigin::Reflection || origin.kind == ActionOrigin::Concern) {
+        row.prepare(QStringLiteral(
+            "SELECT coalesce(s.reported,h.timestamp) "
+            "FROM chat_history h LEFT JOIN cognitive_source s ON s.event=h.cognitive_event "
+            "AND s.channel=h.channel AND s.session=h.session_id AND s.subject=h.subject "
+            "AND s.input=h.user_input WHERE h.id=?"));
+    } else {
+        return {};
+    }
+    row.addBindValue(origin.id);
+    if (!row.exec() || !row.next()) return {};
+    return row.value(0).toString();
+}
+
+QString ActionPolicy::originSourceError(const ActionOrigin &origin, const QString &actionKind) const
+{
+    if (!m_memory) return QStringLiteral("source_unavailable");
+    if (!origin.isValid()) return QStringLiteral("invalid_origin");
+    if (origin.kind == ActionOrigin::Wake) {
+        QSqlQuery row(m_memory->m_db);
+        row.prepare(QStringLiteral(
+            "SELECT version,coalesce(run_id,''),coalesce(scope_key,''),"
+            "coalesce(current_context_epoch,0) FROM open_wake WHERE id=?"));
+        row.addBindValue(origin.id);
+        if (!row.exec() || !row.next()) return QStringLiteral("origin_not_found");
+        if (row.value(0).toInt() != origin.version)
+            return QStringLiteral("origin_version_mismatch");
+        if (row.value(1).toString() != origin.runId)
+            return QStringLiteral("origin_run_mismatch");
+        if (row.value(2).toString() != origin.scope)
+            return QStringLiteral("origin_scope_mismatch");
+        if (row.value(3).toLongLong() != origin.contextEpoch)
+            return QStringLiteral("context_epoch_mismatch");
+        // OpenWake 的 contact 必须显式 allow_contact；enabled 不参与此判断（两者独立）。
+        if (actionKind == kProposalKindContact
+            && !ConfigManager::instance().openWakeAllowContact())
+            return QStringLiteral("open_wake_contact_disabled");
+        return {};
+    }
+    if (origin.kind == ActionOrigin::Reflection || origin.kind == ActionOrigin::Concern) {
+        QSqlQuery row(m_memory->m_db);
+        row.prepare(QStringLiteral(
+            "SELECT coalesce(r.version,0),h.channel,h.session_id,h.subject,h.sensitive,h.turn_kind "
+            "FROM private_reflection r JOIN chat_history h ON h.id=r.turn_id WHERE r.turn_id=?"));
+        row.addBindValue(origin.id);
+        if (!row.exec() || !row.next()) return QStringLiteral("origin_not_found");
+        if (row.value(0).toInt() != origin.version)
+            return QStringLiteral("origin_version_mismatch");
+        if (row.value(3).toString() != QStringLiteral("user") || row.value(4).toBool()
+            || row.value(5).toString() != QStringLiteral("reply"))
+            return QStringLiteral("origin_not_owner_source");
+        if (!channelVisibleFromOwnerPrivate(row.value(1).toString(), row.value(2).toString()))
+            return QStringLiteral("origin_invisible");
+        return {};
+    }
+    if (origin.kind == ActionOrigin::Thought || origin.kind == ActionOrigin::Activity) {
+        const RefEvidence artifact = readArtifactRef(m_memory->m_db, origin.ref);
+        if (!artifact.ok) return artifact.reason;
+        // 分享版本必须是成果版本：不允许把随机数/旧版本写成 action_key。
+        if (artifact.artifactVersion != origin.version)
+            return QStringLiteral("artifact_version_mismatch");
+        if (origin.scope != QStringLiteral("owner")) return QStringLiteral("origin_scope_mismatch");
+        return {};
+    }
+    return QStringLiteral("origin_kind_not_allowed");
+}
+
+ClaimValidation ActionPolicy::validateClaimForPurpose(const QString &channel, const QString &session,
+                                                      const ActionOrigin &origin,
+                                                      EvidencePurpose purpose,
+                                                      const QJsonObject &claim) const
+{
+    const auto insufficient = [](const QString &reason) {
+        ClaimValidation validation;
+        validation.result = ClaimValidation::Insufficient;
+        validation.reason = reason;
+        return validation;
+    };
+    if (!m_memory) return insufficient(QStringLiteral("db_error"));
+    if (!origin.isValid()) return insufficient(QStringLiteral("invalid_origin"));
+    const QString type = claim.value(QStringLiteral("type")).toString().trimmed();
+    EvidencePurpose derived = EvidencePurpose::HistoricalFact;
+    if (!purposeForClaimType(type, &derived))
+        return insufficient(QStringLiteral("invalid_claim_type"));
+    if (derived != purpose) return insufficient(QStringLiteral("purpose_mismatch"));
+    const QString declaredPurpose = claim.value(QStringLiteral("purpose")).toString().trimmed();
+    if (!declaredPurpose.isEmpty() && declaredPurpose != evidencePurposeName(purpose))
+        return insufficient(QStringLiteral("purpose_mismatch"));
+    QString originReported;
+    if (purpose == EvidencePurpose::NewEvidence || purpose == EvidencePurpose::CurrentState) {
+        originReported = originReportedText(origin);
+        if (originReported.isEmpty()) return insufficient(QStringLiteral("origin_not_found"));
+    }
+    Q_UNUSED(channel);
+    Q_UNUSED(session);
+    ClaimValidation validation = validateClaimRefsWithOrigin(m_memory->m_db, purpose, claim,
+                                                             originReported);
+    if (validation.result == ClaimValidation::Entailed && validation.purpose.isEmpty())
+        validation.purpose = evidencePurposeName(purpose);
+    return validation;
+}
+
+ClaimValidation ActionPolicy::validateEvidenceRef(const QString &channel, const QString &session,
+                                                  const ActionOrigin &origin,
+                                                  EvidencePurpose purpose,
+                                                  const QString &refText) const
+{
+    const auto insufficient = [](const QString &reason) {
+        ClaimValidation validation;
+        validation.result = ClaimValidation::Insufficient;
+        validation.reason = reason;
+        return validation;
+    };
+    if (!m_memory) return insufficient(QStringLiteral("db_error"));
+    if (!origin.isValid()) return insufficient(QStringLiteral("invalid_origin"));
+    const QString ref = refText.trimmed();
+    if (ref.isEmpty()) return insufficient(QStringLiteral("invalid_ref"));
+    QString originReported;
+    if (purpose == EvidencePurpose::NewEvidence || purpose == EvidencePurpose::CurrentState) {
+        originReported = originReportedText(origin);
+        if (originReported.isEmpty()) return insufficient(QStringLiteral("origin_not_found"));
+    }
+    Q_UNUSED(channel);
+    Q_UNUSED(session);
+    const RefEvidence evidence = readPurposeRef(m_memory->m_db, purpose, ref, originReported);
+    if (!evidence.ok) return insufficient(evidence.reason);
+    ClaimValidation validation;
+    validation.result = ClaimValidation::Entailed;
+    validation.purpose = evidencePurposeName(purpose);
+    validation.supportingRefs.append(ref);
+    return validation;
 }
 
 ClaimValidation ActionPolicy::validateClaimDeterministic(const QString &channel, const QString &session,
@@ -275,174 +1009,18 @@ ClaimValidation ActionPolicy::validateClaimDeterministic(const QString &channel,
     };
     if (!m_memory || !claim.value(QStringLiteral("type")).isString())
         return insufficient(QStringLiteral("invalid_claim"));
-    const auto type = claim.value(QStringLiteral("type")).toString().trimmed();
-    if (!isFactClaimType(type) && type != kInference)
+    const QString type = claim.value(QStringLiteral("type")).toString().trimmed();
+    EvidencePurpose purpose = EvidencePurpose::HistoricalFact;
+    if (!purposeForClaimType(type, &purpose))
         return insufficient(QStringLiteral("invalid_claim_type"));
-    if (claim.value(QStringLiteral("text")).toString().trimmed().isEmpty())
-        return insufficient(QStringLiteral("missing_claim_text"));
-    const auto refsValue = claim.value(QStringLiteral("refs"));
-    if (!refsValue.isArray()) return insufficient(QStringLiteral("missing_refs"));
-    const auto refs = refsValue.toArray();
-    if (refs.size() > 4) return insufficient(QStringLiteral("too_many_refs"));
-    if (refs.isEmpty()) {
-        // inference 不需要事实来源；事实/承诺/执行结果没有 refs 就是无法证明。
-        if (type == kInference) {
-            ClaimValidation validation;
-            validation.result = ClaimValidation::Entailed;
-            return validation;
-        }
-        return insufficient(QStringLiteral("missing_refs"));
+    // 旧入口的"关注来源"语义：concernTurn>0 时来源必须是真实主人轮次，并作为新证据时序基准。
+    QString originReported;
+    if (concernTurn > 0) {
+        EvidenceReader reader(m_memory->m_db, channel, session, concernTurn);
+        if (!reader.originReason().isEmpty()) return insufficient(reader.originReason());
+        originReported = reader.originReported();
     }
-    EvidenceReader reader(m_memory->m_db, channel, session, concernTurn);
-    for (const auto &value : refs) {
-        if (!value.isString() || value.toString().trimmed().isEmpty())
-            return insufficient(QStringLiteral("invalid_ref"));
-    }
-    if (!reader.originReason().isEmpty()) return insufficient(reader.originReason());
-
-    ClaimValidation validation;
-    validation.result = ClaimValidation::Entailed;
-    for (const auto &value : refs) {
-        const auto ref = value.toString().trimmed();
-        if (type == kInference) {
-            // 自己的理解：reflection/<turn> 或 matter/<名称>；只要求"她确实留下过这条理解"。
-            bool ok = false;
-            if (ref.startsWith(QStringLiteral("reflection/"))) {
-                const auto turn = ref.mid(QStringLiteral("reflection/").size()).section(':', 0, 0).toLongLong();
-                QSqlQuery row(m_memory->m_db);
-                row.prepare("SELECT h.channel,h.session_id FROM private_reflection r "
-                            "JOIN chat_history h ON h.id=r.turn_id WHERE r.turn_id=? AND h.subject='user' LIMIT 1");
-                row.addBindValue(turn);
-                ok = row.exec() && row.next()
-                    && channelVisibleFromOwnerPrivate(row.value(0).toString(), row.value(1).toString());
-            } else if (ref.startsWith(QStringLiteral("matter/"))
-                       || ref.startsWith(QStringLiteral("revision/"))) {
-                const auto matter = ref.startsWith(QStringLiteral("matter/"))
-                    ? ref.mid(QStringLiteral("matter/").size()).section(':', 0, 0)
-                    : ref.mid(QStringLiteral("revision/").size()).section('/', 0, 0);
-                QSqlQuery row(m_memory->m_db);
-                row.prepare("SELECT s.channel,s.session FROM matter_revision r "
-                            "JOIN cognitive_source s ON s.id=r.source "
-                            "WHERE r.matter=? AND s.subject='user' ORDER BY r.version DESC LIMIT 1");
-                row.addBindValue(matter);
-                ok = row.exec() && row.next()
-                    && channelVisibleFromOwnerPrivate(row.value(0).toString(), row.value(1).toString());
-            }
-            if (!ok) return insufficient(QStringLiteral("inference_ref_not_found"));
-            validation.supportingRefs.append(ref);
-            continue;
-        }
-        if (type == kReportedFact) {
-            QString reason;
-            if (ref.startsWith(QStringLiteral("chat/"))) {
-                const auto turn = ref.mid(5).section(':', 0, 0).toLongLong();
-                const auto row = reader.chatRef(turn, 1);
-                reason = row.reason;
-                if (reason.isEmpty())
-                    reason = reader.checkOwnerStatementTiming(row.reported);
-            } else if (ref.startsWith(QStringLiteral("source/"))) {
-                const auto sourceId = ref.mid(QStringLiteral("source/").size()).section(':', 0, 0).toLongLong();
-                QSqlQuery row(m_memory->m_db);
-                row.prepare("SELECT subject,channel,session,input,reported FROM cognitive_source WHERE id=?");
-                row.addBindValue(sourceId);
-                if (!row.exec() || !row.next()) reason = QStringLiteral("invalid_ref");
-                else if (row.value(0).toString() != QStringLiteral("user")
-                         || row.value(3).toString().trimmed().isEmpty())
-                    reason = QStringLiteral("not_owner_statement");
-                else if (!channelVisibleFromOwnerPrivate(row.value(1).toString(), row.value(2).toString()))
-                    reason = QStringLiteral("invisible_ref");
-                else
-                    reason = reader.checkOwnerStatementTiming(row.value(4).toString());
-            } else if (ref.startsWith(QStringLiteral("raw_event/"))) {
-                const auto eventId = ref.mid(QStringLiteral("raw_event/").size()).section(':', 0, 0).toLongLong();
-                QSqlQuery row(m_memory->m_db);
-                row.prepare("SELECT channel,session_id,direction,sensitive,content,visibility,occurred_at "
-                            "FROM raw_events WHERE id=?");
-                row.addBindValue(eventId);
-                if (!row.exec() || !row.next()) reason = QStringLiteral("invalid_ref");
-                else if (row.value(3).toBool()) reason = QStringLiteral("sensitive_ref");
-                else if (row.value(2).toString() != QStringLiteral("in"))
-                    reason = QStringLiteral("not_owner_statement");
-                else if (!channelVisibleFromOwnerPrivate(row.value(0).toString(), row.value(1).toString()))
-                    reason = QStringLiteral("invisible_ref");
-                else
-                    reason = reader.checkOwnerStatementTiming(row.value(6).toString());
-            } else {
-                reason = QStringLiteral("invalid_ref");
-            }
-            if (!reason.isEmpty()) return insufficient(reason);
-        } else if (type == kUserCommitment) {
-            QString reason;
-            if (ref.startsWith(QStringLiteral("chat/"))) {
-                const auto turn = ref.mid(5).section(':', 0, 0).toLongLong();
-                const auto row = reader.chatRef(turn, 1);
-                reason = row.reason;
-                if (reason.isEmpty())
-                    reason = reader.checkOwnerStatementTiming(row.reported);
-            } else if (ref.startsWith(QStringLiteral("source/"))) {
-                const auto sourceId = ref.mid(QStringLiteral("source/").size()).section(':', 0, 0).toLongLong();
-                QSqlQuery row(m_memory->m_db);
-                row.prepare("SELECT subject,channel,session,input,reported FROM cognitive_source WHERE id=?");
-                row.addBindValue(sourceId);
-                if (!row.exec() || !row.next()) reason = QStringLiteral("invalid_ref");
-                else if (row.value(0).toString() != QStringLiteral("user")
-                         || row.value(3).toString().trimmed().isEmpty())
-                    reason = QStringLiteral("not_owner_statement");
-                else if (!channelVisibleFromOwnerPrivate(row.value(1).toString(), row.value(2).toString()))
-                    reason = QStringLiteral("invisible_ref");
-                else
-                    reason = reader.checkOwnerStatementTiming(row.value(4).toString());
-            } else if (ref.startsWith(QStringLiteral("reminder/"))) {
-                // 提醒是"已安排的执行"，不是主人此刻的原话；提醒链自己执行，不能拿来支持承诺。
-                reason = QStringLiteral("reminder_not_owner_statement");
-            } else {
-                reason = QStringLiteral("invalid_ref");
-            }
-            if (!reason.isEmpty()) return insufficient(reason);
-        } else { // execution_result
-            QString reason;
-            if (ref.startsWith(QStringLiteral("delivery/"))) {
-                const auto key = ref.mid(QStringLiteral("delivery/").size());
-                QString actionState, deliveryChannel, deliverySession;
-                bool found = false;
-                QSqlQuery row(m_memory->m_db);
-                row.prepare("SELECT a.state,a.channel,a.session_id FROM cognitive_action a "
-                            "WHERE a.action_key=? LIMIT 1");
-                row.addBindValue(key);
-                if (row.exec() && row.next()) {
-                    found = true;
-                    actionState = row.value(0).toString();
-                    deliveryChannel = row.value(1).toString();
-                    deliverySession = row.value(2).toString();
-                }
-                if (!found && key.toLongLong() > 0) {
-                    QSqlQuery byId(m_memory->m_db);
-                    byId.prepare("SELECT a.state,a.channel,a.session_id FROM action_outbox o "
-                                 "JOIN cognitive_action a ON a.id=o.action_id WHERE o.id=? LIMIT 1");
-                    byId.addBindValue(key.toLongLong());
-                    if (byId.exec() && byId.next()) {
-                        found = true;
-                        actionState = byId.value(0).toString();
-                        deliveryChannel = byId.value(1).toString();
-                        deliverySession = byId.value(2).toString();
-                    }
-                }
-                if (!found) reason = QStringLiteral("execution_result_not_found");
-                else if (actionState != QStringLiteral("handed_off"))
-                    reason = QStringLiteral("execution_result_not_found");
-                else if (!channelVisibleFromOwnerPrivate(deliveryChannel, deliverySession))
-                    reason = QStringLiteral("invisible_ref");
-            } else if (ref.startsWith(QStringLiteral("chat/"))) {
-                const auto turn = ref.mid(5).section(':', 0, 0).toLongLong();
-                reason = reader.chatRef(turn, 2).reason;
-            } else {
-                reason = QStringLiteral("invalid_ref");
-            }
-            if (!reason.isEmpty()) return insufficient(reason);
-        }
-        validation.supportingRefs.append(ref);
-    }
-    return validation;
+    return validateClaimRefsWithOrigin(m_memory->m_db, purpose, claim, originReported);
 }
 
 QString ActionPolicy::validateMotivation(const QString &channel, const QString &session,
@@ -484,22 +1062,22 @@ QString ActionPolicy::validateMotivation(const QString &channel, const QString &
             return QStringLiteral("motivation_ref_invisible");
         return {};
     }
-    // activity_share：必须是 completed 且有产物的活动，分享去重由切片 B 的投递层负责。
-    if (!ref.startsWith(QStringLiteral("thought/")))
+    // activity_share：必须是 completed 且有真实成果的活动（legacy thought/<id> 与
+    // internal activity/<id> 都支持）。内部想法/未完成目标不能当成果分享。
+    ActivityRef activity;
+    QString parseError;
+    if (!ActivityRef::parse(ref, &activity, &parseError))
         return QStringLiteral("invalid_motivation_ref");
-    const auto activityId = ref.mid(QStringLiteral("thought/").size()).section(':', 0, 0).toLongLong();
-    QSqlQuery row(m_memory->m_db);
-    row.prepare("SELECT channel,session_id,sensitive,"
-                "coalesce(json_extract(thought_result,'$.status'),''),"
-                "coalesce(json_extract(thought_result,'$.artifact_ref'),'') "
-                "FROM chat_history WHERE id=? AND thought IS NOT NULL AND thought<>''");
-    row.addBindValue(activityId);
-    if (!row.exec() || !row.next()) return QStringLiteral("motivation_artifact_not_found");
-    if (row.value(2).toBool() || !visibleSession(row.value(0).toString(), row.value(1).toString(),
-                                                 channel, session))
+    const QJsonObject view = m_memory->activityByRef(activity.ref());
+    if (view.isEmpty()) return QStringLiteral("motivation_artifact_not_found");
+    if (!visibleSession(view.value(QStringLiteral("channel")).toString(),
+                        view.value(QStringLiteral("session")).toString(), channel, session))
         return QStringLiteral("motivation_ref_invisible");
-    if (row.value(3).toString() != QStringLiteral("completed")
-        || row.value(4).toString().trimmed().isEmpty())
+    if (view.value(QStringLiteral("status")).toString() != QStringLiteral("completed"))
+        return QStringLiteral("motivation_artifact_not_completed");
+    const QString artifactRef = view.value(QStringLiteral("artifact_ref")).toString().trimmed();
+    const QString draft = view.value(QStringLiteral("draft")).toString().trimmed();
+    if (artifactRef != activity.ref() || draft.isEmpty())
         return QStringLiteral("motivation_artifact_not_completed");
     return {};
 }
@@ -772,5 +1350,249 @@ QJsonObject ActionPolicy::evaluateSpontaneousContact(const QString &channel, con
     result[QStringLiteral("semantic_status")] = QStringLiteral("repair_needed");
     result[QStringLiteral("repair_reason")] = validation.reason;
     result[QStringLiteral("repairable_claims")] = contact.value(QStringLiteral("claims")).toArray();
+    return result;
+}
+
+CoverageCheck ActionPolicy::deterministicCoverageCheck(const QString &message,
+                                                       const QString &reason,
+                                                       const QJsonArray &claims) const
+{
+    CoverageCheck check;
+    const QString text = message + QLatin1Char('\n') + reason;
+    if (text.trimmed().isEmpty()) return check;
+    QStringList declaredRefs;
+    bool hasFactualClaim = false;
+    for (const auto &value : claims) {
+        const QJsonObject claim = value.toObject();
+        for (const auto &ref : claim.value(QStringLiteral("refs")).toArray()) {
+            const QString declared = ref.toString().trimmed();
+            if (!declared.isEmpty()) declaredRefs.append(declared);
+        }
+        EvidencePurpose purpose = EvidencePurpose::HistoricalFact;
+        if (purposeForClaimType(claim.value(QStringLiteral("type")).toString(), &purpose)
+            && purpose != EvidencePurpose::InternalState)
+            hasFactualClaim = true;
+    }
+    // 1) 自然语言里出现的显式引用必须被 declared claims 覆盖
+    //    （内部记录引用 reflection/concern/wake/matter/revision 不算外部事实）。
+    static const QRegularExpression refToken(QStringLiteral(
+        "(chat|source|raw_event|delivery|thought|activity|reflection|concern|reminder|matter|revision)/[0-9A-Za-z_:.\\-]+"));
+    auto matches = refToken.globalMatch(text);
+    while (matches.hasNext()) {
+        const auto match = matches.next();
+        const QString token = match.captured(0);
+        if (token.startsWith(QStringLiteral("reflection/"))
+            || token.startsWith(QStringLiteral("concern/"))
+            || token.startsWith(QStringLiteral("wake/"))
+            || token.startsWith(QStringLiteral("matter/"))
+            || token.startsWith(QStringLiteral("revision/")))
+            continue;
+        if (declaredRefs.contains(token)) continue;
+        check.complete = false;
+        if (check.reason.isEmpty()) check.reason = QStringLiteral("undeclared_reference");
+        if (!check.undeclared.contains(token)) check.undeclared.append(token);
+        if (check.undeclared.size() >= 4) break;
+    }
+    // 2) 外部事实/承诺断言：没有任何事实 claim 覆盖时不能直接放行（claims=[] 同样适用）。
+    if (!hasFactualClaim) {
+        const auto assertions = externalFactAssertions(text);
+        if (!assertions.isEmpty()) {
+            check.complete = false;
+            if (check.reason.isEmpty()) check.reason = QStringLiteral("undeclared_external_fact");
+            for (const auto &fragment : assertions) {
+                if (!check.undeclared.contains(fragment)) check.undeclared.append(fragment);
+                if (check.undeclared.size() >= 4) break;
+            }
+        }
+    }
+    return check;
+}
+
+CoverageCheck ActionPolicy::verifyContactCoverage(const QString &message, const QString &reason,
+                                                  const QJsonArray &claims,
+                                                  const ActionOrigin &origin) const
+{
+    CoverageCheck check = deterministicCoverageCheck(message, reason, claims);
+    if (!check.complete) return check;
+    // 默认没有真实模型：确定性检测已完成；有注入的 coverage verifier 时只调用一次。
+    if (!m_coverageVerifier) return check;
+    CoverageCheck semantic;
+    try {
+        semantic = m_coverageVerifier(message, reason, claims, origin);
+    } catch (...) {
+        CoverageCheck failed;
+        failed.complete = false;
+        failed.reason = QStringLiteral("coverage_verifier_exception");
+        return failed;
+    }
+    if (!semantic.complete) {
+        if (semantic.reason.isEmpty()) semantic.reason = QStringLiteral("claim_coverage_incomplete");
+        return semantic;
+    }
+    semantic.semantic = true; // 单次动作内至多一次语义 coverage 核验
+    return semantic;
+}
+
+QJsonObject ActionPolicy::validateActionProposal(const QJsonObject &proposal,
+                                                 QString *error) const
+{
+    if (error) error->clear();
+    QJsonArray claimResults;
+    const auto fail = [error, &claimResults](const QString &reason) {
+        if (error) *error = reason;
+        return QJsonObject{{QStringLiteral("allowed"), false},
+                           {QStringLiteral("decision"), QStringLiteral("withheld")},
+                           {QStringLiteral("reason"), reason},
+                           {QStringLiteral("semantic_status"), QStringLiteral("withheld")},
+                           {QStringLiteral("claims"), claimResults}};
+    };
+    if (!m_memory) return fail(QStringLiteral("source_unavailable"));
+    if (!proposal.value(QStringLiteral("origin")).isObject())
+        return fail(QStringLiteral("invalid_origin"));
+    // 1) 来源身份：严格解析（服务端字段不允许伪造）。
+    ActionOrigin origin;
+    QString originError;
+    if (!ActionOrigin::fromJson(proposal.value(QStringLiteral("origin")).toObject(),
+                                &origin, &originError)) {
+        QJsonObject result = fail(QStringLiteral("invalid_origin"));
+        result.insert(QStringLiteral("detail"), originError);
+        return result;
+    }
+    if (!origin.hasTarget()) return fail(QStringLiteral("invalid_target"));
+    // 2) kind / action_key：action_key 必须由 origin+kind 派生。
+    const QString kind = proposal.value(QStringLiteral("kind")).toString().trimmed();
+    if (kind != kProposalKindContact && kind != kProposalKindActivityShare)
+        return fail(QStringLiteral("invalid_kind"));
+    const QString expectedKey = origin.actionKey(kind);
+    if (expectedKey.isEmpty()) return fail(QStringLiteral("origin_kind_not_allowed"));
+    const QString providedKey = proposal.value(QStringLiteral("action_key")).toString().trimmed();
+    if (!providedKey.isEmpty() && providedKey != expectedKey)
+        return fail(QStringLiteral("action_key_mismatch"));
+    // 3) target 从 origin 生成；调用方给出时必须完全一致，且必须落在主人私聊域。
+    const QJsonObject providedTarget = proposal.value(QStringLiteral("target")).toObject();
+    if (!providedTarget.isEmpty()) {
+        const QString channel = providedTarget.value(QStringLiteral("channel")).toString().trimmed();
+        QString session = providedTarget.value(QStringLiteral("session_id")).toString().trimmed();
+        if (session.isEmpty())
+            session = providedTarget.value(QStringLiteral("session")).toString().trimmed();
+        if ((!channel.isEmpty() && channel != origin.targetChannel)
+            || (!session.isEmpty() && session != origin.targetSession))
+            return fail(QStringLiteral("target_mismatch"));
+    }
+    if (!channelVisibleFromOwnerPrivate(origin.targetChannel, origin.targetSession))
+        return fail(QStringLiteral("target_not_visible"));
+    // 4) 来源真实身份（wake/reflection/concern/成果）+ allow_contact。
+    const QString sourceError = originSourceError(origin, kind);
+    if (!sourceError.isEmpty()) return fail(sourceError);
+    // 5) payload / claims。
+    if (!proposal.value(QStringLiteral("payload")).isObject())
+        return fail(QStringLiteral("invalid_payload"));
+    const QJsonObject payload = proposal.value(QStringLiteral("payload")).toObject();
+    const QJsonValue claimsValue = proposal.value(QStringLiteral("claims"));
+    if (!claimsValue.isUndefined() && !claimsValue.isArray())
+        return fail(QStringLiteral("invalid_claims"));
+    const QJsonArray claims = claimsValue.toArray();
+    if (proposal.contains(QStringLiteral("expires_at"))
+        && proposal.value(QStringLiteral("expires_at")).toInteger(0) < 0)
+        return fail(QStringLiteral("invalid_expires_at"));
+    bool needsVerifier = false;
+    bool anyUnknown = false;
+    for (const auto &value : claims) {
+        if (!value.isObject()) return fail(QStringLiteral("invalid_claims"));
+        const QJsonObject claim = value.toObject();
+        const QString type = claim.value(QStringLiteral("type")).toString().trimmed();
+        EvidencePurpose purpose = EvidencePurpose::HistoricalFact;
+        if (!purposeForClaimType(type, &purpose))
+            return fail(QStringLiteral("invalid_claim_type"));
+        const QString declaredPurpose = claim.value(QStringLiteral("purpose")).toString().trimmed();
+        if (!declaredPurpose.isEmpty() && declaredPurpose != evidencePurposeName(purpose))
+            return fail(QStringLiteral("purpose_mismatch"));
+        const ClaimValidation validation = validateClaimForPurpose(
+            origin.targetChannel, origin.targetSession, origin, purpose, claim);
+        QJsonArray supporting;
+        for (const auto &ref : validation.supportingRefs) supporting.append(ref);
+        claimResults.append(QJsonObject{
+            {QStringLiteral("id"), claim.value(QStringLiteral("id")).toString()},
+            {QStringLiteral("type"), type},
+            {QStringLiteral("purpose"), evidencePurposeName(purpose)},
+            {QStringLiteral("core"), claim.value(QStringLiteral("core")).toBool()},
+            {QStringLiteral("result"),
+             validation.unknown ? QStringLiteral("unknown")
+                 : validation.result == ClaimValidation::Entailed ? QStringLiteral("entailed")
+                                                                  : QStringLiteral("insufficient")},
+            {QStringLiteral("reason"), validation.reason},
+            {QStringLiteral("supporting_refs"), supporting}});
+        if (validation.unknown) {
+            anyUnknown = true;
+            continue;
+        }
+        if (validation.result != ClaimValidation::Entailed)
+            return fail(validation.reason);
+        // 内部状态只能证明她内部有过记录，不能成为对外动作核心/事实来源。
+        if (purpose == EvidencePurpose::InternalState
+            && claim.value(QStringLiteral("core")).toBool())
+            return fail(QStringLiteral("internal_state_core"));
+        if (purpose != EvidencePurpose::InternalState
+            && purpose != EvidencePurpose::ArtifactResult)
+            needsVerifier = true;
+    }
+    // 6) kind 专属 payload 检查（只核验，不发送）。
+    QString coverageMessage = payload.value(QStringLiteral("message")).toString();
+    const QString coverageReason = payload.value(QStringLiteral("reason")).toString();
+    if (kind == kProposalKindContact) {
+        if (coverageMessage.trimmed().isEmpty()) return fail(QStringLiteral("missing_message"));
+        if (coverageMessage.size() > 1000) return fail(QStringLiteral("message_too_long"));
+    } else {
+        const QString draft = payload.value(QStringLiteral("draft")).toString().trimmed();
+        if (draft.isEmpty()) return fail(QStringLiteral("missing_artifact_draft"));
+        // 分享正文必须绑定真实成果（版本/哈希由服务端落库，模型不能自造成果）。
+        const QJsonObject view = m_memory->activityByRef(origin.ref);
+        if (view.isEmpty()) return fail(QStringLiteral("artifact_not_found"));
+        const QString storedHash = view.value(QStringLiteral("artifact_hash")).toString().trimmed();
+        const QString storedDraft = view.value(QStringLiteral("draft")).toString().trimmed();
+        if (!storedHash.isEmpty()) {
+            if (artifactDraftHash(draft) != storedHash)
+                return fail(QStringLiteral("artifact_hash_mismatch"));
+        } else if (!storedDraft.isEmpty() && storedDraft != draft) {
+            return fail(QStringLiteral("artifact_draft_mismatch"));
+        }
+    }
+    // 7) coverage：claims=[] 也必须执行（确定性检测 + 至多一次语义 coverage verifier）。
+    const CoverageCheck coverage = verifyContactCoverage(coverageMessage, coverageReason,
+                                                         claims, origin);
+    QJsonArray undeclared;
+    for (const auto &item : coverage.undeclared) undeclared.append(item);
+    const QJsonObject coverageJson{
+        {QStringLiteral("complete"), coverage.complete},
+        {QStringLiteral("semantic"), coverage.semantic},
+        {QStringLiteral("reason"), coverage.reason},
+        {QStringLiteral("undeclared"), undeclared}};
+    if (!coverage.complete) {
+        QJsonObject result = fail(coverage.reason.isEmpty()
+                                      ? QStringLiteral("claim_coverage_incomplete")
+                                      : coverage.reason);
+        result.insert(QStringLiteral("coverage"), coverageJson);
+        result.insert(QStringLiteral("needs_verifier"), needsVerifier);
+        return result;
+    }
+    // 8) 允许：确定性/成果/coverage 已通过；真实语义蕴含留给上层（本片不接模型）。
+    QString semanticStatus = QStringLiteral("not_required");
+    if (needsVerifier) semanticStatus = QStringLiteral("unverified");
+    else if (anyUnknown) semanticStatus = QStringLiteral("unknown");
+    QJsonObject result{{QStringLiteral("allowed"), true},
+                       {QStringLiteral("decision"), QStringLiteral("allowed")},
+                       {QStringLiteral("reason"), QStringLiteral("ok")},
+                       {QStringLiteral("action_key"), expectedKey},
+                       {QStringLiteral("kind"), kind},
+                       {QStringLiteral("origin"), origin.toJson()},
+                       {QStringLiteral("target"),
+                        QJsonObject{{QStringLiteral("channel"), origin.targetChannel},
+                                    {QStringLiteral("session_id"), origin.targetSession}}},
+                       {QStringLiteral("action_origin_target_channel"), origin.targetChannel},
+                       {QStringLiteral("action_origin_target_session"), origin.targetSession},
+                       {QStringLiteral("claims"), claimResults},
+                       {QStringLiteral("coverage"), coverageJson},
+                       {QStringLiteral("needs_verifier"), needsVerifier},
+                       {QStringLiteral("semantic_status"), semanticStatus}};
     return result;
 }

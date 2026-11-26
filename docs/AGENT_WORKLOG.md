@@ -488,3 +488,13 @@ B5 节奏按报告修正：固定提交基线 → 2–4h 受控冒烟（self_des
 - 验证：全量 `ctest 23/23`；`tst_memorymanager 139/1 skipped`、`tst_memoryagent 91`、`tst_cognitivesnapshot 15`、`tst_actionoutbox 15`、`tst_actionpolicy 9`。无 schema 变更。
 - 真实运行：v31 OpenWake rest/reflect 已实证；内部活动运行时被 ActivityReview 实际领取，但模型返回契约外 status，被正确拒绝并持久退避，无 chat/outbox；临时数据已清理。成功路径由单测覆盖。
 - 未做：R12-2 contact/outbox、R12-3 快照连续性、后台 tool loop。
+
+---
+
+## 2026-11-26 · R12-1b 补充 + R12-2a（暂停点）
+
+- **R12-1b 补充**：完成需真实成果（draft/artifact version/hash；reflection-only 拒绝；纯思考需 completion_condition；外部活动拒绝）；模型投影与原始读取分离（嵌套字段/盲区/群聊/长记忆）；完成目录有界可读；share_intent 与完成同事务、绑定成果版本/哈希；回顾/前台输出协议分离、ActivityReview schema/诊断码、Concern self_desire 矛盾修正。
+- 真实模型验证：受控 internal activity 合法 completed（draft、artifact_version/hash、share_intent saved），无 chat/outbox/ledger 增量；临时数据清理。
+- **R12-2a**：v32 `action_proposal`；ActionOrigin；EvidencePurpose 七类（HistoricalFact 不因早于 wake stale；NewEvidence 唯一 stale_ref；UserCommitment/ExecutionResult/ArtifactResult/InternalState 严格）；统一 validateActionProposal + coverage（claims=[] 也跑）；allow_contact=false 拒绝 OpenWake contact。未接 Outbox/发送；生产库仍 v31。
+- 验证：`ctest 23/23`；`tst_memorymanager 146/1 skipped`、`tst_memoryagent 93`、`tst_actionpolicy 17`、`tst_cognitivesnapshot 15`、`tst_actionoutbox 15`。
+- **暂停点**：用户要求 R12-2a 后暂停，R12-2b（Outbox/回执/真实投递）未开始。

@@ -1055,6 +1055,14 @@ OpenWakeConfig ConfigManager::getOpenWakeConfig() const
     return m_openWake;
 }
 
+bool ConfigManager::openWakeAllowContact() const
+{
+    // R12-2a：只读确认 allow_contact；与 enabled 解耦（enabled 控制是否创建唤醒，
+    // allow_contact 控制 OpenWake 能否产生 contact 提案）。缺省 false 是安全默认。
+    ensureIdentityLoaded();
+    return m_openWake.allowContact;
+}
+
 int ConfigManager::getSnapshotBudgetBytes() const
 {
     ensureIdentityLoaded();

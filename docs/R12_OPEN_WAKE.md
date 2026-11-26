@@ -10,7 +10,8 @@
 | R12-0 诊断/契约/退避/日志/快照统计 | **已完成（源码+测试已提交）** | 无 schema、无发送行为变化 |
 | R12-1a OpenWake 持久化 + 共享调度 + 最小快照 | **已完成（源码+测试已提交）** | v31；OpenWake 仅 rest/reflect，allow_contact=false；无活动创建/投递 |
 | R12-1b 统一活动管理（internal_activity 完整生命周期） | **已完成（源码+测试已提交）** | 前台/OpenWake 新活动写 internal_activity；legacy thought 只读适配；legacy 分享保留，internal 分享仅落意愿 |
-| R12-2 自主行动契约 + 真实投递 | 待实施 | commitOpenWakeContactAction；Evidence Purpose；commit/dispatch 复验 |
+| R12-2a 通用 ActionOrigin/Proposal、Evidence Purpose、统一核验 | **已完成（源码+测试已提交）** | v32 `action_proposal`；不发送、不接 Outbox；生产库仍 v31，待 R12-2b 受控迁移 |
+| R12-2b OpenWake 联系/内部活动分享提交、Outbox、回执 | **暂停待下一次评审** | 用户指定 R12-2a 后暂停 |
 | R12-3 认知快照连续性优化 | 待实施 | 跨入口一致性、去重、来源追踪、进一步预算优化 |
 
 ## R12-1a 补充修正（已独立提交）
@@ -31,7 +32,15 @@
 - **感知**：前台/回顾/快照统一读取活动 ref/status/version/goal/progress/draft/artifact/next_step；completed 不再以过时 next_step 出现在 current；群聊/第三方隔离。
 - **边界**：本片不实现 R12-2 contact/outbox；模型写出作品≠已分享，分别记录。
 
-## 测试与运行验证（R12-1a 补充 + R12-1b）
+## R12-2a 已落地（暂停点）
+
+- v32 迁移新增 `action_proposal`（action_key 唯一、origin/run_id/scope/context_epoch/target、payload/claims、state 机、expires、committed_action_key）；单事务幂等；**未接 Outbox/发送**。
+- `ActionOrigin`：kind/ref/id/version/runId/scope/contextEpoch/target；`wake|reflection|concern:<id>:<version>:contact`、`thought|activity:<id>:<version>:share`；拒绝伪造/负数/串线。
+- `EvidencePurpose`：HistoricalFact（不因早于 wake stale）/CurrentState/NewEvidence（唯一 stale_ref）/UserCommitment/ExecutionResult/ArtifactResult/InternalState（不得当用户事实）；activity_share 支持新旧 ActivityRef 且要求真实完成成果。
+- 统一 `validateActionProposal`：origin 身份/版本/action_key/target、claims purposes、artifact 真实、coverage（claims=[] 也执行）、semantic_status 服务端；`allow_contact=false` 拒绝 OpenWake contact。
+- 提案持久化 API：persist/actionProposal/update CAS/expire/mark committed；幂等与冲突明确。
+- 验证：全量 `ctest 23/23`；`tst_memorymanager 146/1 skipped`、`tst_memoryagent 93`、`tst_actionpolicy 17`、`tst_cognitivesnapshot 15`、`tst_actionoutbox 15`。生产库仍 v31（未静默迁移）；迁移测试在临时库通过。
+- **未做**：R12-2b 提交路径/Outbox/回执/真实 verifier 请求、R12-3、后台 tool loop。
 
 - 全量 `ctest 23/23`；`tst_memorymanager` 139 passed/1 skipped、`tst_memoryagent` 91、`tst_cognitivesnapshot` 15、`tst_actionoutbox` 15、`tst_actionpolicy` 9。
 - 生产库 v31 无 schema 变更；R12-1b 无新迁移。

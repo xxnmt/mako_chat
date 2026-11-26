@@ -168,6 +168,10 @@ public:
     SemanticVerifierConfig getSemanticVerifierConfig();
     // R12-1a：OpenWake 调度配置（identity.json 的 cognition.open_wake 段），已夹紧。
     OpenWakeConfig getOpenWakeConfig() const;
+    // R12-2a：OpenWake 主动联系授权（cognition.open_wake.allow_contact，默认 false）。
+    // 与 enabled 独立：允许联系不代表允许创建唤醒；未显式开启时永远返回 false。
+    // 这是纯读取确认接口，不改变任何 UI/写配置行为。
+    bool openWakeAllowContact() const;
     // R12-1a：认知快照提示词字节预算（cognition.snapshot_budget_bytes，默认 4096，夹 2048..8192）。
     // 本片只解析/保存，快照 builder 的接线由下一 agent 完成。
     int getSnapshotBudgetBytes() const;

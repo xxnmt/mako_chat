@@ -7,6 +7,7 @@ set(PHASE0_CORE_SOURCES
     ${PROJECT_SOURCE_DIR}/src/memory/memorymanager.h
     ${PROJECT_SOURCE_DIR}/src/memory/memorymanager.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/matterstore.cpp ${PROJECT_SOURCE_DIR}/src/memory/privatereflection.cpp
+    ${PROJECT_SOURCE_DIR}/src/cognition/actionorigin.h
     ${PROJECT_SOURCE_DIR}/src/cognition/actionpolicy.h
     ${PROJECT_SOURCE_DIR}/src/cognition/actionpolicy.cpp
     ${PROJECT_SOURCE_DIR}/src/config/configmanager.h
@@ -68,6 +69,7 @@ add_phase0_test(tst_memorymanager
     ${PROJECT_SOURCE_DIR}/src/memory/memoryindexworker.h
     ${PROJECT_SOURCE_DIR}/src/memory/memoryindexworker.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/matterstore.cpp ${PROJECT_SOURCE_DIR}/src/memory/privatereflection.cpp
+    ${PROJECT_SOURCE_DIR}/src/cognition/actionorigin.h
     ${PROJECT_SOURCE_DIR}/src/cognition/actionpolicy.h
     ${PROJECT_SOURCE_DIR}/src/cognition/actionpolicy.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/recentcontext.h
