@@ -45,6 +45,7 @@ qt_add_executable(Windows_AI
     src/memory/memoryexecutor.h src/memory/memoryexecutor.cpp
     src/cognition/imageperception.cpp
     src/cognition/cognitivesnapshot.h src/cognition/cognitivesnapshot.cpp
+    src/cognition/cognitivecontext.h src/cognition/cognitivecontext.cpp
     src/cognition/actionpolicy.h src/cognition/actionpolicy.cpp
     src/cognition/actioncommitter.h src/cognition/actioncommitter.cpp
     src/cognition/llmservice.h src/cognition/llmservice.cpp

@@ -23,6 +23,7 @@
 #include <QPair>
 #include "memorymanager.h"
 #include "cognitivesnapshot.h"
+#include "cognitivecontext.h"
 #include "promptassembler.h"
 #include "memoryoutputguard.h"
 #include "recentcontext.h"
@@ -213,7 +214,9 @@ QString reviewOutputProtocol(const QString &kind)
 // 保证“同一来源同一 authority/type 语义”。没有记忆库时返回空对象（不注入）。
 // R12-1a：system content = 固定前缀 + 固定规则行 + 纯数据 JSON（说明文字不计入数据预算）。
 QJsonObject cognitiveSnapshotMessage(MemoryManager *memory, const RequestMeta &meta,
-                                     const QString &triggerRef, const QString &purpose)
+                                     const QString &triggerRef, const QString &purpose,
+                                     CognitiveSnapshot *outSnapshot = nullptr,
+                                     SnapshotBuildStats *outStats = nullptr)
 {
     if (!memory) return {};
     // R12-1a：盲区不注入任何认知快照。前台入口已在调用前过滤；回顾/其它调用路径
@@ -222,6 +225,8 @@ QJsonObject cognitiveSnapshotMessage(MemoryManager *memory, const RequestMeta &m
     CognitiveSnapshotBuilder builder(memory);
     const auto snapshot=builder.build(meta,meta.runId,triggerRef,purpose);
     const auto prompt=builder.toPromptJson(snapshot);
+    if (outSnapshot) *outSnapshot = snapshot;
+    if (outStats) *outStats = builder.stats();
     // R12-0/R12-1a：每域统计只打 DEBUG（可解释“查询为空/权限过滤/查询上限/预算裁剪”），
     // 另加一条 INFO 摘要，避免每域一行 INFO 刷屏。
     const auto &stats = builder.stats();
@@ -688,6 +693,17 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
     m_run.meta = meta;
     m_run.input = userInput;
 
+    // R12-3a shadow：以下材料都是本路径已经读取的内容；shadow 关闭时这些变量不会被使用，
+    // 也不会产生额外查库/模型请求（关闭时连快照 out 参数都不取）。
+    const bool shadowEnabled = cognitiveShadowEnabled();
+    QJsonArray shadowUnderstanding;
+    QJsonArray shadowConcerns;
+    QJsonArray shadowActivities;
+    QJsonArray shadowReminders;
+    CognitiveSnapshot shadowSnapshot;
+    SnapshotBuildStats shadowSnapshotStats;
+    bool shadowSnapshotBuilt = false;
+
     m_systemPromptCache=loadSystemPrompt();
 
     const MemoryPolicyConfig memoryPolicy =
@@ -1011,6 +1027,7 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
         if (meta.subject=="user" && meta.persistTurn && options.enabled && meta.channel!=Channel::kQQGroup
             && options.targets.contains(qMakePair(meta.channel,meta.sessionId))) {
             const auto existing=m_memoryManager->pendingReminders(meta);
+            if (shadowEnabled) shadowReminders = existing;
             messagesArray.append(QJsonObject{{"role","system"},{"content",QStringLiteral(
                 "你能在当前私下会话安排未来消息。用户明确委托且你接受时，最终 JSON 必须附 reminder_plan 对象，"
                 "add 数组逐次给出 at、until（带时区的 ISO 日期时间，分别为发送时间和最晚仍有意义时间）及 message（届时实际发送的原话）。"
@@ -1022,6 +1039,7 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
         }
         const auto understanding = m_memoryManager->currentUnderstanding(
             meta, userInput, &m_run.catalogKeys, {}, true);
+        if (shadowEnabled) shadowUnderstanding = understanding;
         // 关注：先按当前话题解析"她尚未放下的事"（前台与后台回顾共用同一份解析器），
         // 再退回"最近一条想法"兜底，避免只注入离题的最新一条。
         QJsonArray concerns = m_memoryManager->matchedConcerns(meta, m_run.retrievalTerms, userInput, 0, 2);
@@ -1029,6 +1047,7 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
             const auto reflection = m_memoryManager->recentPrivateReflection(meta,rankedTurns);
             if (!reflection.isEmpty()) concerns.append(reflection);
         }
+        if (shadowEnabled) shadowConcerns = concerns;
         if (!concerns.isEmpty()) {
             QJsonArray providedRefs;
             QJsonArray visibleConcerns;
@@ -1062,6 +1081,7 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
             const auto activities = m_memoryManager->currentActivitiesForModel(
                 2, meta.channel, meta.sessionId, QStringLiteral("user"),
                 memoryPolicy.longTermMemoryEnabled && meta.longTermMemoryEnabled);
+            if (shadowEnabled) shadowActivities = activities;
             QJsonObject thought;
             if (!activities.isEmpty()) {
                 thought = activities.first().toObject();
@@ -1199,7 +1219,10 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
     if (cognitiveSnapshotEligible) {
         const QJsonObject snapshotMessage = cognitiveSnapshotMessage(
             m_memoryManager, m_run.meta, m_run.meta.eventId,
-            QStringLiteral("foreground_reply"));
+            QStringLiteral("foreground_reply"),
+            shadowEnabled ? &shadowSnapshot : nullptr,
+            shadowEnabled ? &shadowSnapshotStats : nullptr);
+        shadowSnapshotBuilt = shadowEnabled;
         if (!snapshotMessage.isEmpty()) {
             messagesArray.append(snapshotMessage);
             qDebug().noquote() << "[LLM]认知快照已注入:"
@@ -1365,6 +1388,108 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
     };
 
     const QString requestId = QString("%1/%2").arg(meta.runId).arg(m_agentGeneration);
+
+    // ===== R12-3a shadow：统一认知上下文（只观测，不替换 messages、不增模型请求）=====
+    // 打开条件仅是本进程开关；构建过程只做内存归一化/去重/统计，不查库、不发请求。
+    if (shadowEnabled) {
+        CognitiveContextRequest shadow;
+        shadow.entry = QStringLiteral("foreground_reply");
+        shadow.meta = meta;
+        shadow.runId = meta.runId;
+        shadow.triggerRef = meta.eventId;
+        shadow.purpose = QStringLiteral("foreground_reply");
+        shadow.currentInput = userInput;
+        shadow.eventId = meta.eventId;
+        shadow.inputEvents = meta.inputEvents;
+        shadow.hasSnapshot = shadowSnapshotBuilt;
+        shadow.snapshot = shadowSnapshot;
+        shadow.snapshotStats = shadowSnapshotStats;
+        shadow.canReadUnderstanding = canReadUnderstanding;
+        shadow.understanding = shadowUnderstanding;
+        shadow.understandingMatters = m_run.catalogKeys;
+        shadow.concerns = shadowConcerns;
+        shadow.activities = shadowActivities;
+        shadow.reminders = shadowReminders;
+        shadow.hasMemoryContext = !toolMode && !m_benchmarkChatOnly && m_memoryManager;
+        shadow.memoryContext = context;
+        shadow.access = access;
+        shadow.history = historyQA;
+        shadow.retrievalDone = m_run.retrievalBackend != QStringLiteral("unknown");
+        shadow.retrievalStatus = m_run.retrievalStatus;
+        shadow.retrievalBackend = m_run.retrievalBackend;
+        shadow.retrievalTruncated = m_run.retrievalTruncated;
+        shadow.retrieved = m_lastRetrievalResult.evidence;
+        shadow.recent = recentBundle;
+        shadow.privateEvidence = privateEvidence;
+        shadow.legacyEvidence = m_run.evidence;
+        int promptBytes = 0;
+        int dataBytes = 0;
+        for (const auto &value : messagesArray) {
+            const auto message = value.toObject();
+            const QString content = message.value(QStringLiteral("content")).toString();
+            const int bytes = content.toUtf8().size();
+            promptBytes += bytes;
+            if (message.contains(QStringLiteral("name"))
+                || content.startsWith(QStringLiteral("CURRENT_UNDERSTANDING"))
+                || content.startsWith(QString::fromUtf8("【"))) {
+                dataBytes += bytes;
+            }
+        }
+        shadow.legacyPromptBytes = promptBytes;
+        shadow.legacyDataBytes = dataBytes;
+        CognitiveContextBuilder builder(m_memoryManager);
+        ShadowComparison comparison;
+        const CognitiveContext shadowContext = builder.buildShadow(shadow, &comparison);
+        QJsonArray identities;
+        for (const auto &evidence : shadowContext.evidence) {
+            if (identities.size() >= 64) break;
+            identities.append(QJsonObject{
+                {QStringLiteral("stable_key"), evidence.identity.stableKey()},
+                {QStringLiteral("display_ref"), evidence.identity.displayRef()},
+                {QStringLiteral("kind"), evidenceKindName(evidence.kind)},
+                {QStringLiteral("authority"), evidenceAuthorityName(evidence.authority)},
+                {QStringLiteral("usages"), QJsonArray::fromStringList(evidence.usages)}});
+        }
+        const QJsonObject report{
+            {QStringLiteral("entry"), QStringLiteral("foreground_reply")},
+            {QStringLiteral("run_id"), meta.runId},
+            {QStringLiteral("context_bytes"), shadowContext.budget.contextBytes},
+            {QStringLiteral("context_chars"), shadowContext.budget.contextChars},
+            {QStringLiteral("estimated_tokens"), shadowContext.budget.estimatedTokens},
+            {QStringLiteral("legacy_prompt_bytes"), promptBytes},
+            {QStringLiteral("legacy_data_bytes"), dataBytes},
+            {QStringLiteral("snapshot_budget_bytes"), shadowContext.budget.snapshotBudgetBytes},
+            {QStringLiteral("evidence_count"), shadowContext.budget.evidenceCount},
+            {QStringLiteral("unique_event_count"), shadowContext.budget.uniqueEventCount},
+            {QStringLiteral("total_material_bytes"), shadowContext.budget.totalMaterialBytes},
+            {QStringLiteral("unique_evidence_bytes"), shadowContext.budget.uniqueEvidenceBytes},
+            {QStringLiteral("duplicate_material_bytes"), shadowContext.budget.duplicateMaterialBytes},
+            {QStringLiteral("coverage_overall"), shadowContext.coverage.overall},
+            {QStringLiteral("coverage"), shadowContext.coverage.toJson()},
+            {QStringLiteral("comparison"), comparison.toJson()},
+            {QStringLiteral("identities"), identities},
+            {QStringLiteral("time"), shadowContext.time.toJson()}};
+        m_cognitiveShadowReports.append(report);
+        while (m_cognitiveShadowReports.size() > 8) m_cognitiveShadowReports.removeFirst();
+        qInfo().noquote()
+            << QStringLiteral("[Cognitive][Shadow] entry=foreground_reply evidence=%1 events=%2"
+                              " legacy_refs=%3 matched=%4 missing=%5 dup_modules=%6 conflicts=%7"
+                              " privacy_filtered=%8 privacy_leaks=%9 bytes=%10 est_tokens=%11"
+                              " legacy_prompt_bytes=%12 coverage=%13")
+                   .arg(shadowContext.budget.evidenceCount)
+                   .arg(shadowContext.budget.uniqueEventCount)
+                   .arg(comparison.legacyRefCount)
+                   .arg(comparison.matchedRefs)
+                   .arg(comparison.missingInUnified)
+                   .arg(comparison.duplicateAcrossModules)
+                   .arg(comparison.identityConflicts)
+                   .arg(comparison.privacyFiltered)
+                   .arg(comparison.privacyLeaks)
+                   .arg(shadowContext.budget.contextBytes)
+                   .arg(shadowContext.budget.estimatedTokens)
+                   .arg(promptBytes)
+                   .arg(shadowContext.coverage.overall);
+    }
 
     if (toolMode && m_memoryManager) {
         m_lastRequestMessages = messagesArray;
@@ -1594,6 +1719,9 @@ void LLMService::requestPrivateReview(qlonglong id, int version, const QJsonObje
 
 void LLMService::generatePrivateReview(qlonglong id, int version, const QJsonObject &thread)
 {
+    const bool shadowEnabled = cognitiveShadowEnabled();
+    CognitiveSnapshot shadowSnapshot;
+    SnapshotBuildStats shadowSnapshotStats;
     QNetworkRequest req(m_endpoint);
     req.setTransferTimeout(30000);
     req.setHeader(QNetworkRequest::ContentTypeHeader,"application/json");
@@ -1900,13 +2028,153 @@ void LLMService::generatePrivateReview(qlonglong id, int version, const QJsonObj
                     {"content",reviewPersonaFromFull(loadSystemPrompt())}}};
     const QJsonObject snapshotMessage =
         cognitiveSnapshotMessage(m_memoryManager, reviewMeta, reviewTrigger,
-                                 QStringLiteral("private_review"));
+                                 QStringLiteral("private_review"),
+                                 shadowEnabled ? &shadowSnapshot : nullptr,
+                                 shadowEnabled ? &shadowSnapshotStats : nullptr);
     if (!snapshotMessage.isEmpty()) messages.append(snapshotMessage);
     messages.append(QJsonObject{{"role","system"},
                                 {"content",reviewOutputProtocol(kind)}});
     messages.append(QJsonObject{{"role","system"},{"content",instruction}});
     messages.append(QJsonObject{{"role","user"},
         {"content",QString::fromUtf8(QJsonDocument(modelThread).toJson(QJsonDocument::Compact))}});
+
+    // ===== R12-3a shadow：回顾入口共享同一套证据身份（只观测，不替换 messages）=====
+    if (shadowEnabled) {
+        CognitiveContextRequest shadow;
+        shadow.entry = QStringLiteral("private_review");
+        shadow.meta = reviewMeta;
+        shadow.runId = thread.value(QStringLiteral("origin")).toObject()
+                           .value(QStringLiteral("runId")).toString();
+        if (shadow.runId.isEmpty()) shadow.runId = reviewTrigger;
+        shadow.triggerRef = reviewTrigger;
+        shadow.purpose = QStringLiteral("private_review");
+        shadow.currentInput = thread.value(QStringLiteral("owner_statement")).toString();
+        if (shadow.currentInput.isEmpty())
+            shadow.currentInput = thread.value(QStringLiteral("concern")).toObject()
+                                      .value(QStringLiteral("own_reflection")).toString();
+        shadow.eventId = thread.value(QStringLiteral("event")).toString();
+        shadow.hasSnapshot = true;
+        shadow.snapshot = shadowSnapshot;
+        shadow.snapshotStats = shadowSnapshotStats;
+        shadow.reviewThread = thread;
+        shadow.reviewSourceTurn = id;
+        shadow.consultedRows = thread.value(QStringLiteral("consulted")).toArray();
+        shadow.retrievalDone = thread.contains(QStringLiteral("history_retrieval_status"));
+        shadow.retrievalStatus = thread.value(QStringLiteral("history_retrieval_status")).toString();
+        shadow.missingSources = QStringList{QStringLiteral("memory_data"),
+                                            QStringLiteral("history"),
+                                            QStringLiteral("recent_group_context"),
+                                            QStringLiteral("memory_tool"),
+                                            QStringLiteral("execution_receipt"),
+                                            QStringLiteral("capabilities")};
+        // 对照：回顾当前没有单独的 evidence 目录，按 thread 里实际注入的 refs 构造等价目录。
+        QJsonObject legacy;
+        const auto addLegacy = [&legacy](const QString &ref, const QString &scope,
+                                         const QJsonObject &extra = {}) {
+            if (ref.isEmpty()) return;
+            QJsonObject meta = extra;
+            meta.insert(QStringLiteral("scope"), scope);
+            legacy.insert(ref, meta);
+        };
+        if (id > 0) {
+            addLegacy(QStringLiteral("reflection/%1").arg(id), QStringLiteral("review_source"));
+            addLegacy(QStringLiteral("chat/%1").arg(id), QStringLiteral("review_source"));
+        }
+        for (const auto &value : thread.value(QStringLiteral("history")).toArray()) {
+            const auto turn = value.toObject().value(QStringLiteral("turn")).toInteger();
+            if (turn > 0)
+                addLegacy(QStringLiteral("chat/%1").arg(turn), QStringLiteral("review_history"));
+        }
+        const auto prior = thread.value(QStringLiteral("prior")).toObject();
+        if (!prior.isEmpty()) {
+            addLegacy(prior.value(QStringLiteral("ref")).toString(),
+                      QStringLiteral("review_prior"),
+                      QJsonObject{{QStringLiteral("version"), prior.value(QStringLiteral("version"))}});
+            addLegacy(prior.value(QStringLiteral("root_ref")).toString(),
+                      QStringLiteral("review_prior_concern"),
+                      QJsonObject{{QStringLiteral("version"), prior.value(QStringLiteral("version"))}});
+        }
+        const auto concern = thread.value(QStringLiteral("concern")).toObject();
+        addLegacy(concern.value(QStringLiteral("ref")).toString(), QStringLiteral("review_concern"));
+        for (const auto &value : thread.value(QStringLiteral("consulted")).toArray()) {
+            const auto row = value.toObject();
+            if (row.value(QStringLiteral("turn")).toInteger() > 0) {
+                addLegacy(QStringLiteral("chat/%1").arg(row.value(QStringLiteral("turn")).toInteger()),
+                          QStringLiteral("review_consulted"));
+            }
+        }
+        for (const auto &value : thread.value(QStringLiteral("basis")).toObject()
+                                      .value(QStringLiteral("reminders")).toArray()) {
+            const auto row = value.toObject();
+            if (row.value(QStringLiteral("id")).toInteger() > 0) {
+                addLegacy(QStringLiteral("reminder/%1").arg(row.value(QStringLiteral("id")).toInteger()),
+                          QStringLiteral("review_basis_reminder"));
+            }
+        }
+        shadow.legacyEvidence = legacy;
+        int promptBytes = 0;
+        for (const auto &value : messages) {
+            promptBytes += value.toObject().value(QStringLiteral("content")).toString()
+                               .toUtf8().size();
+        }
+        shadow.legacyPromptBytes = promptBytes;
+        shadow.legacyDataBytes = promptBytes;
+        CognitiveContextBuilder builder(m_memoryManager);
+        ShadowComparison comparison;
+        const CognitiveContext shadowContext = builder.buildShadow(shadow, &comparison);
+        QJsonArray identities;
+        for (const auto &evidence : shadowContext.evidence) {
+            if (identities.size() >= 64) break;
+            identities.append(QJsonObject{
+                {QStringLiteral("stable_key"), evidence.identity.stableKey()},
+                {QStringLiteral("display_ref"), evidence.identity.displayRef()},
+                {QStringLiteral("kind"), evidenceKindName(evidence.kind)},
+                {QStringLiteral("authority"), evidenceAuthorityName(evidence.authority)},
+                {QStringLiteral("usages"), QJsonArray::fromStringList(evidence.usages)}});
+        }
+        const QJsonObject report{
+            {QStringLiteral("entry"), QStringLiteral("private_review")},
+            {QStringLiteral("kind"), kind},
+            {QStringLiteral("run_id"), shadow.runId},
+            {QStringLiteral("context_bytes"), shadowContext.budget.contextBytes},
+            {QStringLiteral("context_chars"), shadowContext.budget.contextChars},
+            {QStringLiteral("estimated_tokens"), shadowContext.budget.estimatedTokens},
+            {QStringLiteral("legacy_prompt_bytes"), promptBytes},
+            {QStringLiteral("legacy_data_bytes"), promptBytes},
+            {QStringLiteral("snapshot_budget_bytes"), shadowContext.budget.snapshotBudgetBytes},
+            {QStringLiteral("evidence_count"), shadowContext.budget.evidenceCount},
+            {QStringLiteral("unique_event_count"), shadowContext.budget.uniqueEventCount},
+            {QStringLiteral("total_material_bytes"), shadowContext.budget.totalMaterialBytes},
+            {QStringLiteral("unique_evidence_bytes"), shadowContext.budget.uniqueEvidenceBytes},
+            {QStringLiteral("duplicate_material_bytes"), shadowContext.budget.duplicateMaterialBytes},
+            {QStringLiteral("coverage_overall"), shadowContext.coverage.overall},
+            {QStringLiteral("coverage"), shadowContext.coverage.toJson()},
+            {QStringLiteral("comparison"), comparison.toJson()},
+            {QStringLiteral("identities"), identities},
+            {QStringLiteral("time"), shadowContext.time.toJson()}};
+        m_cognitiveShadowReports.append(report);
+        while (m_cognitiveShadowReports.size() > 8) m_cognitiveShadowReports.removeFirst();
+        qInfo().noquote()
+            << QStringLiteral("[Cognitive][Shadow] entry=private_review kind=%1 evidence=%2"
+                              " events=%3 legacy_refs=%4 matched=%5 missing=%6 dup_modules=%7"
+                              " conflicts=%8 privacy_filtered=%9 privacy_leaks=%10 bytes=%11"
+                              " est_tokens=%12 legacy_prompt_bytes=%13 coverage=%14")
+                   .arg(kind)
+                   .arg(shadowContext.budget.evidenceCount)
+                   .arg(shadowContext.budget.uniqueEventCount)
+                   .arg(comparison.legacyRefCount)
+                   .arg(comparison.matchedRefs)
+                   .arg(comparison.missingInUnified)
+                   .arg(comparison.duplicateAcrossModules)
+                   .arg(comparison.identityConflicts)
+                   .arg(comparison.privacyFiltered)
+                   .arg(comparison.privacyLeaks)
+                   .arg(shadowContext.budget.contextBytes)
+                   .arg(shadowContext.budget.estimatedTokens)
+                   .arg(promptBytes)
+                   .arg(shadowContext.coverage.overall);
+    }
+
     QJsonObject body{{"model","deepseek-v4-flash"},{"messages",messages},
                      {"response_format",QJsonObject{{"type","json_object"}}},{"max_tokens",2048}};
     auto *reply = m_extractManager->post(req,QJsonDocument(body).toJson(QJsonDocument::Compact));
@@ -3409,6 +3677,27 @@ QString LLMService::retrievalDatabasePath() const
     return m_memoryManager
         ? m_memoryManager->databasePath()
         : ConfigManager::instance().getMemoryPath();
+}
+
+void LLMService::setCognitiveShadowEnabled(bool enabled)
+{
+    m_cognitiveShadowEnabled = enabled;
+    m_cognitiveShadowEnvChecked = true;
+}
+
+bool LLMService::cognitiveShadowEnabled() const
+{
+    // 显式 setter 优先；否则进程启动时读取一次环境变量（生产默认关闭）。
+    // 不在每次调用重新读环境变量，避免运行期环境抖动改变生产行为。
+    auto *self = const_cast<LLMService *>(this);
+    if (!self->m_cognitiveShadowEnvChecked) {
+        self->m_cognitiveShadowEnvChecked = true;
+        const QByteArray value = qgetenv("MAKO_COGNITIVE_SHADOW");
+        self->m_cognitiveShadowEnabled =
+            value == QByteArray("1") || value.toLower() == QByteArray("true")
+            || value.toLower() == QByteArray("on");
+    }
+    return m_cognitiveShadowEnabled;
 }
 
 void LLMService::setMemoryManager(MemoryManager *manager)

@@ -12,8 +12,9 @@
 | R12-1b 统一活动管理（internal_activity 完整生命周期） | **已完成（源码+测试已提交）** | 前台/OpenWake 新活动写 internal_activity；legacy thought 只读适配；legacy 分享保留，internal 分享仅落意愿 |
 | R12-2a 通用 ActionOrigin/Proposal、Evidence Purpose、统一核验 | **已完成（源码+测试已提交）** | v32 `action_proposal`；不发送、不接 Outbox；生产库仍 v31，待 R12-2b 受控迁移 |
 | R12-2b OpenWake 联系/内部活动分享提交、Outbox、回执 | **已完成（源码+测试已提交）** | v32；allow_contact 默认 false；只入 Outbox，受控测试用 mock；生产库已 v32、零新发送 |
-| R12-2c 行动一致性与认知连续性修正 | **已完成（源码+测试已提交）** | v33 仅代码/测试；生产库仍 v32，迁移待独立评审 |
-| R12-3a/b 统一认知上下文/状态连续性 | 待实施 | 按要求后置，不提前开始 |
+| R12-2c 行动一致性与认知连续性修正 | **已完成（源码+测试已提交）** | v33 仅代码/测试；生产库仍 v32 迁移待独立评审，2026-11-27 生产库备份副本已升 v33 验证 |
+| R12-3a 统一认知上下文与证据目录（第一切片） | **已完成（shadow；源码+测试已提交）** | 不替换生产 prompt、不新增 schema、不删除旧模块；见 [设计](R12_3A_CONTEXT_DESIGN.md)/[盘点](R12_3A_SOURCE_INVENTORY.md) |
+| R12-3b 逐模块替换/状态连续性 | 未开始 | 按用户要求后置，不提前开始 |
 
 ## R12-1a 补充修正（已独立提交）
 
@@ -123,3 +124,29 @@
 | 数据库 | 真实 v32 备份副本升级到 v33，v33 备份恢复副本可读。两份副本的完整性、外键和关键表行数检查一致。 |
 
 - 分享恢复会领取尚未请求核验的意图。如果进程在核验结果落库之前中断，已登记请求的成果保留在活动记录里，分享记为 `verification_outcome_unknown`。
+
+## R12-3a 统一认知上下文与证据目录（第一切片，2026-11-27）
+
+按用户授权只实现 shadow 切片：源码盘点 + 共享数据层 + 新旧对照，不替换生产 prompt。
+
+- **新增 `src/cognition/cognitivecontext.{h,cpp}`**：证据身份 `sourceKind|ref@version#facet`、
+  语义用途 `EvidenceKind`（权威域继续复用 `EvidenceAuthority`）、四条时间线
+  （reported/event/effective/recorded）、来源覆盖状态（complete/empty/partial/degraded/
+  denied/error/budget_trimmed/not_queried）、owner-private 投影、预算与重复度报告、
+  新旧 `ShadowComparison`。
+- **复用现有结构**：`CognitiveSnapshotBuilder` 输出与每域统计、`MemoryAccessPolicy`（MEMORY_DATA
+  claims 二次授权）、`MemoryEvidence` 的 `chat/<turn>:user|assistant` 等既有 ref、
+  `currentUnderstanding` 的 `source/<id>`、`revision/<matter>/<version>`、`MemoryAgentItem`
+  内部 id → stable_ref。没有新造平行资料表。
+- **shadow 接线**：`LLMService` 前台与私下回顾两个入口在 messages 组装完成后构建统一上下文；
+  开关默认关闭（`MAKO_COGNITIVE_SHADOW=1` 或测试 setter），不额外查库、不发请求、不写库、
+  不改变本轮 messages；日志前缀 `[Cognitive][Shadow]`，报告可由测试读取。
+- **验证**：`tst_cognitivecontext` 16 passed（14 个测试函数）；`tst_memoryagent`
+  新增跨入口用例（前台/回顾共享同一 `chat/<turn>` 身份、模型请求数不增加）。
+  全量 `ctest 24/24`；`tst_memoryagent 115 passed/4 skipped`、`tst_memorymanager 157 passed/1 skipped`。
+  生产库/配置未改动（v33、`contact_daily_limit=0`、`snapshot_budget_bytes=4096`），
+  未启动应用、未发真实消息、未跑真实模型。
+- **未做/边界**：未替换 `CURRENT_UNDERSTANDING`/`MEMORY_DATA`/快照/旧历史；工具轮、matter consult、
+  行动核验、Outbox 回执入口尚未运行时接 shadow；生产规模 shadow 数据待后续受控运行观察；
+  逐模块替换建议见 [设计文档](R12_3A_CONTEXT_DESIGN.md) §8，需另行授权。
+

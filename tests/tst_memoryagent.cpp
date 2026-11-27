@@ -18,6 +18,7 @@
 #include "configmanager.h"
 #include "cognitivecoordinator.h"
 #include "cognitivesnapshot.h"
+#include "cognitivecontext.h"
 #include "memorydashscope.h"
 
 #include "memoryagent.h"
@@ -855,6 +856,99 @@ private slots:
                 QVERIFY(!value.toObject().value(QStringLiteral("content")).toString()
                              .contains(prefix));
         }
+    }
+
+    // R12-3a：统一认知上下文 shadow —— 前台与私下回顾两个入口共享同一证据身份；
+    // shadow 只观测：模型请求数不因 shadow 增加（mock 服务器按请求计数）。
+    void cognitiveShadowSharesIdentityAcrossEntries()
+    {
+        SemanticReviewConfigGuard guard;
+        QVERIFY(guard.enable());
+        auto &cfg = ConfigManager::instance();
+        QVERIFY(cfg.writeConfigDocument(QStringLiteral("setting.json"),
+            QJsonDocument(QJsonObject{{QStringLiteral("memory"),
+                QJsonObject{{QStringLiteral("long_term_memory_enabled"), true},
+                            {QStringLiteral("agent_enabled"), false}}}}).toJson(),
+            nullptr));
+
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager db(dir.filePath(QStringLiteral("shadow-shared.db")));
+        RequestMeta meta;
+        meta.channel = Channel::kPet;
+        meta.sessionId = Channel::kDefaultSession;
+        meta.subject = QStringLiteral("user");
+        meta.speaker = QStringLiteral("欧尼酱");
+        meta.runId = QStringLiteral("shadow-foreground");
+        meta.eventId = QStringLiteral("shadow-source");
+        meta.receivedAtUtc = QDateTime::currentDateTimeUtc();
+        meta.occurredAtUtc = meta.receivedAtUtc;
+        const auto turn = db.recordInput(QStringLiteral("周末一起去看展"), meta, true);
+        QVERIFY(turn > 0);
+        SentenceText sentence;
+        sentence.zhText = QStringLiteral("好呀");
+        sentence.jaText = QStringLiteral("いいよ");
+        QVERIFY(db.saveQATurn(QStringLiteral("周末一起去看展"),
+                              QStringLiteral(R"({"sentences":[{"zh_text":"好呀","ja_text":"いいよ"}]})"),
+                              {sentence}, meta, turn));
+
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QByteArray> bodies;
+        serveCompletions(server, bodies, [](int) -> QString {
+            return QStringLiteral(
+                R"({"sentences":[{"zh_text":"好呀","ja_text":"いいよ","tags":{"emotion":"happy"}}]})");
+        });
+        LLMService service(QStringLiteral("test"), nullptr,
+                           QUrl(QStringLiteral("http://127.0.0.1:%1/")
+                                    .arg(server.serverPort())));
+        service.setMemoryManager(&db);
+        service.setCognitiveShadowEnabled(true);
+        QSignalSpy spoken(&service, &LLMService::sentencesReady);
+        QSignalSpy failed(&service, &LLMService::replyAbnormal);
+        service.askDeepSeek(QStringLiteral("周末一起去看展"), {}, meta);
+        QTRY_VERIFY_WITH_TIMEOUT(spoken.size() + failed.size() > 0, 8000);
+        QCOMPARE(spoken.size(), 1);
+        QCOMPARE(bodies.size(), 1); // shadow 没有增加任何模型请求
+
+        const auto keysOf = [](const QJsonObject &report) {
+            QStringList keys;
+            for (const auto &value : report.value(QStringLiteral("identities")).toArray())
+                keys.append(value.toObject().value(QStringLiteral("stable_key")).toString());
+            return keys;
+        };
+        const auto foreground = service.lastCognitiveShadowReport();
+        QCOMPARE(foreground.value(QStringLiteral("entry")).toString(),
+                 QStringLiteral("foreground_reply"));
+        QCOMPARE(foreground.value(QStringLiteral("comparison")).toObject()
+                     .value(QStringLiteral("privacy_leaks")).toInt(), 0);
+        QCOMPARE(foreground.value(QStringLiteral("comparison")).toObject()
+                     .value(QStringLiteral("identity_conflicts")).toInt(), 0);
+        QVERIFY(foreground.value(QStringLiteral("evidence_count")).toInt() > 0);
+        QVERIFY(foreground.value(QStringLiteral("legacy_prompt_bytes")).toInt() > 0);
+        const QString chatKey = QStringLiteral("chat|chat/%1#user_statement").arg(turn);
+        QVERIFY2(keysOf(foreground).contains(chatKey),
+                 qPrintable(keysOf(foreground).join(QLatin1Char(','))));
+
+        // 同一来源轮次进入私下回顾：必须得到与前台的同一个证据身份。
+        const auto context = db.claimPrivateReflection(12, 0);
+        QCOMPARE(context.value(QStringLiteral("id")).toInteger(), turn);
+        const int version = context.value(QStringLiteral("version")).toInt();
+        QSignalSpy finished(&service, &LLMService::privateReviewFinished);
+        service.requestPrivateReview(turn, version, context);
+        QTRY_COMPARE_WITH_TIMEOUT(bodies.size(), 2, 8000);
+        QTRY_VERIFY_WITH_TIMEOUT(finished.size() >= 1, 8000);
+        QCOMPARE(bodies.size(), 2); // 回顾自身一次请求；shadow 仍为零额外请求
+
+        const auto review = service.lastCognitiveShadowReport();
+        QCOMPARE(review.value(QStringLiteral("entry")).toString(),
+                 QStringLiteral("private_review"));
+        QCOMPARE(review.value(QStringLiteral("comparison")).toObject()
+                     .value(QStringLiteral("privacy_leaks")).toInt(), 0);
+        QVERIFY2(keysOf(review).contains(chatKey),
+                 qPrintable(keysOf(review).join(QLatin1Char(','))));
+        QCOMPARE(review.value(QStringLiteral("snapshot_budget_bytes")).toInt(),
+                 CognitiveSnapshotBuilder::promptByteBudget());
     }
 
     void privateBackgroundIsAvailableButReplyStaysPublic_data()
@@ -3387,6 +3481,9 @@ private slots:
         options.insert(QStringLiteral("allow_contact"), true);
         QVERIFY(config.write(options, QJsonObject{
             {"enabled", true},
+            // 固定安静时段为“空”：该用例依赖实际提交/发送路径，不能被运行时刻的
+            // 默认安静时段（23:00–08:00）改变结果（2026-11-27 23:2x 版全量回归暴露）。
+            {"quiet_hours", QJsonObject{{"start", "00:00"}, {"end", "00:00"}}},
             {"targets", QJsonArray{QJsonObject{{"channel", Channel::kPet},
                                              {"session_id", Channel::kDefaultSession}}}}}));
         QTemporaryDir dir;

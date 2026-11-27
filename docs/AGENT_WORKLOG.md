@@ -518,3 +518,25 @@ B5 节奏按报告修正：固定提交基线 → 2–4h 受控冒烟（self_des
 - c3 回执/历史/恢复：DB 权威 receipt + 同事务历史投影 + history_projected 幂等；对账不饿死；旧 wake 不覆盖新；分享回执绑定成果版本/哈希；分享意图崩溃恢复有界/节流/失效；每尝试 run_id；迟到失败版本隔离；next_due UTC/local/epoch。
 - 集成修复：VerifierVerdict 命名空间；thought_review_log 无 id 列，runId 回填改用 rowid/来源 fallback。
 - 验证：`ctest 23/23`；`tst_memorymanager 154/1 skipped`、`tst_memoryagent 100`、`tst_actionoutbox 38`、`tst_actionpolicy 18`、`tst_cognitivesnapshot 15`。生产库仍 v32、应用未启动、无真实发送；v33 待独立评审迁移。
+
+---
+
+## 2026-11-27 · R12-2c-final 基线核对 + R12-3a 第一切片（shadow）
+
+- **基线核对**：报告 HEAD `a9289c2` 与当前 `main=4dcafb6` 整树 diff 为空（tree `c239b5e7…`）；
+  本地提交历史只重写 commit message（reflog: `a9289c2`→`bc10393`→`4dcafb6`），四个业务提交逐对 tree 相同；
+  `origin/main`/GitHub 实测 = `4dcafb6`；最终测试二进制内含最后提交的新字面量，22:43:32 矩阵 15/15 通过。
+  结论：满足“仅 SHA 变化、代码树一致”，不重跑真实模型验收。报告原文未入库、不可恢复。
+  生产库 v33（SHA `8628AD01…`，mtime 19:38:49）、`identity.json`/`setting.json` 未变
+  （`contact_daily_limit=0`、`snapshot_budget_bytes=4096`），未启动应用、未发真实消息。
+- **R12-3a 第一切片**：新增 `src/cognition/cognitivecontext.{h,cpp}` 统一证据身份/语义/四条时间线/
+  覆盖状态/owner 私有投影/预算与重复度/新旧对照；复用 `CognitiveSnapshotBuilder`、`MemoryAccessPolicy`、
+  `MemoryEvidence`、`memory_recall` 结构；`LLMService` 前台与回顾入口在 messages 组装后构建 shadow，
+  默认关闭、不额外查库/不发请求/不改 prompt/无 schema。新增 `tst_cognitivecontext`（16 passed）与
+  `tst_memoryagent::cognitiveShadowSharesIdentityAcrossEntries`。全量 `ctest 24/24`，
+  `tst_memoryagent 115 passed/4 skipped`、`tst_memorymanager 157 passed/1 skipped`。
+  修复测试脆弱性：`actionEvidenceBinding` 固定空安静时段（默认 23:00–08:00 会使其在夜间返回 quiet）。
+- 交付文档：`docs/R12_2C_FINAL_BASELINE.md`、`docs/R12_2C_FINAL_COVERAGE.md`、
+  `docs/R12_3A_SOURCE_INVENTORY.md`、`docs/R12_3A_CONTEXT_DESIGN.md`。
+  未替换/删除 `CURRENT_UNDERSTANDING`/`MEMORY_DATA`/快照/历史；未进入 R12-3b、Matter 重构、Vision、
+  后台通用工具循环或完整 Attention 重构。

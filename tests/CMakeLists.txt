@@ -151,6 +151,8 @@ add_phase0_test(tst_memoryagent
     ${PROJECT_SOURCE_DIR}/src/cognition/imageperception.cpp
     ${PROJECT_SOURCE_DIR}/src/cognition/cognitivesnapshot.h
     ${PROJECT_SOURCE_DIR}/src/cognition/cognitivesnapshot.cpp
+    ${PROJECT_SOURCE_DIR}/src/cognition/cognitivecontext.h
+    ${PROJECT_SOURCE_DIR}/src/cognition/cognitivecontext.cpp
     ${PROJECT_SOURCE_DIR}/src/cognition/llmservice.cpp
     ${PROJECT_SOURCE_DIR}/src/memory/memoryoutputguard.cpp
     ${PROJECT_SOURCE_DIR}/src/config/configmanager.cpp
@@ -349,6 +351,31 @@ add_phase0_test(tst_cognitivesnapshot
     ${PROJECT_SOURCE_DIR}/src/cognition/cognitivesnapshot.cpp
     ${PHASE0_CORE_SOURCES}
 )
+
+# R12-3a：统一认知上下文/证据身份/去重/时间与覆盖状态（shadow 数据层）。
+# 纯内存归一化：不查库、不发模型请求；材料由测试从临时 MemoryManager 读取后传入。
+add_phase0_test(tst_cognitivecontext
+    tst_cognitivecontext.cpp
+    ${PROJECT_SOURCE_DIR}/src/cognition/cognitivecontext.h
+    ${PROJECT_SOURCE_DIR}/src/cognition/cognitivecontext.cpp
+    ${PROJECT_SOURCE_DIR}/src/cognition/cognitivesnapshot.h
+    ${PROJECT_SOURCE_DIR}/src/cognition/cognitivesnapshot.cpp
+    ${PROJECT_SOURCE_DIR}/src/cognition/promptassembler.h
+    ${PROJECT_SOURCE_DIR}/src/cognition/promptassembler.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryevidence.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryevidence.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryaccesspolicy.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryaccesspolicy.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryresultjson.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryresultjson.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryrecalltypes.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memoryrecalltypes.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memorytimeframe.h
+    ${PROJECT_SOURCE_DIR}/src/memory/memorytimeframe.cpp
+    ${PROJECT_SOURCE_DIR}/src/memory/memorytextutils.h
+    ${PHASE0_CORE_SOURCES}
+)
+target_link_libraries(tst_cognitivecontext PRIVATE Qt6::Network)
 
 # 主动外发统一提交/Outbox（报告切片 B）：域状态 CAS + cognitive_action + action_outbox
 # 同一事务提交，OutboxDispatcher 唯一发送，回执/恢复的状态机回归。

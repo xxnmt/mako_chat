@@ -44,6 +44,19 @@ public:
     QJsonArray lastRequestMessages() const { return m_lastRequestMessages; }
     RetrievalResult lastRetrievalResult() const { return m_lastRetrievalResult; }
     QJsonObject lastResponseUsage() const { return m_lastResponseUsage; }
+    // ===== R12-3a：统一认知上下文 shadow（只观测，不替换生产 prompt）=====
+    // 默认关闭（也可用环境变量 MAKO_COGNITIVE_SHADOW=1 在进程启动时打开）；打开后：
+    //   * 使用调用路径里已经读取到的材料构建统一 CognitiveContext 并与当前 evidence 目录对照；
+    //   * 不额外查库、不发模型请求、不写库、不改变本轮 messages；
+    //   * 最近报告通过 lastCognitiveShadowReport()/cognitiveShadowReports() 读取（测试/诊断用）。
+    void setCognitiveShadowEnabled(bool enabled);
+    bool cognitiveShadowEnabled() const;
+    QJsonObject lastCognitiveShadowReport() const
+    {
+        return m_cognitiveShadowReports.isEmpty() ? QJsonObject{}
+                                                  : m_cognitiveShadowReports.last().toObject();
+    }
+    QJsonArray cognitiveShadowReports() const { return m_cognitiveShadowReports; }
     // 当前被授予的能力清单：由 ConfigManager 配置与服务端状态生成（只读）。
     // 前台提示词与私下回顾共用同一份数据源，避免两处各说一套。
     QJsonObject capabilityManifest(const RequestMeta &meta) const;
@@ -274,6 +287,9 @@ private:
     RetrievalResult m_lastRetrievalResult;
     QJsonObject m_lastResponseUsage;
     bool m_benchmarkChatOnly = false;
+    bool m_cognitiveShadowEnabled = false;
+    bool m_cognitiveShadowEnvChecked = false;
+    QJsonArray m_cognitiveShadowReports; // 最近 N 次 shadow 报告（只观测；生产默认关闭）
     QJsonArray m_pendingMessages; // legacy：等待 MemoryAgent 的主请求
     quint64 m_agentGeneration = 0;
     bool m_agentPending = false;
