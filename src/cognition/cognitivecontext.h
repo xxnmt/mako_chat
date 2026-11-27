@@ -181,6 +181,7 @@ struct CognitiveContextScene
     bool longTermMemoryEnabled = false;
     bool ownerPrivate = false;
     bool viewerIsOwner = false;   // 当前对话对象是否主人（群内主人 ≠ 第三方）
+    bool ownerCrossChannelAllowed = false; // 主人私聊跨渠道读取开关（来自既有配置）
     QString capabilityScope;
     QJsonObject toJson() const;
 };
@@ -306,12 +307,26 @@ struct CognitiveProjectionStats
     int refsEmitted = 0;
     int refsResolved = 0;
     int refsUnresolved = 0;
-    // R12-3b：模型实际可见性检查（A 服务端可解析 / B 正文在最终输入 / C 结构化状态在最终输入 / D 授权）
-    int refsBodyVisible = 0;
-    int refsStructuredVisible = 0;
-    int refsAuthorized = 0;
-    int duplicateRefsReplaced = 0;
-    int duplicateTextCharsRemoved = 0;
+    // R12-3b-final：最终可见性统计（分母/分子分开，不以目录存在代替模型可见）
+    int aRefsTotal = 0;            // 发出的引用出现次数（A 分母）
+    int aRefsResolved = 0;         // 服务端可解析（A 分子）
+    int bRefsTotal = 0;            // 需要“正文在最终输入”的 dedup 引用数（B 分母）
+    int bRefsVisible = 0;          // 正文确实在最终输入（B 分子）
+    int bRefsInvalid = 0;          // 发现 dedup 但正文不可见（应为 0）
+    int cRowsTotal = 0;            // 需要结构化状态的行数（C 分母）
+    int cRowsStructured = 0;       // 结构化字段实际保留（C 分子）
+    int dRefsTotal = 0;            // 引用出现次数（D 分母）
+    int dRefsAuthorized = 0;       // 映射到本入口已授权证据（D 分子）
+    int uniqueEvidenceCount = 0;   // 去重后唯一证据身份数
+    int refOccurrences = 0;        // 最终输入里引用字符串出现次数
+    int domainRows = 0;            // 最终快照域行数 + 私密证据 items + 回执
+    int fullRows = 0;              // 最终保留正文的行数
+    int dedupRows = 0;             // 最终 dedup 行数
+    int truncatedRows = 0;         // 因预算被缩短正文的行数
+    int budgetOmittedRows = 0;     // 因预算整条省略的行数
+    int dedupSavedChars = 0;       // 真正因去重节省的正文（有其它可见正文）
+    int budgetOmittedChars = 0;    // 因预算省略的正文
+    int truncatedChars = 0;        // 因预算缩短的正文
     int privacyFiltered = 0;
     int privacyLeaks = 0;
     qint64 buildMs = 0;
@@ -320,6 +335,8 @@ struct CognitiveProjectionStats
     bool snapshotBudgetTrimmed = false;
     QStringList trimmedDomains;
     QStringList overflowDomains;
+    QStringList truncatedDomains;
+    QStringList truncationOrder; // 每次正文缩短的域顺序（用于验证“低优先先缩短”）
     QHash<QString, int> domainKept; // 每域完整条目数
     QJsonObject toJson() const;
 };
@@ -356,6 +373,7 @@ struct CognitiveProjection
     QStringList refOnlyKeys;         // 被改写为“仅引用”的身份（服务端 stableKey）
     QStringList structuredRefOnlyKeys; // 其中保留了必要结构化状态的身份
     QStringList fullKeys;            // 本次给出完整正文的身份
+    QHash<QString, QString> dedupSources; // dedup 引用 -> 实际承载正文的来源
     CognitiveProjectionStats stats;
     QJsonObject toJson() const;
 };
@@ -434,6 +452,8 @@ struct CognitiveContextRequest
     QJsonObject reviewThread;        // 私下回顾 thread（kind/history/prior/concern/basis/...）
     qlonglong reviewSourceTurn = 0;  // 回顾来源轮次（reflection/concern 的 id）
     QJsonArray receipts;             // 服务端执行回执材料（可选，含 ref/action_key/outcome）
+    // 回执查询状态：complete / error / unavailable / not_queried（空数组 ≠ 已完整查询）
+    QString receiptsState = QStringLiteral("not_queried");
 
     // 对照材料。
     QJsonObject legacyEvidence;      // 当前实际注入的 evidence 目录（前台 m_run.evidence）

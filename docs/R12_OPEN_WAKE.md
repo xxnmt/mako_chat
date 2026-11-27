@@ -16,6 +16,7 @@
 | R12-3a 第一切片（shadow） | **已完成（源码+测试已提交）** | 不替换生产 prompt、不新增 schema、不删除旧模块；见 [设计](R12_3A_CONTEXT_DESIGN.md)/[盘点](R12_3A_SOURCE_INVENTORY.md) |
 | R12-3a 第二切片（实际模型输入投影） | **已完成（默认关闭、可回退；源码+测试已提交）** | 仅接管前台/回顾的快照块与跨渠道证据块；CURRENT_UNDERSTANDING/MEMORY_DATA/历史/工具/行动链未改；见设计文档 §9 |
 | R12-3b 跨入口认知连续性与资源分配（第一轮） | **已完成（默认关闭、可回退；源码+测试已提交）** | 领域结构化投影、A/B/C/D 可见性、按用途预算、跨入口连续性、真实执行回执只读接入；CURRENT_UNDERSTANDING/MEMORY_DATA/工具/consult 正文仍未迁移；见设计文档 §10 |
+| R12-3b-final 预算/去重语义与 B5 准备 | **已完成（源码+测试已提交；actual 默认关闭）** | 预算裁剪不再产生假 dedup；A/B/C/D 最终输入统计；权限/回执错误状态复验；T01–T10 通过；B5 准备见 [B5_ACCEPTANCE_PREP.md](B5_ACCEPTANCE_PREP.md) |
 | R12-3b 后续（正文位置迁移/其它入口） | 未开始 | 完成后停止评审再评估；不提前进入 B5 自然运行 |
 
 ## R12-1a 补充修正（已独立提交）
@@ -206,4 +207,30 @@ actual 仍默认关闭，生产配置/库未改。
 - **风险**：真实模型/网络非确定（A-contact 偶发重试）；短上下文 saved_bytes 可能为负；
   CURRENT_UNDERSTANDING/MEMORY_DATA/工具/consult 正文位置未迁移；actual 未默认开启。
   细节与可退役机制见 [设计文档 §10](R12_3A_CONTEXT_DESIGN.md)。
+
+## R12-3b-final 预算/去重语义收尾与 B5 准备（2026-11-28）
+
+R12 最后一次集中功能收尾；不新增认知能力、不改生产配置/库、actual 仍默认关闭。
+
+- **预算与去重语义**：只有实际记录了“正文承载来源”（history/current/recent/review thread/
+  已注入私密证据）的条目才允许 `dedup=true`；预算不足先缩短低优先正文（保留结构化字段），
+  仍超预算才整条省略，`truncated_rows/budget_omitted_rows/trimmed_domains` 显式报告；
+  唯一正文不再被裁剪成虚假重复引用。
+- **最终可见性统计**：A 引用出现/解析、B 正文实际覆盖（精确正文+来源记录）、
+  C 结构化字段实际保留、D 入口授权，各自分母/分子分离；不再用前 48 字符近似，
+  不再令 `refs_authorized=refs.size()`。
+- **最终权限复验**：Pet/QQ 私聊、群内主人、群内第三方、非主人私聊、盲区、
+  跨渠道权限关闭全部在最终模型输入层验证；群内主人仅获上游授权的共享认识，
+  不自动获得私人 Pet/私聊原文或内部状态。
+- **回执错误语义**：`recentActionReceiptsWithStatus()` 返回 complete/error/unavailable，
+  空数组不再被当成“已完整查询且无回执”。
+- **T01–T10**：全部通过（详见设计文档 §11.4）；真实模型单次补验通过
+  （前台/回顾 A/B/C/D 全解析、工具轮 requests=3、OpenWake/Activity 行动链 5/5、
+  verifier 拒绝无依据 claim）。
+- **验证**：全量 `ctest 24/24`（159.29s）；`tst_cognitivecontext 30 passed`；
+  `tst_memoryagent 126 passed/6 skipped`；`tst_memorymanager 157 passed/1 skipped`。
+- **B5**：候选二进制、备份说明、actual 临时启用/回退、日志、2–4h 受控计划、7 天观察计划、
+  停止/回退条件见 [B5_ACCEPTANCE_PREP.md](B5_ACCEPTANCE_PREP.md)；本轮不启动正式自然运行。
+- **后续**：架构收敛清单（正文位置迁移/重复适配层/临时证据表/Shadow/模块解耦）
+  登记至 B5 后，不在本轮展开。
 

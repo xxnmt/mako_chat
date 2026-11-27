@@ -614,6 +614,9 @@ public:
     // {ref(action_key),kind,state,outcome,updated_at,channel,session,last_error}。
     // outcome 优先 last_outcome，其次 ledger state；不把“队列中”伪装成已送达。
     QJsonArray recentActionReceipts(int limit = 6) const;
+    // R12-3b-final：带查询状态的只读回执目录。{status:complete|error|unavailable, items:[...],
+    // error:"..."}。调用方不得把 error/unavailable 当成“完整查询且没有回执”。
+    QJsonObject recentActionReceiptsWithStatus(int limit = 6) const;
 
     // ===== R12-2c-3：internal activity share 的崩溃恢复 =====
     // 扫描已完成活动的有效未处理分享意愿（只有 status='completed'、share_intent.state='saved'、

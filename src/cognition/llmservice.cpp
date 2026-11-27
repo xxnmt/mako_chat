@@ -1426,8 +1426,14 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
         shadow.retrieved = m_lastRetrievalResult.evidence;
         shadow.recent = recentBundle;
         shadow.privateEvidence = privateEvidence;
-        // R12-3b：只读执行回执（来自既有行动/投递权威数据，不新增账本）。
-        if (m_memoryManager) shadow.receipts = m_memoryManager->recentActionReceipts(6);
+        // R12-3b-final：只读回执查询带状态；空数组不等于“已完整查询且没有回执”。
+        if (m_memoryManager) {
+            const QJsonObject receiptQuery = m_memoryManager->recentActionReceiptsWithStatus(6);
+            shadow.receipts = receiptQuery.value(QStringLiteral("items")).toArray();
+            shadow.receiptsState = receiptQuery.value(QStringLiteral("status")).toString();
+        } else {
+            shadow.receiptsState = QStringLiteral("unavailable");
+        }
         shadow.legacyEvidence = m_run.evidence;
         int promptChars = 0;
         int promptBytes = 0;
@@ -1551,17 +1557,49 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
                 }
                 return nullptr;
             };
-            const auto bodyContainsText = [&finalContents](const QString &text) {
-                const QString needle = text.trimmed().left(48);
-                if (needle.size() < 4) return false;
+            const auto textVisibleInFinal = [&finalContents](const QString &text) {
+                if (text.trimmed().isEmpty()) return true;
                 for (const QString &content : finalContents)
-                    if (content.contains(needle)) return true;
+                    if (content.contains(text)) return true;
                 return false;
             };
-            int refsBodyVisible = int(projection.fullKeys.size());
+            // A：引用出现次数（分母）与服务端解析（分子）分开。
+            int refOccurrences = 0;
+            int aResolvedOccurrences = 0;
+            int dAuthorizedOccurrences = 0;
+            for (const QString &ref : refs) {
+                int occurrences = 0;
+                for (const QString &content : finalContents)
+                    occurrences += int(content.count(ref));
+                if (occurrences <= 0) occurrences = 1; // 引用出现在投影结构里至少一次
+                refOccurrences += occurrences;
+                if (resolves(ref)) aResolvedOccurrences += occurrences;
+                for (const auto &evidence : shadowContext.evidence) {
+                    if (evidenceRefMatches(evidence, ref)) {
+                        dAuthorizedOccurrences += occurrences;
+                        break;
+                    }
+                }
+            }
+            // B：只有记录了实际承载来源且正文确实出现在最终输入，才允许 dedup。
+            int bVisible = 0;
+            int bInvalid = 0;
+            QStringList invalidDedup;
             for (const QString &key : projection.refOnlyKeys) {
+                const QString source = options.serializedSources.value(key);
                 const auto *evidence = evidenceByKey(key);
-                if (evidence && bodyContainsText(evidence->text)) ++refsBodyVisible;
+                const bool sourceRecorded = !source.isEmpty()
+                    || projection.dedupSources.contains(key);
+                if (sourceRecorded && evidence && textVisibleInFinal(evidence->text)) {
+                    ++bVisible;
+                } else {
+                    ++bInvalid;
+                    if (invalidDedup.size() < 8) invalidDedup.append(key);
+                }
+            }
+            if (!invalidDedup.isEmpty()) {
+                qWarning().noquote() << "[Cognitive][Actual] invalid dedup (body not visible):"
+                                     << invalidDedup.join(QLatin1Char(','));
             }
             CognitiveProjectionStats stats = projection.stats;
             stats.baselineChars = promptChars;
@@ -1573,9 +1611,14 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
             stats.refsEmitted = int(refs.size());
             stats.refsResolved = resolved;
             stats.refsUnresolved = int(refs.size()) - resolved;
-            stats.refsBodyVisible = refsBodyVisible;
-            stats.refsStructuredVisible += int(projection.fullKeys.size());
-            stats.refsAuthorized = int(refs.size());
+            stats.aRefsTotal = refOccurrences;
+            stats.aRefsResolved = aResolvedOccurrences;
+            stats.bRefsTotal = int(projection.refOnlyKeys.size());
+            stats.bRefsVisible = bVisible;
+            stats.bRefsInvalid = bInvalid;
+            stats.dRefsTotal = refOccurrences;
+            stats.dRefsAuthorized = dAuthorizedOccurrences;
+            stats.refOccurrences = refOccurrences;
             stats.privacyFiltered = comparison.privacyFiltered;
             stats.privacyLeaks = comparison.privacyLeaks;
             stats.modelRequests = m_modelRequestCount;
@@ -1587,26 +1630,34 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
             qInfo().noquote()
                 << QStringLiteral("[Cognitive][Actual] entry=foreground_reply input_chars=%1"
                                   " baseline_chars=%2 saved_chars=%3 input_bytes=%4"
-                                  " dup_evidence=%5 dup_replaced=%6 effective=%7"
-                                  " refs=%8/%9 body_visible=%10 structured_visible=%11"
-                                  " privacy_filtered=%12 privacy_leaks=%13"
-                                  " snapshot_budget=%14 trimmed=%15 build_ms=%16")
+                                  " dup_evidence=%5 dedup_rows=%6 full_rows=%7 omits=%8"
+                                  " A=%9/%10 B=%11/%12 invalid=%13 C=%14/%15 D=%16/%17"
+                                  " dedup_saved=%18 omitted_chars=%19 truncated_chars=%20"
+                                  " privacy_filtered=%21 privacy_leaks=%22 budget=%23 trimmed=%24")
                        .arg(stats.inputChars)
                        .arg(stats.baselineChars)
                        .arg(stats.savedChars)
                        .arg(stats.inputBytes)
                        .arg(stats.duplicateEvidenceCount)
-                       .arg(stats.duplicateRefsReplaced)
-                       .arg(stats.effectiveEvidenceCount)
-                       .arg(stats.refsResolved)
-                       .arg(stats.refsEmitted)
-                       .arg(stats.refsBodyVisible)
-                       .arg(stats.refsStructuredVisible)
+                       .arg(stats.dedupRows)
+                       .arg(stats.fullRows)
+                       .arg(stats.budgetOmittedRows)
+                       .arg(stats.aRefsResolved)
+                       .arg(stats.aRefsTotal)
+                       .arg(stats.bRefsVisible)
+                       .arg(stats.bRefsTotal)
+                       .arg(stats.bRefsInvalid)
+                       .arg(stats.cRowsStructured)
+                       .arg(stats.cRowsTotal)
+                       .arg(stats.dRefsAuthorized)
+                       .arg(stats.dRefsTotal)
+                       .arg(stats.dedupSavedChars)
+                       .arg(stats.budgetOmittedChars)
+                       .arg(stats.truncatedChars)
                        .arg(stats.privacyFiltered)
                        .arg(stats.privacyLeaks)
                        .arg(stats.snapshotBudgetBytes)
-                       .arg(stats.snapshotBudgetTrimmed ? QStringLiteral("true") : QStringLiteral("false"))
-                       .arg(stats.buildMs);
+                       .arg(stats.snapshotBudgetTrimmed ? QStringLiteral("true") : QStringLiteral("false"));
         }
         m_cognitiveShadowReports.append(report);
         while (m_cognitiveShadowReports.size() > 8) m_cognitiveShadowReports.removeFirst();
@@ -2361,17 +2412,47 @@ void LLMService::generatePrivateReview(qlonglong id, int version, const QJsonObj
                 }
                 return nullptr;
             };
-            const auto bodyContainsText = [&finalContents](const QString &text) {
-                const QString needle = text.trimmed().left(48);
-                if (needle.size() < 4) return false;
+            const auto textVisibleInFinal = [&finalContents](const QString &text) {
+                if (text.trimmed().isEmpty()) return true;
                 for (const QString &content : finalContents)
-                    if (content.contains(needle)) return true;
+                    if (content.contains(text)) return true;
                 return false;
             };
-            int refsBodyVisible = int(projection.fullKeys.size());
+            int refOccurrences = 0;
+            int aResolvedOccurrences = 0;
+            int dAuthorizedOccurrences = 0;
+            for (const QString &ref : refs) {
+                int occurrences = 0;
+                for (const QString &content : finalContents)
+                    occurrences += int(content.count(ref));
+                if (occurrences <= 0) occurrences = 1;
+                refOccurrences += occurrences;
+                if (resolves(ref)) aResolvedOccurrences += occurrences;
+                for (const auto &evidence : shadowContext.evidence) {
+                    if (evidenceRefMatches(evidence, ref)) {
+                        dAuthorizedOccurrences += occurrences;
+                        break;
+                    }
+                }
+            }
+            int bVisible = 0;
+            int bInvalid = 0;
+            QStringList invalidDedup;
             for (const QString &key : projection.refOnlyKeys) {
+                const QString source = options.serializedSources.value(key);
                 const auto *evidence = evidenceByKey(key);
-                if (evidence && bodyContainsText(evidence->text)) ++refsBodyVisible;
+                const bool sourceRecorded = !source.isEmpty()
+                    || projection.dedupSources.contains(key);
+                if (sourceRecorded && evidence && textVisibleInFinal(evidence->text)) {
+                    ++bVisible;
+                } else {
+                    ++bInvalid;
+                    if (invalidDedup.size() < 8) invalidDedup.append(key);
+                }
+            }
+            if (!invalidDedup.isEmpty()) {
+                qWarning().noquote() << "[Cognitive][Actual] invalid dedup (review):"
+                                     << invalidDedup.join(QLatin1Char(','));
             }
             CognitiveProjectionStats stats = projection.stats;
             stats.baselineChars = promptChars;
@@ -2383,9 +2464,14 @@ void LLMService::generatePrivateReview(qlonglong id, int version, const QJsonObj
             stats.refsEmitted = int(refs.size());
             stats.refsResolved = resolved;
             stats.refsUnresolved = int(refs.size()) - resolved;
-            stats.refsBodyVisible = refsBodyVisible;
-            stats.refsStructuredVisible += int(projection.fullKeys.size());
-            stats.refsAuthorized = int(refs.size());
+            stats.aRefsTotal = refOccurrences;
+            stats.aRefsResolved = aResolvedOccurrences;
+            stats.bRefsTotal = int(projection.refOnlyKeys.size());
+            stats.bRefsVisible = bVisible;
+            stats.bRefsInvalid = bInvalid;
+            stats.dRefsTotal = refOccurrences;
+            stats.dRefsAuthorized = dAuthorizedOccurrences;
+            stats.refOccurrences = refOccurrences;
             stats.privacyFiltered = comparison.privacyFiltered;
             stats.privacyLeaks = comparison.privacyLeaks;
             stats.modelRequests = m_modelRequestCount;
@@ -2395,22 +2481,28 @@ void LLMService::generatePrivateReview(qlonglong id, int version, const QJsonObj
             qInfo().noquote()
                 << QStringLiteral("[Cognitive][Actual] entry=private_review kind=%1"
                                   " input_chars=%2 baseline_chars=%3 saved_chars=%4"
-                                  " dup_evidence=%5 dup_replaced=%6 refs=%7/%8"
-                                  " body_visible=%9 structured_visible=%10"
-                                  " privacy_filtered=%11 privacy_leaks=%12 build_ms=%13")
+                                  " dup_evidence=%5 dedup_rows=%6 full_rows=%7 omits=%8"
+                                  " A=%9/%10 B=%11/%12 invalid=%13 C=%14/%15 D=%16/%17"
+                                  " privacy_filtered=%18 privacy_leaks=%19")
                        .arg(kind)
                        .arg(stats.inputChars)
                        .arg(stats.baselineChars)
                        .arg(stats.savedChars)
                        .arg(stats.duplicateEvidenceCount)
-                       .arg(stats.duplicateRefsReplaced)
-                       .arg(stats.refsResolved)
-                       .arg(stats.refsEmitted)
-                       .arg(stats.refsBodyVisible)
-                       .arg(stats.refsStructuredVisible)
+                       .arg(stats.dedupRows)
+                       .arg(stats.fullRows)
+                       .arg(stats.budgetOmittedRows)
+                       .arg(stats.aRefsResolved)
+                       .arg(stats.aRefsTotal)
+                       .arg(stats.bRefsVisible)
+                       .arg(stats.bRefsTotal)
+                       .arg(stats.bRefsInvalid)
+                       .arg(stats.cRowsStructured)
+                       .arg(stats.cRowsTotal)
+                       .arg(stats.dRefsAuthorized)
+                       .arg(stats.dRefsTotal)
                        .arg(stats.privacyFiltered)
-                       .arg(stats.privacyLeaks)
-                       .arg(stats.buildMs);
+                       .arg(stats.privacyLeaks);
         }
         m_cognitiveShadowReports.append(report);
         while (m_cognitiveShadowReports.size() > 8) m_cognitiveShadowReports.removeFirst();

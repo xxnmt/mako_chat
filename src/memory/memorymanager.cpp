@@ -12232,10 +12232,21 @@ QString receiptHistoryRef(const QString &actionKey)
 
 } // namespace
 
-QJsonArray MemoryManager::recentActionReceipts(int limit) const
+QJsonObject MemoryManager::recentActionReceiptsWithStatus(int limit) const
 {
-    QJsonArray rows;
-    if (!m_db.isOpen() || limit <= 0) return rows;
+    QJsonObject result{{QStringLiteral("status"), QStringLiteral("complete")},
+                       {QStringLiteral("items"), QJsonArray{}},
+                       {QStringLiteral("error"), QString()}};
+    if (!m_db.isOpen()) {
+        result.insert(QStringLiteral("status"), QStringLiteral("unavailable"));
+        result.insert(QStringLiteral("error"), QStringLiteral("database_closed"));
+        return result;
+    }
+    if (limit <= 0) {
+        result.insert(QStringLiteral("status"), QStringLiteral("error"));
+        result.insert(QStringLiteral("error"), QStringLiteral("invalid_limit"));
+        return result;
+    }
     QSqlQuery q(m_db);
     q.prepare(QStringLiteral(
         "SELECT ca.action_key,ca.kind,ca.state,ca.last_outcome,ca.updated_at,"
@@ -12243,12 +12254,17 @@ QJsonArray MemoryManager::recentActionReceipts(int limit) const
         "FROM cognitive_action ca LEFT JOIN delivery_ledger dl ON dl.ref=ca.action_key "
         "ORDER BY ca.updated_at DESC,ca.id DESC LIMIT ?"));
     q.addBindValue(limit);
-    if (!q.exec()) return rows;
+    if (!q.exec()) {
+        result.insert(QStringLiteral("status"), QStringLiteral("error"));
+        result.insert(QStringLiteral("error"), q.lastError().text());
+        return result;
+    }
     const auto iso = [](const qint64 seconds) {
         return seconds > 0
             ? QDateTime::fromSecsSinceEpoch(seconds, Qt::UTC).toString(Qt::ISODateWithMs)
             : QString();
     };
+    QJsonArray rows;
     while (q.next()) {
         const QString actionOutcome = q.value(3).toString().trimmed();
         const QString ledgerState = q.value(7).toString().trimmed();
@@ -12268,7 +12284,13 @@ QJsonArray MemoryManager::recentActionReceipts(int limit) const
             {QStringLiteral("ledger_state"), ledgerState},
             {QStringLiteral("last_error"), q.value(9).toString()}});
     }
-    return rows;
+    result.insert(QStringLiteral("items"), rows);
+    return result;
+}
+
+QJsonArray MemoryManager::recentActionReceipts(int limit) const
+{
+    return recentActionReceiptsWithStatus(limit).value(QStringLiteral("items")).toArray();
 }
 
 bool MemoryManager::recordActionReceipt(const QString &actionKey, const QString &outcome,

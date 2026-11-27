@@ -563,3 +563,98 @@ open_wake saved_chars 64 / B1 C1；activity saved_chars 55 / B1 C1；均 refs �
 边界：不新增独立架构层；`cognitivecontext.*` 仍只做证据/时间/覆盖/投影，不持库、不发请求；
 行动核验仍从权威数据源读完整证据；不进入 B5 正式自然运行、不设 actual 生产默认、
 不进入 R13/Vision/后台通用 tool loop/完整 Attention 重构。
+
+---
+
+## 11. R12-3b-final：预算/去重语义收尾与 B5 准备（2026-11-28）
+
+### 11.1 预算裁剪与 dedup 语义修复
+
+旧问题：预算裁剪会把“唯一正文”降级为 `dedup=true` 的引用，而实际没有其它可见位置承载正文。
+
+修复（`projectModelInput`）：
+1. **dedup 只来自真实来源**：只有 `options.serializedSources`（前台 history/current/recent、
+   回顾 thread 实际字段、私密证据块实际注入）记录了来源身份，才允许 `dedup=true`，
+   行内写 `dedup_source`；`projection.dedupSources` 保留映射。
+2. **预算裁剪不再产生 dedup**：先对低优先域正文做“缩短”（保留结构化字段，行标
+   `truncated=true` 并计 `truncated_rows/truncated_chars`）；仍超预算再整条省略
+   （`budget_omitted_rows/budget_omitted_chars`、`trimmed_domains/overflow_domains` 显式报告）。
+3. `fullKeys/refOnlyKeys/domainKept` 在裁剪后重算，不再用裁剪前值。
+4. 唯一正文只可能完整、缩短或显式省略，绝不会被伪装成重复引用。
+5. 若 dedup 来源被省略，B 校验会报 `b_refs_invalid`（本轮所有实测为 0）。
+
+### 11.2 最终可见性统计（分母/分子分离）
+
+| 指标 | 含义 | 分母 | 分子 |
+|---|---|---|---|
+| A `a_refs_total/a_refs_resolved` | 引用出现次数 / 服务端可解析 | 最终输入中 ref 出现次数 | 可解析次数 |
+| B `b_refs_total/b_refs_visible` | 需要“正文在别处”的 dedup 引用 | `refOnlyKeys` | 来源记录 + 正文精确出现在最终 messages |
+| C `c_rows_total/c_rows_structured` | 需要结构化状态的行 | 结构化域行/私密项 | 必需字段在最终 JSON 中实际存在 |
+| D `d_refs_total/d_refs_authorized` | 引用实际入口授权 | ref 出现次数 | 能映射到本入口已授权证据的次数 |
+
+其他：`unique_evidence_count`、`ref_occurrences`、`domain_rows`、`full_rows`、`dedup_rows`、
+`truncated_rows`、`budget_omitted_rows`、`dedup_saved_chars`、`budget_omitted_chars`、
+`truncated_chars`。B 的验证使用“来源记录 + 完整正文匹配”，不再用前 48 字符近似；
+D 不再直接令 `refs_authorized=refs.size()`。
+
+### 11.3 最终权限与错误状态复验
+
+- 在**最终模型输入**上覆盖：Pet 主人私聊、QQ 主人私聊、QQ 群内主人、群内第三方、
+  非主人私聊、盲区、跨渠道权限关闭（测试 `actualPermissionAudiencesDoNotLeakPrivateBody`）。
+  - Pet/QQ 私聊只带本会话正文；群内主人不得自动获得私人 Pet/私聊原文与内部状态，
+    仅允许上游已授权的共享认识（matter/claim/summary 等派生资料）；
+  - 群内第三方/非主人私聊/盲区全部过滤私人正文；
+  - 关闭跨渠道权限时，主人私聊也不接收其它渠道原始检索证据；开启后可合法使用（T05）。
+- 复用 `MemoryAccessPolicy` 与既有检索授权链，未新增独立隐私规则体系。
+- `recentActionReceiptsWithStatus()`：回执查询返回 `complete|error|unavailable`；
+  `recentActionReceipts()` 保留旧接口。空数组不再被解释为“已完整查询且没有回执”，
+  `execution_receipt` 覆盖状态区分 error / empty / not_queried。
+
+### 11.4 T01–T10 验收结果
+
+| # | 结果 | 证据 |
+|---|---|---|
+| T01 唯一正文紧张预算不产生假 dedup | PASS | `t01UniqueBodyNeverFakeDedup` |
+| T02 原正文裁剪/省略后引用正确处理 | PASS | `t02TrimmedOrOmittedSourcesKeepRefsHonest` |
+| T03 相同文本开头不同事件不互相代替 | PASS | `t03SamePrefixDifferentEventsNotSubstituted` |
+| T04 裁剪后领域数量与实际输入一致 | PASS | `t04PostTrimCountsMatchFinalRows` |
+| T05 有权私聊可用合法跨渠道证据 | PASS | 权限测试：开启 `owner_cross_channel_private` 后 Pet 可见 QQ 合法跨渠道证据 |
+| T06 群聊/第三方不获未授权私人正文 | PASS | 权限测试：群内主人/第三方/非主人私聊/盲区均无私人正文 |
+| T07 回执查询错误 ≠ 确实没有回执 | PASS | `receiptQueryFailureIsNotCompleteEmpty`（complete/error/unavailable） |
+| T08 长上下文多域关键语义不丢失 | PASS | `t08LongMultiDomainKeepsRequiredSemantics`（前台委托/观察、活动/成果优先保留） |
+| T09 actual 下工具结果引用可解析 | PASS | `toolPathRequiresFrameAndAuditsResolution` actual=1；真实 tool 轮 requests=3、A/B 全解析 |
+| T10 actual 下行动仍用权威完整证据 | PASS | `actionEvidenceBinding` actual=1（10/10）；真实 OpenWake contact/quiet/share 单轮通过 |
+
+### 11.5 最终真实模型补验（actual=1，未无限重跑）
+
+- 前台/回顾：A 6/6、B 4/4 与 3/3、C 4/4 与 3/3、D 6/6 与 3/3、`b_refs_invalid=0`、
+  `privacy_leaks=0`；真实 `prompt_tokens` 前台 3461、回顾 1995。
+- `realModelActualToolRecall`：真实工具轮发生，requests=3。
+- `realActionAcceptance` 单次运行：A-contact/B-quiet/D-share 5/5 通过（verifier→Outbox→
+  mock sender→receipt）。若模型自主选择安静/不联系，按合法安静结果记录；网络错误/截断/
+  协议错误按技术失败记录，不无限重跑。
+- `realVerifierRejectsUnsupportedClaim`：真实 verifier 拒绝无依据 claim。
+- 单次运行结果留档 `build/stage-b/r12-3b-final-real*.log`。
+
+### 11.6 构建与回归
+
+- 全量构建通过；**ctest 24/24 通过**（`build/stage-b/r12-3b-final-ctest.log`，159.29s）。
+- `tst_cognitivecontext 30 passed`；`tst_memoryagent 126 passed / 6 skipped`（opt-in 真实用例）；
+  `tst_memorymanager 157 passed / 1 skipped`。
+- 生产库/配置未改（哈希/mtime 同前）；未启动生产应用、未发真实渠道消息。
+
+### 11.7 B5 准备与后续架构收敛
+
+- B5 候选二进制、生产备份说明、actual 临时启用/回退、日志采集、2–4h 受控计划、
+  7 天自然观察计划、停止/回退条件：见 `docs/B5_ACCEPTANCE_PREP.md`。
+- **B5 后架构收敛清单**（本轮不做）：CURRENT_UNDERSTANDING/MEMORY_DATA 正文迁移、
+  Matter consult/tool 正文统一、旧正文位置/重复适配层/临时证据表收敛、Shadow 只读化、
+  模块解耦与旧机制退役。不新增独立 Planner、不新增通用追踪系统。
+
+### 11.8 剩余风险
+
+1. 真实模型/网络非确定：单次补充验收通过，但长期仍需观察；技术失败不无限重试。
+2. 短上下文总字节可能因统一时间/结构化引用固定开销上升；长上下文收益待 B5 观察。
+3. 回顾/工具/consult 正文位置仍未迁移；B 可见性依赖来源记录，后续迁移需继续用 A/B/C/D。
+4. 群内主人的共享认识依赖上游检索/工具授权；本轮只收紧入口投影，不改上游权限链。
+5. actual 仍未默认开启；B5 需要用户授权与值守。

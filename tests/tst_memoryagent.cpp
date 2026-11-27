@@ -1075,21 +1075,28 @@ private slots:
         const auto projection = report.value(QStringLiteral("projection")).toObject();
         QVERIFY(projection.value(QStringLiteral("saved_chars")).toInt() > 0);
         QVERIFY(projection.value(QStringLiteral("input_chars")).toInt() > 0);
-        QVERIFY(projection.value(QStringLiteral("duplicate_entries_omitted")).toInt() > 0);
+        QVERIFY(projection.value(QStringLiteral("dedup_rows")).toInt() > 0);
         // 本 fixture 的历史覆盖了全部快照/检索原文，因此投影里没有“新的完整证据”，
-        // effective_evidence_count=0 是正确结果（正文只有历史里的一份）。
-        QVERIFY(projection.contains(QStringLiteral("effective_evidence_count")));
+        // full_rows=0 是正确结果（正文只有历史里的一份）。
+        QVERIFY(projection.contains(QStringLiteral("full_rows")));
         QCOMPARE(projection.value(QStringLiteral("privacy_leaks")).toInt(), 0);
         QCOMPARE(projection.value(QStringLiteral("refs_unresolved")).toInt(), 0);
         QVERIFY(projection.value(QStringLiteral("refs_emitted")).toInt() > 0);
-        // R12-3b：模型实际可见性 A/B/C/D 分离检查。
-        QVERIFY2(projection.value(QStringLiteral("refs_body_visible")).toInt() > 0,
+        // R12-3b-final：A/B/C/D 分母分子分开，并以最终输入为准。
+        QVERIFY2(projection.value(QStringLiteral("b_refs_visible")).toInt() > 0,
                  "去重引用的正文必须在最终输入里可见（B）");
-        QVERIFY2(projection.value(QStringLiteral("refs_structured_visible")).toInt() > 0,
+        QCOMPARE(projection.value(QStringLiteral("b_refs_invalid")).toInt(), 0);
+        QVERIFY2(projection.value(QStringLiteral("c_rows_structured")).toInt() > 0,
                  "必要结构化状态必须在最终输入里可见（C）");
-        QCOMPARE(projection.value(QStringLiteral("refs_authorized")).toInt(),
-                 projection.value(QStringLiteral("refs_emitted")).toInt());
-        QVERIFY(projection.value(QStringLiteral("duplicate_text_chars_removed")).toInt() > 0);
+        QCOMPARE(projection.value(QStringLiteral("c_rows_structured")).toInt(),
+                 projection.value(QStringLiteral("c_rows_total")).toInt());
+        QCOMPARE(projection.value(QStringLiteral("d_refs_authorized")).toInt(),
+                 projection.value(QStringLiteral("d_refs_total")).toInt());
+        QCOMPARE(projection.value(QStringLiteral("d_refs_authorized")).toInt(),
+                 projection.value(QStringLiteral("a_refs_resolved")).toInt());
+        QVERIFY(projection.value(QStringLiteral("dedup_saved_chars")).toInt() > 0);
+        QCOMPARE(projection.value(QStringLiteral("budget_omitted_rows")).toInt(), 0);
+        QCOMPARE(projection.value(QStringLiteral("truncated_rows")).toInt(), 0);
         // 时间一致性：统一时间块是服务端时间源，旧相对时间不能当当前时间。
         QVERIFY(actualBody.contains(QStringLiteral("now_utc=").toUtf8()));
         QVERIFY(actualBody.contains(QStringLiteral("timezone=").toUtf8()));
@@ -1536,7 +1543,9 @@ private slots:
         QVERIFY(cfg.writeConfigDocument(QStringLiteral("setting.json"),
             QJsonDocument(QJsonObject{{QStringLiteral("memory"),
                 QJsonObject{{QStringLiteral("long_term_memory_enabled"), true},
-                            {QStringLiteral("agent_enabled"), false}}}}).toJson(), nullptr));
+                            {QStringLiteral("agent_enabled"), false},
+                            {QStringLiteral("owner_cross_channel_private"), true}}}}).toJson(),
+            nullptr));
         QTemporaryDir dir;
         QVERIFY(dir.isValid());
         MemoryManager db(dir.filePath(QStringLiteral("r12b-correction.db")));
@@ -1617,6 +1626,179 @@ private slots:
         QVERIFY(comparison.value(QStringLiteral("cross_version_groups")).toInt() >= 1);
         QCOMPARE(report.value(QStringLiteral("projection")).toObject()
                      .value(QStringLiteral("refs_unresolved")).toInt(), 0);
+    }
+
+    // R12-3b-final T05/T06：最终模型输入层的权限复验。宠物/QQ 私聊可取本会话资料；
+    // 群内主人、群内第三方、非主人私聊、盲区不得自动获得私人 Pet/私聊原文。
+    void actualPermissionAudiencesDoNotLeakPrivateBody()
+    {
+        SemanticReviewConfigGuard guard;
+        QVERIFY(guard.enable());
+        auto &cfg = ConfigManager::instance();
+        QVERIFY(cfg.writeConfigDocument(QStringLiteral("setting.json"),
+            QJsonDocument(QJsonObject{{QStringLiteral("memory"),
+                QJsonObject{{QStringLiteral("long_term_memory_enabled"), true},
+                            {QStringLiteral("agent_enabled"), false},
+                            {QStringLiteral("owner_cross_channel_private"), false}}}}).toJson(),
+            nullptr));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QCOMPARE(ConfigManager::instance().getMemoryPolicyConfig().agent.ownerCrossChannelPrivate,
+                 false);
+        MemoryManager db(dir.filePath(QStringLiteral("r12b-permissions.db")));
+        const QString petText = QStringLiteral("PET_PRIVATE_TEXT_ONLY_FOR_PET");
+        const QString qqText = QStringLiteral("QQ_PRIVATE_TEXT_ONLY_FOR_QQ");
+        {
+            RequestMeta pet;
+            pet.channel = Channel::kPet;
+            pet.sessionId = Channel::kDefaultSession;
+            pet.subject = QStringLiteral("user");
+            pet.eventId = pet.runId = QStringLiteral("r12b-perm-pet");
+            QVERIFY(db.recordInput(petText, pet, true) > 0);
+            RequestMeta qq;
+            qq.channel = Channel::kQQPrivate;
+            qq.sessionId = qq.actorId = QStringLiteral("10001");
+            qq.subject = QStringLiteral("user");
+            qq.eventId = qq.runId = QStringLiteral("r12b-perm-qq");
+            QVERIFY(db.recordInput(qqText, qq, true) > 0);
+        }
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QByteArray> bodies;
+        serveCompletions(server, bodies, [](int) -> QString {
+            return QStringLiteral(
+                R"({"sentences":[{"zh_text":"好呀","ja_text":"いいよ","tags":{"emotion":"happy"}}]})");
+        });
+        const auto run = [&](const RequestMeta &meta) -> QPair<QByteArray, QJsonObject> {
+            const int before = bodies.size();
+            LLMService model(QStringLiteral("test"), nullptr,
+                             QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.serverPort())));
+            model.setMemoryManager(&db);
+            model.setCognitiveContextActualEnabled(true);
+            QSignalSpy spoken(&model, &LLMService::sentencesReady);
+            QSignalSpy failed(&model, &LLMService::replyAbnormal);
+            model.askDeepSeek(QStringLiteral("在吗"), {}, meta);
+            for (int waited = 0; waited < 8000 && spoken.size() + failed.size() == 0; waited += 50)
+                QTest::qWait(50);
+            if (spoken.size() + failed.size() == 0) {
+                qWarning() << "permission audit: no reply within timeout";
+                return {QByteArray(), QJsonObject()};
+            }
+            if (spoken.size() != 1) return {QByteArray(), QJsonObject()};
+            QByteArray body;
+            for (int i = before; i < bodies.size(); ++i)
+                if (bodies.at(i).contains(QStringLiteral("【输出要求】").toUtf8()))
+                    body = bodies.at(i);
+            if (body.isEmpty()) return {QByteArray(), QJsonObject()};
+            return qMakePair(body, model.lastCognitiveShadowReport());
+        };
+
+        RequestMeta pet;
+        pet.channel = Channel::kPet;
+        pet.sessionId = Channel::kDefaultSession;
+        pet.subject = QStringLiteral("user");
+        pet.eventId = pet.runId = QStringLiteral("r12b-perm-visit-pet");
+        const auto petResult = run(pet);
+        QVERIFY(!petResult.first.isEmpty());
+        QVERIFY(petResult.first.contains(petText.toUtf8()));
+        QVERIFY(!petResult.first.contains(qqText.toUtf8()));
+        QCOMPARE(petResult.second.value(QStringLiteral("projection")).toObject()
+                     .value(QStringLiteral("privacy_leaks")).toInt(), 0);
+
+        RequestMeta qq;
+        qq.channel = Channel::kQQPrivate;
+        qq.sessionId = qq.actorId = QStringLiteral("10001");
+        qq.subject = QStringLiteral("user");
+        qq.eventId = qq.runId = QStringLiteral("r12b-perm-visit-qq");
+        const auto qqResult = run(qq);
+        QVERIFY(!qqResult.first.isEmpty());
+        QVERIFY(qqResult.first.contains(qqText.toUtf8()));
+        QVERIFY(!qqResult.first.contains(petText.toUtf8()));
+
+        RequestMeta groupOwner;
+        groupOwner.channel = Channel::kQQGroup;
+        groupOwner.sessionId = QStringLiteral("group-1");
+        groupOwner.actorId = QStringLiteral("20143");
+        groupOwner.subject = QStringLiteral("user");
+        groupOwner.eventId = groupOwner.runId = QStringLiteral("r12b-perm-visit-group-owner");
+        const auto groupOwnerResult = run(groupOwner);
+        QVERIFY(!groupOwnerResult.first.isEmpty());
+        QVERIFY(!groupOwnerResult.first.contains(petText.toUtf8()));
+        QVERIFY(!groupOwnerResult.first.contains(qqText.toUtf8()));
+
+        RequestMeta groupThird;
+        groupThird.channel = Channel::kQQGroup;
+        groupThird.sessionId = QStringLiteral("group-1");
+        groupThird.actorId = QStringLiteral("10002");
+        groupThird.subject = QStringLiteral("qq:10002");
+        groupThird.eventId = groupThird.runId = QStringLiteral("r12b-perm-visit-group-third");
+        const auto groupThirdResult = run(groupThird);
+        QVERIFY(!groupThirdResult.first.isEmpty());
+        QVERIFY(!groupThirdResult.first.contains(petText.toUtf8()));
+        QVERIFY(!groupThirdResult.first.contains(qqText.toUtf8()));
+
+        RequestMeta nonOwner;
+        nonOwner.channel = Channel::kQQPrivate;
+        nonOwner.sessionId = nonOwner.actorId = QStringLiteral("10002");
+        nonOwner.subject = QStringLiteral("qq:10002");
+        nonOwner.eventId = nonOwner.runId = QStringLiteral("r12b-perm-visit-nonowner");
+        const auto nonOwnerResult = run(nonOwner);
+        QVERIFY(!nonOwnerResult.first.isEmpty());
+        QVERIFY(!nonOwnerResult.first.contains(petText.toUtf8()));
+        QVERIFY(!nonOwnerResult.first.contains(qqText.toUtf8()));
+
+        // 盲区：即使主人 Pet 会话也不读取/注入私人正文。
+        QVERIFY(cfg.writeConfigDocument(QStringLiteral("identity.json"),
+            QJsonDocument(QJsonObject{
+                {QStringLiteral("memory"), QJsonObject{
+                     {QStringLiteral("blind_zones"), QJsonArray{QJsonObject{
+                          {QStringLiteral("channel"), Channel::kPet},
+                          {QStringLiteral("session_id"), Channel::kDefaultSession}}}}}}}).toJson(),
+            nullptr));
+        RequestMeta blind = pet;
+        blind.eventId = blind.runId = QStringLiteral("r12b-perm-visit-blind");
+        const auto blindResult = run(blind);
+        QVERIFY(!blindResult.first.isEmpty());
+        QVERIFY(!blindResult.first.contains(petText.toUtf8()));
+        QVERIFY(!blindResult.first.contains(qqText.toUtf8()));
+
+        // T05：明确开启跨渠道权限的主人私聊入口，可以使用合法跨渠道证据（来源仍可区分）。
+        QVERIFY(cfg.writeConfigDocument(QStringLiteral("identity.json"),
+            QJsonDocument(QJsonObject{
+                {QStringLiteral("memory"), QJsonObject{{QStringLiteral("blind_zones"), QJsonArray{}}}}}).toJson(),
+            nullptr));
+        QVERIFY(cfg.writeConfigDocument(QStringLiteral("setting.json"),
+            QJsonDocument(QJsonObject{{QStringLiteral("memory"),
+                QJsonObject{{QStringLiteral("long_term_memory_enabled"), true},
+                            {QStringLiteral("agent_enabled"), false},
+                            {QStringLiteral("owner_cross_channel_private"), true}}}}).toJson(),
+            nullptr));
+        RequestMeta petCross = pet;
+        petCross.eventId = petCross.runId = QStringLiteral("r12b-perm-visit-pet-cross");
+        const auto crossResult = run(petCross);
+        QVERIFY(!crossResult.first.isEmpty());
+        QVERIFY2(crossResult.first.contains(qqText.toUtf8()),
+                 "开启跨渠道权限的主人私聊应能使用合法跨渠道证据");
+        QCOMPARE(crossResult.second.value(QStringLiteral("projection")).toObject()
+                     .value(QStringLiteral("privacy_leaks")).toInt(), 0);
+    }
+
+    // R12-3b-final T07：回执查询失败不得伪装成“已完整查询且没有回执”。
+    void receiptQueryFailureIsNotCompleteEmpty()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager db(dir.filePath(QStringLiteral("r12b-receipt-status.db")));
+        const auto complete = db.recentActionReceiptsWithStatus(6);
+        QCOMPARE(complete.value(QStringLiteral("status")).toString(), QStringLiteral("complete"));
+        QVERIFY(complete.value(QStringLiteral("items")).toArray().isEmpty());
+        {
+            QSqlQuery raw(QSqlDatabase::database(QStringLiteral("memory_db_connection")));
+            QVERIFY(raw.exec(QStringLiteral("DROP TABLE cognitive_action")));
+        }
+        const auto failed = db.recentActionReceiptsWithStatus(6);
+        QCOMPARE(failed.value(QStringLiteral("status")).toString(), QStringLiteral("error"));
+        QVERIFY(!failed.value(QStringLiteral("error")).toString().isEmpty());
     }
 
     // R12-3a 第二切片：隔离数据库上的真实模型集成（opt-in；凭据来自环境变量）。

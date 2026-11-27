@@ -118,6 +118,12 @@ private slots:
     void projectionOriginKindDoesNotCrossMap();
     void projectionPurposePriority();
     void projectionReceiptsVisibilityGate();
+    void t01UniqueBodyNeverFakeDedup();
+    void t02TrimmedOrOmittedSourcesKeepRefsHonest();
+    void t03SamePrefixDifferentEventsNotSubstituted();
+    void t04PostTrimCountsMatchFinalRows();
+    void t07ReceiptQueryStateDistinguishable();
+    void t08LongMultiDomainKeepsRequiredSemantics();
 };
 
 void CognitiveContextTest::identityNormalization()
@@ -769,18 +775,22 @@ void CognitiveContextTest::projectionDedupesAndKeepsRefs()
     CognitiveProjectionOptions options;
     options.entry = QStringLiteral("foreground_reply");
     options.ownerPrivate = context.scene.ownerPrivate;
-    options.alreadySerialized.insert(
+    options.markSerialized(
         evidenceIdentityForRef(QStringLiteral("chat/1"), QString(), 0,
-                               QStringLiteral("user_statement")).stableKey());
-    options.alreadySerialized.insert(
-        evidenceIdentityForRef(QStringLiteral("reply/1")).stableKey());
-    options.alreadySerialized.insert(
-        evidenceIdentityForRef(QStringLiteral("current_input")).stableKey());
+                               QStringLiteral("user_statement")).stableKey(),
+        QStringLiteral("history:user"));
+    options.markSerialized(
+        evidenceIdentityForRef(QStringLiteral("reply/1")).stableKey(),
+        QStringLiteral("history:assistant"));
+    options.markSerialized(
+        evidenceIdentityForRef(QStringLiteral("current_input")).stableKey(),
+        QStringLiteral("current_input"));
     const CognitiveProjection projection = projectModelInput(context, options);
     // 历史已完整序列化的 user/assistant 面在快照与检索块里只给 ref，不重复正文。
-    QVERIFY(projection.stats.duplicateEntriesOmitted >= 2);
-    QVERIFY(projection.stats.effectiveEvidenceCount >= 1
-            || projection.stats.duplicateEntriesOmitted >= 2);
+    QVERIFY(projection.stats.dedupRows >= 2);
+    QVERIFY(projection.stats.dedupRows >= 2);
+    QVERIFY(projection.stats.dedupSavedChars > 0);
+    QVERIFY(projection.stats.bRefsInvalid == 0);
     const QString snapshotJson = QString::fromUtf8(
         QJsonDocument(projection.snapshotJson).toJson(QJsonDocument::Compact));
     QVERIFY(snapshotJson.contains(QStringLiteral("chat/1")));
@@ -838,8 +848,9 @@ void CognitiveContextTest::projectionKeepsFullForUnserialized()
     CognitiveProjectionOptions options;
     options.entry = QStringLiteral("foreground_reply");
     options.ownerPrivate = true;
-    options.alreadySerialized.insert(
-        evidenceIdentityForRef(QStringLiteral("current_input")).stableKey());
+    options.markSerialized(
+        evidenceIdentityForRef(QStringLiteral("current_input")).stableKey(),
+        QStringLiteral("current_input"));
     const CognitiveProjection projection = projectModelInput(context, options);
     bool sawFull = false;
     for (const auto &value : projection.privateEvidenceItems) {
@@ -1183,27 +1194,46 @@ void CognitiveContextTest::projectionPurposePriority()
         return builder.buildShadow(request);
     };
     const CognitiveContext context = build();
-    auto priorityFor = [&](const QString &entry, const QString &kind) {
+    auto project = [&](const QString &entry, const QString &kind) {
         CognitiveProjectionOptions options;
         options.entry = entry;
         options.reviewKind = kind;
         options.ownerPrivate = true;
         options.snapshotBudgetBytes = 4096;
-        return projectModelInput(context, options).stats;
+        return projectModelInput(context, options);
     };
-    // 前台：观察优先于动机/活动；活动优先级高于动机。
-    auto foreground = priorityFor(QStringLiteral("foreground_reply"), {});
-    QVERIFY(foreground.trimmedDomains.contains(QStringLiteral("motivations")));
-    QVERIFY(foreground.domainKept.value(QStringLiteral("observations")) > 0);
-    // OpenWake：动机/活动优先于观察。
-    auto openWake = priorityFor(QStringLiteral("private_review"), QStringLiteral("open_wake"));
-    QVERIFY(openWake.trimmedDomains.contains(QStringLiteral("observations")));
-    QVERIFY(openWake.domainKept.value(QStringLiteral("motivations")) > 0);
-    // ActivityReview：活动优先于动机/观察。
-    auto activity = priorityFor(QStringLiteral("private_review"), QStringLiteral("activity"));
-    QVERIFY(activity.trimmedDomains.contains(QStringLiteral("motivations"))
-            || activity.trimmedDomains.contains(QStringLiteral("observations")));
-    QVERIFY(activity.domainKept.value(QStringLiteral("activities")) > 0);
+    const auto rowsTruncated = [](const QJsonObject &snapshot, const QString &domain) {
+        for (const auto &value : snapshot.value(domain).toArray()) {
+            if (value.toObject().value(QStringLiteral("truncated")).toBool()) return true;
+        }
+        return false;
+    };
+    const auto orderIndex = [](const CognitiveProjection &projection, const QString &domain) {
+        return int(projection.stats.truncationOrder.indexOf(domain));
+    };
+    // 前台：观察优先级高；低优先动机在观察之前被缩短。
+    const auto foreground = project(QStringLiteral("foreground_reply"), {});
+    QVERIFY(foreground.stats.snapshotBudgetTrimmed);
+    QVERIFY(rowsTruncated(foreground.snapshotJson, QStringLiteral("motivations")));
+    const int fgObservation = orderIndex(foreground, QStringLiteral("observations"));
+    const int fgMotivation = orderIndex(foreground, QStringLiteral("motivations"));
+    QVERIFY(fgMotivation >= 0);
+    QVERIFY(fgObservation < 0 || fgObservation > fgMotivation);
+    // OpenWake：动机优先级高；观察在动机之前被缩短。
+    const auto openWake = project(QStringLiteral("private_review"), QStringLiteral("open_wake"));
+    QVERIFY(rowsTruncated(openWake.snapshotJson, QStringLiteral("observations")));
+    const int owObservation = orderIndex(openWake, QStringLiteral("observations"));
+    const int owMotivation = orderIndex(openWake, QStringLiteral("motivations"));
+    QVERIFY(owObservation >= 0);
+    QVERIFY(owMotivation < 0 || owObservation < owMotivation);
+    // ActivityReview：活动/成果优先级高；观察/动机先被缩短。
+    const auto activity = project(QStringLiteral("private_review"), QStringLiteral("activity"));
+    const int actObservation = orderIndex(activity, QStringLiteral("observations"));
+    const int actMotivation = orderIndex(activity, QStringLiteral("motivations"));
+    const int actActivity = orderIndex(activity, QStringLiteral("activities"));
+    QVERIFY(actObservation >= 0 || actMotivation >= 0);
+    QVERIFY(actActivity < 0
+            || (actActivity > actObservation && (actMotivation < 0 || actActivity > actMotivation)));
 }
 
 void CognitiveContextTest::projectionReceiptsVisibilityGate()
@@ -1232,6 +1262,276 @@ void CognitiveContextTest::projectionReceiptsVisibilityGate()
     options.receiptsInjected = false;
     auto withoutReceipts = projectModelInput(context, options);
     QVERIFY(withoutReceipts.receipts.isEmpty());
+}
+
+void CognitiveContextTest::t01UniqueBodyNeverFakeDedup()
+{
+    const QDateTime at = nowUtc();
+    CognitiveContextRequest request = baseRequest();
+    request.currentInput = QStringLiteral("在吗");
+    request.meta.receivedAtUtc = at;
+    request.hasSnapshot = true;
+    request.snapshot.builtAtUtc = at;
+    request.snapshot.observations.append(fact(
+        QStringLiteral("chat/1"), EvidenceAuthority::UserStatement,
+        QStringLiteral("这是唯一一份正文，不允许被裁剪成 dedup"), QStringLiteral("pet"),
+        QStringLiteral("default"), at));
+    CognitiveContextBuilder builder(nullptr);
+    const CognitiveContext context = builder.buildShadow(request);
+    CognitiveProjectionOptions options;
+    options.entry = QStringLiteral("foreground_reply");
+    options.ownerPrivate = true;
+    options.snapshotBudgetBytes = 120; // 紧张预算
+    const CognitiveProjection projection = projectModelInput(context, options);
+    QVERIFY(projection.stats.snapshotBudgetTrimmed);
+    QCOMPARE(projection.stats.dedupRows, 0);
+    QCOMPARE(projection.stats.bRefsTotal, 0);
+    bool anyDedup = false;
+    for (const QString &domain : {QStringLiteral("observations")}) {
+        for (const auto &value : projection.snapshotJson.value(domain).toArray()) {
+            const auto row = value.toObject();
+            if (row.value(QStringLiteral("dedup")).toBool()) anyDedup = true;
+        }
+    }
+    QVERIFY(!anyDedup);
+    // 正文要么被缩短/省略，要么完整；但不会被伪装成“重复引用”。
+    QVERIFY(projection.stats.truncatedRows + projection.stats.budgetOmittedRows > 0);
+}
+
+void CognitiveContextTest::t02TrimmedOrOmittedSourcesKeepRefsHonest()
+{
+    const QDateTime at = nowUtc();
+    CognitiveContextRequest request = baseRequest();
+    request.currentInput = QStringLiteral("在吗");
+    request.meta.receivedAtUtc = at;
+    request.hasSnapshot = true;
+    request.snapshot.builtAtUtc = at;
+    // A：历史中确有正文（可安全 dedup）；B：唯一正文（预算不足时只能省略/缩短）。
+    request.snapshot.observations.append(fact(
+        QStringLiteral("chat/1"), EvidenceAuthority::UserStatement,
+        QStringLiteral("历史里已经完整存在的一段正文"), QStringLiteral("pet"),
+        QStringLiteral("default"), at));
+    request.snapshot.observations.append(fact(
+        QStringLiteral("chat/2"), EvidenceAuthority::UserStatement,
+        QStringLiteral("另一条唯一正文不能变成 dedup 引用"), QStringLiteral("pet"),
+        QStringLiteral("default"), at));
+    CognitiveContextBuilder builder(nullptr);
+    const CognitiveContext context = builder.buildShadow(request);
+    CognitiveProjectionOptions options;
+    options.entry = QStringLiteral("foreground_reply");
+    options.ownerPrivate = true;
+    options.snapshotBudgetBytes = 220;
+    options.markSerialized(
+        evidenceIdentityForRef(QStringLiteral("chat/1"), QString(), 0,
+                               QStringLiteral("user_statement")).stableKey(),
+        QStringLiteral("history:user"));
+    const CognitiveProjection projection = projectModelInput(context, options);
+    // chat/1 的 dedup 必须带实际来源；chat/2 绝不出现 dedup=true。
+    bool sawChat1Dedup = false;
+    bool chat2FakeDedup = false;
+    for (const auto &value : projection.snapshotJson.value(QStringLiteral("observations")).toArray()) {
+        const auto row = value.toObject();
+        if (row.value(QStringLiteral("ref")).toString() == QStringLiteral("chat/1")
+            && row.value(QStringLiteral("dedup")).toBool()) {
+            sawChat1Dedup = true;
+            QCOMPARE(row.value(QStringLiteral("dedup_source")).toString(),
+                     QStringLiteral("history:user"));
+        }
+        if (row.value(QStringLiteral("ref")).toString() == QStringLiteral("chat/2")
+            && row.value(QStringLiteral("dedup")).toBool()) {
+            chat2FakeDedup = true;
+        }
+    }
+    if (sawChat1Dedup) {
+        QCOMPARE(projection.stats.dedupRows, 1);
+    } else {
+        // 预算紧张时允许整条省略 dedup 行，但不得留下“无来源的引用”。
+        QCOMPARE(projection.stats.dedupRows, 0);
+        QVERIFY(projection.refOnlyKeys.isEmpty());
+    }
+    QVERIFY(!chat2FakeDedup);
+    QVERIFY(projection.stats.bRefsInvalid == 0);
+    QCOMPARE(projection.stats.bRefsTotal, int(projection.refOnlyKeys.size()));
+}
+
+void CognitiveContextTest::t03SamePrefixDifferentEventsNotSubstituted()
+{
+    const QDateTime at = nowUtc();
+    CognitiveContextRequest request = baseRequest();
+    request.currentInput = QStringLiteral("在吗");
+    request.meta.receivedAtUtc = at;
+    request.hasSnapshot = true;
+    request.snapshot.builtAtUtc = at;
+    const QString sharedPrefix = QStringLiteral("这是完全相同的前缀文本开头，但事件不同：");
+    request.snapshot.observations.append(fact(
+        QStringLiteral("chat/1"), EvidenceAuthority::UserStatement,
+        sharedPrefix + QStringLiteral("事件A"), QStringLiteral("pet"),
+        QStringLiteral("default"), at));
+    request.snapshot.observations.append(fact(
+        QStringLiteral("chat/2"), EvidenceAuthority::UserStatement,
+        sharedPrefix + QStringLiteral("事件B"), QStringLiteral("pet"),
+        QStringLiteral("default"), at));
+    CognitiveContextBuilder builder(nullptr);
+    const CognitiveContext context = builder.buildShadow(request);
+    CognitiveProjectionOptions options;
+    options.entry = QStringLiteral("foreground_reply");
+    options.ownerPrivate = true;
+    options.markSerialized(
+        evidenceIdentityForRef(QStringLiteral("chat/1"), QString(), 0,
+                               QStringLiteral("user_statement")).stableKey(),
+        QStringLiteral("history:user"));
+    const CognitiveProjection projection = projectModelInput(context, options);
+    bool chat1Dedup = false;
+    bool chat2Full = false;
+    for (const auto &value : projection.snapshotJson.value(QStringLiteral("observations")).toArray()) {
+        const auto row = value.toObject();
+        if (row.value(QStringLiteral("ref")).toString() == QStringLiteral("chat/1"))
+            chat1Dedup = row.value(QStringLiteral("dedup")).toBool();
+        if (row.value(QStringLiteral("ref")).toString() == QStringLiteral("chat/2")) {
+            chat2Full = !row.value(QStringLiteral("dedup")).toBool()
+                && row.value(QStringLiteral("text")).toString().contains(QStringLiteral("事件B"));
+        }
+    }
+    QVERIFY(chat1Dedup);
+    QVERIFY2(chat2Full, "相同前缀的不同事件不能被当成同一证据去重");
+    QVERIFY(projection.stats.bRefsInvalid == 0);
+}
+
+void CognitiveContextTest::t04PostTrimCountsMatchFinalRows()
+{
+    const QDateTime at = nowUtc();
+    CognitiveContextRequest request = baseRequest();
+    request.currentInput = QStringLiteral("在吗");
+    request.meta.receivedAtUtc = at;
+    request.hasSnapshot = true;
+    request.snapshot.builtAtUtc = at;
+    for (int i = 0; i < 6; ++i) {
+        request.snapshot.observations.append(fact(
+            QStringLiteral("chat/%1").arg(900 + i), EvidenceAuthority::UserStatement,
+            QString(300, QLatin1Char('o')), QStringLiteral("pet"),
+            QStringLiteral("default"), at));
+        request.snapshot.motivations.append(SelfMotivation{
+            QStringLiteral("concern/%1").arg(950 + i), QStringLiteral("concern"),
+            QString(300, QLatin1Char('m')), 1});
+    }
+    CognitiveContextBuilder builder(nullptr);
+    const CognitiveContext context = builder.buildShadow(request);
+    CognitiveProjectionOptions options;
+    options.entry = QStringLiteral("foreground_reply");
+    options.ownerPrivate = true;
+    options.snapshotBudgetBytes = 900;
+    const CognitiveProjection projection = projectModelInput(context, options);
+    int rowsInFinal = int(projection.privateEvidenceItems.size()) + int(projection.receipts.size());
+    for (const QString &domain : {QStringLiteral("observations"), QStringLiteral("motivations"),
+                                  QStringLiteral("inferences"), QStringLiteral("commitments"),
+                                  QStringLiteral("activities"), QStringLiteral("recent_activity_results"),
+                                  QStringLiteral("internal_wakes")}) {
+        rowsInFinal += int(projection.snapshotJson.value(domain).toArray().size());
+    }
+    QCOMPARE(projection.stats.domainRows, rowsInFinal);
+    QCOMPARE(projection.stats.fullRows, int(projection.fullKeys.size()));
+    QCOMPARE(projection.stats.dedupRows, int(projection.refOnlyKeys.size()));
+    QCOMPARE(projection.stats.snapshotBudgetTrimmed, true);
+    const int bytes = QJsonDocument(projection.snapshotJson).toJson(QJsonDocument::Compact).size();
+    QVERIFY(bytes <= 900);
+}
+
+void CognitiveContextTest::t07ReceiptQueryStateDistinguishable()
+{
+    auto request = baseRequest();
+    request.currentInput = QStringLiteral("在吗");
+    request.meta.receivedAtUtc = nowUtc();
+    CognitiveContextBuilder builder(nullptr);
+    {
+        request.receiptsState = QStringLiteral("error");
+        const auto context = builder.buildShadow(request);
+        QCOMPARE(context.coverage.sourceStates.value(QStringLiteral("execution_receipt")),
+                 QStringLiteral("error"));
+        QCOMPARE(context.coverage.overall, QStringLiteral("error"));
+    }
+    {
+        request.receiptsState = QStringLiteral("complete");
+        const auto context = builder.buildShadow(request);
+        QCOMPARE(context.coverage.sourceStates.value(QStringLiteral("execution_receipt")),
+                 QStringLiteral("empty"));
+    }
+    {
+        request.receiptsState = QStringLiteral("not_queried");
+        const auto context = builder.buildShadow(request);
+        QCOMPARE(context.coverage.sourceStates.value(QStringLiteral("execution_receipt")),
+                 QStringLiteral("not_queried"));
+    }
+}
+
+void CognitiveContextTest::t08LongMultiDomainKeepsRequiredSemantics()
+{
+    const QDateTime at = nowUtc();
+    CognitiveContextRequest request = baseRequest();
+    request.currentInput = QStringLiteral("在吗");
+    request.meta.receivedAtUtc = at;
+    request.hasSnapshot = true;
+    request.snapshot.builtAtUtc = at;
+    for (int i = 0; i < 3; ++i) {
+        request.snapshot.observations.append(fact(
+            QStringLiteral("chat/%1").arg(700 + i), EvidenceAuthority::UserStatement,
+            QString(400, QLatin1Char('o')), QStringLiteral("pet"),
+            QStringLiteral("default"), at));
+        request.snapshot.selfExpressions.append(fact(
+            QStringLiteral("chat/%1").arg(700 + i), EvidenceAuthority::AssistantExpression,
+            QString(400, QLatin1Char('s')), QStringLiteral("pet"),
+            QStringLiteral("default"), at));
+        request.snapshot.inferences.append(fact(
+            QStringLiteral("revision/住所/%1").arg(i + 1), EvidenceAuthority::SelfInference,
+            QString(400, QLatin1Char('i')), QStringLiteral("pet"),
+            QStringLiteral("default"), at));
+        request.snapshot.motivations.append(SelfMotivation{
+            QStringLiteral("concern/%1").arg(800 + i), QStringLiteral("concern"),
+            QString(400, QLatin1Char('m')), i + 1});
+        request.snapshot.commitments.append(DelegatedCommitment{
+            QStringLiteral("reminder/%1").arg(830 + i), QStringLiteral("reminder"),
+            QStringLiteral("pending"), at.addSecs(3600 + i), at.addSecs(7200),
+            QString(300, QLatin1Char('c'))});
+        request.snapshot.activities.append(QJsonObject{
+            {QStringLiteral("ref"), QStringLiteral("activity/%1").arg(840 + i)},
+            {QStringLiteral("version"), i + 1},
+            {QStringLiteral("status"), QStringLiteral("active")},
+            {QStringLiteral("goal"), QStringLiteral("目标%1").arg(i)},
+            {QStringLiteral("draft"), QString(400, QLatin1Char('d'))}});
+        request.snapshot.recentActivityResults.append(QJsonObject{
+            {QStringLiteral("ref"), QStringLiteral("activity/%1").arg(840 + i)},
+            {QStringLiteral("version"), i + 1},
+            {QStringLiteral("artifact_ref"), QStringLiteral("activity/%1").arg(840 + i)},
+            {QStringLiteral("artifact_version"), i + 1},
+            {QStringLiteral("status"), QStringLiteral("completed")},
+            {QStringLiteral("completed_at"), iso(at)},
+            {QStringLiteral("summary"), QString(300, QLatin1Char('r'))}});
+        request.snapshot.internalWakes.append(QJsonObject{
+            {QStringLiteral("ref"), QStringLiteral("wake/%1").arg(850 + i)},
+            {QStringLiteral("version"), i + 1},
+            {QStringLiteral("kind"), QStringLiteral("open_wake")},
+            {QStringLiteral("own_next_review_at"), iso(at.addSecs(1800))},
+            {QStringLiteral("note"), QString(300, QLatin1Char('w'))}});
+    }
+    CognitiveContextBuilder builder(nullptr);
+    const CognitiveContext context = builder.buildShadow(request);
+    CognitiveProjectionOptions foreground;
+    foreground.entry = QStringLiteral("foreground_reply");
+    foreground.ownerPrivate = true;
+    foreground.snapshotBudgetBytes = 4096;
+    const auto fg = projectModelInput(context, foreground);
+    QVERIFY(fg.stats.snapshotBudgetTrimmed);
+    // 前台：委托与观察最低语义覆盖优先保留。
+    QVERIFY(fg.snapshotJson.value(QStringLiteral("commitments")).toArray().size() >= 1);
+    QVERIFY(fg.snapshotJson.value(QStringLiteral("observations")).toArray().size() >= 1);
+    // 被省略/缩短必须显式报告。
+    QVERIFY(fg.stats.truncatedRows + fg.stats.budgetOmittedRows > 0);
+    // ActivityReview：活动与成果优先保留。
+    CognitiveProjectionOptions activity = foreground;
+    activity.entry = QStringLiteral("private_review");
+    activity.reviewKind = QStringLiteral("activity");
+    const auto act = projectModelInput(context, activity);
+    QVERIFY(act.snapshotJson.value(QStringLiteral("activities")).toArray().size() >= 1);
+    QVERIFY(act.snapshotJson.value(QStringLiteral("recent_activity_results")).toArray().size() >= 1);
 }
 
 QTEST_MAIN(CognitiveContextTest)

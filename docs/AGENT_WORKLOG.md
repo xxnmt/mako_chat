@@ -599,3 +599,35 @@ B5 节奏按报告修正：固定提交基线 → 2–4h 受控冒烟（self_des
 - **未做/风险**：CURRENT_UNDERSTANDING/MEMORY_DATA/tool/consult 正文位置未迁移；短上下文
   saved_bytes 可能为负；真实模型非确定；actual+tool/memory_read 未单独强制真实模型。
   旧机制退役条件见设计文档 §10.10，本轮不删；不进入 B5 自然运行/R13/Vision/tool loop/Attention 重构。
+
+---
+
+## 2026-11-28 · R12-3b-final 预算/去重语义收尾与 B5 准备
+
+R12 最后一次集中功能收尾。修复预算裁剪与 dedup 的语义冲突，补齐最终可见性/权限/错误状态复验，
+完成 T01–T10 与必要真实模型补验，准备 B5。不新增认知能力、不改生产配置/库、actual 默认关闭。
+
+- **预算/去重语义**：dedup 只允许来自真实记录的承载来源（`serializedSources`/`dedupSources`），
+  行内含 `dedup_source`；预算不足先缩短低优先正文（保留结构化字段），再整条省略并显式报告
+  `truncated_rows/budget_omitted_rows/trimmed_domains`；唯一正文不再被伪装成重复引用；
+  `fullKeys/refOnlyKeys/domainKept` 裁剪后重算。
+- **A/B/C/D 统计**：A 引用出现/解析、B 正文实际可见（来源记录+完整正文匹配，不用前 48 字符）、
+  C 结构化字段实际保留、D 入口实际授权；新增 `unique_evidence_count/ref_occurrences/domain_rows/
+  full_rows/dedup_rows/dedup_saved_chars/budget_omitted_chars/truncated_chars`。
+- **权限复验**：最终模型输入层覆盖 Pet/QQ 私聊、群内主人、群内第三方、非主人私聊、盲区、
+  跨渠道关闭；群内主人仅保留上游授权的共享认识（matter/claim/summary），不自动获得私人
+  Pet/私聊原文与内部状态；关闭跨渠道时主人私聊也拦截原始检索证据，开启时可合法使用（T05）。
+- **回执错误语义**：`recentActionReceiptsWithStatus()`（complete/error/unavailable）；
+  覆盖状态区分 error/empty/not_queried，空数组不再等于“已完整查询且无回执”。
+- **T01–T10 全通过**：唯一正文假 dedup、裁剪后引用、相同前缀不同事件、裁剪计数、
+  跨渠道权限、群/第三方隐私、回执错误、长上下文多域、actual 工具引用、actual 行动权威证据。
+- **真实模型单次补验（actual=1，不无限重跑）**：前台 A6/6 B4/4 C4/4 D6/6、回顾 A3/3 B3/3
+  C3/3 D3/3，`b_refs_invalid=0`、`privacy_leaks=0`；prompt_tokens 3427→3461/1975→1995；
+  工具轮 requests=3；OpenWake contact/quiet、Activity share 5/5；verifier 拒绝无依据 claim。
+- **验证**：全量 `ctest 24/24`（159.29s）；`tst_cognitivecontext 30 passed`；
+  `tst_memoryagent 126 passed/6 skipped`；`tst_memorymanager 157 passed/1 skipped`。
+  生产库/配置哈希/mtime 未变；未启动应用、未发真实渠道消息；actual 默认关闭。
+- **B5**：新增 `docs/B5_ACCEPTANCE_PREP.md`（候选二进制/哈希、备份说明、actual 启用/回退、
+  日志、2–4h 受控计划、7 天自然观察、停止/回退条件）。本轮只准备，不启动正式自然运行。
+- **后续**：正文位置迁移、重复适配层、临时证据表、Shadow 只读化、模块解耦登记至 B5 后；
+  不进入 R13/Vision/tool loop/Attention 重构。
