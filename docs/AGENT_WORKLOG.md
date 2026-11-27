@@ -631,3 +631,31 @@ R12 最后一次集中功能收尾。修复预算裁剪与 dedup 的语义冲突
   日志、2–4h 受控计划、7 天自然观察、停止/回退条件）。本轮只准备，不启动正式自然运行。
 - **后续**：正文位置迁移、重复适配层、临时证据表、Shadow 只读化、模块解耦登记至 B5 后；
   不进入 R13/Vision/tool loop/Attention 重构。
+
+---
+
+## 2026-11-28 · B5 补充：认知参数设置界面
+
+只改配置读取/保存与设置界面；不修改认知算法、调度、行动核验或数据库。
+
+- **新页面**：设置 →「认知与自主行为」（identity.json）。常用字段 OpenWake 启用/允许联系、
+  共享预算占比、快照预算、`cognition.context_actual_enabled`；「每日上限」区分
+  `proactive.daily_limit`（每日回顾）、`open_wake.max_per_day`（每日自主唤醒）、
+  `proactive.contact_daily_limit`（每日主动联系）；高级设置默认收起，含首次/默认/最小/最大
+  间隔、单步上限、到期让出次数、`review_backoff_seconds`（新 `ints` 输入）与
+  `max_review_failures`。
+- **actual 开关**：ConfigManager 新增 `contextActualEnabled()`（identity 缺省 false）；
+  LLMService 读取顺序为 setter > 环境变量（显式 0/false/off 也覆盖）> 配置；
+  页面保存后重启生效，状态标签同时展示配置值与当前实际运行状态。
+- **保存**：沿用 `writeConfigDocument`，只改本页绑定字段；`future_extension` 等未展示 cognition
+  字段、账户/API/隐私/渠道与 `contact_daily_limit=0` 等原值保留；权限缩减继续由既有
+  `reconcileActionPermissions` 推进 action epoch。
+- **测试**：`tst_settingspages` 新增认知页默认值（生产 identity 无 cognition 段）、保存/重开一致、
+  未展示字段保留、环境变量状态；`tst_memoryagent` 新增 actual 配置/环境变量优先级；
+  `tst_actionoutbox` 新增“关闭再开启权限不复活失效行动”。
+- **验证**：全量 `ctest 24/24`（138.69s）；`tst_settingspages 5 passed`；
+  `tst_memoryagent 127 passed/6 skipped`；`tst_cognitivecontext 30 passed`；
+  `tst_memorymanager 157 passed/1 skipped`。生产库/配置哈希未变、未启动应用；
+  候选二进制 `build/stage-b/Windows_AI.exe` SHA-256
+  `49D23A58135C96FA72644CB5D0E777B15C28655C39824C41E72E8E4ED55F2D50`。
+- **未做**：不启动 B5 自然运行、不永久启用 actual、不改生产配置/库、不进入 R13。

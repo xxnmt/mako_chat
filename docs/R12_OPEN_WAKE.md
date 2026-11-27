@@ -17,6 +17,7 @@
 | R12-3a 第二切片（实际模型输入投影） | **已完成（默认关闭、可回退；源码+测试已提交）** | 仅接管前台/回顾的快照块与跨渠道证据块；CURRENT_UNDERSTANDING/MEMORY_DATA/历史/工具/行动链未改；见设计文档 §9 |
 | R12-3b 跨入口认知连续性与资源分配（第一轮） | **已完成（默认关闭、可回退；源码+测试已提交）** | 领域结构化投影、A/B/C/D 可见性、按用途预算、跨入口连续性、真实执行回执只读接入；CURRENT_UNDERSTANDING/MEMORY_DATA/工具/consult 正文仍未迁移；见设计文档 §10 |
 | R12-3b-final 预算/去重语义与 B5 准备 | **已完成（源码+测试已提交；actual 默认关闭）** | 预算裁剪不再产生假 dedup；A/B/C/D 最终输入统计；权限/回执错误状态复验；T01–T10 通过；B5 准备见 [B5_ACCEPTANCE_PREP.md](B5_ACCEPTANCE_PREP.md) |
+| B5 补充：认知参数设置界面 | **已完成（源码+测试已提交；actual 仍默认关闭）** | 新增「认知与自主行为」页；OpenWake/快照预算/退避参数/三个每日上限；`cognition.context_actual_enabled` 配置 + 环境变量覆盖；见 B5 准备 §3.1 |
 | R12-3b 后续（正文位置迁移/其它入口） | 未开始 | 完成后停止评审再评估；不提前进入 B5 自然运行 |
 
 ## R12-1a 补充修正（已独立提交）
@@ -233,4 +234,24 @@ R12 最后一次集中功能收尾；不新增认知能力、不改生产配置/
   停止/回退条件见 [B5_ACCEPTANCE_PREP.md](B5_ACCEPTANCE_PREP.md)；本轮不启动正式自然运行。
 - **后续**：架构收敛清单（正文位置迁移/重复适配层/临时证据表/Shadow/模块解耦）
   登记至 B5 后，不在本轮展开。
+
+## B5 补充：认知参数设置界面（2026-11-28）
+
+仅修改配置读取/保存与设置界面；不修改认知算法、调度策略、行动核验或数据库。
+
+- **新增页面**：设置 →「认知与自主行为」（identity.json）。常用：OpenWake 启用/允许联系、
+  共享预算占比、快照预算、`cognition.context_actual_enabled`；「每日上限」区分
+  每日回顾上限 `proactive.daily_limit`、每日自主唤醒上限 `open_wake.max_per_day`、
+  每日主动联系上限 `proactive.contact_daily_limit`；高级设置默认收起，含调度间隔、
+  单步上限、失败退避秒数列表、连续失败阈值。
+- **actual 开关**：缺省 false；保存到 identity 后重启生效；环境变量
+  `MAKO_COGNITIVE_CONTEXT_ACTUAL` 显式设置（含 0）优先于配置；setter 仍有效；
+  界面同时显示配置值和当前实际运行状态；关闭后恢复旧上下文路径。
+- **保存**：沿用 `writeConfigDocument`，只改本页字段；未展示字段、账户/API/隐私/渠道与
+  既有 `contact_daily_limit=0`/`daily_limit=288`/`cooldown_seconds=60`/`idle_seconds=120`
+  等原值保留；权限缩减仍走既有 epoch 撤回，关闭再开启不复活失效行动。
+- **验证**：全量 `ctest 24/24`（138.69s）；`tst_settingspages 5 passed`；
+  `tst_memoryagent 127 passed/6 skipped`；`tst_cognitivecontext 30 passed`；
+  `tst_memorymanager 157 passed/1 skipped`。生产配置/库未改，未启动应用。
+- 候选二进制与 B5 操作说明见 [B5_ACCEPTANCE_PREP.md](B5_ACCEPTANCE_PREP.md)。
 

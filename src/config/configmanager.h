@@ -175,6 +175,9 @@ public:
     // R12-1a：认知快照提示词字节预算（cognition.snapshot_budget_bytes，默认 4096，夹 2048..8192）。
     // 本片只解析/保存，快照 builder 的接线由下一 agent 完成。
     int getSnapshotBudgetBytes() const;
+    // R12-3b-final：统一认知上下文实际投影开关（cognition.context_actual_enabled，默认 false）。
+    // 仅配置值；进程环境变量 MAKO_COGNITIVE_CONTEXT_ACTUAL 可临时覆盖（见 LLMService）。
+    bool contextActualEnabled() const;
     QQConfig getQQConfig() const;
     MemoryPolicyConfig getMemoryPolicyConfig() const;
     QQGroupMemoryConfig getQQGroupMemoryConfig() const;
@@ -226,6 +229,7 @@ private:
     mutable SemanticVerifierConfig m_semanticVerifier;
     mutable OpenWakeConfig m_openWake;
     mutable int m_snapshotBudgetBytes = 4096;
+    mutable bool m_contextActualEnabled = false;
     void ensureIdentityLoaded() const;
 
     QString m_logDirectory;

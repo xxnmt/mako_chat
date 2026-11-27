@@ -90,8 +90,8 @@ QString settingHelp(const Field &field)
         {"proactive.private_writing", "允许空闲时回顾最近的主人私下交流，留下自己的想法或休息，也可以继续到期的文字活动。两者共用每日上限和回顾间隔。主动联系另行设置。"},
         {"proactive.targets", "填写可主动联系的渠道及会话标识，桌宠会话填 default。"},
         {"proactive.idle_seconds", "从最近一次会话活动开始计时。达到该秒数后才允许进行后台创作回顾或尝试主动联系。0 表示没有额外空闲等待。"},
-        {"proactive.daily_limit", "每天最多领取多少次后台创作回顾任务。0 停止领取。这个上限按回顾任务计数。"},
-        {"proactive.contact_daily_limit", "每日最多主动开口次数，0 不限制。"},
+        {"proactive.daily_limit", "每天最多领取多少次后台创作回顾任务。0 停止领取。这是每日回顾上限，不等同于自主唤醒上限或每日主动联系上限。"},
+        {"proactive.contact_daily_limit", "每日最多主动开口次数，0 不限制。这是主动联系上限，不等同于每日回顾上限或自主唤醒上限。"},
         {"proactive.concern_default_check_minutes", "关注默认再检查间隔，0 表示只在新证据时。"},
         {"proactive.concern_retention_days", "超过该天数的关注不再按时间到期。"},
         {"proactive.cooldown_seconds", "两次后台创作回顾之间的间隔，单位为秒。运行时至少等待 60 秒。"},
@@ -102,6 +102,20 @@ QString settingHelp(const Field &field)
         {"conversation.input_pause_ms", "同一会话、发送者和引用目标的连续输入可一起回答。每条新输入重新计时，从第一条起最多等待 6 秒。0 表示逐条处理。"},
         {"logging.separate_runs", "开启后每次运行生成独立文件。关闭后按本地日期追加，跨午夜自动换文件。"},
         {"memory.debug_full_logs", "开启后记录对话正文和模型请求，用于诊断。"},
+        {"cognition.open_wake.enabled", "允许系统按计划创建内部唤醒（OpenWake）。关闭后不再创建新的唤醒；已有的提醒、回顾和主动联系仍按各自开关执行。"},
+        {"cognition.open_wake.allow_contact", "允许内部唤醒在符合条件时主动联系主人。与启用唤醒独立：只开启唤醒、不开启此项时，唤醒只做内部回顾。"},
+        {"cognition.open_wake.max_per_day", "每天最多创建多少次内部唤醒。这是自主唤醒独立上限，不等同于每日回顾上限或每日主动联系上限。"},
+        {"cognition.open_wake.shared_budget_percent", "内部唤醒与普通回顾共享每日预算时，允许占用的百分比。调低会让唤醒更少占用回顾额度。"},
+        {"cognition.snapshot_budget_bytes", "每轮认知快照的提示词字节预算，范围 2048 至 8192。预算不足时先缩短低优先正文，再显式省略；不会增加模型请求。"},
+        {"cognition.context_actual_enabled", "实验功能：使用统一认知上下文替换旧的上下文组装路径。默认关闭；保存后需重启应用生效。进程环境变量 MAKO_COGNITIVE_CONTEXT_ACTUAL 可临时覆盖本配置（显式设为 0 表示关闭）。"},
+        {"cognition.open_wake.initial_delay_seconds", "应用启动后默认等待多少秒再安排第一次内部唤醒。"},
+        {"cognition.open_wake.default_interval_seconds", "模型没有给出下次唤醒时间时使用的默认间隔。"},
+        {"cognition.open_wake.min_interval_seconds", "允许模型提议的最小唤醒间隔；小于此值会在提交边界被夹紧。"},
+        {"cognition.open_wake.max_interval_seconds", "允许模型提议的最大唤醒间隔。"},
+        {"cognition.open_wake.max_model_steps_per_wake", "单次内部唤醒最多允许的模型步骤数。"},
+        {"cognition.open_wake.max_non_open_jobs_when_due", "内部唤醒到期后，先让出多少次普通回顾任务再执行唤醒。"},
+        {"cognition.review_backoff_seconds", "回顾连续失败后的退避秒数列表（最多 5 个，每个 30 至 86400）。例如 120, 300, 900。"},
+        {"cognition.max_review_failures", "连续失败多少次后暂停回顾；达到后退避列表用尽即 suspended。"},
     };
     const auto path = field.path.join('.');
     QString help = explanations.value(path);
@@ -407,6 +421,30 @@ Binding buildField(const Field &field, const QJsonValue &value, QWidget *parent)
     if (field.type == "rules" || field.type == "schedule" || field.type == "targets"
         || field.type == "zones" || field.type == "modes" || field.type == "senders")
         return tableBinding(field, value, label, parent);
+    if (field.type == "ints") {
+        QStringList initial;
+        for (const auto &entry : value.toArray()) initial.append(QString::number(entry.toInt()));
+        auto *text = new QLineEdit(initial.join(QStringLiteral(", ")), parent);
+        text->setPlaceholderText(QStringLiteral("多个整数以逗号或空格分隔，例如 120, 300, 900"));
+        return {field, text, label, [text]() -> QJsonValue {
+            QString normalized = text->text();
+            normalized.replace(QLatin1Char('，'), QLatin1Char(','));
+            const auto parts = normalized.split(QRegularExpression(QStringLiteral("[,;\\s]+")),
+                                                Qt::SkipEmptyParts);
+            QJsonArray result;
+            if (parts.size() > 5)
+                throw QStringLiteral("最多填写 5 个值");
+            for (const auto &part : parts) {
+                bool ok = false;
+                const int seconds = part.toInt(&ok);
+                if (!ok || seconds < 30 || seconds > 86400)
+                    throw QStringLiteral("每个值应为 30 至 86400 之间的整数（秒）");
+                result.append(seconds);
+            }
+            if (result.isEmpty()) throw QStringLiteral("至少填写一个值");
+            return QJsonValue(result);
+        }, {}};
+    }
 
     const bool referenceDirectory = field.type == "reference_directory";
     const bool logDirectory = field.type == "log_directory";
@@ -462,7 +500,7 @@ Binding buildField(const Field &field, const QJsonValue &value, QWidget *parent)
     }, {}};
 }
 
-struct Group { QString title; QList<Field> fields; };
+struct Group { QString title; QList<Field> fields; bool advanced = false; };
 struct Page { QString title; QString detail; QString file; QList<Group> groups; };
 Field field(const QString &path, const QString &label, QJsonValue fallback, const QString &type = {})
 {
@@ -615,6 +653,30 @@ QList<Page> pages()
                 field("proactive.schedule", "计划时间（调度暂未接入）", QJsonArray{}, "schedule"),
             }},
         }},
+        {"认知与自主行为", "设置内部唤醒、每日上限、认知快照预算与统一认知上下文。", "identity.json", {
+            {"常用", {
+                field("cognition.open_wake.enabled", "启用内部唤醒（OpenWake）", false, "bool"),
+                field("cognition.open_wake.allow_contact", "允许内部唤醒联系主人", false, "bool"),
+                field("cognition.open_wake.shared_budget_percent", "共享每日预算占比（%）", 30, "num:1:100"),
+                field("cognition.snapshot_budget_bytes", "认知快照提示词预算（字节）", 4096, "num:2048:8192"),
+                field("cognition.context_actual_enabled", "启用统一认知上下文（B5 实验功能）", false, "bool"),
+            }},
+            {"每日上限（三个上限相互独立）", {
+                field("proactive.daily_limit", "每日回顾上限", 3, "num:0:999"),
+                field("cognition.open_wake.max_per_day", "每日自主唤醒上限", 12, "num:0:96"),
+                field("proactive.contact_daily_limit", "每日主动联系上限", 3, "num:0:99"),
+            }},
+            {"高级设置：调度与失败退避", {
+                field("cognition.open_wake.initial_delay_seconds", "首次唤醒延迟（秒）", 900, "num:60:86400"),
+                field("cognition.open_wake.default_interval_seconds", "默认唤醒间隔（秒）", 1800, "num:300:86400"),
+                field("cognition.open_wake.min_interval_seconds", "最小唤醒间隔（秒）", 300, "num:300:86400"),
+                field("cognition.open_wake.max_interval_seconds", "最大唤醒间隔（秒）", 86400, "num:300:86400"),
+                field("cognition.open_wake.max_model_steps_per_wake", "单次唤醒最多模型步数", 3, "num:1:8"),
+                field("cognition.open_wake.max_non_open_jobs_when_due", "到期后先让出的普通回顾次数", 3, "num:0:20"),
+                field("cognition.review_backoff_seconds", "回顾失败退避（秒，逗号分隔）", QJsonArray{120, 300, 900}, "ints"),
+                field("cognition.max_review_failures", "连续失败暂停阈值", 4, "num:1:10"),
+            }, true},
+        }},
         {"时间与状态", "设置昼夜切换与桌宠状态持续时间。", "setting.json", {
             {"昼夜切换", {
                 field("time.night_start", "夜间开始", "22:00", "time"),
@@ -680,6 +742,21 @@ PageView buildPage(const Page &page, const std::function<void()> &applied, QWidg
         if (bundled.open(QIODevice::ReadOnly)) promptText = QString::fromUtf8(bundled.readAll());
     }
     PageView view{panel, std::make_shared<QList<Binding>>(), {}};
+
+    // 高级设置默认收起，避免常用参数与调度/退避参数混在一起。
+    auto advancedCards = std::make_shared<QList<QGroupBox *>>();
+    const bool hasAdvanced = std::any_of(page.groups.cbegin(), page.groups.cend(),
+                                         [](const Group &group) { return group.advanced; });
+    QCheckBox *advancedToggle = nullptr;
+    if (hasAdvanced) {
+        advancedToggle = new QCheckBox(QStringLiteral("显示高级设置"), contents);
+        advancedToggle->setObjectName(QStringLiteral("showAdvancedSettings"));
+        cards->addWidget(advancedToggle);
+        QObject::connect(advancedToggle, &QCheckBox::toggled, contents,
+                         [advancedCards](bool shown) {
+                             for (QGroupBox *card : *advancedCards) card->setVisible(shown);
+                         });
+    }
 
     for (const auto &group : page.groups) {
         auto *card = new QGroupBox(group.title, contents);
@@ -753,10 +830,35 @@ PageView buildPage(const Page &page, const std::function<void()> &applied, QWidg
                 });
             }
             form->addRow(label, binding.row);
+            // actual 开关：同时显示配置值（勾选框）和当前实际运行状态（环境变量/配置）。
+            if (key == "cognition.context_actual_enabled") {
+                const QByteArray envValue = qgetenv("MAKO_COGNITIVE_CONTEXT_ACTUAL").trimmed();
+                QString status;
+                if (!envValue.isEmpty()) {
+                    const QByteArray lowered = envValue.toLower();
+                    const bool envOn = lowered == QByteArray("1") || lowered == QByteArray("true")
+                        || lowered == QByteArray("on");
+                    status = QStringLiteral("当前实际运行：环境变量覆盖为「%1」。"
+                                            "环境变量显式设置时优先于配置（含 0）；保存配置不影响本次运行。")
+                                 .arg(envOn ? QStringLiteral("开") : QStringLiteral("关"));
+                } else {
+                    status = QStringLiteral("当前实际运行：按 identity.json 配置为「%1」。"
+                                            "保存后需重启应用生效；旧上下文路径仍可回退。")
+                                 .arg(configured.toBool() ? QStringLiteral("开") : QStringLiteral("关"));
+                }
+                auto *runtimeStatus = new QLabel(status, card);
+                runtimeStatus->setWordWrap(true);
+                runtimeStatus->setObjectName(key + QStringLiteral(".status"));
+                form->addRow(new QLabel(QStringLiteral("当前运行状态"), card), runtimeStatus);
+            }
             indexes.append(view.bindings->size());
             view.bindings->append(std::move(binding));
         }
         cards->addWidget(card);
+        if (group.advanced) {
+            card->setVisible(false);
+            advancedCards->append(card);
+        }
         view.groups.append({card, indexes});
     }
     cards->addStretch();
@@ -926,7 +1028,11 @@ QWidget *buildSettingsPages(QWidget *history, std::function<void()> applied, QWi
             const auto &view = views[i];
             const bool all = query.isEmpty() || definitions[i].title.contains(query, Qt::CaseInsensitive);
             bool pageMatches = all;
-            for (const auto &[card, indexes] : view.groups) {
+            for (int groupIndex = 0; groupIndex < view.groups.size(); ++groupIndex) {
+                auto [card, indexes] = view.groups.at(groupIndex);
+                const bool advanced = definitions[i].groups.value(groupIndex).advanced;
+                auto *advancedToggle = view.widget->findChild<QCheckBox *>(
+                    QStringLiteral("showAdvancedSettings"));
                 const bool groupMatches = all || card->title().contains(query, Qt::CaseInsensitive);
                 bool any = false;
                 for (const auto index : indexes) {
@@ -936,8 +1042,12 @@ QWidget *buildSettingsPages(QWidget *history, std::function<void()> applied, QWi
                     static_cast<QFormLayout *>(card->layout())->setRowVisible(binding.row, show);
                     any |= show;
                 }
-                card->setVisible(any);
-                pageMatches |= any;
+                if (advanced && any && !query.isEmpty() && !all && advancedToggle)
+                    advancedToggle->setChecked(true);
+                const bool advancedVisible = !advanced
+                    || (advancedToggle && advancedToggle->isChecked());
+                card->setVisible(any && advancedVisible);
+                pageMatches |= any && advancedVisible;
             }
             navigation->item(i)->setHidden(!pageMatches);
             if (first < 0 && pageMatches) first = i;

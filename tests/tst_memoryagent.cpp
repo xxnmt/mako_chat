@@ -1801,6 +1801,61 @@ private slots:
         QVERIFY(!failed.value(QStringLiteral("error")).toString().isEmpty());
     }
 
+    // R12-3b-final：actual 配置开关与环境变量覆盖优先级。
+    // 环境变量显式设置（含 0/false/off）优先于 identity.json；setter 仍可强制覆盖（测试用）。
+    void actualConfigAndEnvironmentPrecedence()
+    {
+        SemanticReviewConfigGuard guard;
+        QVERIFY(guard.enable());
+        auto &cfg = ConfigManager::instance();
+        const auto writeConfig = [&cfg](bool enabled) {
+            return cfg.writeConfigDocument(QStringLiteral("identity.json"),
+                QJsonDocument(QJsonObject{
+                    {QStringLiteral("memory"), QJsonObject{
+                         {QStringLiteral("long_term_memory_enabled"), true}}},
+                    {QStringLiteral("cognition"), QJsonObject{
+                         {QStringLiteral("context_actual_enabled"), enabled}}}}).toJson(),
+                nullptr);
+        };
+        const QUrl endpoint(QStringLiteral("http://127.0.0.1:1/"));
+        qunsetenv("MAKO_COGNITIVE_CONTEXT_ACTUAL");
+        QVERIFY(writeConfig(true));
+        {
+            LLMService model(QStringLiteral("test"), nullptr, endpoint);
+            QVERIFY(model.cognitiveContextActualEnabled());
+        }
+        // 显式 0 覆盖配置 true（进程启动读取一次环境变量）。
+        qputenv("MAKO_COGNITIVE_CONTEXT_ACTUAL", "0");
+        {
+            LLMService model(QStringLiteral("test"), nullptr, endpoint);
+            QVERIFY(!model.cognitiveContextActualEnabled());
+        }
+        // 显式 false/off 同样视为关闭。
+        qputenv("MAKO_COGNITIVE_CONTEXT_ACTUAL", "off");
+        {
+            LLMService model(QStringLiteral("test"), nullptr, endpoint);
+            QVERIFY(!model.cognitiveContextActualEnabled());
+        }
+        // 环境变量开启覆盖配置 false。
+        QVERIFY(writeConfig(false));
+        qputenv("MAKO_COGNITIVE_CONTEXT_ACTUAL", "1");
+        {
+            LLMService model(QStringLiteral("test"), nullptr, endpoint);
+            QVERIFY(model.cognitiveContextActualEnabled());
+        }
+        // setter 仍有效：测试/调用方强制关闭优先于环境变量。
+        {
+            LLMService model(QStringLiteral("test"), nullptr, endpoint);
+            model.setCognitiveContextActualEnabled(false);
+            QVERIFY(!model.cognitiveContextActualEnabled());
+        }
+        qunsetenv("MAKO_COGNITIVE_CONTEXT_ACTUAL");
+        {
+            LLMService model(QStringLiteral("test"), nullptr, endpoint);
+            QVERIFY(!model.cognitiveContextActualEnabled());
+        }
+    }
+
     // R12-3a 第二切片：隔离数据库上的真实模型集成（opt-in；凭据来自环境变量）。
     // 只验证真实 provider 能接受投影后的实际输入并返回可解析结果；不接任何真实渠道、
     // 不发送真实消息、不写生产库。

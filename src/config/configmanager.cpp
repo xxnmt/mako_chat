@@ -979,6 +979,9 @@ void ConfigManager::ensureIdentityLoaded() const
         // R12-1a：快照提示词字节预算。本片只解析/保存，接线由下一 agent 完成。
         m_snapshotBudgetBytes =
             qBound(2048, cognitionObj.value("snapshot_budget_bytes").toInt(4096), 8192);
+        // R12-3b-final：统一认知上下文实际投影开关，缺省 false（与既有行为一致）。
+        m_contextActualEnabled =
+            cognitionObj.value("context_actual_enabled").toBool(false);
     }
     QJsonObject quietObj = proObj.value("quiet_hours").toObject();
     m_proactive.quietStart = quietObj.value("start").toString("23:00");
@@ -1067,6 +1070,12 @@ int ConfigManager::getSnapshotBudgetBytes() const
 {
     ensureIdentityLoaded();
     return m_snapshotBudgetBytes;
+}
+
+bool ConfigManager::contextActualEnabled() const
+{
+    ensureIdentityLoaded();
+    return m_contextActualEnabled;
 }
 
 QQConfig ConfigManager::getQQConfig() const

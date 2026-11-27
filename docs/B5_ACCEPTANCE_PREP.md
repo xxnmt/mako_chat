@@ -10,8 +10,8 @@
 | 项 | 值 |
 |---|---|
 | 候选路径 | `build/stage-b/Windows_AI.exe` |
-| 大小 / 时间 | 112,767,677 B / 2026-11-28 01:59:05（最终构建后） |
-| SHA-256 | `02D73B6413B2E23A7D1F181671334C5E138D6F99CFAFAF4141027DB5BFA3077C` |
+| 大小 / 时间 | 113,002,774 B / 2026-11-28 06:23:46（最终构建后） |
+| SHA-256 | `49D23A58135C96FA72644CB5D0E777B15C28655C39824C41E72E8E4ED55F2D50` |
 | 构建 | Ninja Debug，Qt 6.11.1 / MinGW 13.1；全量构建通过 |
 | 说明 | 候选二进制未复制到生产运行目录 `build/Desktop_Qt_6_11_1_MinGW_64_bit_Debug`；生产 run 目录二进制/配置/库保持原样 |
 
@@ -32,13 +32,42 @@
 
 ## 3. actual 模式临时启用 / 恢复旧模式
 
-- **启用 actual（临时）**：在启动进程前设置环境变量 `MAKO_COGNITIVE_CONTEXT_ACTUAL=1`。
+- **启用 actual（正常方式）**：打开设置 →「认知与自主行为」→ 勾选
+  「启用统一认知上下文（B5 实验功能）」→ 保存 → **重启应用**。
+  - 写入 `identity.json` 的 `cognition.context_actual_enabled`，缺省 false；不新增 schema。
+  - 页面同时显示“配置值”（勾选框）与“当前运行状态”：未设环境变量时按配置，
+    保存后需重启；设了环境变量时显示环境变量覆盖。
+- **启用 actual（临时覆盖）**：启动进程前设置 `MAKO_COGNITIVE_CONTEXT_ACTUAL=1`。
+  - 环境变量只要显式设置就优先于配置，包括显式 `0`/`false`/`off`（表示强制关闭）。
   - 仅影响本次进程；不写配置、不迁移数据库。
-  - 启动后日志应出现 `[Cognitive][Actual]`；`LLMService::lastCognitiveShadowReport()` 的
-    `actual_mode=true`、`projection` 含 A/B/C/D、裁剪/去重与 `prompt_tokens` 字段。
-- **恢复旧模式（回退）**：去掉该环境变量并重启进程即可；无需回滚数据。
-  - 旧 prompt 组装路径仍在，actual 关闭时行为与 R12-3b 之前一致。
-- **不建议**在 B5 期间通过代码/配置永久打开 actual；验收结束按结论决定是否切换默认。
+- **恢复旧模式（回退）**：
+  1. 首选：在设置中取消勾选并保存，然后重启；或
+  2. 不启动候选版本前移除 `MAKO_COGNITIVE_CONTEXT_ACTUAL` 环境变量并重启。
+  - 关闭后恢复旧上下文组装路径；无需回滚数据/配置（除非用户主动改了参数）。
+- 启动后日志应出现 `[Cognitive][Actual]`；`actual_mode=true`、`projection` 含 A/B/C/D、
+  裁剪/去重与 `prompt_tokens` 字段。
+- **不建议**在 B5 期间用环境变量长期替代界面配置；验收结束按结论决定是否保留配置或回退。
+
+## 3.1 认知参数设置界面（B5 补充）
+
+设置 →「认知与自主行为」（`identity.json`）：
+
+- **常用**：启用内部唤醒（OpenWake）、允许内部唤醒联系主人、共享每日预算占比、
+  认知快照提示词预算、启用统一认知上下文（B5 实验功能）。
+- **每日上限（三个上限相互独立）**：每日回顾上限 `proactive.daily_limit`、
+  每日自主唤醒上限 `cognition.open_wake.max_per_day`、每日主动联系上限
+  `proactive.contact_daily_limit`；界面与帮助文案明确区分，不互相替代。
+- **高级设置（默认收起，点击“显示高级设置”）**：首次唤醒延迟、默认/最小/最大唤醒间隔、
+  单次唤醒最多模型步数、到期后先让出的普通回顾次数、回顾失败退避秒数列表、
+  连续失败暂停阈值。
+- **actual 状态**：勾选框保存 `cognition.context_actual_enabled`；下方只读标签显示
+  “配置值/环境变量覆盖”和当前实际运行开/关；保存后需重启生效。
+- **保存机制**：沿用 `ConfigManager::writeConfigDocument` 与现有设置保存；
+  只修改本页展示的字段，`cognition` 未展示字段与其他账户/API/隐私/渠道设置原样保留。
+  权限缩减仍走既有 `reconcileActionPermissions` → action context epoch 撤回；
+  关闭再开启权限不会让已失效的在途行动复活。
+- **范围/校验**：沿用 ConfigManager 的夹紧规则（如快照预算 2048..8192、
+  唤醒上限 0..96）；不新增另一套规则、不新增数据库 schema。
 
 ## 4. 日志采集
 
@@ -118,3 +147,12 @@ duplicate 投递、隐私过滤/泄漏、行动回执状态。**不以主动联�
 
 本轮只准备 B5：未启动生产应用、未永久启用 actual、未修改生产配置/数据库、未清理历史、
 未进入 R13/Vision/后台通用 tool loop/完整 Attention 重构。
+
+## 11. 候选版本验证记录
+
+- 全量构建通过；**ctest 24/24 通过**（`build/stage-b/b5-settings-ctest.log`，138.69s）。
+- `tst_settingspages 5 passed`（认知页默认值/加载保存/未展示字段保留/重开一致/环境变量状态）；
+  `tst_memoryagent 127 passed / 6 skipped`（含 actual 配置与环境变量优先级）；
+  `tst_cognitivecontext 30 passed`；`tst_memorymanager 157 passed / 1 skipped`；
+  `tst_actionoutbox` 含“关闭再开启权限不复活失效行动”用例。
+- 生产库/配置哈希与 mtime 未变；候选版本尚未复制到生产 run 目录、未启动。

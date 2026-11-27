@@ -2606,6 +2606,38 @@ private slots:
         }
     }
 
+    // 设置页关闭再开启行动权限：只恢复配置，不恢复已失效的在途行动。
+    void permissionReductionThenRestoreDoesNotReviveExpiredAction()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableOpenWakeContact(true));
+        const QString path = dir.filePath(QStringLiteral("permission-fence.db"));
+        MemoryManager db(path);
+        ActionCommitter committer(&db);
+        const QString runId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        const qlonglong wakeId = seedOpenWakeRow(path, QStringLiteral("permission-wake"), runId);
+        QVERIFY(wakeId > 0);
+        const QString key = persistVerifiedProposal(
+            db, wakeContactProposal(wakeId, 1, runId, QStringLiteral("在忙吗？")));
+        QVERIFY(!key.isEmpty());
+        // 关闭权限：既有 action epoch 机制推进 fence epoch（对应设置页保存后的权限撤回）。
+        const qint64 epochBefore = db.actionContextEpoch();
+        QVERIFY(db.bumpActionContextEpoch(QStringLiteral("action_permissions_reduced")) > epochBefore);
+        // 再开启权限（设置页恢复 allow_contact）不会让旧行动复活。
+        QVERIFY(identity.enableOpenWakeContact(true));
+        const auto committed = committer.commitOpenWakeContact(key);
+        QCOMPARE(committed.value(QStringLiteral("error")).toString(),
+                 QStringLiteral("stale_origin"));
+        RawDb raw(path, QStringLiteral("permission-fence-post"));
+        QVERIFY(raw.open());
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_outbox")).toInt(), 0);
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM action_proposal WHERE action_key='")
+                            + key + QStringLiteral("'")).toString(),
+                 QStringLiteral("expired"));
+    }
+
 };
 
 QTEST_GUILESS_MAIN(TestActionOutbox)
