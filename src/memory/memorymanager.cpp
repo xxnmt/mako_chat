@@ -12648,9 +12648,11 @@ QJsonArray MemoryManager::claimPendingActivityShareIntents(int limit, bool force
         }
         // 已有成功/未知/被撤销的分享回执：不自动重发（at-most-once / 已交付）。
         if (!shareOutcome.isEmpty()) continue;
-        // 同成果版本已经产生过提案：verified/committed/withheld/expired/unknown 都视为已处理，
-        // 不再重复自动分享。只有停在 proposed（提交前崩溃/核验在途无结果）的行允许重新核验；
-        // 重新核验仍是同一 action_key/同一内容，persist 幂等，proposed→verified 由 CAS 完成。
+        // A persisted requested marker reserves the one verifier call for this artifact version.
+        // After a restart or an expired request, a missing result is ambiguous. Preserve the
+        // activity and audit the withheld share instead of issuing a second verifier call.
+        const qint64 recoveryAt = intent.value(QStringLiteral("recovery_at")).toInteger();
+        QString proposalState;
         {
             QSqlQuery existing(m_db);
             existing.prepare(QStringLiteral(
@@ -12660,15 +12662,24 @@ QJsonArray MemoryManager::claimPendingActivityShareIntents(int limit, bool force
             existing.addBindValue(ref);
             existing.addBindValue(intentVersion);
             if (!existing.exec()) return QJsonArray{};
-            if (existing.next()
-                && existing.value(0).toString() != QStringLiteral("proposed"))
-                continue;
+            if (existing.next()) proposalState = existing.value(0).toString();
         }
-        // 进程内/跨重启节流：非 force 时 requested 后 retryAfter 秒内不重复发起核验。
-        const qint64 recoveryAt = intent.value(QStringLiteral("recovery_at")).toInteger();
-        if (!force && recoveryState == QStringLiteral("requested")
-            && recoveryAt > 0 && now - recoveryAt < retryAfter)
+        if (!proposalState.isEmpty() && proposalState != QStringLiteral("proposed")) continue;
+        if (recoveryState == QStringLiteral("requested") || !proposalState.isEmpty()) {
+            if (!force && recoveryAt > 0 && now - recoveryAt < retryAfter) continue;
+            if (!withhold(QStringLiteral("verification_outcome_unknown"))) return QJsonArray{};
+            if (!proposalState.isEmpty()) {
+                QSqlQuery cancel(m_db);
+                cancel.prepare("UPDATE action_proposal SET state='withheld',semantic_status='withheld',"
+                               "error_code='verification_outcome_unknown',updated_at=unixepoch() "
+                               "WHERE kind='activity_share' AND origin_kind='activity' "
+                               "AND origin_ref=? AND origin_version=? AND state='proposed'");
+                cancel.addBindValue(ref);
+                cancel.addBindValue(intentVersion);
+                if (!cancel.exec()) return QJsonArray{};
+            }
             continue;
+        }
         if (!markIntent(candidate.id, QStringLiteral("requested"), QString(), now))
             return QJsonArray{};
         result.append(QJsonObject{
@@ -12736,6 +12747,8 @@ bool MemoryManager::markActivityShareIntentRequested(const QString &ref, int art
         "updated_at=unixepoch() "
         "WHERE id=? AND status='completed' "
         "AND json_extract(result_json,'$.share_intent.state')='saved' "
+        "AND coalesce(json_extract(result_json,'$.share_intent.recovery_state'),'') "
+        "NOT IN ('requested','withheld') "
         "AND json_extract(result_json,'$.share_intent.artifact_version')=?"));
     update.addBindValue(QString::fromUtf8(QJsonDocument(QJsonObject{
         {QStringLiteral("share_intent"),

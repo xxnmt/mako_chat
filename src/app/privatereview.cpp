@@ -1014,9 +1014,9 @@ void PrivateReview::receive(qlonglong id, int version, const QJsonObject &propos
             qInfo().noquote()
                 << QStringLiteral("[Activity] share_proposal_requested ref=%1 key=%2")
                        .arg(ref, shareKey);
-            // R12-2c-3：标记恢复节流（requested+recovery_at）；提案落库后恢复扫描按唯一键跳过。
-            store.markActivityShareIntentRequested(
-                ref, intent.value(QStringLiteral("artifact_version")).toInt());
+            if (!store.markActivityShareIntentRequested(
+                    ref, intent.value(QStringLiteral("artifact_version")).toInt()))
+                return;
             emit internalShareProposalReady(request);
         }
         return;

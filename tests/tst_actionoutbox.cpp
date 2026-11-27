@@ -2524,6 +2524,18 @@ private slots:
             MemoryManager reopened(path);
             QCOMPARE(reopened.claimPendingActivityShareIntents(4, true).size(), 1);
         }
+        // The verifier might have received the claimed request just before the crash.
+        {
+            MemoryManager reopened(path);
+            QCOMPARE(reopened.claimPendingActivityShareIntents(4, true).size(), 0);
+            RawDb raw(path, QStringLiteral("a22-unknown-verification"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT json_extract(result_json,'$.share_intent.recovery_reason') "
+                         "FROM internal_activity ORDER BY id DESC LIMIT 1")).toString(),
+                     QStringLiteral("verification_outcome_unknown"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_outbox")).toInt(), 1);
+        }
         Q_UNUSED(actionKey);
     }
 
