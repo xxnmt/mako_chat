@@ -1596,3 +1596,113 @@ QJsonObject ActionPolicy::validateActionProposal(const QJsonObject &proposal,
                        {QStringLiteral("semantic_status"), semanticStatus}};
     return result;
 }
+
+// R12-2c-1：verifier 响应的严格白名单解析。
+//
+// 这一步只回答"模型返回的协议是否合法"，不回答"提案是否可通过"：
+//   * request_id 缺失/非字符串 → schema_invalid（与请求不匹配由调用方比对后报
+//     request_mismatch，两者诊断码分开）；
+//   * claim_coverage/result 必须是封闭枚举字符串，未知值 → unknown_enum；
+//   * supporting_refs 必须是字符串数组（可选）；missing_claims 必须是 {type,text}
+//     字符串对象数组（可选），元素类型不符 → schema_invalid；
+//   * 元素数量有界，避免模型输出放大内存/日志。
+VerifierVerdict ActionPolicy::parseVerifierVerdict(const QJsonObject &response)
+{
+    VerifierVerdict verdict;
+    const auto fail = [&verdict](const QString &error) {
+        verdict.valid = false;
+        verdict.error = error;
+        return verdict;
+    };
+    if (response.isEmpty()) return fail(QStringLiteral("schema_invalid"));
+    const QJsonValue requestIdValue = response.value(QStringLiteral("request_id"));
+    if (!requestIdValue.isString() || requestIdValue.toString().trimmed().isEmpty())
+        return fail(QStringLiteral("schema_invalid"));
+    verdict.requestId = requestIdValue.toString().trimmed();
+
+    const QJsonValue coverageValue = response.value(QStringLiteral("claim_coverage"));
+    if (!coverageValue.isString()) return fail(QStringLiteral("schema_invalid"));
+    const QString coverage = coverageValue.toString().trimmed();
+    if (coverage != QStringLiteral("complete") && coverage != QStringLiteral("incomplete"))
+        return fail(QStringLiteral("unknown_enum"));
+    verdict.coverageComplete = coverage == QStringLiteral("complete");
+
+    const QJsonValue resultValue = response.value(QStringLiteral("result"));
+    if (!resultValue.isString()) return fail(QStringLiteral("schema_invalid"));
+    const QString result = resultValue.toString().trimmed();
+    if (result == QStringLiteral("entailed")) {
+        verdict.result = VerifierVerdict::Entailed;
+    } else if (result == QStringLiteral("contradicted")) {
+        verdict.result = VerifierVerdict::Contradicted;
+    } else if (result == QStringLiteral("insufficient")) {
+        verdict.result = VerifierVerdict::Insufficient;
+    } else {
+        return fail(QStringLiteral("unknown_enum"));
+    }
+
+    // supporting_refs：可选；存在时必须是字符串数组且有界（只做审计，不参与状态）。
+    const QJsonValue refsValue = response.value(QStringLiteral("supporting_refs"));
+    if (!refsValue.isUndefined() && !refsValue.isNull()) {
+        if (!refsValue.isArray()) return fail(QStringLiteral("schema_invalid"));
+        for (const auto &ref : refsValue.toArray()) {
+            if (!ref.isString()) return fail(QStringLiteral("schema_invalid"));
+            verdict.supportingRefs.append(ref.toString());
+            if (verdict.supportingRefs.size() > 8)
+                return fail(QStringLiteral("schema_invalid"));
+        }
+    }
+
+    // missing_claims：可选；存在时必须是 {type?,text?} 的字符串对象数组（只做诊断）。
+    const QJsonValue missingValue = response.value(QStringLiteral("missing_claims"));
+    if (!missingValue.isUndefined() && !missingValue.isNull()) {
+        if (!missingValue.isArray()) return fail(QStringLiteral("schema_invalid"));
+        QJsonArray normalized;
+        for (const auto &value : missingValue.toArray()) {
+            if (!value.isObject()) return fail(QStringLiteral("schema_invalid"));
+            const auto claim = value.toObject();
+            const QJsonValue typeValue = claim.value(QStringLiteral("type"));
+            const QJsonValue textValue = claim.value(QStringLiteral("text"));
+            if ((!typeValue.isUndefined() && !typeValue.isNull() && !typeValue.isString())
+                || (!textValue.isUndefined() && !textValue.isNull()
+                    && !textValue.isString())) {
+                return fail(QStringLiteral("schema_invalid"));
+            }
+            normalized.append(QJsonObject{
+                {QStringLiteral("type"), typeValue.toString()},
+                {QStringLiteral("text"), textValue.toString()}});
+            if (normalized.size() > 16) return fail(QStringLiteral("schema_invalid"));
+        }
+        verdict.missingClaims = normalized;
+    }
+
+    const QJsonValue reasonValue = response.value(QStringLiteral("reason_code"));
+    if (!reasonValue.isUndefined() && !reasonValue.isNull()) {
+        if (!reasonValue.isString()) return fail(QStringLiteral("schema_invalid"));
+        verdict.reasonCode = reasonValue.toString().left(120);
+    }
+
+    verdict.valid = true;
+    verdict.error.clear();
+    return verdict;
+}
+
+bool ActionPolicy::isValidSemanticStatus(const QString &status)
+{
+    // 与记忆层 action_proposal 持久化约束保持一致，并保留 legacy contact 的
+    // retained/repaired；空串/null 表示"尚无结论"，不允许作为终态写回。
+    static const QSet<QString> allowed{
+        QStringLiteral("unverified"), QStringLiteral("entailed"),
+        QStringLiteral("entailed_coverage"), QStringLiteral("repaired"),
+        QStringLiteral("repair_needed"), QStringLiteral("contradicted"),
+        QStringLiteral("insufficient"), QStringLiteral("withheld"),
+        QStringLiteral("not_required"), QStringLiteral("unknown"),
+        QStringLiteral("retained")};
+    return !status.trimmed().isEmpty() && allowed.contains(status.trimmed());
+}
+
+QString ActionPolicy::verifiedSemanticStatus(bool hasFactualClaims)
+{
+    return hasFactualClaims ? QStringLiteral("entailed")
+                            : QStringLiteral("entailed_coverage");
+}
+

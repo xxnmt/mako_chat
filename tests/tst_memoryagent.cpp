@@ -5,12 +5,14 @@
 #include <QJsonDocument>
 #include <QFile>
 #include <QSignalSpy>
+#include <QSet>
 #include <QTemporaryDir>
 #include <QTimer>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <memory>
 #include "llmservice.h"
+#include "actionorigin.h"
 #include "configmanager.h"
 #include "cognitivecoordinator.h"
 #include "cognitivesnapshot.h"
@@ -107,6 +109,89 @@ QString capabilityPromptText(const QByteArray &body)
     }
     return {};
 }
+
+// R12-2c-1：从 verifier 请求体里取出用户输入 JSON（request_id/action_key/来源身份/
+// payload_digest/预算诊断都在这里）。
+QJsonObject verifierUserInput(const QByteArray &body)
+{
+    const auto messages = QJsonDocument::fromJson(body).object()
+                              .value(QStringLiteral("messages")).toArray();
+    for (const auto &value : messages) {
+        const auto message = value.toObject();
+        if (message.value(QStringLiteral("role")).toString() != QStringLiteral("user"))
+            continue;
+        return QJsonDocument::fromJson(
+            message.value(QStringLiteral("content")).toString().toUtf8()).object();
+    }
+    return {};
+}
+
+// 构造 verifier 应答：原样回显 request_id（缺失会被服务端判 schema_invalid 并 withheld）。
+// 只用于测试真实 HTTP 契约，不改变服务端判定逻辑。
+QString verifierAnswer(const QByteArray &body, const QString &coverage,
+                       const QString &result, const QString &reasonCode,
+                       const QJsonArray &missingClaims = QJsonArray{})
+{
+    return QString::fromUtf8(QJsonDocument(QJsonObject{
+        {QStringLiteral("request_id"),
+         verifierUserInput(body).value(QStringLiteral("request_id")).toString()},
+        {QStringLiteral("claim_coverage"), coverage},
+        {QStringLiteral("missing_claims"), missingClaims},
+        {QStringLiteral("result"), result},
+        {QStringLiteral("supporting_refs"), QJsonArray{}},
+        {QStringLiteral("reason_code"), reasonCode}}).toJson(QJsonDocument::Compact));
+}
+
+// R12-2c-1：延迟应答的 completion mock。请求体收齐后先不回包，测试用 respond(index)
+// 手动决定回包时机，用来构造"verifier 晚到/跨 generation"的竞态。
+class DeferredCompletionServer
+{
+public:
+    bool listen() { return server.listen(QHostAddress::LocalHost); }
+    quint16 port() const { return server.serverPort(); }
+    QList<QByteArray> bodies;
+
+    DeferredCompletionServer()
+    {
+        QObject::connect(&server, &QTcpServer::newConnection, &server, [this] {
+            auto *socket = server.nextPendingConnection();
+            QObject::connect(socket, &QTcpSocket::readyRead, socket, [this, socket] {
+                const auto bytes = socket->peek(socket->bytesAvailable());
+                const auto header = bytes.indexOf("\r\n\r\n");
+                if (header < 0) return;
+                const auto length = QRegularExpression("content-length: (\\d+)",
+                    QRegularExpression::CaseInsensitiveOption).match(
+                        QString::fromLatin1(bytes.left(header)));
+                if (!length.hasMatch()
+                    || bytes.size() - header - 4 < length.captured(1).toInt())
+                    return;
+                socket->readAll();
+                bodies.append(bytes.mid(header + 4));
+                sockets.append(socket);
+            });
+        });
+    }
+
+    void respond(int index, const QString &content)
+    {
+        if (index < 0 || index >= static_cast<int>(sockets.size()) || !sockets.at(index)) return;
+        auto *socket = sockets.at(index);
+        const QJsonObject message{{QStringLiteral("finish_reason"), QStringLiteral("stop")},
+                                  {QStringLiteral("message"),
+                                   QJsonObject{{QStringLiteral("content"), content}}}};
+        const auto payload = QJsonDocument(
+            QJsonObject{{QStringLiteral("choices"), QJsonArray{message}}}).toJson();
+        socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n"
+                      "Content-Length: "
+                      + QByteArray::number(payload.size()) + "\r\n\r\n" + payload);
+        socket->disconnectFromHost();
+        sockets[index] = nullptr;
+    }
+
+private:
+    QTcpServer server;
+    QList<QTcpSocket *> sockets; // socket 由 QTcpServer 托管，测试对象存活期内有效
+};
 
 // 语义核验/主动联系用例的配置守卫：写 setting.json + identity.json，析构时恢复原文件。
 // 与 tst_actionoutbox 的 ProactiveIdentityGuard 同思路，但额外要求长期记忆与语义核验开启。
@@ -1609,6 +1694,7 @@ private slots:
         QList<QByteArray> bodies;
         int reviewRound = 0;
         int verifierCalls = 0;
+        QJsonObject lastVerifierInput;
         serveCompletions(server, bodies, [&](int) -> QString {
             const QByteArray body = bodies.last();
             if (body.contains("【语义核验】")) {
@@ -1616,25 +1702,18 @@ private slots:
                 // 新契约：verifier 一次请求同时给出 claim_coverage 与 entailment 结论。
                 // 从请求体里解析出 verifier 输入，按 declared_claims 是否为空区分轮次
                 // （HTTP body 里输入 JSON 是转义字符串，不能直接做子串匹配）。
-                QJsonArray declaredClaims;
-                for (const auto &value : QJsonDocument::fromJson(body).object()
-                                             .value(QStringLiteral("messages")).toArray()) {
-                    const auto message = value.toObject();
-                    if (message.value(QStringLiteral("role")).toString() != QStringLiteral("user"))
-                        continue;
-                    declaredClaims = QJsonDocument::fromJson(
-                        message.value(QStringLiteral("content")).toString().toUtf8()).object()
-                                         .value(QStringLiteral("declared_claims")).toArray();
-                }
+                lastVerifierInput = verifierUserInput(body);
+                const QJsonArray declaredClaims =
+                    lastVerifierInput.value(QStringLiteral("declared_claims")).toArray();
                 if (!declaredClaims.isEmpty())
-                    return R"({"claim_coverage":"complete","missing_claims":[],)"
-                           R"("result":"insufficient","supporting_refs":[],"reason_code":"unrelated"})";
+                    return verifierAnswer(body, QStringLiteral("complete"),
+                                          QStringLiteral("insufficient"),
+                                          QStringLiteral("unrelated"));
                 // 纯 self_desire：claims 为空、无外部事实 → coverage 完整且 entailed。
-                return R"({"claim_coverage":"complete","missing_claims":[],)"
-                       R"("result":"entailed","supporting_refs":[],"reason_code":"pure_self_desire"})";
+                return verifierAnswer(body, QStringLiteral("complete"),
+                                      QStringLiteral("entailed"),
+                                      QStringLiteral("pure_self_desire"));
             }
-            if (body.contains("【约束修复】"))
-                return R"({"contact":{"reason":"想问问","message":"后来去成了吗","claims":[]}})";
             ++reviewRound;
             if (reviewRound == 1) {
                 // 编造的承诺：refs 指向主动消息（assistant 表达），确定性校验必须先拒绝。
@@ -1748,6 +1827,20 @@ private slots:
             QCOMPARE(row.value(1).toString(), QStringLiteral("entailed_coverage"));
         }
         QCOMPARE(reviewRound, 3);
+        // R12-2c-1：每轮 verifier 输入都必须带 request_id/action_key/来源身份/payload_digest；
+        // 第 3 轮 claims=[] 仍要真实执行 coverage 核验（A01）。
+        QVERIFY(!lastVerifierInput.value(QStringLiteral("request_id")).toString().isEmpty());
+        QCOMPARE(lastVerifierInput.value(QStringLiteral("action_key")).toString(),
+                 QStringLiteral("concern:%1:%2:contact").arg(turn).arg(versionC));
+        QCOMPARE(lastVerifierInput.value(QStringLiteral("origin_ref")).toString(),
+                 QStringLiteral("concern/%1").arg(turn));
+        QCOMPARE(lastVerifierInput.value(QStringLiteral("origin_version")).toInt(), versionC);
+        QVERIFY(lastVerifierInput.contains(QStringLiteral("run_id")));
+        QVERIFY(lastVerifierInput.contains(QStringLiteral("context_epoch")));
+        QCOMPARE(lastVerifierInput.value(QStringLiteral("payload_digest")).toString().size(), 16);
+        QVERIFY(lastVerifierInput.contains(QStringLiteral("budget")));
+        QCOMPARE(lastVerifierInput.value(QStringLiteral("budget")).toObject()
+                     .value(QStringLiteral("selected_claims")).toInt(), 0);
     }
 
     // P0-1：模型回顾 claims=[] 却把主人承诺写进 message。单次 verifier 同时做 coverage：
@@ -1776,10 +1869,12 @@ private slots:
             if (body.contains("【语义核验】")) {
                 ++verifierCalls;
                 // 独立判定：message 里的"你答应过我要去睡觉"没有任何 declared_claim 覆盖。
-                return R"({"claim_coverage":"incomplete",)"
-                       R"("missing_claims":[{"type":"user_commitment","text":"主人答应过要去睡觉"}],)"
-                       R"("result":"insufficient","supporting_refs":[],)"
-                       R"("reason_code":"undeclared_commitment"})";
+                return verifierAnswer(body, QStringLiteral("incomplete"),
+                                      QStringLiteral("insufficient"),
+                                      QStringLiteral("undeclared_commitment"),
+                                      QJsonArray{QJsonObject{
+                                          {QStringLiteral("type"), QStringLiteral("user_commitment")},
+                                          {QStringLiteral("text"), QStringLiteral("主人答应过要去睡觉")}}});
             }
             return QString(R"({"choice":"consider","concern_action":"contact","note":"想提醒睡觉",)"
                            R"("contact":{"timing":"now","reason":"到点了",)"
@@ -1802,19 +1897,14 @@ private slots:
         QCOMPARE(contact.value(QStringLiteral("withhold_reason")).toString(),
                  QStringLiteral("claim_coverage_incomplete"));
         QCOMPARE(verifierCalls, 1); // 单次 verifier，不做 repair
-        // verifier 输入契约：message/reason/declared_claims/sources 同时给到，不能只喂声明。
+        // verifier 输入契约：message/reason/declared_claims/sources 同时给到，不能只喂声明；
+        // R12-2c-1 起还必须带 request_id/action_key/payload_digest 等关联字段。
         QJsonObject verifierInput;
         bool sawVerifierInput = false;
         for (const auto &body : bodies) {
             if (!body.contains("【语义核验】")) continue;
             sawVerifierInput = true;
-            for (const auto &value : QJsonDocument::fromJson(body).object()
-                                         .value(QStringLiteral("messages")).toArray()) {
-                const auto message = value.toObject();
-                if (message.value(QStringLiteral("role")).toString() != QStringLiteral("user")) continue;
-                verifierInput = QJsonDocument::fromJson(
-                    message.value(QStringLiteral("content")).toString().toUtf8()).object();
-            }
+            verifierInput = verifierUserInput(body);
         }
         QVERIFY(sawVerifierInput);
         QCOMPARE(verifierInput.value(QStringLiteral("message")).toString(),
@@ -1824,6 +1914,10 @@ private slots:
         QCOMPARE(verifierInput.value(QStringLiteral("sources")).toArray().size(), 0);
         QVERIFY(verifierInput.value(QStringLiteral("rules")).toString()
                     .contains(QStringLiteral("覆盖")));
+        QVERIFY(!verifierInput.value(QStringLiteral("request_id")).toString().isEmpty());
+        QCOMPARE(verifierInput.value(QStringLiteral("action_key")).toString(),
+                 QStringLiteral("concern:%1:%2:contact").arg(turn).arg(version));
+        QCOMPARE(verifierInput.value(QStringLiteral("payload_digest")).toString().size(), 16);
 
         // 记忆层路径：关注放回 consider（不给 proposed），审计行 outcome/semantic_status=withheld。
         QVERIFY(db.finishConcernReview(turn, version, proposal));
@@ -1871,8 +1965,9 @@ private slots:
             const QByteArray body = bodies.last();
             if (body.contains("【语义核验】")) {
                 ++verifierCalls;
-                return R"({"claim_coverage":"complete","missing_claims":[],)"
-                       R"("result":"entailed","supporting_refs":[],"reason_code":"pure_greeting"})";
+                return verifierAnswer(body, QStringLiteral("complete"),
+                                      QStringLiteral("entailed"),
+                                      QStringLiteral("pure_greeting"));
             }
             return QString(R"({"choice":"consider","concern_action":"contact","note":"想问问好",)"
                            R"("contact":{"timing":"now","reason":"突然想到",)"
@@ -1891,6 +1986,10 @@ private slots:
         const auto proposal = finished.takeFirst().at(2).toJsonObject();
         const auto contact = proposal.value(QStringLiteral("contact")).toObject();
         QCOMPARE(verifierCalls, 1); // claims 为空也必须过一次 coverage 核验
+        // A01：claims=[] 仍真实发 verifier，且输入含 request_id（响应必须回显）。
+        const auto verifierInput = verifierUserInput(bodies.last());
+        QVERIFY(!verifierInput.value(QStringLiteral("request_id")).toString().isEmpty());
+        QCOMPARE(verifierInput.value(QStringLiteral("declared_claims")).toArray().size(), 0);
         QCOMPARE(contact.value(QStringLiteral("semantic_status")).toString(),
                  QStringLiteral("entailed_coverage"));
         QVERIFY(db.finishConcernReview(turn, version, proposal));
@@ -1905,6 +2004,528 @@ private slots:
             QCOMPARE(row.value(0).toString(), QStringLiteral("proposed"));
             QCOMPARE(row.value(1).toString(), QStringLiteral("entailed_coverage"));
         }
+    }
+
+    // R12-2c-1：A04 输入预算按"完整证据项"分配。超预算时要么保留完整对象、要么明确
+    // evidence_budget_exceeded；绝不出现被 left(3000) 截断的残缺 JSON。
+    void verifierInputBudgetKeepsWholeEvidenceItems()
+    {
+        const QJsonObject identity{
+            {QStringLiteral("request_id"), QStringLiteral("req-budget-1")},
+            {QStringLiteral("kind"), QStringLiteral("contact")},
+            {QStringLiteral("action_key"), QStringLiteral("concern:1:1:contact")},
+            {QStringLiteral("origin_ref"), QStringLiteral("concern/1")},
+            {QStringLiteral("origin_version"), 1},
+            {QStringLiteral("run_id"), QStringLiteral("run-budget")},
+            {QStringLiteral("context_epoch"), 7},
+            {QStringLiteral("payload_digest"), QStringLiteral("0123456789abcdef")}};
+        const QJsonObject core{
+            {QStringLiteral("message"), QStringLiteral("m").repeated(200)},
+            {QStringLiteral("reason"), QStringLiteral("自己想到")},
+            {QStringLiteral("rules"), QStringLiteral("r").repeated(400)}};
+        const QJsonArray requiredClaims{QJsonObject{
+            {QStringLiteral("id"), QStringLiteral("c-core")},
+            {QStringLiteral("type"), QStringLiteral("user_commitment")},
+            {QStringLiteral("text"), QStringLiteral("c").repeated(120)},
+            {QStringLiteral("refs"), QJsonArray{QStringLiteral("chat/1")}}}};
+        const QJsonArray requiredSources{QJsonObject{
+            {QStringLiteral("ref"), QStringLiteral("chat/1")},
+            {QStringLiteral("text"), QStringLiteral("s").repeated(200)}}};
+        QJsonArray optionalClaims;
+        QJsonArray optionalSources;
+        for (int i = 0; i < 20; ++i) {
+            optionalClaims.append(
+                QJsonObject{{QStringLiteral("id"), QStringLiteral("opt%1").arg(i)},
+                            {QStringLiteral("type"), QStringLiteral("reported_fact")},
+                            {QStringLiteral("text"), QStringLiteral("x").repeated(150)},
+                            {QStringLiteral("refs"),
+                             QJsonArray{QStringLiteral("chat/%1").arg(i + 2)}}});
+            optionalSources.append(
+                QJsonObject{{QStringLiteral("ref"), QStringLiteral("chat/%1").arg(i + 2)},
+                            {QStringLiteral("text"), QStringLiteral("y").repeated(250)}});
+        }
+        const auto budget = LLMService::allocateVerifierInput(
+            identity, core, requiredClaims, requiredSources, optionalClaims, optionalSources);
+        QVERIFY2(budget.ok, qPrintable(budget.error));
+        QVERIFY(budget.bytes <= LLMService::kVerifierInputBudget);
+        QVERIFY(budget.omittedClaimCount > 0);
+        QVERIFY(budget.omittedSourceCount > 0);
+        // 预算诊断写进输入，供审计（selected/omitted/bytes）。
+        const auto budgetDiag = budget.input.value(QStringLiteral("budget")).toObject();
+        QCOMPARE(budgetDiag.value(QStringLiteral("selected_claims")).toInt(),
+                 budget.selectedClaimCount);
+        QCOMPARE(budgetDiag.value(QStringLiteral("omitted_claims")).toInt(),
+                 budget.omittedClaimCount);
+        QCOMPARE(budgetDiag.value(QStringLiteral("selected_sources")).toInt(),
+                 budget.selectedSourceCount);
+        QCOMPARE(budgetDiag.value(QStringLiteral("omitted_sources")).toInt(),
+                 budget.omittedSourceCount);
+        // 保留的每个 claim/source 都是完整对象（text 长度与原始一致，没有字符串截断）。
+        bool coreClaimKept = false;
+        for (const auto &value : budget.input.value(QStringLiteral("declared_claims")).toArray()) {
+            const auto claim = value.toObject();
+            QVERIFY(claim.contains(QStringLiteral("id")));
+            QVERIFY(claim.contains(QStringLiteral("type")));
+            QVERIFY(claim.contains(QStringLiteral("refs")));
+            if (claim.value(QStringLiteral("id")).toString() == QStringLiteral("c-core")) {
+                coreClaimKept = true;
+                QCOMPARE(claim.value(QStringLiteral("text")).toString().size(), 120);
+            } else {
+                QCOMPARE(claim.value(QStringLiteral("text")).toString().size(), 150);
+            }
+        }
+        QVERIFY(coreClaimKept); // 核心 claim 必须完整保留
+        bool coreSourceKept = false;
+        for (const auto &value : budget.input.value(QStringLiteral("sources")).toArray()) {
+            const auto source = value.toObject();
+            QVERIFY(source.contains(QStringLiteral("ref")));
+            if (source.value(QStringLiteral("ref")).toString() == QStringLiteral("chat/1")) {
+                coreSourceKept = true;
+                QCOMPARE(source.value(QStringLiteral("text")).toString().size(), 200);
+            } else {
+                QCOMPARE(source.value(QStringLiteral("text")).toString().size(), 250);
+            }
+        }
+        QVERIFY(coreSourceKept);
+        // 序列化后仍可完整解析（不是被截断的 JSON）。
+        QJsonParseError parseError;
+        const auto serialized = QJsonDocument(budget.input).toJson(QJsonDocument::Compact);
+        const auto reparsed = QJsonDocument::fromJson(serialized, &parseError);
+        QCOMPARE(parseError.error, QJsonParseError::NoError);
+        QVERIFY(reparsed.isObject());
+        // 必要核心（message/reason/核心 claim/证据）放不下 → 明确 evidence_budget_exceeded。
+        const QJsonObject hugeCore{
+            {QStringLiteral("message"), QStringLiteral("m").repeated(3500)},
+            {QStringLiteral("reason"), QStringLiteral("r")},
+            {QStringLiteral("rules"), QStringLiteral("rules")}};
+        const auto exceeded = LLMService::allocateVerifierInput(
+            identity, hugeCore, requiredClaims, requiredSources, optionalClaims, optionalSources);
+        QCOMPARE(exceeded.ok, false);
+        QCOMPARE(exceeded.error, QStringLiteral("evidence_budget_exceeded"));
+        // 超预算也只是"整项报错"，不把 message/JSON 截断（旧实现是 left(3000)）。
+        QCOMPARE(exceeded.input.value(QStringLiteral("message")).toString().size(), 3500);
+    }
+
+    // R12-2c-1：A04（集成）声明证据太多、核心材料放不进 3000 字符预算时，必须
+    // evidence_budget_exceeded 并压下行动，不能退回 left(3000) 截断后继续核验。
+    void budgetExceededWithholdsWithoutVerifier()
+    {
+        SemanticReviewConfigGuard config;
+        QVERIFY(config.enable());
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath(QStringLiteral("budget-exceeded.db"));
+        MemoryManager db(path);
+        int version = 0;
+        const qlonglong turn = seedDueConcernForSemanticReview(
+            db, path, QStringLiteral("budget-exceeded"), &version);
+        QVERIFY(turn > 0);
+        QVERIFY(version > 0);
+        QJsonArray claims;
+        for (int i = 0; i < 12; ++i) {
+            RequestMeta evidenceMeta;
+            evidenceMeta.channel = Channel::kPet;
+            evidenceMeta.sessionId = Channel::kDefaultSession;
+            evidenceMeta.subject = QStringLiteral("user");
+            evidenceMeta.turnKind = QStringLiteral("reply");
+            evidenceMeta.eventId = evidenceMeta.runId =
+                QStringLiteral("budget-evidence-%1").arg(i);
+            evidenceMeta.receivedAtUtc = QDateTime::currentDateTimeUtc().addSecs(3600 + i * 60);
+            const auto evidence = db.recordInput(
+                QStringLiteral("主人说后天可以去海边"), evidenceMeta, true);
+            QVERIFY(evidence > 0);
+            claims.append(QJsonObject{
+                {QStringLiteral("id"), QStringLiteral("c%1").arg(i)},
+                {QStringLiteral("type"), QStringLiteral("reported_fact")},
+                {QStringLiteral("text"), QStringLiteral("x").repeated(200)},
+                {QStringLiteral("refs"),
+                 QJsonArray{QStringLiteral("chat/%1").arg(evidence)}}});
+        }
+        const QJsonObject reviewProposal{
+            {QStringLiteral("choice"), QStringLiteral("consider")},
+            {QStringLiteral("concern_action"), QStringLiteral("contact")},
+            {QStringLiteral("note"), QStringLiteral("想确认")},
+            {QStringLiteral("contact"),
+             QJsonObject{{QStringLiteral("timing"), QStringLiteral("now")},
+                         {QStringLiteral("reason"), QStringLiteral("想起看海的事")},
+                         {QStringLiteral("message"), QStringLiteral("在忙吗")},
+                         {QStringLiteral("motivation"),
+                          QJsonObject{{QStringLiteral("type"), QStringLiteral("self_desire")},
+                                      {QStringLiteral("summary"), QStringLiteral("想接着聊")}}},
+                         {QStringLiteral("claims"), claims}}},
+        };
+
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QByteArray> bodies;
+        int verifierCalls = 0;
+        serveCompletions(server, bodies, [&](int) -> QString {
+            if (bodies.last().contains("【语义核验】")) {
+                ++verifierCalls;
+                return verifierAnswer(bodies.last(), QStringLiteral("complete"),
+                                      QStringLiteral("entailed"), QStringLiteral("ok"));
+            }
+            return QString::fromUtf8(
+                QJsonDocument(reviewProposal).toJson(QJsonDocument::Compact));
+        });
+        LLMService model(QStringLiteral("test"), nullptr,
+                         QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.serverPort())));
+        model.setMemoryManager(&db);
+        QSignalSpy finished(&model, &LLMService::privateReviewFinished);
+        model.requestPrivateReview(turn, version,
+                                   QJsonObject{{QStringLiteral("kind"), QStringLiteral("concern")}});
+        QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 1, 8000);
+        const auto proposal = finished.takeFirst().at(2).toJsonObject();
+        const auto contact = proposal.value(QStringLiteral("contact")).toObject();
+        QCOMPARE(verifierCalls, 0);  // 核心证据放不进预算：不发送核验请求
+        QCOMPARE(bodies.size(), 1);  // 只有回顾请求，没有 verifier 请求
+        QCOMPARE(contact.value(QStringLiteral("withhold_reason")).toString(),
+                 QStringLiteral("evidence_budget_exceeded"));
+        QVERIFY(db.finishConcernReview(turn, version, proposal));
+        QVERIFY(!db.hasProposedContact(turn, version));
+    }
+
+    // R12-2c-1：A03 非核心事实 claim 无法证明时 repair 默认 fail closed：
+    // 不发送第二次自由生成请求；即使 mock 准备了"清空 claims 但文本仍含事实"的 repair
+    // 应答也不会被调用；整项 withhold（repair_failed）。
+    void repairIsFailClosedWithoutSecondGeneration()
+    {
+        SemanticReviewConfigGuard config;
+        QVERIFY(config.enable());
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath(QStringLiteral("repair-fail-closed.db"));
+        MemoryManager db(path);
+        int version = 0;
+        const qlonglong turn = seedDueConcernForSemanticReview(
+            db, path, QStringLiteral("repair-fail-closed"), &version);
+        QVERIFY(turn > 0);
+        QVERIFY(version > 0);
+        RequestMeta evidenceMeta;
+        evidenceMeta.channel = Channel::kPet;
+        evidenceMeta.sessionId = Channel::kDefaultSession;
+        evidenceMeta.subject = QStringLiteral("user");
+        evidenceMeta.turnKind = QStringLiteral("reply");
+        evidenceMeta.eventId = evidenceMeta.runId = QStringLiteral("repair-evidence");
+        evidenceMeta.receivedAtUtc = QDateTime::currentDateTimeUtc().addSecs(3600);
+        const auto evidence = db.recordInput(QStringLiteral("后天应该可以去"), evidenceMeta, true);
+        QVERIFY(evidence > 0);
+
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QByteArray> bodies;
+        int verifierCalls = 0;
+        int repairCalls = 0;
+        serveCompletions(server, bodies, [&](int) -> QString {
+            const QByteArray body = bodies.last();
+            if (body.contains("【语义核验】")) {
+                ++verifierCalls;
+                return verifierAnswer(body, QStringLiteral("complete"),
+                                      QStringLiteral("insufficient"),
+                                      QStringLiteral("unrelated"));
+            }
+            if (body.contains("【约束修复】")) {
+                ++repairCalls;
+                // 旧实现会接受"claims 清空但文本仍含事实"的修复；R12-2c-1 不再发送该请求。
+                return QStringLiteral(R"({"contact":{"reason":"想起看海的事","message":)"
+                                      R"("你后来去成海边了吗","claims":[]}})");
+            }
+            return QString(R"({"choice":"consider","concern_action":"contact","note":"想确认",)"
+                           R"("contact":{"timing":"now","reason":"想起看海的事",)"
+                           R"("message":"你后来去成海边了吗",)"
+                           R"("motivation":{"type":"self_desire","summary":"想接着聊"},)"
+                           R"("claims":[{"id":"c2","type":"reported_fact",)"
+                           R"("text":"主人说后天可以去","refs":["chat/%1"]}],)"
+                           R"("core_claim_ids":[]}})").arg(evidence);
+        });
+        LLMService model(QStringLiteral("test"), nullptr,
+                         QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.serverPort())));
+        model.setMemoryManager(&db);
+        QSignalSpy finished(&model, &LLMService::privateReviewFinished);
+        model.requestPrivateReview(turn, version,
+                                   QJsonObject{{QStringLiteral("kind"), QStringLiteral("concern")}});
+        QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 1, 8000);
+        const auto proposal = finished.takeFirst().at(2).toJsonObject();
+        const auto contact = proposal.value(QStringLiteral("contact")).toObject();
+        QCOMPARE(verifierCalls, 1);
+        QCOMPARE(repairCalls, 0);   // fail closed：第二次自由生成请求从不发出
+        QCOMPARE(bodies.size(), 2); // 只有回顾 + 一次 verifier
+        QCOMPARE(contact.value(QStringLiteral("semantic_status")).toString(),
+                 QStringLiteral("withheld"));
+        QCOMPARE(contact.value(QStringLiteral("withhold_reason")).toString(),
+                 QStringLiteral("repair_failed"));
+        QVERIFY(db.finishConcernReview(turn, version, proposal));
+        QVERIFY(!db.hasProposedContact(turn, version));
+    }
+
+    // R12-2c-1：verifier 响应缺 request_id / 未知枚举 / request_id 不匹配 → 明确诊断并 withheld，
+    // 不把模型输出当成可通过结论。
+    void verdictProtocolViolationsAreWithheld()
+    {
+        SemanticReviewConfigGuard config;
+        QVERIFY(config.enable());
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath(QStringLiteral("verdict-violations.db"));
+        MemoryManager db(path);
+        int version = 0;
+        const qlonglong turn = seedDueConcernForSemanticReview(
+            db, path, QStringLiteral("verdict-violations"), &version);
+        QVERIFY(turn > 0);
+        QVERIFY(version > 0);
+
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QByteArray> bodies;
+        int verifierCalls = 0;
+        serveCompletions(server, bodies, [&](int) -> QString {
+            const QByteArray body = bodies.last();
+            ++verifierCalls;
+            const QString requestId = verifierUserInput(body)
+                                          .value(QStringLiteral("request_id")).toString();
+            if (verifierCalls == 1) {
+                // 缺 request_id → schema_invalid。
+                return QStringLiteral(R"({"claim_coverage":"complete",)"
+                                      R"("result":"entailed","supporting_refs":[]})");
+            }
+            if (verifierCalls == 2) {
+                // 未知枚举 → unknown_enum。
+                return QString::fromUtf8(QJsonDocument(QJsonObject{
+                    {QStringLiteral("request_id"), requestId},
+                    {QStringLiteral("claim_coverage"), QStringLiteral("maybe")},
+                    {QStringLiteral("result"), QStringLiteral("entailed")}})
+                                             .toJson(QJsonDocument::Compact));
+            }
+            // request_id 与请求不一致 → request_mismatch。
+            return QString::fromUtf8(QJsonDocument(QJsonObject{
+                {QStringLiteral("request_id"),
+                 QStringLiteral("00000000-0000-0000-0000-000000000000")},
+                {QStringLiteral("claim_coverage"), QStringLiteral("complete")},
+                {QStringLiteral("result"), QStringLiteral("entailed")}})
+                                         .toJson(QJsonDocument::Compact));
+        });
+        LLMService model(QStringLiteral("test"), nullptr,
+                         QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.serverPort())));
+        model.setMemoryManager(&db);
+        QSignalSpy finished(&model, &LLMService::actionProposalVerificationFinished);
+        const auto origin = ActionOrigin::forConcern(
+            turn, version, QStringLiteral("owner"), Channel::kPet,
+            Channel::kDefaultSession);
+        const QJsonObject request{
+            {QStringLiteral("kind"), QStringLiteral("contact")},
+            {QStringLiteral("origin"), origin.toJson()},
+            {QStringLiteral("target"),
+             QJsonObject{{QStringLiteral("channel"), Channel::kPet},
+                         {QStringLiteral("session_id"), Channel::kDefaultSession}}},
+            {QStringLiteral("payload"),
+             QJsonObject{{QStringLiteral("message"), QStringLiteral("在忙吗")},
+                         {QStringLiteral("reason"), QStringLiteral("自己想到")}}},
+            {QStringLiteral("claims"), QJsonArray{}}};
+        const QStringList expected{QStringLiteral("schema_invalid"),
+                                   QStringLiteral("unknown_enum"),
+                                   QStringLiteral("request_mismatch")};
+        for (int round = 0; round < static_cast<int>(expected.size()); ++round) {
+            model.requestActionProposalVerification(request);
+            QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 1, 8000);
+            const auto result = finished.takeFirst().at(0).toJsonObject();
+            QCOMPARE(result.value(QStringLiteral("state")).toString(),
+                     QStringLiteral("withheld"));
+            QCOMPARE(result.value(QStringLiteral("withhold_reason")).toString(),
+                     expected.value(round));
+            QVERIFY(!result.value(QStringLiteral("request_id")).toString().isEmpty());
+        }
+        QCOMPARE(verifierCalls, 3);
+    }
+
+    // R12-2c-1：A05 旧 generation 的在途 verifier 晚到不能污染新一轮回顾。
+    void staleVerifierCannotPolluteNewReview()
+    {
+        SemanticReviewConfigGuard config;
+        QVERIFY(config.enable());
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath(QStringLiteral("stale-verifier.db"));
+        MemoryManager db(path);
+        int versionA = 0;
+        const qlonglong turnA = seedDueConcernForSemanticReview(
+            db, path, QStringLiteral("stale-a"), &versionA);
+        QVERIFY(turnA > 0);
+        QVERIFY(versionA > 0);
+        // 第二次 seed 复用同一 DB：先把回顾冷却时钟拨回，避免每秒冷却挡住新来源领取。
+        {
+            RawSqlConnection raw(path, QStringLiteral("stale-rewind"));
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral(
+                "UPDATE thought_review_log SET started_at=started_at-120")));
+        }
+        int versionB = 0;
+        const qlonglong turnB = seedDueConcernForSemanticReview(
+            db, path, QStringLiteral("stale-b"), &versionB);
+        QVERIFY(turnB > 0);
+        QVERIFY(versionB > 0);
+
+        DeferredCompletionServer server;
+        QVERIFY(server.listen());
+        LLMService model(QStringLiteral("test"), nullptr,
+                         QUrl(QStringLiteral("http://127.0.0.1:%1/")
+                                  .arg(server.port())));
+        model.setMemoryManager(&db);
+        QSignalSpy finished(&model, &LLMService::privateReviewFinished);
+        const auto greetingProposal = [] {
+            return QStringLiteral(
+                R"({"choice":"consider","concern_action":"contact","note":"想问候",)"
+                R"("contact":{"timing":"now","reason":"自己想到","message":"在忙吗",)"
+                R"("motivation":{"type":"self_desire","summary":"想问候主人"},)"
+                R"("claims":[]}})");
+        };
+
+        // 第一轮回顾：回顾请求 index0 → verifier index1。
+        model.requestPrivateReview(turnA, versionA,
+                                   QJsonObject{{QStringLiteral("kind"), QStringLiteral("concern")}});
+        QTRY_COMPARE_WITH_TIMEOUT(server.bodies.size(), 1, 8000);
+        server.respond(0, greetingProposal());
+        QTRY_COMPARE_WITH_TIMEOUT(server.bodies.size(), 2, 8000);
+        const QString requestA = verifierUserInput(server.bodies.at(1))
+                                     .value(QStringLiteral("request_id")).toString();
+        QVERIFY(!requestA.isEmpty());
+        // generation 变化：取消第一轮（在途 verifier 被丢弃/中止）。
+        model.cancelPrivateReview();
+        // 第二轮回顾（不同来源轮次）：回顾请求 index2 → verifier index3。
+        model.requestPrivateReview(turnB, versionB,
+                                   QJsonObject{{QStringLiteral("kind"), QStringLiteral("concern")}});
+        QTRY_COMPARE_WITH_TIMEOUT(server.bodies.size(), 3, 8000);
+        server.respond(2, greetingProposal());
+        QTRY_COMPARE_WITH_TIMEOUT(server.bodies.size(), 4, 8000);
+        const QString requestB = verifierUserInput(server.bodies.at(3))
+                                     .value(QStringLiteral("request_id")).toString();
+        QVERIFY(!requestB.isEmpty());
+        QVERIFY(requestA != requestB);
+        // 旧 A 的 verifier 晚到（此时 B 仍在途）：必须被丢弃，不能产生终态。
+        server.respond(1, verifierAnswer(server.bodies.at(1), QStringLiteral("complete"),
+                                         QStringLiteral("entailed"),
+                                         QStringLiteral("late")));
+        QTest::qWait(50);
+        QCOMPARE(finished.count(), 0);
+        // B 正常通过，且只产生一次终态。
+        server.respond(3, verifierAnswer(server.bodies.at(3), QStringLiteral("complete"),
+                                         QStringLiteral("entailed"),
+                                         QStringLiteral("ok")));
+        QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 1, 8000);
+        const auto proposal = finished.takeFirst().at(2).toJsonObject();
+        QCOMPARE(proposal.value(QStringLiteral("contact")).toObject()
+                     .value(QStringLiteral("semantic_status")).toString(),
+                 QStringLiteral("entailed_coverage"));
+    }
+
+    // R12-2c-1：A06 并行的分享核验与联系核验各自按 request_id 关联，不互相覆盖/串线。
+    void parallelShareAndContactVerifierIdsDoNotCross()
+    {
+        SemanticReviewConfigGuard config;
+        QVERIFY(config.enable());
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath(QStringLiteral("parallel-verifier.db"));
+        MemoryManager db(path);
+        int version = 0;
+        const qlonglong turn = seedDueConcernForSemanticReview(
+            db, path, QStringLiteral("parallel"), &version);
+        QVERIFY(turn > 0);
+        QVERIFY(version > 0);
+        QString activityError;
+        const auto created = db.createActivity(
+            QStringLiteral("owner"), Channel::kPet, Channel::kDefaultSession,
+            QStringLiteral("海边速写"), QStringLiteral("画出海面"),
+            QStringLiteral("foreground"), QStringLiteral("chat/201"),
+            QStringLiteral("run-parallel-share"), &activityError);
+        QVERIFY2(!created.isEmpty(), qPrintable(activityError));
+        const QString draft = QStringLiteral("海面泛着光");
+        const auto finishedActivity = db.finishActivity(
+            created.value(QStringLiteral("ref")).toString(),
+            created.value(QStringLiteral("version")).toInt(),
+            QJsonObject{{QStringLiteral("status"), QStringLiteral("completed")},
+                        {QStringLiteral("reflection"), QStringLiteral("画完了")},
+                        {QStringLiteral("draft"), draft},
+                        {QStringLiteral("activity_kind"), QStringLiteral("writing")}},
+            &activityError);
+        QVERIFY2(!finishedActivity.isEmpty(), qPrintable(activityError));
+        const int artifactVersion =
+            finishedActivity.value(QStringLiteral("artifact_version")).toInt();
+        QVERIFY(artifactVersion > 0);
+
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QByteArray> bodies;
+        serveCompletions(server, bodies, [&](int) -> QString {
+            return verifierAnswer(bodies.last(), QStringLiteral("complete"),
+                                  QStringLiteral("entailed"), QStringLiteral("ok"));
+        });
+        LLMService model(QStringLiteral("test"), nullptr,
+                         QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.serverPort())));
+        model.setMemoryManager(&db);
+        QSignalSpy finished(&model, &LLMService::actionProposalVerificationFinished);
+
+        const auto contactOrigin = ActionOrigin::forConcern(
+            turn, version, QStringLiteral("owner"), Channel::kPet,
+            Channel::kDefaultSession);
+        const QJsonObject contactRequest{
+            {QStringLiteral("kind"), QStringLiteral("contact")},
+            {QStringLiteral("origin"), contactOrigin.toJson()},
+            {QStringLiteral("target"),
+             QJsonObject{{QStringLiteral("channel"), Channel::kPet},
+                         {QStringLiteral("session_id"), Channel::kDefaultSession}}},
+            {QStringLiteral("payload"),
+             QJsonObject{{QStringLiteral("message"), QStringLiteral("在忙吗")},
+                         {QStringLiteral("reason"), QStringLiteral("自己想到")}}},
+            {QStringLiteral("claims"), QJsonArray{}}};
+        const auto shareOrigin = ActionOrigin::forActivity(
+            created.value(QStringLiteral("id")).toInteger(), artifactVersion,
+            QStringLiteral("owner"), Channel::kPet, Channel::kDefaultSession);
+        const QJsonObject shareRequest{
+            {QStringLiteral("kind"), QStringLiteral("activity_share")},
+            {QStringLiteral("origin"), shareOrigin.toJson()},
+            {QStringLiteral("target"),
+             QJsonObject{{QStringLiteral("channel"), Channel::kPet},
+                         {QStringLiteral("session_id"), Channel::kDefaultSession}}},
+            {QStringLiteral("payload"), QJsonObject{{QStringLiteral("draft"), draft}}},
+            {QStringLiteral("claims"), QJsonArray{}}};
+        // 两个核验并发在途：旧实现的单指针会互相覆盖，只留最后一个终态。
+        model.requestActionProposalVerification(contactRequest);
+        model.requestActionProposalVerification(shareRequest);
+        QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 2, 8000);
+        QList<QJsonObject> results;
+        for (int i = 0; i < static_cast<int>(finished.count()); ++i)
+            results.append(finished.at(i).at(0).toJsonObject());
+        QSet<QString> requestIds;
+        QSet<QString> actionKeys;
+        for (const auto &result : results) {
+            QCOMPARE(result.value(QStringLiteral("state")).toString(),
+                     QStringLiteral("verified"));
+            QCOMPARE(result.value(QStringLiteral("semantic_status")).toString(),
+                     QStringLiteral("entailed_coverage"));
+            const QString requestId = result.value(QStringLiteral("request_id")).toString();
+            const QString actionKey = result.value(QStringLiteral("action_key")).toString();
+            QVERIFY(!requestId.isEmpty());
+            requestIds.insert(requestId);
+            actionKeys.insert(actionKey);
+            // 每个终态必须对应自己那份 verifier 请求输入（request_id + action_key 一致）。
+            bool found = false;
+            for (const auto &body : bodies) {
+                if (!body.contains("【语义核验】")) continue;
+                const auto input = verifierUserInput(body);
+                if (input.value(QStringLiteral("request_id")).toString() != requestId) continue;
+                QCOMPARE(input.value(QStringLiteral("action_key")).toString(), actionKey);
+                found = true;
+            }
+            QVERIFY(found);
+        }
+        QCOMPARE(requestIds.size(), 2);
+        QCOMPARE(actionKeys.size(), 2);
+        QVERIFY(actionKeys.contains(
+            QStringLiteral("concern:%1:%2:contact").arg(turn).arg(version)));
+        QVERIFY(actionKeys.contains(
+            QStringLiteral("activity:%1:%2:share")
+                .arg(created.value(QStringLiteral("id")).toInteger())
+                .arg(artifactVersion)));
     }
 
     // 能力清单应包含"当前正在做的事"：来自 attention_state + 活动快照。
@@ -2436,9 +3057,9 @@ private slots:
             const QByteArray body = bodies.last();
             if (body.contains("【语义核验】")) {
                 ++verifierCalls;
-                return QStringLiteral(R"({"claim_coverage":"complete","missing_claims":[],)"
-                                      R"("result":"entailed","supporting_refs":[],)"
-                                      R"("reason_code":"pure_self_desire"})");
+                return verifierAnswer(body, QStringLiteral("complete"),
+                                      QStringLiteral("entailed"),
+                                      QStringLiteral("pure_self_desire"));
             }
             return QStringLiteral(
                 R"({"schema_version":1,"decision":"contact","note":"想问候一下",)"
@@ -2466,7 +3087,21 @@ private slots:
         const auto proposal = finished.takeFirst().at(2).toJsonObject();
         QCOMPARE(proposal.value(QStringLiteral("decision")).toString(), QStringLiteral("contact"));
         QCOMPARE(verifierCalls, 1);
+        // R12-2c-1：action 核验请求带 request_id/来源身份/payload_digest，终态结果回带同一 id。
+        QJsonObject actionVerifierInput;
+        for (const auto &body : bodies)
+            if (body.contains("【语义核验】")) actionVerifierInput = verifierUserInput(body);
+        QVERIFY(!actionVerifierInput.value(QStringLiteral("request_id")).toString().isEmpty());
+        QCOMPARE(actionVerifierInput.value(QStringLiteral("action_key")).toString(),
+                 QStringLiteral("wake:%1:%2:contact").arg(wakeId).arg(wakeVersion));
+        QCOMPARE(actionVerifierInput.value(QStringLiteral("origin_ref")).toString(),
+                 QStringLiteral("wake/%1").arg(wakeId));
+        QCOMPARE(actionVerifierInput.value(QStringLiteral("origin_version")).toInt(), wakeVersion);
+        QVERIFY(!actionVerifierInput.value(QStringLiteral("run_id")).toString().isEmpty());
+        QCOMPARE(actionVerifierInput.value(QStringLiteral("payload_digest")).toString().size(), 16);
         const auto action = proposal.value(QStringLiteral("_action")).toObject();
+        QCOMPARE(action.value(QStringLiteral("request_id")).toString(),
+                 actionVerifierInput.value(QStringLiteral("request_id")).toString());
         QCOMPARE(action.value(QStringLiteral("state")).toString(), QStringLiteral("verified"));
         QCOMPARE(action.value(QStringLiteral("action_key")).toString(),
                  QStringLiteral("wake:%1:%2:contact").arg(wakeId).arg(wakeVersion));

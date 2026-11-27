@@ -1,6 +1,7 @@
 #include "privatereview.h"
 #include "actioncommitter.h"
 #include "actionorigin.h"
+#include "actionpolicy.h"
 #include "configmanager.h"
 #include "memorymanager.h"
 
@@ -995,6 +996,19 @@ void PrivateReview::receiveShareProposalResult(const QJsonObject &result)
     const bool verified = result.value(QStringLiteral("state")).toString()
         == QStringLiteral("verified");
     const QString semanticStatus = result.value(QStringLiteral("semantic_status")).toString();
+    // R12-2c-1：verified 终态只能携带服务端封闭枚举里的 semantic_status；空串/未知值
+    // 一律不提升，按 schema_invalid 落 withheld（模型输出不能直接决定状态）。
+    if (verified && !ActionPolicy::isValidSemanticStatus(semanticStatus)) {
+        QString stateError;
+        store.updateActionProposalState(actionKey, QStringLiteral("proposed"),
+                                        QStringLiteral("withheld"),
+                                        QStringLiteral("withheld"),
+                                        QStringLiteral("schema_invalid"), &stateError);
+        qInfo().noquote()
+            << QStringLiteral("[ShareProposal] withheld key=%1 reason=schema_invalid")
+                   .arg(actionKey);
+        return;
+    }
     const QString withholdReason = result.value(QStringLiteral("withhold_reason")).toString();
     if (!verified) {
         QString stateError;
@@ -1013,7 +1027,7 @@ void PrivateReview::receiveShareProposalResult(const QJsonObject &result)
     QString stateError;
     const bool promoted = store.updateActionProposalState(
         actionKey, QStringLiteral("proposed"), QStringLiteral("verified"),
-        semanticStatus.isEmpty() ? QStringLiteral("unverified") : semanticStatus, QString(),
+        semanticStatus, QString(),
         &stateError);
     if (!promoted) {
         // CAS 失败（可能已被 drain 并发推进）：只要最终状态不是 verified/committed 就放弃。
@@ -1277,18 +1291,24 @@ void PrivateReview::receiveOpenWake(const Attempt &attempt, const QJsonObject &p
             store.persistActionProposal(persistProposal, &persistError);
             const bool persistOk = persistError.isEmpty()
                 || persistError == QStringLiteral("conflict");
-            if (planState != QStringLiteral("verified")) {
+            const QString planSemantic = plan.value(QStringLiteral("semantic_status")).toString();
+            // R12-2c-1：verified 只能携带服务端封闭枚举里的 semantic_status；
+            // 空串/未知值一律不提升 verified，按 schema_invalid 落 withheld。
+            const bool planSemanticValid = ActionPolicy::isValidSemanticStatus(planSemantic);
+            if (planState != QStringLiteral("verified") || !planSemanticValid) {
                 const QString reason =
                     plan.value(QStringLiteral("withhold_reason")).toString().trimmed();
+                const QString rejectReason = planState == QStringLiteral("verified")
+                    ? QStringLiteral("schema_invalid")
+                    : (reason.isEmpty() ? QStringLiteral("policy_rejected") : reason);
                 if (persistOk) {
                     store.updateActionProposalState(
                         actionKey, QStringLiteral("proposed"), QStringLiteral("withheld"),
-                        QStringLiteral("withheld"),
-                        reason.isEmpty() ? QStringLiteral("policy_rejected") : reason);
+                        QStringLiteral("withheld"), rejectReason);
                 }
                 qInfo().noquote()
                     << QStringLiteral("[OpenWake] contact_rejected reason=%1 key=%2")
-                           .arg(reason.isEmpty() ? QStringLiteral("withheld") : reason, actionKey);
+                           .arg(rejectReason, actionKey);
                 decision = QStringLiteral("reflect");
             } else if (!persistOk) {
                 qInfo().noquote()
@@ -1297,12 +1317,11 @@ void PrivateReview::receiveOpenWake(const Attempt &attempt, const QJsonObject &p
                            .arg(actionKey, persistError);
                 decision = QStringLiteral("reflect");
             } else {
-                const QString semantic = plan.value(QStringLiteral("semantic_status")).toString();
+                const QString semantic = planSemantic;
                 QString stateError;
                 store.updateActionProposalState(
                     actionKey, QStringLiteral("proposed"), QStringLiteral("verified"),
-                    semantic.isEmpty() ? QStringLiteral("unverified") : semantic, QString(),
-                    &stateError);
+                    semantic, QString(), &stateError);
                 ActionCommitter committer(&store);
                 const auto committed = committer.commitOpenWakeContact(actionKey);
                 if (committed.contains(QStringLiteral("error"))) {

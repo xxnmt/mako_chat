@@ -1214,6 +1214,90 @@ private slots:
                      .value(QStringLiteral("reason")).toString(),
                  QStringLiteral("open_wake_contact_disabled"));
     }
+
+    // R12-2c-1：verifier 响应严格白名单解析（request_id/封闭枚举/类型检查），
+    // semantic_status 只认服务端正式枚举；模型输出不能决定 verified 终态。
+    void verifierVerdictStrictWhitelist()
+    {
+        const QJsonObject base{
+            {QStringLiteral("request_id"), QStringLiteral("req-1")},
+            {QStringLiteral("claim_coverage"), QStringLiteral("complete")},
+            {QStringLiteral("missing_claims"), QJsonArray{}},
+            {QStringLiteral("result"), QStringLiteral("entailed")},
+            {QStringLiteral("supporting_refs"), QJsonArray{QStringLiteral("chat/1")}},
+            {QStringLiteral("reason_code"), QStringLiteral("ok")}};
+        const auto valid = ActionPolicy::parseVerifierVerdict(base);
+        QVERIFY(valid.valid);
+        QCOMPARE(valid.requestId, QStringLiteral("req-1"));
+        QCOMPARE(valid.coverageComplete, true);
+        QCOMPARE(static_cast<int>(valid.result),
+                 static_cast<int>(VerifierVerdict::Entailed));
+        QCOMPARE(valid.supportingRefs.size(), 1);
+
+        // 缺 request_id → schema_invalid（调用方 withheld；不得猜测为匹配）。
+        auto noRequestId = base;
+        noRequestId.remove(QStringLiteral("request_id"));
+        auto verdict = ActionPolicy::parseVerifierVerdict(noRequestId);
+        QCOMPARE(verdict.valid, false);
+        QCOMPARE(verdict.error, QStringLiteral("schema_invalid"));
+        // 未知枚举 → unknown_enum。
+        auto badCoverage = base;
+        badCoverage[QStringLiteral("claim_coverage")] = QStringLiteral("partial");
+        verdict = ActionPolicy::parseVerifierVerdict(badCoverage);
+        QCOMPARE(verdict.valid, false);
+        QCOMPARE(verdict.error, QStringLiteral("unknown_enum"));
+        auto badResult = base;
+        badResult[QStringLiteral("result")] = QStringLiteral("maybe");
+        verdict = ActionPolicy::parseVerifierVerdict(badResult);
+        QCOMPARE(verdict.valid, false);
+        QCOMPARE(verdict.error, QStringLiteral("unknown_enum"));
+        // 字段类型检查：supporting_refs 必须是字符串数组，missing_claims 必须是对象数组。
+        auto badRefs = base;
+        badRefs[QStringLiteral("supporting_refs")] = QStringLiteral("chat/1");
+        QCOMPARE(ActionPolicy::parseVerifierVerdict(badRefs).error,
+                 QStringLiteral("schema_invalid"));
+        auto badMissing = base;
+        badMissing[QStringLiteral("missing_claims")] = QJsonArray{1};
+        QCOMPARE(ActionPolicy::parseVerifierVerdict(badMissing).error,
+                 QStringLiteral("schema_invalid"));
+        auto badMissingText = base;
+        badMissingText[QStringLiteral("missing_claims")] =
+            QJsonArray{QJsonObject{{QStringLiteral("type"), QStringLiteral("reported_fact")},
+                                   {QStringLiteral("text"), 7}}};
+        QCOMPARE(ActionPolicy::parseVerifierVerdict(badMissingText).error,
+                 QStringLiteral("schema_invalid"));
+        // 合法但非通过的结果：contradicted/insufficient 解析成功，终态仍由调用方 withheld。
+        auto contradicted = base;
+        contradicted[QStringLiteral("result")] = QStringLiteral("contradicted");
+        verdict = ActionPolicy::parseVerifierVerdict(contradicted);
+        QVERIFY(verdict.valid);
+        QCOMPARE(static_cast<int>(verdict.result),
+                 static_cast<int>(VerifierVerdict::Contradicted));
+        auto insufficient = base;
+        insufficient[QStringLiteral("result")] = QStringLiteral("insufficient");
+        QVERIFY(ActionPolicy::parseVerifierVerdict(insufficient).valid);
+
+        // semantic_status 白名单：只接受正式枚举；空串/任意字符串都不合法。
+        for (const auto &allowed :
+             {QStringLiteral("unverified"), QStringLiteral("entailed"),
+              QStringLiteral("entailed_coverage"), QStringLiteral("repaired"),
+              QStringLiteral("repair_needed"), QStringLiteral("contradicted"),
+              QStringLiteral("insufficient"), QStringLiteral("withheld"),
+              QStringLiteral("not_required"), QStringLiteral("unknown"),
+              QStringLiteral("retained")}) {
+            QVERIFY2(ActionPolicy::isValidSemanticStatus(allowed),
+                     qPrintable(allowed));
+        }
+        for (const auto &invalid :
+             {QString(), QStringLiteral("verified"), QStringLiteral("complete"),
+              QStringLiteral("ok"), QStringLiteral("ENTAILED")}) {
+            QVERIFY2(!ActionPolicy::isValidSemanticStatus(invalid),
+                     qPrintable(invalid));
+        }
+        QCOMPARE(ActionPolicy::verifiedSemanticStatus(true), QStringLiteral("entailed"));
+        QCOMPARE(ActionPolicy::verifiedSemanticStatus(false),
+                 QStringLiteral("entailed_coverage"));
+    }
 };
 
 QTEST_MAIN(TestActionPolicy)

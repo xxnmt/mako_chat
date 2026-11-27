@@ -74,6 +74,23 @@ struct PolicyDecision
     QStringList verifierRefs;
 };
 
+// R12-2c-1：语义核验响应（模型输出）的严格解析结果。
+//
+// 模型输出只是"核验证据"，不是终态：本结构不包含也不接受 proposal state/verified
+// 之类的字段，终态一律由服务端按封闭枚举映射（verifiedSemanticStatus）。
+// 未知枚举、缺 request_id、字段类型不对都判 invalid，调用方必须 fail closed（withheld）。
+struct VerifierVerdict
+{
+    bool valid = false;
+    QString error;              // schema_invalid / unknown_enum
+    QString requestId;          // 必须与请求一致；不匹配由调用方报 request_mismatch
+    bool coverageComplete = false;
+    enum Result { Entailed, Contradicted, Insufficient } result = Insufficient;
+    QString reasonCode;         // 仅审计/诊断，不参与状态判定
+    QStringList supportingRefs; // 仅审计，不参与状态判定
+    QJsonArray missingClaims;   // 规范化后的 [{type,text}]，仅诊断/确定性删除依据
+};
+
 // 主动联系/通用动作的授权/事实策略（报告切片 C + R12-2a）。
 //
 // 设计要点：
@@ -188,6 +205,21 @@ public:
 
     // 单条 ref 的文本摘要（无文本时 ref 仍保留，text 为空）。供审计/调试。
     QString refExcerpt(const QString &ref, int maxChars = 512) const;
+
+    // ===== R12-2c-1：verifier 协议严格解析 / 服务端语义状态映射 =====
+    // 只接受封闭枚举：claim_coverage ∈ {complete,incomplete}；
+    // result ∈ {entailed,contradicted,insufficient}；supporting_refs/missing_claims 做
+    // 元素类型检查。request_id 缺失/非字符串 → schema_invalid；未知枚举 → unknown_enum。
+    // 不读取任何 state/verified 字段：模型输出不能决定提案终态。
+    static VerifierVerdict parseVerifierVerdict(const QJsonObject &response);
+
+    // semantic_status 的正式封闭枚举（与记忆层持久化约束一致，含 legacy retained/repaired）。
+    // 空串表示"尚未产生结论"，不属于合法终态。
+    static bool isValidSemanticStatus(const QString &status);
+
+    // 服务端唯一映射：通过时存在事实 claim → entailed，否则 entailed_coverage。
+    // 非通过状态一律 withheld（由调用方在 withhold 路径显式写）。
+    static QString verifiedSemanticStatus(bool hasFactualClaims);
 
 private:
     // 来源时间（时序基准）：wake 用 open_wake.started_at/created_at，
