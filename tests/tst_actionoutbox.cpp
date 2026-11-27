@@ -1,3 +1,4 @@
+#include "testactionverification.h"
 #include <QtTest>
 #include <QTemporaryDir>
 #include <QFile>
@@ -315,7 +316,7 @@ static QString persistVerifiedProposal(MemoryManager &db, const QJsonObject &pro
     const QString key = stored.value(QStringLiteral("action_key")).toString();
     const QString requestId = QStringLiteral("test-request-")
         + QUuid::createUuid().toString(QUuid::WithoutBraces);
-    if (!db.markActionProposalVerified(key, semanticStatus, requestId, &error)) {
+    if (!markTestActionProposalVerified(db, key, semanticStatus, requestId, &error)) {
         qWarning() << "markActionProposalVerified failed" << key << error;
         return {};
     }

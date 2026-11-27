@@ -1,3 +1,4 @@
+#include <limits>
 #include "actionpolicy.h"
 
 #include "activityref.h"
@@ -1154,6 +1155,26 @@ QString ActionPolicy::refExcerpt(const QString &ref, int maxChars) const
         return row.exec() && row.next() ? truncate(row.value(0).toString()) : QString();
     }
     return {};
+}
+
+bool ActionPolicy::proposalEvidence(const QJsonArray &claims, QJsonArray *sources) const
+{
+    QSet<QString> references;
+    for (const auto &claim : factualClaimsForVerification(claims)) {
+        for (const auto &value : claim.toObject().value(QStringLiteral("refs")).toArray())
+            references.insert(value.toString().trimmed());
+    }
+    auto sorted = references.values();
+    sorted.sort();
+    QJsonArray evidence;
+    for (const auto &ref : sorted) {
+        const auto excerpt = refExcerpt(ref, std::numeric_limits<int>::max());
+        if (excerpt.trimmed().isEmpty()) return false;
+        evidence.append(QJsonObject{{QStringLiteral("ref"), ref},
+                                    {QStringLiteral("text"), excerpt}});
+    }
+    *sources = evidence;
+    return true;
 }
 
 QJsonArray ActionPolicy::claimSources(const QString &channel, const QString &session,

@@ -11305,9 +11305,9 @@ bool MemoryManager::markActionProposalVerified(const QString &actionKey,
     //    与 verifier 实际输入集合不一致说明"核验过的证据"已不成立 → fail closed。
     {
         ActionPolicy policy(this);
-        const QJsonArray factual = ActionPolicy::factualClaimsForVerification(claims);
-        const QJsonArray sources =
-            policy.claimSources(binding.targetChannel, binding.targetSession, 0, factual);
+        QJsonArray sources;
+        if (!policy.proposalEvidence(claims, &sources))
+            return failRollback(QStringLiteral("verification_evidence_unavailable"));
         const QString evidenceDigest = ActionPolicy::canonicalEvidenceDigest(claims, sources);
         if (evidenceDigest != binding.evidenceDigest) {
             qInfo().noquote()
@@ -11369,61 +11369,6 @@ bool MemoryManager::markActionProposalVerified(const QString &actionKey,
 // 它从库内行推导一份 binding（内容指纹来自库内内容），所以**不能**证明 verifier 实际
 // 核验的就是这份内容；真正的生产路径由 PrivateReview 传入 LLMService 生成的
 // VerificationBinding 走上面的重载。
-bool MemoryManager::markActionProposalVerified(const QString &actionKey,
-                                               const QString &semanticStatus,
-                                               const QString &verifiedRequestId, QString *error)
-{
-    if (error) error->clear();
-    const auto fail = [error](const QString &reason) {
-        if (error) *error = reason;
-        return false;
-    };
-    const QString key = actionKey.trimmed();
-    const QString semantic = semanticStatus.trimmed();
-    const QString requestId = verifiedRequestId.trimmed();
-    if (key.isEmpty()) return fail(QStringLiteral("invalid_action_key"));
-    if (!m_db.isOpen()) return fail(QStringLiteral("db_error"));
-    if (semantic.isEmpty() || semantic == QStringLiteral("withheld")
-        || !proposalSemanticStatusValid(semantic))
-        return fail(QStringLiteral("invalid_semantic_status"));
-    if (requestId.isEmpty()) return fail(QStringLiteral("missing_verified_request_id"));
-    if (requestId.size() > 120) return fail(QStringLiteral("invalid_verified_request_id"));
-    const QJsonObject row = actionProposal(key);
-    if (row.isEmpty()) return fail(QStringLiteral("not_found"));
-    ActionOrigin origin;
-    QString originError;
-    if (!ActionOrigin::fromJson(row.value(QStringLiteral("origin")).toObject(), &origin,
-                                &originError))
-        return fail(originError.isEmpty() ? QStringLiteral("invalid_origin") : originError);
-    const QJsonObject payload = row.value(QStringLiteral("payload")).toObject();
-    const QJsonArray claims = row.value(QStringLiteral("claims")).toArray();
-    VerificationBinding binding;
-    binding.requestId = requestId;
-    binding.actionKey = key;
-    binding.kind = row.value(QStringLiteral("kind")).toString();
-    binding.originKind = origin.kindName();
-    binding.originRef = origin.ref;
-    binding.originId = origin.id;
-    binding.originVersion = origin.version;
-    binding.runId = origin.runId;
-    binding.scope = origin.scope;
-    binding.originContextEpoch = origin.contextEpoch;
-    binding.actionContextEpoch = row.value(QStringLiteral("action_context_epoch")).toInteger();
-    binding.targetChannel = origin.targetChannel;
-    binding.targetSession = origin.targetSession;
-    binding.payloadDigest = ActionPolicy::canonicalProposalPayloadDigest(payload, claims);
-    binding.claimsDigest = ActionPolicy::canonicalProposalClaimsDigest(claims);
-    ActionPolicy policy(this);
-    const QJsonArray factual = ActionPolicy::factualClaimsForVerification(claims);
-    binding.evidenceDigest = ActionPolicy::canonicalEvidenceDigest(
-        claims, policy.claimSources(binding.targetChannel, binding.targetSession, 0, factual));
-    binding.verifierInputDigest = ActionPolicy::canonicalJsonDigest(
-        QJsonObject{{QStringLiteral("payload"), payload}, {QStringLiteral("claims"), claims}});
-    binding.state = QStringLiteral("verified");
-    binding.semanticStatus = semantic;
-    return markActionProposalVerified(key, binding, error);
-}
-
 // R12-2c-2：取消审计（幂等）。未提交提案回 expired；已 committed 的保持状态（回执闭环依赖
 // committed），只写 cancel_reason，供 claimOutbox/发送前复验识别"已取消、不得发送"。
 bool MemoryManager::cancelActionProposal(const QString &actionKey, const QString &reason)

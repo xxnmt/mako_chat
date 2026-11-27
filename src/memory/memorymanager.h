@@ -541,12 +541,6 @@ public:
     //     核验失效），不一致 → 置 expired + cancel_reason=context_epoch_changed，返回 false。
     // 任一步失败整体回滚；成功后提交/发送前还会再次复核这些绑定。
     //
-    // R12-2c-final-1：生产路径（PrivateReview）必须使用下面的 VerificationBinding 重载。
-    // 旧 (semanticStatus, verifiedRequestId) 重载只为兼容既有测试/管理路径而保留：
-    // 它在库内行上推导一份 binding（内容指纹来自库内内容），因此**不能**证明 verifier
-    // 实际核验的就是这份内容；新的核验链不再调用它。
-    bool markActionProposalVerified(const QString &actionKey,const QString &semanticStatus,
-                                    const QString &verifiedRequestId,QString *error = nullptr);
     // R12-2c-final-1：proposed→verified 的服务端内容绑定入口（单事务）。binding 由
     // LLMService 在构建 verifier 请求时生成，随异步终态回调传递。事务内重新读取权威提案行，
     // 逐项比较 binding 与提案：kind/origin(kind/ref/id/version)/runId/scope/origin

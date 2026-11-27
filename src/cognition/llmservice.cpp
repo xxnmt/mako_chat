@@ -2746,12 +2746,6 @@ QJsonObject actionVerifiedOutcome(const QJsonObject &request, const QJsonObject 
     return result;
 }
 
-// 提案里的事实性 claim（需要语义蕴含判断的类型）。选择逻辑与 legacy contact 共用
-// ActionPolicy::factualClaimsForVerification，保证 binding 的 evidence digest 可复核。
-QJsonArray actionFactualClaims(const QJsonArray &claims)
-{
-    return ActionPolicy::factualClaimsForVerification(claims);
-}
 
 bool actionClaimIsCore(const QJsonObject &claim, const QJsonArray &coreIds)
 {
@@ -2972,7 +2966,7 @@ void LLMService::verifyActionProposalSemantics(const QJsonObject &request,
                                                ActionVerificationCallback done)
 {
     const auto claims = request.value(QStringLiteral("claims")).toArray();
-    const auto factual = actionFactualClaims(claims);
+    const auto factual = ActionPolicy::factualClaimsForVerification(claims);
     const auto payload = request.value(QStringLiteral("payload")).toObject();
     const auto originJson = deterministic.value(QStringLiteral("origin")).toObject();
     const auto targetJson = deterministic.value(QStringLiteral("target")).toObject();
@@ -2980,11 +2974,11 @@ void LLMService::verifyActionProposalSemantics(const QJsonObject &request,
     const QString actionKey = deterministic.value(QStringLiteral("action_key")).toString();
     const QString requestId = request.value(QStringLiteral("request_id")).toString().trimmed();
     ActionPolicy policy(m_memoryManager);
-    const auto sources = policy.claimSources(targetJson.value(QStringLiteral("channel")).toString(),
-                                             targetJson.value(QStringLiteral("session_id")).toString(),
-                                             0, factual);
-    // R12-2c-1：与 legacy contact 一致——claims 与 sources 全是核验成立所必需的完整证据项，
-    // 全部作为必选项；放不下就 evidence_budget_exceeded（fail closed）。
+    QJsonArray sources;
+    if (!policy.proposalEvidence(claims, &sources)) {
+        done(actionWithheldOutcome(request, QStringLiteral("verification_evidence_unavailable")));
+        return;
+    }
     const QJsonObject identity{
         {QStringLiteral("request_id"), requestId},
         {QStringLiteral("kind"), kind},

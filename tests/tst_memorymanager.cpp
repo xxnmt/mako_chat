@@ -340,10 +340,9 @@ static VerificationBinding bindingForProposal(MemoryManager &db, const QString &
     binding.payloadDigest = ActionPolicy::canonicalProposalPayloadDigest(payload, claims);
     binding.claimsDigest = ActionPolicy::canonicalProposalClaimsDigest(claims);
     ActionPolicy policy(&db);
-    binding.evidenceDigest = ActionPolicy::canonicalEvidenceDigest(
-        claims,
-        policy.claimSources(binding.targetChannel, binding.targetSession, 0,
-                            ActionPolicy::factualClaimsForVerification(claims)));
+    QJsonArray sources;
+    policy.proposalEvidence(claims, &sources);
+    binding.evidenceDigest = ActionPolicy::canonicalEvidenceDigest(claims, sources);
     binding.verifierInputDigest = ActionPolicy::canonicalJsonDigest(
         QJsonObject{{QStringLiteral("payload"), payload}, {QStringLiteral("claims"), claims}});
     binding.state = QStringLiteral("verified");

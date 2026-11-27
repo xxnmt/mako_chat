@@ -3218,6 +3218,104 @@ private slots:
                  QStringLiteral("contact_handed_off"));
     }
 
+    void actionEvidenceBinding_data()
+    {
+        QTest::addColumn<QString>("scenario");
+        QTest::addColumn<int>("length");
+        QTest::newRow("normal") << QStringLiteral("pass") << 30;
+        QTest::newRow("near-budget") << QStringLiteral("pass") << 1350;
+        QTest::newRow("over-budget") << QStringLiteral("budget") << 3000;
+        QTest::newRow("changed-during-verification") << QStringLiteral("changed") << 30;
+        QTest::newRow("missing-during-verification") << QStringLiteral("missing") << 30;
+    }
+
+    void actionEvidenceBinding()
+    {
+        QFETCH(QString, scenario);
+        QFETCH(int, length);
+        OpenWakeConfigGuard config;
+        auto options = openWakeTestJson(true, 12, 3);
+        options.insert(QStringLiteral("allow_contact"), true);
+        QVERIFY(config.write(options, QJsonObject{
+            {"enabled", true},
+            {"targets", QJsonArray{QJsonObject{{"channel", Channel::kPet},
+                                             {"session_id", Channel::kDefaultSession}}}}}));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager db(dir.filePath(QStringLiteral("binding.db")));
+        RequestMeta meta;
+        meta.channel = Channel::kPet;
+        meta.sessionId = Channel::kDefaultSession;
+        meta.subject = QStringLiteral("user");
+        meta.eventId = meta.runId = QStringLiteral("binding-evidence");
+        meta.receivedAtUtc = QDateTime::currentDateTimeUtc().addSecs(-3600);
+        const QString evidence = QStringLiteral("I visited the coast. ") + QString(length, 'x');
+        const qint64 turn = db.recordInput(evidence, meta, true);
+        QVERIFY(turn > 0);
+        QVERIFY(db.recordQuiet(turn, QStringLiteral("close")));
+        QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+        const auto wake = db.claimOpenWake(12, 60, 12, 50, 3);
+        QVERIFY(!wake.isEmpty());
+        const auto origin = ActionOrigin::forWake(
+            wake.value("id").toInteger(), wake.value("version").toInt(),
+            wake.value("run_id").toString(), QStringLiteral("owner"),
+            wake.value("current_context_epoch").toInteger(),
+            Channel::kPet, Channel::kDefaultSession);
+        const QJsonObject proposal{
+            {"kind", "contact"}, {"origin", origin.toJson()},
+            {"payload", QJsonObject{{"message", "How was the coast?"}, {"reason", "Curious"},
+                {"motivation", QJsonObject{{"type", "self_desire"}, {"summary", "Curious"}}}}},
+            {"claims", QJsonArray{QJsonObject{{"id", "past"}, {"type", "historical_fact"},
+                {"text", "The owner visited the coast."},
+                {"refs", QJsonArray{QStringLiteral("chat/%1").arg(turn)}}}}}};
+        QString error;
+        const auto stored = db.persistActionProposal(proposal, &error);
+        QVERIFY2(!stored.contains(QStringLiteral("error")), qPrintable(error));
+        const auto key = stored.value(QStringLiteral("action_key")).toString();
+        DeferredCompletionServer server;
+        QVERIFY(server.listen());
+        LLMService model(QStringLiteral("test"), nullptr,
+            QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.port())));
+        model.setMemoryManager(&db);
+        QSignalSpy finished(&model, &LLMService::actionProposalVerificationFinished);
+        model.requestActionProposalVerification(proposal);
+        if (scenario == QStringLiteral("budget")) {
+            QTRY_COMPARE(finished.count(), 1);
+            QCOMPARE(finished.first().at(0).toJsonObject().value("withhold_reason").toString(),
+                     QStringLiteral("evidence_budget_exceeded"));
+            QVERIFY(server.bodies.isEmpty());
+            return;
+        }
+        QTRY_VERIFY2(server.bodies.size() == 1,
+                     finished.isEmpty() ? "no verifier request" :
+                     qPrintable(finished.first().at(0).toJsonObject().value("withhold_reason").toString()));
+        const auto input = verifierUserInput(server.bodies.first());
+        QCOMPARE(input.value("sources").toArray().first().toObject().value("text").toString(), evidence);
+        if (scenario == QStringLiteral("changed"))
+            QVERIFY(execMemorySql(QStringLiteral("UPDATE chat_history SET user_input='changed' WHERE id=%1").arg(turn)));
+        if (scenario == QStringLiteral("missing"))
+            QVERIFY(execMemorySql(QStringLiteral("UPDATE chat_history SET user_input='' WHERE id=%1").arg(turn)));
+        server.respond(0, verifierAnswer(server.bodies.first(), QStringLiteral("complete"),
+                                         QStringLiteral("entailed"), QStringLiteral("ok")));
+        QTRY_COMPARE(finished.count(), 1);
+        const auto outcome = finished.first().at(0).toJsonObject();
+        VerificationBinding binding;
+        QVERIFY2(VerificationBinding::fromJson(outcome.value("verification_binding").toObject(),
+                                               &binding, &error), qPrintable(error));
+        if (scenario != QStringLiteral("pass")) {
+            QVERIFY(!db.markActionProposalVerified(key, binding, &error));
+            QCOMPARE(error, scenario == QStringLiteral("changed")
+                       ? QStringLiteral("verification_evidence_mismatch")
+                       : QStringLiteral("verification_evidence_unavailable"));
+            QCOMPARE(db.actionProposal(key).value("state").toString(), QStringLiteral("proposed"));
+            return;
+        }
+        QVERIFY2(db.markActionProposalVerified(key, binding, &error), qPrintable(error));
+        const auto committed = db.commitVerifiedActionProposal(key, &error);
+        QVERIFY2(!committed.contains(QStringLiteral("error")),
+                 QJsonDocument(committed).toJson(QJsonDocument::Compact).constData());
+    }
+
     // ===== R12-2c-final-1：verifier 输出预算/完整诊断/内容绑定 =====
 
     // V01：verifier 请求输出预算提高到 1024（真实 provider 默认 thinking 下 reasoning 也占
