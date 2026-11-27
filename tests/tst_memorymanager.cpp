@@ -25,6 +25,7 @@
 #include "privatereview.h"
 #include "activityref.h"
 #include "actionorigin.h"
+#include "actionpolicy.h"
 
 // 独立于 MemoryManager 的原始连接，用于建 v1 库/直接校验表结构。
 // 注意：QSqlDatabase 句柄必须在 removeDatabase 前析构（close() 内先释放 m_db）。
@@ -308,6 +309,63 @@ private:
     QByteArray m_original;
     bool m_existed = false;
 };
+
+// R12-2c-final-1：按权威提案行构造测试用 VerificationBinding（模拟 LLMService 在构建
+// verifier 请求时生成的服务端对象）。测试用它验证"binding 与提案逐项一致才允许 verified"，
+// 以及内容/证据被替换后必须 fail closed。
+static VerificationBinding bindingForProposal(MemoryManager &db, const QString &actionKey,
+                                              const QString &semanticStatus,
+                                              const QString &requestId)
+{
+    const QJsonObject row = db.actionProposal(actionKey);
+    VerificationBinding binding;
+    binding.requestId = requestId;
+    binding.actionKey = actionKey;
+    binding.kind = row.value(QStringLiteral("kind")).toString();
+    ActionOrigin origin;
+    QString originError;
+    ActionOrigin::fromJson(row.value(QStringLiteral("origin")).toObject(), &origin, &originError);
+    binding.originKind = origin.kindName();
+    binding.originRef = origin.ref;
+    binding.originId = origin.id;
+    binding.originVersion = origin.version;
+    binding.runId = origin.runId;
+    binding.scope = origin.scope;
+    binding.originContextEpoch = origin.contextEpoch;
+    binding.actionContextEpoch = row.value(QStringLiteral("action_context_epoch")).toInteger();
+    binding.targetChannel = origin.targetChannel;
+    binding.targetSession = origin.targetSession;
+    const QJsonObject payload = row.value(QStringLiteral("payload")).toObject();
+    const QJsonArray claims = row.value(QStringLiteral("claims")).toArray();
+    binding.payloadDigest = ActionPolicy::canonicalProposalPayloadDigest(payload, claims);
+    binding.claimsDigest = ActionPolicy::canonicalProposalClaimsDigest(claims);
+    ActionPolicy policy(&db);
+    binding.evidenceDigest = ActionPolicy::canonicalEvidenceDigest(
+        claims,
+        policy.claimSources(binding.targetChannel, binding.targetSession, 0,
+                            ActionPolicy::factualClaimsForVerification(claims)));
+    binding.verifierInputDigest = ActionPolicy::canonicalJsonDigest(
+        QJsonObject{{QStringLiteral("payload"), payload}, {QStringLiteral("claims"), claims}});
+    binding.state = QStringLiteral("verified");
+    binding.semanticStatus = semanticStatus;
+    return binding;
+}
+
+// 造一条 open_wake 行（deferred，避免与 running 唯一约束冲突）；返回 id。
+static qlonglong seedOpenWakeRow(const QString &dbPath, const QString &tag,
+                                 const QString &runId, qint64 epoch = 0)
+{
+    RawDb raw(dbPath, tag);
+    if (!raw.open()) return 0;
+    if (!raw.exec(QStringLiteral(
+            "INSERT INTO open_wake(scope_key,run_id,version,state,trigger_reason,"
+            "created_at,started_at,current_context_epoch) "
+            "VALUES('owner','%1',1,'deferred','test',unixepoch(),unixepoch(),%2)")
+            .arg(runId)
+            .arg(epoch)))
+        return 0;
+    return raw.scalar(QStringLiteral("SELECT last_insert_rowid()")).toLongLong();
+}
 
 // 回顾领取有 60s 冷却：把 thought_review_log 往前挪，模拟冷却已过。
 static bool rewindReviewCooldown(const QString &dbPath, const QString &tag)
@@ -5927,8 +5985,10 @@ private slots:
             {QStringLiteral("expires_at"), 0}};
         QString error;
         QVERIFY(!db.persistActionProposal(proposal, &error).contains(QStringLiteral("error")));
-        QVERIFY(db.markActionProposalVerified(key, QStringLiteral("entailed"),
-                                              QStringLiteral("req-cancel"), &error));
+        QVERIFY(db.markActionProposalVerified(
+            key, bindingForProposal(db, key, QStringLiteral("entailed"),
+                                    QStringLiteral("req-cancel")),
+            &error));
         QVERIFY(db.cancelActionProposal(key, QStringLiteral("context_epoch_changed")));
         auto row = db.actionProposal(key);
         QCOMPARE(row.value(QStringLiteral("state")).toString(), QStringLiteral("expired"));
@@ -6043,10 +6103,12 @@ private slots:
                                                   QStringLiteral("entailed"), {}, &casError));
             QCOMPARE(casError, QStringLiteral("verified_binding_required"));
             // 唯一入口：markActionProposalVerified 写入 payload/claims 指纹、request_id、
-            // verified_at 与提案生成时的 fence epoch 快照。
-            QVERIFY(db.markActionProposalVerified(key, QStringLiteral("entailed"),
-                                                  QStringLiteral("req-memory-manager"),
-                                                  &casError));
+            // verified_at 与提案生成时的 fence epoch 快照（R12-2c-final-1：必须传
+            // LLMService 生成的服务端 VerificationBinding，而不是裸 request_id）。
+            QVERIFY(db.markActionProposalVerified(
+                key, bindingForProposal(db, key, QStringLiteral("entailed"),
+                                        QStringLiteral("req-memory-manager")),
+                &casError));
             const auto verifiedRow = db.actionProposal(key);
             QCOMPARE(verifiedRow.value(QStringLiteral("semantic_status")).toString(),
                      QStringLiteral("entailed"));
@@ -6059,9 +6121,10 @@ private slots:
             QVERIFY(verifiedRow.value(QStringLiteral("verified_at")).toInteger() > 0);
             QVERIFY(verifiedRow.value(QStringLiteral("action_context_epoch")).toInteger() >= 0);
             // 重复标记核验通过是幂等的（不覆盖首次绑定）。
-            QVERIFY(db.markActionProposalVerified(key, QStringLiteral("entailed"),
-                                                  QStringLiteral("req-memory-manager"),
-                                                  &casError));
+            QVERIFY(db.markActionProposalVerified(
+                key, bindingForProposal(db, key, QStringLiteral("entailed"),
+                                        QStringLiteral("req-memory-manager")),
+                &casError));
             // 前态不匹配（已经从 verified 推进过）仍然拒绝。
             QVERIFY(!db.updateActionProposalState(key, QStringLiteral("proposed"),
                                                   QStringLiteral("withheld"),
@@ -6110,6 +6173,164 @@ private slots:
             QCOMPARE(row.value(QStringLiteral("origin_ref")).toString(),
                      QStringLiteral("concern/7"));
         }
+    }
+
+    // R12-2c-final-1（V06）：verified 必须由服务端 VerificationBinding 绑定"verifier 实际核验
+    // 的内容"。binding 与权威提案逐项不一致（payload/claims/evidence/身份/终态）一律 fail closed，
+    // 绝不在事务内重新计算"当前 DB 内容"后直接视为已核验。
+    void verificationBindingBindsVerifierContent()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath(QStringLiteral("binding-content.db"));
+        MemoryManager db(path);
+        const auto origin = ActionOrigin::forConcern(7, 2, QStringLiteral("owner"),
+                                                     Channel::kPet, Channel::kDefaultSession);
+        QVERIFY(origin.isValid());
+        const QString key = origin.actionKey(QStringLiteral("contact"));
+        const QJsonObject proposal{
+            {QStringLiteral("origin"), origin.toJson()},
+            {QStringLiteral("kind"), QStringLiteral("contact")},
+            {QStringLiteral("payload"),
+             QJsonObject{{QStringLiteral("message"), QStringLiteral("在忙吗")},
+                         {QStringLiteral("reason"), QStringLiteral("自己想到")}}},
+            {QStringLiteral("claims"), QJsonArray{}},
+            {QStringLiteral("expires_at"), 0}};
+        QString error;
+        QVERIFY(!db.persistActionProposal(proposal, &error).contains(QStringLiteral("error")));
+        // 1) payload digest 与权威提案不一致（核验的是别的内容）→ 拒绝，状态保持 proposed。
+        {
+            auto wrong = bindingForProposal(db, key, QStringLiteral("entailed"),
+                                            QStringLiteral("req-binding-1"));
+            wrong.payloadDigest = QStringLiteral("0123456789abcdef");
+            QVERIFY(!db.markActionProposalVerified(key, wrong, &error));
+            QCOMPARE(error, QStringLiteral("verification_binding_mismatch"));
+            QCOMPARE(db.actionProposal(key).value(QStringLiteral("state")).toString(),
+                     QStringLiteral("proposed"));
+        }
+        // 2) claims digest 不一致 → 拒绝。
+        {
+            auto wrong = bindingForProposal(db, key, QStringLiteral("entailed"),
+                                            QStringLiteral("req-binding-1"));
+            wrong.claimsDigest = QStringLiteral("fedcba9876543210");
+            QVERIFY(!db.markActionProposalVerified(key, wrong, &error));
+            QCOMPARE(error, QStringLiteral("verification_binding_mismatch"));
+        }
+        // 3) evidence 集合摘要不一致（verifier 实际看到的证据集合已变化）→ 拒绝。
+        {
+            auto wrong = bindingForProposal(db, key, QStringLiteral("entailed"),
+                                            QStringLiteral("req-binding-1"));
+            wrong.evidenceDigest = QStringLiteral("0011223344556677");
+            QVERIFY(!db.markActionProposalVerified(key, wrong, &error));
+            QCOMPARE(error, QStringLiteral("verification_evidence_mismatch"));
+            QCOMPARE(db.actionProposal(key).value(QStringLiteral("state")).toString(),
+                     QStringLiteral("proposed"));
+        }
+        // 4) 同 key 但 origin 版本不一致（串线/伪造）→ 拒绝。
+        {
+            auto wrong = bindingForProposal(db, key, QStringLiteral("entailed"),
+                                            QStringLiteral("req-binding-1"));
+            wrong.originVersion = 99;
+            QVERIFY(!db.markActionProposalVerified(key, wrong, &error));
+            QCOMPARE(error, QStringLiteral("verification_binding_mismatch"));
+        }
+        // 5) withheld binding（verifier 未通过）不能提升提案。
+        {
+            auto wrong = bindingForProposal(db, key, QStringLiteral("entailed"),
+                                            QStringLiteral("req-binding-1"));
+            wrong.state = QStringLiteral("withheld");
+            wrong.semanticStatus = QStringLiteral("withheld");
+            wrong.withholdReason = QStringLiteral("verifier_insufficient");
+            QVERIFY(!db.markActionProposalVerified(key, wrong, &error));
+            QCOMPARE(error, QStringLiteral("verification_state_not_verified"));
+        }
+        // 6) 正确 binding 才允许 proposed→verified，并写入 v33 既有列。
+        {
+            const auto binding = bindingForProposal(db, key, QStringLiteral("entailed"),
+                                                    QStringLiteral("req-binding-1"));
+            QVERIFY2(db.markActionProposalVerified(key, binding, &error), qPrintable(error));
+            const auto row = db.actionProposal(key);
+            QCOMPARE(row.value(QStringLiteral("state")).toString(), QStringLiteral("verified"));
+            QCOMPARE(row.value(QStringLiteral("verified_payload_hash")).toString(),
+                     binding.payloadDigest);
+            QCOMPARE(row.value(QStringLiteral("verified_claims_hash")).toString(),
+                     binding.claimsDigest);
+            QCOMPARE(row.value(QStringLiteral("verified_request_id")).toString(),
+                     QStringLiteral("req-binding-1"));
+        }
+        // 7) 已被另一份 binding 核验过的行：不同 request_id/内容不得改写首次绑定。
+        {
+            const auto other = bindingForProposal(db, key, QStringLiteral("entailed"),
+                                                  QStringLiteral("req-binding-2"));
+            QVERIFY(!db.markActionProposalVerified(key, other, &error));
+            QCOMPARE(error, QStringLiteral("already_verified_with_different_binding"));
+            QCOMPARE(db.actionProposal(key).value(QStringLiteral("verified_request_id")).toString(),
+                     QStringLiteral("req-binding-1"));
+        }
+    }
+
+    // R12-2c-final-1（V09）：verified 之后提案内容被改写，提交必须拒绝（不允许"核验的是 A、
+    // 发送的是 B"）；失败把提案落 withheld，绝不建动作/Outbox。
+    void commitRejectsContentChangedAfterVerifiedBinding()
+    {
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.writeIdentity(QByteArray(
+            R"({"proactive":{"enabled":true,"private_writing":false,"cooldown_seconds":0,)"
+            R"("quiet_hours":{"start":"00:00","end":"00:00"},)"
+            R"("targets":[{"channel":"pet","session_id":"default"}]},)"
+            R"("cognition":{"open_wake":{"enabled":false,"allow_contact":true}}})")));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath(QStringLiteral("commit-bound-content.db"));
+        MemoryManager db(path);
+        const QString runId = QStringLiteral("run-binding-commit");
+        const qlonglong wakeId = seedOpenWakeRow(path, QStringLiteral("binding-commit"), runId);
+        QVERIFY(wakeId > 0);
+        const auto origin = ActionOrigin::forWake(wakeId, 1, runId, QStringLiteral("owner"), 0,
+                                                  Channel::kPet, Channel::kDefaultSession);
+        const QString key = origin.actionKey(QStringLiteral("contact"));
+        const QJsonObject proposal{
+            {QStringLiteral("origin"), origin.toJson()},
+            {QStringLiteral("kind"), QStringLiteral("contact")},
+            {QStringLiteral("payload"),
+             QJsonObject{{QStringLiteral("message"), QStringLiteral("在忙吗")},
+                         {QStringLiteral("reason"), QStringLiteral("自己想到")}}},
+            {QStringLiteral("claims"), QJsonArray{}},
+            {QStringLiteral("expires_at"), 0}};
+        QString error;
+        QVERIFY(!db.persistActionProposal(proposal, &error).contains(QStringLiteral("error")));
+        QVERIFY2(db.markActionProposalVerified(
+                     key,
+                     bindingForProposal(db, key, QStringLiteral("entailed_coverage"),
+                                        QStringLiteral("req-commit-binding")),
+                     &error),
+                 qPrintable(error));
+        QCOMPARE(db.actionProposal(key).value(QStringLiteral("state")).toString(),
+                 QStringLiteral("verified"));
+        // 核验之后改写权威提案内容（模拟窗口内被替换/换稿）。
+        {
+            RawDb raw(path, QStringLiteral("binding-commit-mutate"));
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral(
+                "UPDATE action_proposal SET payload_json="
+                "'{\"message\":\"换过的内容\",\"reason\":\"自己想到\"}' "
+                "WHERE action_key='%1'")
+                                 .arg(key)));
+        }
+        QString commitError;
+        const auto committed = db.commitVerifiedActionProposal(key, &commitError);
+        QVERIFY2(committed.contains(QStringLiteral("error")),
+                 "verified 后内容被改写必须拒绝提交");
+        QCOMPARE(committed.value(QStringLiteral("error")).toString(),
+                 QStringLiteral("policy_rejected"));
+        QCOMPARE(committed.value(QStringLiteral("detail")).toString(),
+                 QStringLiteral("verified_content_mismatch"));
+        QCOMPARE(db.actionProposal(key).value(QStringLiteral("state")).toString(),
+                 QStringLiteral("withheld"));
+        RawDb raw(path, QStringLiteral("binding-commit-check"));
+        QVERIFY(raw.open());
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM cognitive_action")).toInt(), 0);
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_outbox")).toInt(), 0);
     }
 
     // R12-1a：四类来源的失败计数/退避/源状态持久化（各来源一次 -> 计数递增）。

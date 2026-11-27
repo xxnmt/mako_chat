@@ -261,6 +261,49 @@ QJsonObject buildInternalShareRequest(MemoryManager &store, const QString &activ
         {QStringLiteral("expires_at"), QDateTime::currentSecsSinceEpoch() + 3600}};
 }
 
+// R12-2c-final-1：校验服务端 VerificationBinding 与本次核验结果/来源/target/fence 一致。
+// 这里只做"结构 + 关联"层校验（binding 是 LLMService 在构建 verifier 请求时生成的，模型
+// 不能签发）；binding 与**权威提案内容**是否一致必须由 MemoryManager::markActionProposalVerified
+// 在同一事务内逐项复核（payload/claims/evidence digest + CAS），不能在这里代替。
+// 返回空串=通过；否则返回可审计原因码（一律不提升 verified）。
+QString verificationBindingMismatch(const VerificationBinding &binding, const QJsonObject &result,
+                                    const QString &actionKey, const QString &kind,
+                                    const ActionOrigin &origin, qint64 currentEpoch)
+{
+    QString bindingError;
+    if (!binding.isValid(&bindingError))
+        return bindingError.isEmpty() ? QStringLiteral("verification_binding_invalid")
+                                      : bindingError;
+    if (binding.state != QStringLiteral("verified"))
+        return QStringLiteral("verification_binding_not_verified");
+    if (result.value(QStringLiteral("state")).toString() != QStringLiteral("verified"))
+        return QStringLiteral("verification_result_not_verified");
+    if (binding.actionKey != actionKey)
+        return QStringLiteral("verification_binding_action_key_mismatch");
+    if (binding.kind != kind)
+        return QStringLiteral("verification_binding_kind_mismatch");
+    const QString semantic = result.value(QStringLiteral("semantic_status")).toString();
+    if (binding.semanticStatus != semantic)
+        return QStringLiteral("verification_binding_semantic_mismatch");
+    if (binding.requestId != result.value(QStringLiteral("request_id")).toString())
+        return QStringLiteral("verification_binding_request_mismatch");
+    if (binding.originKind != origin.kindName() || binding.originRef != origin.ref
+        || binding.originId != origin.id || binding.originVersion != origin.version
+        || binding.runId != origin.runId || binding.scope != origin.scope
+        || binding.originContextEpoch != origin.contextEpoch)
+        return QStringLiteral("verification_binding_origin_mismatch");
+    if (binding.targetChannel != origin.targetChannel
+        || binding.targetSession != origin.targetSession)
+        return QStringLiteral("verification_binding_target_mismatch");
+    // Action Context Fence：核验请求构建时与当前语境 epoch 必须一致；迟到结果不得提升。
+    if (binding.actionContextEpoch != currentEpoch)
+        return QStringLiteral("verification_binding_stale_epoch");
+    const QJsonValue resultEpoch = result.value(QStringLiteral("action_context_epoch"));
+    if (resultEpoch.isDouble() && resultEpoch.toInteger() != binding.actionContextEpoch)
+        return QStringLiteral("verification_binding_epoch_mismatch");
+    return {};
+}
+
 } // namespace
 
 PrivateReview::PrivateReview(MemoryManager &memory, QObject *parent)
@@ -1066,14 +1109,54 @@ void PrivateReview::receiveShareProposalResult(const QJsonObject &result)
         return;
     }
     QString stateError;
+    // R12-2c-final-1：verified 必须携带 LLMService 在构建核验请求时生成的服务端
+    // VerificationBinding；模型/调用方无法签发。binding 先与结果/来源/epoch 关联校验，
+    // 再由 markActionProposalVerified 在同一事务内与权威提案内容逐项复核。
+    VerificationBinding binding;
+    if (!VerificationBinding::fromJson(result.value(QStringLiteral("verification_binding"))
+                                           .toObject(),
+                                       &binding, &stateError)) {
+        store.updateActionProposalState(actionKey, QStringLiteral("proposed"),
+                                        QStringLiteral("withheld"),
+                                        QStringLiteral("withheld"),
+                                        stateError.isEmpty()
+                                            ? QStringLiteral("verification_binding_missing")
+                                            : stateError);
+        qInfo().noquote()
+            << QStringLiteral("[ShareProposal] withheld key=%1 reason=verification_binding_invalid"
+                              " detail=%2")
+                   .arg(actionKey,
+                        stateError.isEmpty() ? QStringLiteral("missing") : stateError);
+        return;
+    }
+    const QString associationError = verificationBindingMismatch(
+        binding, result, actionKey, kind, origin, store.actionContextEpoch());
+    if (!associationError.isEmpty()) {
+        store.updateActionProposalState(actionKey, QStringLiteral("proposed"),
+                                        QStringLiteral("withheld"),
+                                        QStringLiteral("withheld"), associationError);
+        qInfo().noquote()
+            << QStringLiteral("[ShareProposal] withheld key=%1 reason=verification_binding_rejected"
+                              " detail=%2")
+                   .arg(actionKey, associationError);
+        return;
+    }
     // R12-2c-2：verified 必须经唯一入口写入内容指纹 + verifier request_id + fence 快照；
     // 普通 updateActionProposalState 不再允许直接推进到 verified。
-    const bool promoted = store.markActionProposalVerified(
-        actionKey, semanticStatus, result.value(QStringLiteral("request_id")).toString(),
-        &stateError);
+    const bool promoted = store.markActionProposalVerified(actionKey, binding, &stateError);
     if (!promoted) {
         const QJsonObject now = store.actionProposal(actionKey);
         const QString state = now.value(QStringLiteral("state")).toString();
+        // 绑定复核失败（内容/证据/epoch/状态不一致）不得留下可被后续 drain 提升的提案：
+        // 只要还停在 proposed，就按 withheld 收口（不发送、不覆盖既有终态）。
+        if (state == QStringLiteral("proposed")) {
+            QString withholdError;
+            store.updateActionProposalState(actionKey, QStringLiteral("proposed"),
+                                            QStringLiteral("withheld"),
+                                            QStringLiteral("withheld"),
+                                            QStringLiteral("verification_binding_mismatch"),
+                                            &withholdError);
+        }
         qInfo().noquote()
             << QStringLiteral("[ShareProposal] verify_failed key=%1 error=%2 state=%3")
                    .arg(actionKey, stateError, state);
@@ -1378,88 +1461,136 @@ void PrivateReview::receiveOpenWake(const Attempt &attempt, const QJsonObject &p
                        .arg(planError.isEmpty() ? QStringLiteral("mismatch") : planError);
             decision = QStringLiteral("reflect");
         } else {
-            const QJsonObject persistProposal{
-                {QStringLiteral("kind"), QStringLiteral("contact")},
-                {QStringLiteral("origin"), plan.value(QStringLiteral("origin"))},
-                {QStringLiteral("action_key"), actionKey},
-                {QStringLiteral("target"), plan.value(QStringLiteral("target"))},
-                {QStringLiteral("payload"), plan.value(QStringLiteral("payload"))},
-                {QStringLiteral("claims"), plan.value(QStringLiteral("claims"))},
-                {QStringLiteral("expires_at"), plan.value(QStringLiteral("expires_at"))}};
-            QString persistError;
-            store.persistActionProposal(persistProposal, &persistError);
-            const bool persistOk = persistError.isEmpty()
-                || persistError == QStringLiteral("conflict");
-            const QString planSemantic = plan.value(QStringLiteral("semantic_status")).toString();
-            // R12-2c-1：verified 只能携带服务端封闭枚举里的 semantic_status；
-            // 空串/未知值一律不提升 verified，按 schema_invalid 落 withheld。
-            const bool planSemanticValid = ActionPolicy::isValidSemanticStatus(planSemantic);
-            if (planState != QStringLiteral("verified") || !planSemanticValid) {
-                const QString reason =
-                    plan.value(QStringLiteral("withhold_reason")).toString().trimmed();
-                const QString rejectReason = planState == QStringLiteral("verified")
-                    ? QStringLiteral("schema_invalid")
-                    : (reason.isEmpty() ? QStringLiteral("policy_rejected") : reason);
-                if (persistOk) {
-                    store.updateActionProposalState(
-                        actionKey, QStringLiteral("proposed"), QStringLiteral("withheld"),
-                        QStringLiteral("withheld"), rejectReason);
-                }
-                qInfo().noquote()
-                    << QStringLiteral("[OpenWake] contact_rejected reason=%1 key=%2")
-                           .arg(rejectReason, actionKey);
-                decision = QStringLiteral("reflect");
-            } else if (!persistOk) {
+            // R12-2c-final-1：迟到的核验结果（构建核验后 Action Context Fence 已推进）不得
+            // 创建或提升新提案；连 withheld 审计行都不落，只保留本次内部记录。
+            const QJsonValue planEpochValue = plan.value(QStringLiteral("action_context_epoch"));
+            if (planEpochValue.isDouble()
+                && planEpochValue.toInteger() != store.actionContextEpoch()) {
                 qInfo().noquote()
                     << QStringLiteral("[OpenWake] contact_rejected"
-                                      " reason=proposal_persist_failed key=%1 error=%2")
-                           .arg(actionKey, persistError);
+                                      " reason=stale_context_epoch key=%1 request=%2 current=%3")
+                           .arg(actionKey)
+                           .arg(planEpochValue.toInteger())
+                           .arg(store.actionContextEpoch());
                 decision = QStringLiteral("reflect");
             } else {
-                const QString semantic = planSemantic;
-                QString stateError;
-                // R12-2c-2：verified 的唯一入口（写内容指纹/request_id/fence 快照）。
-                // 失败说明提案已被语境 fence/有效期/CAS 拦下，不再提交，也不发送。
-                if (!store.markActionProposalVerified(
-                        actionKey, semantic,
-                        plan.value(QStringLiteral("request_id")).toString(), &stateError)) {
-                    const QJsonObject now = store.actionProposal(actionKey);
+                const QJsonObject persistProposal{
+                    {QStringLiteral("kind"), QStringLiteral("contact")},
+                    {QStringLiteral("origin"), plan.value(QStringLiteral("origin"))},
+                    {QStringLiteral("action_key"), actionKey},
+                    {QStringLiteral("target"), plan.value(QStringLiteral("target"))},
+                    {QStringLiteral("payload"), plan.value(QStringLiteral("payload"))},
+                    {QStringLiteral("claims"), plan.value(QStringLiteral("claims"))},
+                    {QStringLiteral("expires_at"), plan.value(QStringLiteral("expires_at"))}};
+                QString persistError;
+                const QJsonObject persistResult =
+                    store.persistActionProposal(persistProposal, &persistError);
+                // R12-2c-final-1：同 key 不同内容的 conflict 绝不能再当成功——旧实现会继续
+                // 把库里那份"没被 verifier 核验过的内容"标成 verified 并提交。只有相同完整
+                // 内容的幂等返回（无 error）才允许继续。
+                const bool persistOk = !persistResult.contains(QStringLiteral("error"));
+                const QString planSemantic =
+                    plan.value(QStringLiteral("semantic_status")).toString();
+                // R12-2c-1：verified 只能携带服务端封闭枚举里的 semantic_status；
+                // 空串/未知值一律不提升 verified，按 schema_invalid 落 withheld。
+                const bool planSemanticValid = ActionPolicy::isValidSemanticStatus(planSemantic);
+                if (planState != QStringLiteral("verified") || !planSemanticValid) {
+                    const QString reason =
+                        plan.value(QStringLiteral("withhold_reason")).toString().trimmed();
+                    const QString rejectReason = planState == QStringLiteral("verified")
+                        ? QStringLiteral("schema_invalid")
+                        : (reason.isEmpty() ? QStringLiteral("policy_rejected") : reason);
+                    if (persistOk) {
+                        store.updateActionProposalState(
+                            actionKey, QStringLiteral("proposed"), QStringLiteral("withheld"),
+                            QStringLiteral("withheld"), rejectReason);
+                    }
                     qInfo().noquote()
-                        << QStringLiteral("[OpenWake] contact_rejected reason=verify_failed"
-                                          " key=%1 error=%2 state=%3")
-                               .arg(actionKey, stateError,
-                                    now.value(QStringLiteral("state")).toString());
+                        << QStringLiteral("[OpenWake] contact_rejected reason=%1 key=%2")
+                               .arg(rejectReason, actionKey);
+                    decision = QStringLiteral("reflect");
+                } else if (!persistOk) {
+                    qInfo().noquote()
+                        << QStringLiteral("[OpenWake] contact_rejected"
+                                          " reason=proposal_persist_failed key=%1 error=%2"
+                                          " conflict=%3")
+                               .arg(actionKey, persistError)
+                               .arg(persistError == QStringLiteral("conflict") ? 1 : 0);
                     decision = QStringLiteral("reflect");
                 } else {
-                    ActionCommitter committer(&store);
-                    const auto committed = committer.commitOpenWakeContact(actionKey);
-                    if (committed.contains(QStringLiteral("error"))) {
-                        const QString commitErrorCode =
-                            committed.value(QStringLiteral("error")).toString();
+                    // R12-2c-final-1：verified 必须携带构建核验请求时生成的服务端
+                    // VerificationBinding（模型只回显 request_id，不能签发）。先做关联校验，
+                    // 再由 markActionProposalVerified 在事务内与权威提案逐项复核。
+                    VerificationBinding binding;
+                    QString stateError;
+                    const bool bindingParsed = VerificationBinding::fromJson(
+                        plan.value(QStringLiteral("verification_binding")).toObject(),
+                        &binding, &stateError);
+                    const QString associationError = bindingParsed
+                        ? verificationBindingMismatch(binding, plan, actionKey,
+                                                      QStringLiteral("contact"), planOrigin,
+                                                      store.actionContextEpoch())
+                        : (stateError.isEmpty() ? QStringLiteral("verification_binding_missing")
+                                                : stateError);
+                    if (!associationError.isEmpty()) {
+                        QString withholdError;
+                        store.updateActionProposalState(
+                            actionKey, QStringLiteral("proposed"), QStringLiteral("withheld"),
+                            QStringLiteral("withheld"), associationError, &withholdError);
+                        qInfo().noquote()
+                            << QStringLiteral("[OpenWake] contact_rejected"
+                                              " reason=verification_binding_rejected key=%1"
+                                              " detail=%2")
+                                   .arg(actionKey, associationError);
+                        decision = QStringLiteral("reflect");
+                    } else if (!store.markActionProposalVerified(actionKey, binding,
+                                                                 &stateError)) {
                         const QJsonObject now = store.actionProposal(actionKey);
-                        if (now.value(QStringLiteral("state")).toString()
-                            == QStringLiteral("withheld")
-                            || now.value(QStringLiteral("state")).toString()
-                                   == QStringLiteral("expired")) {
-                            qInfo().noquote()
-                                << QStringLiteral("[OpenWake] contact_rejected reason=%1 key=%2")
-                                       .arg(commitErrorCode, actionKey);
-                            decision = QStringLiteral("reflect");
+                        const QString state = now.value(QStringLiteral("state")).toString();
+                        if (state == QStringLiteral("proposed")) {
+                            QString withholdError;
+                            store.updateActionProposalState(
+                                actionKey, QStringLiteral("proposed"),
+                                QStringLiteral("withheld"), QStringLiteral("withheld"),
+                                QStringLiteral("verification_binding_mismatch"), &withholdError);
+                        }
+                        qInfo().noquote()
+                            << QStringLiteral("[OpenWake] contact_rejected reason=verify_failed"
+                                              " key=%1 error=%2 state=%3")
+                                   .arg(actionKey, stateError, state);
+                        decision = QStringLiteral("reflect");
+                    } else {
+                        ActionCommitter committer(&store);
+                        const auto committed = committer.commitOpenWakeContact(actionKey);
+                        if (committed.contains(QStringLiteral("error"))) {
+                            const QString commitErrorCode =
+                                committed.value(QStringLiteral("error")).toString();
+                            const QJsonObject now = store.actionProposal(actionKey);
+                            if (now.value(QStringLiteral("state")).toString()
+                                == QStringLiteral("withheld")
+                                || now.value(QStringLiteral("state")).toString()
+                                       == QStringLiteral("expired")) {
+                                qInfo().noquote()
+                                    << QStringLiteral("[OpenWake] contact_rejected reason=%1"
+                                                      " key=%2")
+                                           .arg(commitErrorCode, actionKey);
+                                decision = QStringLiteral("reflect");
+                            } else {
+                                // 可恢复失败（安静/额度/目标/DB）：提案保持 verified 供 drain
+                                // 恢复，wake 本身仍按 contact 完成（不重复回顾、不无限重试）。
+                                contactVerified = true;
+                                qInfo().noquote()
+                                    << QStringLiteral("[OpenWake] contact_commit_pending key=%1"
+                                                      " reason=%2")
+                                           .arg(actionKey, commitErrorCode);
+                            }
                         } else {
-                            // 可恢复失败（安静/额度/目标/DB）：提案保持 verified 供 drain 恢复，
-                            // wake 本身仍按 contact 完成（不重复回顾、不无限重试）。
                             contactVerified = true;
                             qInfo().noquote()
-                                << QStringLiteral("[OpenWake] contact_commit_pending key=%1"
-                                                  " reason=%2")
-                                       .arg(actionKey, commitErrorCode);
+                                << QStringLiteral("[OpenWake] contact_committed key=%1 state=%2")
+                                       .arg(actionKey,
+                                            committed.value(QStringLiteral("state")).toString());
                         }
-                    } else {
-                        contactVerified = true;
-                        qInfo().noquote()
-                            << QStringLiteral("[OpenWake] contact_committed key=%1 state=%2")
-                                   .arg(actionKey,
-                                        committed.value(QStringLiteral("state")).toString());
                     }
                 }
             }

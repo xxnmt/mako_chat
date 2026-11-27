@@ -676,14 +676,22 @@ RefEvidence readPurposeRef(const QSqlDatabase &db, EvidencePurpose purpose, cons
 }
 
 // 统一的 claim refs 确定性校验（purpose 已由服务端判定）。
+// R12-2c-final-1：失败时把"第一个失败 ref / 它的 report 时间 / 来源基准时间"带回
+// ClaimValidation（只用于诊断日志；不改变判定结果），便于区分 claim type→purpose 映射问题
+// 与真正的来源缺失/时序问题。
 ClaimValidation validateClaimRefsWithOrigin(const QSqlDatabase &db, EvidencePurpose purpose,
                                             const QJsonObject &claim,
                                             const QString &originReported)
 {
-    const auto insufficient = [](const QString &reason) {
+    const auto insufficient = [&originReported](const QString &reason,
+                                                const QString &evidenceRef = QString(),
+                                                const QString &evidenceReported = QString()) {
         ClaimValidation validation;
         validation.result = ClaimValidation::Insufficient;
         validation.reason = reason;
+        validation.evidenceRef = evidenceRef;
+        validation.evidenceReported = evidenceReported;
+        validation.originReported = originReported;
         return validation;
     };
     if (claim.value(QStringLiteral("text")).toString().trimmed().isEmpty())
@@ -700,6 +708,7 @@ ClaimValidation validateClaimRefsWithOrigin(const QSqlDatabase &db, EvidencePurp
         unknown.unknown = true;
         unknown.reason = QStringLiteral("explicit_unknown");
         unknown.purpose = QStringLiteral("current_state");
+        unknown.originReported = originReported;
         return unknown;
     }
     if (refs.isEmpty()) {
@@ -710,6 +719,7 @@ ClaimValidation validateClaimRefsWithOrigin(const QSqlDatabase &db, EvidencePurp
             ClaimValidation validation;
             validation.result = ClaimValidation::Entailed;
             validation.purpose = QStringLiteral("internal_state");
+            validation.originReported = originReported;
             return validation;
         }
         return insufficient(QStringLiteral("missing_refs"));
@@ -720,19 +730,23 @@ ClaimValidation validateClaimRefsWithOrigin(const QSqlDatabase &db, EvidencePurp
     }
     ClaimValidation validation;
     validation.result = ClaimValidation::Entailed;
+    validation.originReported = originReported;
     for (const auto &value : refs) {
         const QString ref = value.toString().trimmed();
         const RefEvidence evidence = readPurposeRef(db, purpose, ref, originReported);
-        if (!evidence.ok) return insufficient(evidence.reason);
+        if (!evidence.ok)
+            return insufficient(evidence.reason, ref, evidence.reported);
         if (purpose == EvidencePurpose::ArtifactResult) {
             // 成果版本/哈希可由 claim 显式声明，但必须与真实成果一致（不是随机数）。
             const QJsonValue versionValue = claim.value(QStringLiteral("artifact_version"));
             if (versionValue.isDouble() && versionValue.toInt() != evidence.artifactVersion)
-                return insufficient(QStringLiteral("artifact_version_mismatch"));
+                return insufficient(QStringLiteral("artifact_version_mismatch"), ref,
+                                    evidence.reported);
             const QString claimedHash = claim.value(QStringLiteral("artifact_hash")).toString().trimmed();
             if (!claimedHash.isEmpty() && !evidence.artifactHash.isEmpty()
                 && claimedHash != evidence.artifactHash)
-                return insufficient(QStringLiteral("artifact_hash_mismatch"));
+                return insufficient(QStringLiteral("artifact_hash_mismatch"), ref,
+                                    evidence.reported);
         }
         validation.supportingRefs.append(ref);
     }
@@ -1497,16 +1511,55 @@ QJsonObject ActionPolicy::validateActionProposal(const QJsonObject &proposal,
         return fail(QStringLiteral("invalid_expires_at"));
     bool needsVerifier = false;
     bool anyUnknown = false;
+    // R12-2c-final-1：claim 被拒时记录 type/purpose/ref/report 时间/来源基准时间/原因码。
+    // 只记字段与时间，不记 claim/message 正文；用于判断"历史事实被当成新证据"这类问题。
+    const auto logClaimRejected = [this, &origin](const QJsonObject &claim, const QString &type,
+                                                  EvidencePurpose purpose,
+                                                  const ClaimValidation &validation) {
+        QString ref = validation.evidenceRef;
+        if (ref.isEmpty()) {
+            for (const auto &value : claim.value(QStringLiteral("refs")).toArray()) {
+                const QString candidate = value.toString().trimmed();
+                if (!candidate.isEmpty()) {
+                    ref = candidate;
+                    break;
+                }
+            }
+        }
+        QString originReported = validation.originReported;
+        if (originReported.isEmpty()) originReported = originReportedText(origin);
+        const QString purposeText = validation.purpose.isEmpty()
+            ? evidencePurposeName(purpose) : validation.purpose;
+        qInfo().noquote()
+            << QStringLiteral("[Evidence] claim_rejected type=%1 purpose=%2 ref=%3"
+                              " source_reported=%4 origin_reported=%5 reason=%6")
+                   .arg(type.isEmpty() ? QStringLiteral("-") : type,
+                        purposeText,
+                        ref.isEmpty() ? QStringLiteral("-") : ref,
+                        validation.evidenceReported.isEmpty()
+                            ? QStringLiteral("-") : validation.evidenceReported,
+                        originReported.isEmpty() ? QStringLiteral("-") : originReported,
+                        validation.reason.isEmpty()
+                            ? QStringLiteral("-") : validation.reason);
+    };
     for (const auto &value : claims) {
         if (!value.isObject()) return fail(QStringLiteral("invalid_claims"));
         const QJsonObject claim = value.toObject();
         const QString type = claim.value(QStringLiteral("type")).toString().trimmed();
         EvidencePurpose purpose = EvidencePurpose::HistoricalFact;
-        if (!purposeForClaimType(type, &purpose))
+        if (!purposeForClaimType(type, &purpose)) {
+            logClaimRejected(claim, type, EvidencePurpose::HistoricalFact,
+                             ClaimValidation{});
             return fail(QStringLiteral("invalid_claim_type"));
+        }
         const QString declaredPurpose = claim.value(QStringLiteral("purpose")).toString().trimmed();
-        if (!declaredPurpose.isEmpty() && declaredPurpose != evidencePurposeName(purpose))
+        if (!declaredPurpose.isEmpty() && declaredPurpose != evidencePurposeName(purpose)) {
+            logClaimRejected(claim, type, purpose,
+                             ClaimValidation{ClaimValidation::Insufficient,
+                                             QStringLiteral("purpose_mismatch"), {}, false,
+                                             evidencePurposeName(purpose)});
             return fail(QStringLiteral("purpose_mismatch"));
+        }
         const ClaimValidation validation = validateClaimForPurpose(
             origin.targetChannel, origin.targetSession, origin, purpose, claim);
         QJsonArray supporting;
@@ -1526,12 +1579,16 @@ QJsonObject ActionPolicy::validateActionProposal(const QJsonObject &proposal,
             anyUnknown = true;
             continue;
         }
-        if (validation.result != ClaimValidation::Entailed)
+        if (validation.result != ClaimValidation::Entailed) {
+            logClaimRejected(claim, type, purpose, validation);
             return fail(validation.reason);
+        }
         // 内部状态只能证明她内部有过记录，不能成为对外动作核心/事实来源。
         if (purpose == EvidencePurpose::InternalState
-            && claim.value(QStringLiteral("core")).toBool())
+            && claim.value(QStringLiteral("core")).toBool()) {
+            logClaimRejected(claim, type, purpose, validation);
             return fail(QStringLiteral("internal_state_core"));
+        }
         if (purpose != EvidencePurpose::InternalState
             && purpose != EvidencePurpose::ArtifactResult)
             needsVerifier = true;
@@ -1727,6 +1784,44 @@ QString ActionPolicy::canonicalProposalPayloadDigest(const QJsonObject &payload,
 QString ActionPolicy::canonicalProposalClaimsDigest(const QJsonArray &claims)
 {
     const QByteArray canonical = QJsonDocument(claims).toJson(QJsonDocument::Compact);
+    return QString::fromLatin1(
+        QCryptographicHash::hash(canonical, QCryptographicHash::Sha256).toHex().left(16));
+}
+
+// R12-2c-final-1：需要语义 verifier 判定的 claim 选择。服务端唯一实现：LLMService 构建
+// verifier 请求、MemoryManager 复核 VerificationBinding 的 evidence digest 都必须用它，
+// 否则两边选择集合不一致会让合法提案失败关闭（宁可 fail closed，也不接受不一致证据）。
+QJsonArray ActionPolicy::factualClaimsForVerification(const QJsonArray &claims)
+{
+    QJsonArray factual;
+    for (const auto &value : claims) {
+        const QString type = value.toObject().value(QStringLiteral("type")).toString().trimmed();
+        // historical_fact/current_state 同样需要 entailment（只是不需要"新证据"时序）；
+        // reported_fact 是 NewEvidence 旧类型，保留在核验集合里。
+        if (type == kReportedFact || type == QStringLiteral("historical_fact")
+            || type == QStringLiteral("current_state") || type == kUserCommitment
+            || type == kExecutionResult)
+            factual.append(value);
+    }
+    return factual;
+}
+
+QString ActionPolicy::canonicalEvidenceDigest(const QJsonArray &claims, const QJsonArray &sources)
+{
+    const QJsonObject normalized{
+        {QStringLiteral("evidence_identity"), QStringLiteral("claims+sources")},
+        {QStringLiteral("evidence_version"), 1},
+        {QStringLiteral("claims"), claims},
+        {QStringLiteral("sources"), sources}};
+    const QByteArray canonical = QJsonDocument(normalized).toJson(QJsonDocument::Compact);
+    return QString::fromLatin1(
+        QCryptographicHash::hash(canonical, QCryptographicHash::Sha256).toHex().left(16));
+}
+
+QString ActionPolicy::canonicalJsonDigest(const QJsonValue &value)
+{
+    const QByteArray canonical =
+        QJsonDocument(QJsonObject{{QStringLiteral("v"), value}}).toJson(QJsonDocument::Compact);
     return QString::fromLatin1(
         QCryptographicHash::hash(canonical, QCryptographicHash::Sha256).toHex().left(16));
 }

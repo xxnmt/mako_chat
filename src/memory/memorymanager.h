@@ -16,6 +16,7 @@
 #include "utterance.h"
 #include "recentcontext.h"
 #include "activityref.h"
+#include "actionorigin.h"
 
 class MemoryEmbeddingProvider;
 class MemoryReadPolicy;
@@ -539,8 +540,28 @@ public:
     //   * action_context_epoch 必须仍等于当前 fence epoch（主人私聊插话/成果撤回后旧在途
     //     核验失效），不一致 → 置 expired + cancel_reason=context_epoch_changed，返回 false。
     // 任一步失败整体回滚；成功后提交/发送前还会再次复核这些绑定。
+    //
+    // R12-2c-final-1：生产路径（PrivateReview）必须使用下面的 VerificationBinding 重载。
+    // 旧 (semanticStatus, verifiedRequestId) 重载只为兼容既有测试/管理路径而保留：
+    // 它在库内行上推导一份 binding（内容指纹来自库内内容），因此**不能**证明 verifier
+    // 实际核验的就是这份内容；新的核验链不再调用它。
     bool markActionProposalVerified(const QString &actionKey,const QString &semanticStatus,
                                     const QString &verifiedRequestId,QString *error = nullptr);
+    // R12-2c-final-1：proposed→verified 的服务端内容绑定入口（单事务）。binding 由
+    // LLMService 在构建 verifier 请求时生成，随异步终态回调传递。事务内重新读取权威提案行，
+    // 逐项比较 binding 与提案：kind/origin(kind/ref/id/version)/runId/scope/origin
+    // context_epoch/target/action_context_epoch/payload_digest/claims_digest/evidence_digest/
+    // request_id；再从库内权威 claims 重新计算 evidence 集合摘要，任何不一致都 fail closed
+    // （verification_binding_mismatch / verification_evidence_mismatch），绝不把"当前 DB
+    // 内容"当成"verifier 核验过的内容"。通过后 CAS proposed→verified，并把
+    // binding.payloadDigest/claimsDigest/requestId 写入 v33 既有列：
+    //   verified_payload_hash=binding.payloadDigest；
+    //   verified_claims_hash=binding.claimsDigest；
+    //   verified_request_id=binding.requestId；verified_at=now。
+    // evidence digest 不新增列：它在本次事务内被复核（库里已有权威 payload/claims + 证据
+    // 可由 claimSources 重算），提交时再复核两个持久化 hash 与提交内容一致。
+    bool markActionProposalVerified(const QString &actionKey, const VerificationBinding &binding,
+                                    QString *error = nullptr);
     // 取消审计（幂等、单事务）：未终态（proposed/verified）→ expired；committed 保持 committed
     // （回执闭环需要），只写 cancel_reason 供审计；绝不删除历史事实/成果。
     bool cancelActionProposal(const QString &actionKey,const QString &reason);

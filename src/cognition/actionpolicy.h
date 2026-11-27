@@ -3,6 +3,7 @@
 
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QJsonValue>
 #include <QString>
 #include <QStringList>
 #include <functional>
@@ -23,6 +24,11 @@ struct ClaimValidation
     bool unknown = false;
     // 服务端按 claim 类型判定的用途名（审计用；调用方输入的 purpose 不能改写它）。
     QString purpose;
+    // R12-2c-final-1：失败诊断（只记录 ref/时间/用途，不记录正文）。用于定位
+    // "wake/3 self_desire 引用 chat/589 被判 stale_ref"这类问题，区分 claim type 与 purpose。
+    QString evidenceRef;
+    QString evidenceReported;
+    QString originReported;
 };
 
 // R12-2a：证据用途（Purpose）。由服务端按 claim 类型/来源决定，模型不能自定义。
@@ -232,6 +238,19 @@ public:
     // 仅 claims 数组的规范化摘要（SHA-256 前 16 位），用于把"核验过的声明集合"
     // 与后续提交/发送的 claims 绑定；与 payload 摘要独立，两处都要一致。
     static QString canonicalProposalClaimsDigest(const QJsonArray &claims);
+
+    // ===== R12-2c-final-1：verifier 证据集合与内容绑定 =====
+    // 需要语义 verifier 判定的"事实类 claim"选择（服务端唯一实现；请求构建与
+    // VerificationBinding 复核必须用同一个函数，否则 evidence digest 不可能一致）：
+    //   reported_fact / historical_fact / current_state / user_commitment / execution_result。
+    // artifact_result 由确定性成果校验负责，internal_state 不构成对外事实。
+    static QJsonArray factualClaimsForVerification(const QJsonArray &claims);
+    // verifier 输入中实际 evidence 选择集合（declared_claims + sources）的规范化摘要
+    // （SHA-256 前 16 位）。sources 是 [{ref,text}]，text 来自库内权威原文；持久化层会用
+    // 权威提案行重新计算，摘要变化说明"核验过的证据集合"已不再成立 → fail closed。
+    static QString canonicalEvidenceDigest(const QJsonArray &claims, const QJsonArray &sources);
+    // 任意 JSON 值规范化（紧凑序列化）后的 SHA-256 前 16 位；用于 verifier 输入摘要审计。
+    static QString canonicalJsonDigest(const QJsonValue &value);
 
 private:
     // 来源时间（时序基准）：wake 用 open_wake.started_at/created_at，

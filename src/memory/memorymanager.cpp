@@ -11201,10 +11201,174 @@ bool MemoryManager::updateActionProposalState(const QString &actionKey, const QS
     return true;
 }
 
-// R12-2c-2：proposed→verified 的唯一入口。核验（语义网络请求）已经在调用方/LLMService
-// 完成；这里只做服务端权威的"内容绑定落库"，不发网络请求、不发送消息。
-// 关键不变式：verified 行必须携带"到底核验了哪份内容"的指纹 + verifier request_id +
-// verified_at + 生成时的 fence epoch；之后提交/领取/发送都以此为准重算并逐字比较。
+// R12-2c-final-1：proposed→verified 的服务端内容绑定入口。核验（语义网络请求）已经在
+// LLMService 完成；这里只做服务端权威的"内容绑定落库"，不发网络请求、不发送消息。
+// 关键不变式：verified 行必须携带"到底核验了哪份内容"的 binding（origin/target/两级
+// epoch/payload/claims/证据集合/request_id）；binding 由构建 verifier 请求的一方生成，
+// 事务内与权威提案行逐项比较后才 CAS——绝不把"当前 DB 内容"当成"verifier 核验过的内容"。
+bool MemoryManager::markActionProposalVerified(const QString &actionKey,
+                                               const VerificationBinding &binding,
+                                               QString *error)
+{
+    if (error) error->clear();
+    const auto fail = [error](const QString &reason) {
+        if (error) *error = reason;
+        return false;
+    };
+    const QString key = actionKey.trimmed();
+    if (key.isEmpty()) return fail(QStringLiteral("invalid_action_key"));
+    if (binding.actionKey != key) return fail(QStringLiteral("verification_binding_mismatch"));
+    QString bindingError;
+    if (!binding.isValid(&bindingError))
+        return fail(bindingError.isEmpty() ? QStringLiteral("invalid_verification_binding")
+                                           : bindingError);
+    // verified 终态只能来自服务端映射：withheld binding 不能提升提案。
+    if (binding.state != QStringLiteral("verified"))
+        return fail(QStringLiteral("verification_state_not_verified"));
+    const QString semantic = binding.semanticStatus.trimmed();
+    if (semantic.isEmpty() || semantic == QStringLiteral("withheld")
+        || !proposalSemanticStatusValid(semantic))
+        return fail(QStringLiteral("invalid_semantic_status"));
+    if (!m_db.isOpen()) return fail(QStringLiteral("db_error"));
+    if (!m_db.transaction()) return fail(QStringLiteral("db_error"));
+    auto rollback = qScopeGuard([this] { m_db.rollback(); });
+    const auto failRollback = [this, &rollback, &fail](const QString &reason) {
+        m_db.rollback();
+        rollback.dismiss();
+        return fail(reason);
+    };
+    QJsonObject row;
+    {
+        QSqlQuery query(m_db);
+        query.prepare(QStringLiteral("SELECT ") + kProposalColumns
+                      + QStringLiteral(" FROM action_proposal WHERE action_key=?"));
+        query.addBindValue(key);
+        if (!query.exec() || !query.next()) return failRollback(QStringLiteral("not_found"));
+        row = proposalRowJson(query);
+    }
+    const QString state = row.value(QStringLiteral("state")).toString();
+    if (state == QStringLiteral("committed") || state == QStringLiteral("verified")) {
+        // 幂等只对"同一份 binding"成立：已 verified/committed 的行若不是这份 binding 的
+        // 产物（内容/request_id 不同），说明是另一份核验结果，绝不覆盖首次绑定。
+        const bool sameBinding =
+            row.value(QStringLiteral("verified_payload_hash")).toString() == binding.payloadDigest
+            && row.value(QStringLiteral("verified_claims_hash")).toString() == binding.claimsDigest
+            && row.value(QStringLiteral("verified_request_id")).toString() == binding.requestId;
+        m_db.rollback();
+        rollback.dismiss();
+        if (sameBinding) return true;
+        return fail(QStringLiteral("already_verified_with_different_binding"));
+    }
+    if (state != QStringLiteral("proposed")) return failRollback(QStringLiteral("invalid_state"));
+    // 1) binding 与权威提案行的身份字段必须完全一致（同 key 被替换/串线在这里拒绝）。
+    const auto sameText = [&row](const char *field, const QString &expected) {
+        return row.value(QString::fromLatin1(field)).toString() == expected;
+    };
+    const bool identityMatches =
+        sameText("kind", binding.kind)
+        && sameText("origin_kind", binding.originKind)
+        && sameText("origin_ref", binding.originRef)
+        && row.value(QStringLiteral("origin_version")).toInt() == binding.originVersion
+        && sameText("run_id", binding.runId)
+        && sameText("scope", binding.scope)
+        && row.value(QStringLiteral("context_epoch")).toInteger() == binding.originContextEpoch
+        && sameText("target_channel", binding.targetChannel)
+        && sameText("target_session", binding.targetSession)
+        && row.value(QStringLiteral("action_context_epoch")).toInteger()
+               == binding.actionContextEpoch;
+    if (!identityMatches) {
+        qInfo().noquote()
+            << QStringLiteral("[Proposal] verify_rejected key=%1 reason=binding_mismatch"
+                              " request=%2")
+                   .arg(key, binding.requestId.left(8));
+        return failRollback(QStringLiteral("verification_binding_mismatch"));
+    }
+    // 2) 库内权威 payload/claims 的规范摘要必须等于核验时摘要。
+    const QString kind = row.value(QStringLiteral("kind")).toString();
+    const QJsonObject payload = row.value(QStringLiteral("payload")).toObject();
+    const QJsonArray claims = row.value(QStringLiteral("claims")).toArray();
+    if (ActionPolicy::canonicalProposalPayloadDigest(payload, claims) != binding.payloadDigest
+        || ActionPolicy::canonicalProposalClaimsDigest(claims) != binding.claimsDigest) {
+        qInfo().noquote()
+            << QStringLiteral("[Proposal] verify_rejected key=%1 reason=payload_digest_mismatch"
+                              " request=%2")
+                   .arg(key, binding.requestId.left(8));
+        return failRollback(QStringLiteral("verification_binding_mismatch"));
+    }
+    if (kind == QStringLiteral("contact")
+        && payload.value(QStringLiteral("message")).toString().trimmed().isEmpty())
+        return failRollback(QStringLiteral("missing_message"));
+    if (kind == QStringLiteral("activity_share")
+        && payload.value(QStringLiteral("draft")).toString().trimmed().isEmpty())
+        return failRollback(QStringLiteral("missing_artifact_draft"));
+    // 3) 证据集合摘要：用权威 claims 与当前库内证据（服务端唯一选择函数）重算，
+    //    与 verifier 实际输入集合不一致说明"核验过的证据"已不成立 → fail closed。
+    {
+        ActionPolicy policy(this);
+        const QJsonArray factual = ActionPolicy::factualClaimsForVerification(claims);
+        const QJsonArray sources =
+            policy.claimSources(binding.targetChannel, binding.targetSession, 0, factual);
+        const QString evidenceDigest = ActionPolicy::canonicalEvidenceDigest(claims, sources);
+        if (evidenceDigest != binding.evidenceDigest) {
+            qInfo().noquote()
+                << QStringLiteral("[Proposal] verify_rejected key=%1 reason=evidence_mismatch"
+                                  " request=%2")
+                       .arg(key, binding.requestId.left(8));
+            return failRollback(QStringLiteral("verification_evidence_mismatch"));
+        }
+    }
+    // 4) Action Context Fence：提案落库快照 = binding 快照 = 当前语境版本。
+    //    主人私聊插话/成果撤回等已推进 epoch → 这份"旧在途核验"不能再变成 verified。
+    const qint64 currentEpoch = actionContextEpoch();
+    const qint64 snapshotEpoch = row.value(QStringLiteral("action_context_epoch")).toInteger();
+    if (currentEpoch != snapshotEpoch || binding.actionContextEpoch != currentEpoch) {
+        QSqlQuery expire(m_db);
+        expire.prepare(QStringLiteral(
+            "UPDATE action_proposal SET state='expired',cancel_reason=?,updated_at=unixepoch() "
+            "WHERE action_key=? AND state='proposed'"));
+        expire.addBindValue(QStringLiteral("context_epoch_changed"));
+        expire.addBindValue(key);
+        if (!expire.exec()) return failRollback(QStringLiteral("db_error"));
+        if (!m_db.commit()) return failRollback(QStringLiteral("db_error"));
+        rollback.dismiss();
+        qInfo() << "[Proposal] expired key=" << key
+                << "reason=context_epoch_changed snapshot=" << snapshotEpoch
+                << "current=" << currentEpoch;
+        return fail(QStringLiteral("context_epoch_changed"));
+    }
+    // 5) 不在这里判 expires_at：过期是提交层/Drain 的职责（历史行为保持不变：
+    //    verified 但已过期的提案由 commit 落 expired，而不是拒绝写 verified 绑定）。
+    // 6) CAS proposed→verified：把 binding 的 payload/claims 摘要与 request_id 写入 v33 既有列
+    //    （verified_evidence 不新增列；binding 的 evidence digest 已在上面事务内复核）。
+    QSqlQuery update(m_db);
+    update.prepare(QStringLiteral(
+        "UPDATE action_proposal SET state='verified',semantic_status=?,"
+        "verified_payload_hash=?,verified_claims_hash=?,verified_request_id=?,"
+        "verified_at=?,error_code=NULL,updated_at=unixepoch() "
+        "WHERE action_key=? AND state='proposed'"));
+    update.addBindValue(semantic);
+    update.addBindValue(binding.payloadDigest);
+    update.addBindValue(binding.claimsDigest);
+    update.addBindValue(binding.requestId);
+    update.addBindValue(QDateTime::currentSecsSinceEpoch());
+    update.addBindValue(key);
+    if (!update.exec()) return failRollback(QStringLiteral("db_error"));
+    if (update.numRowsAffected() != 1)
+        return failRollback(QStringLiteral("cas_conflict"));
+    if (!m_db.commit()) return failRollback(QStringLiteral("db_error"));
+    rollback.dismiss();
+    qInfo().noquote()
+        << QStringLiteral("[Proposal] verified key=%1 semantic=%2 request=%3"
+                          " payload=%4 evidence=%5")
+               .arg(key, semantic, binding.requestId.left(8), binding.payloadDigest,
+                    binding.evidenceDigest);
+    return true;
+}
+
+// R12-2c-final-1：旧入口（兼容既有测试/管理路径，生产核验链不再调用）。
+// 它从库内行推导一份 binding（内容指纹来自库内内容），所以**不能**证明 verifier 实际
+// 核验的就是这份内容；真正的生产路径由 PrivateReview 传入 LLMService 生成的
+// VerificationBinding 走上面的重载。
 bool MemoryManager::markActionProposalVerified(const QString &actionKey,
                                                const QString &semanticStatus,
                                                const QString &verifiedRequestId, QString *error)
@@ -11219,109 +11383,45 @@ bool MemoryManager::markActionProposalVerified(const QString &actionKey,
     const QString requestId = verifiedRequestId.trimmed();
     if (key.isEmpty()) return fail(QStringLiteral("invalid_action_key"));
     if (!m_db.isOpen()) return fail(QStringLiteral("db_error"));
-    // 只有服务端封闭枚举才能进入 verified；空串/withheld 都不允许。
     if (semantic.isEmpty() || semantic == QStringLiteral("withheld")
         || !proposalSemanticStatusValid(semantic))
         return fail(QStringLiteral("invalid_semantic_status"));
     if (requestId.isEmpty()) return fail(QStringLiteral("missing_verified_request_id"));
     if (requestId.size() > 120) return fail(QStringLiteral("invalid_verified_request_id"));
-    if (!m_db.transaction()) return fail(QStringLiteral("db_error"));
-    auto rollback = qScopeGuard([this] { m_db.rollback(); });
-    QJsonObject row;
-    {
-        QSqlQuery query(m_db);
-        query.prepare(QStringLiteral("SELECT ") + kProposalColumns
-                      + QStringLiteral(" FROM action_proposal WHERE action_key=?"));
-        query.addBindValue(key);
-        if (!query.exec() || !query.next()) {
-            m_db.rollback();
-            rollback.dismiss();
-            return fail(QStringLiteral("not_found"));
-        }
-        row = proposalRowJson(query);
-    }
-    const QString state = row.value(QStringLiteral("state")).toString();
-    if (state == QStringLiteral("committed") || state == QStringLiteral("verified")) {
-        // 幂等：已经 verified/committed 的提案不重复改写绑定；提交/发送前还会复核绑定。
-        m_db.rollback();
-        rollback.dismiss();
-        return true;
-    }
-    if (state != QStringLiteral("proposed")) {
-        m_db.rollback();
-        rollback.dismiss();
-        return fail(QStringLiteral("invalid_state"));
-    }
-    // Action Context Fence：提案落库时快照的 epoch 必须仍等于当前语境版本。
-    // 主人私聊插话/成果撤回等已推进 epoch → 这份"旧在途核验"不能再变成 verified。
-    const qint64 currentEpoch = actionContextEpoch();
-    const qint64 snapshotEpoch = row.value(QStringLiteral("action_context_epoch")).toInteger();
-    if (currentEpoch != snapshotEpoch) {
-        QSqlQuery expire(m_db);
-        expire.prepare(QStringLiteral(
-            "UPDATE action_proposal SET state='expired',cancel_reason=?,updated_at=unixepoch() "
-            "WHERE action_key=? AND state='proposed'"));
-        expire.addBindValue(QStringLiteral("context_epoch_changed"));
-        expire.addBindValue(key);
-        if (!expire.exec()) return fail(QStringLiteral("db_error"));
-        if (!m_db.commit()) {
-            m_db.rollback();
-            return fail(QStringLiteral("db_error"));
-        }
-        rollback.dismiss();
-        qInfo() << "[Proposal] expired key=" << key
-                << "reason=context_epoch_changed snapshot=" << snapshotEpoch
-                << "current=" << currentEpoch;
-        return fail(QStringLiteral("context_epoch_changed"));
-    }
-    const QString kind = row.value(QStringLiteral("kind")).toString();
+    const QJsonObject row = actionProposal(key);
+    if (row.isEmpty()) return fail(QStringLiteral("not_found"));
+    ActionOrigin origin;
+    QString originError;
+    if (!ActionOrigin::fromJson(row.value(QStringLiteral("origin")).toObject(), &origin,
+                                &originError))
+        return fail(originError.isEmpty() ? QStringLiteral("invalid_origin") : originError);
     const QJsonObject payload = row.value(QStringLiteral("payload")).toObject();
     const QJsonArray claims = row.value(QStringLiteral("claims")).toArray();
-    if (kind == QStringLiteral("contact")
-        && payload.value(QStringLiteral("message")).toString().trimmed().isEmpty()) {
-        m_db.rollback();
-        rollback.dismiss();
-        return fail(QStringLiteral("missing_message"));
-    }
-    if (kind == QStringLiteral("activity_share")
-        && payload.value(QStringLiteral("draft")).toString().trimmed().isEmpty()) {
-        m_db.rollback();
-        rollback.dismiss();
-        return fail(QStringLiteral("missing_artifact_draft"));
-    }
-    const QString payloadHash = ActionPolicy::canonicalProposalPayloadDigest(payload, claims);
-    const QString claimsHash = ActionPolicy::canonicalProposalClaimsDigest(claims);
-    if (payloadHash.isEmpty() || claimsHash.isEmpty()) {
-        m_db.rollback();
-        rollback.dismiss();
-        return fail(QStringLiteral("binding_failed"));
-    }
-    QSqlQuery update(m_db);
-    update.prepare(QStringLiteral(
-        "UPDATE action_proposal SET state='verified',semantic_status=?,"
-        "verified_payload_hash=?,verified_claims_hash=?,verified_request_id=?,"
-        "verified_at=?,error_code=NULL,updated_at=unixepoch() "
-        "WHERE action_key=? AND state='proposed'"));
-    update.addBindValue(semantic);
-    update.addBindValue(payloadHash);
-    update.addBindValue(claimsHash);
-    update.addBindValue(requestId);
-    update.addBindValue(QDateTime::currentSecsSinceEpoch());
-    update.addBindValue(key);
-    if (!update.exec()) return fail(QStringLiteral("db_error"));
-    if (update.numRowsAffected() != 1) {
-        m_db.rollback();
-        rollback.dismiss();
-        return fail(QStringLiteral("cas_conflict"));
-    }
-    if (!m_db.commit()) {
-        m_db.rollback();
-        return fail(QStringLiteral("db_error"));
-    }
-    rollback.dismiss();
-    qInfo() << "[Proposal] verified key=" << key << "semantic=" << semantic
-            << "request=" << requestId.left(8);
-    return true;
+    VerificationBinding binding;
+    binding.requestId = requestId;
+    binding.actionKey = key;
+    binding.kind = row.value(QStringLiteral("kind")).toString();
+    binding.originKind = origin.kindName();
+    binding.originRef = origin.ref;
+    binding.originId = origin.id;
+    binding.originVersion = origin.version;
+    binding.runId = origin.runId;
+    binding.scope = origin.scope;
+    binding.originContextEpoch = origin.contextEpoch;
+    binding.actionContextEpoch = row.value(QStringLiteral("action_context_epoch")).toInteger();
+    binding.targetChannel = origin.targetChannel;
+    binding.targetSession = origin.targetSession;
+    binding.payloadDigest = ActionPolicy::canonicalProposalPayloadDigest(payload, claims);
+    binding.claimsDigest = ActionPolicy::canonicalProposalClaimsDigest(claims);
+    ActionPolicy policy(this);
+    const QJsonArray factual = ActionPolicy::factualClaimsForVerification(claims);
+    binding.evidenceDigest = ActionPolicy::canonicalEvidenceDigest(
+        claims, policy.claimSources(binding.targetChannel, binding.targetSession, 0, factual));
+    binding.verifierInputDigest = ActionPolicy::canonicalJsonDigest(
+        QJsonObject{{QStringLiteral("payload"), payload}, {QStringLiteral("claims"), claims}});
+    binding.state = QStringLiteral("verified");
+    binding.semanticStatus = semantic;
+    return markActionProposalVerified(key, binding, error);
 }
 
 // R12-2c-2：取消审计（幂等）。未提交提案回 expired；已 committed 的保持状态（回执闭环依赖
@@ -11810,7 +11910,10 @@ QJsonObject MemoryManager::commitVerifiedActionProposal(const QString &actionKey
             {QStringLiteral("draft"), draft}};
     }
 
-    // R12-2c-2：即将提交的 payload/claims 必须与"核验时的内容指纹"完全一致。
+    // R12-2c-2/R12-2c-final-1：即将提交的 payload/claims 必须与"核验时的内容指纹"完全一致。
+    // 这里的 verified_payload_hash/verified_claims_hash 就是 VerificationBinding 的
+    // payloadDigest/claimsDigest（binding 已在 mark 时与权威提案逐项复核）；内容在核验后
+    // 被改写（含 claims 集合变化）就拒绝，绝不发送"核验的是 A、发送的是 B"。
     // 这里按提交内容重算；进入事务后再用权威提案行复核一次（双重复验）。
     const QString commitClaimsDigest = ActionPolicy::canonicalProposalClaimsDigest(claims);
     if (ActionPolicy::canonicalProposalPayloadDigest(payload, claims) != verifiedPayloadHash

@@ -1215,6 +1215,104 @@ private slots:
                  QStringLiteral("open_wake_contact_disabled"));
     }
 
+    // R12-2c-final-1（V12/V13/V14）：OpenWake 场景下 claim type→EvidencePurpose 的边界。
+    // 真实日志里 wake/3 self_desire 引用较早的 chat/589 被判 stale_ref：旧输出协议只给出
+    // reported_fact（→NewEvidence，保留新证据时序），没有 historical_fact 这个可表达的
+    // "真实历史事实"类型。这里验证：历史事实（早于 wake）通过；被声明为新证据的旧引用
+    // 仍按时序拒绝（不删时序检查、不按关键词降级）；self_desire 无外部事实不要求新证据。
+    void openWakeEvidencePurposeHistoricalVsNewEvidence()
+    {
+        PolicyIdentityGuard identity;
+        QVERIFY(identity.writeIdentity(QByteArray(
+            R"({"proactive":{"enabled":true,"private_writing":false,"cooldown_seconds":0,)"
+            R"("quiet_hours":{"start":"00:00","end":"00:00"},)"
+            R"("targets":[{"channel":"pet","session_id":"default"}]},)"
+            R"("cognition":{"open_wake":{"enabled":false,"allow_contact":true}}})")));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath(QStringLiteral("purpose-open-wake.db"));
+        MemoryManager memory(path);
+        // 早于本次 wake 的主人真实发言（happened before wake by construction）。
+        const auto earlier = insertOwnerEvidenceTurn(
+            memory, QStringLiteral("以前说过喜欢下雨天"), -7200);
+        QVERIFY(earlier > 0);
+        const auto wakeId = insertRunningOpenWake(
+            path, QStringLiteral("run-purpose-wake"), QStringLiteral("owner"), 0);
+        QVERIFY(wakeId > 0);
+        const auto origin = ActionOrigin::forWake(
+            wakeId, 1, QStringLiteral("run-purpose-wake"), QStringLiteral("owner"), 0,
+            Channel::kPet, Channel::kDefaultSession);
+        QVERIFY(origin.isValid());
+        ActionPolicy policy(&memory);
+        const auto buildProposal = [&origin](const QJsonArray &claims,
+                                             const QString &message) {
+            QJsonArray coreIds;
+            for (const auto &value : claims)
+                coreIds.append(value.toObject().value(QStringLiteral("id")).toString());
+            return QJsonObject{
+                {QStringLiteral("origin"), origin.toJson()},
+                {QStringLiteral("kind"), QStringLiteral("contact")},
+                {QStringLiteral("payload"),
+                 QJsonObject{{QStringLiteral("message"), message},
+                             {QStringLiteral("reason"), QStringLiteral("自己想到")},
+                             {QStringLiteral("core_claim_ids"), coreIds}}},
+                {QStringLiteral("claims"), claims}};
+        };
+        const QString ref = QStringLiteral("chat/%1").arg(earlier);
+
+        // V12：historical_fact（真实历史事实）早于 OpenWake 通过；不需要"新证据"时序。
+        {
+            const auto claim = purposeClaim(
+                QStringLiteral("historical_fact"), QStringLiteral("主人以前说过喜欢下雨天"),
+                {ref}, true);
+            QString error;
+            const auto result = policy.validateActionProposal(
+                buildProposal(QJsonArray{claim}, QStringLiteral("还记得你说过喜欢下雨天吗")),
+                &error);
+            QVERIFY2(result.value(QStringLiteral("allowed")).toBool(),
+                     qPrintable(result.value(QStringLiteral("reason")).toString()));
+            QCOMPARE(result.value(QStringLiteral("needs_verifier")).toBool(), true);
+            const auto claimResult = result.value(QStringLiteral("claims")).toArray()
+                                         .first().toObject();
+            QCOMPARE(claimResult.value(QStringLiteral("purpose")).toString(),
+                     QStringLiteral("historical_fact"));
+            QCOMPARE(claimResult.value(QStringLiteral("result")).toString(),
+                     QStringLiteral("entailed"));
+        }
+        // V13：同一份旧引用若被声明为 reported_fact（new_evidence 旧语义）→ stale_ref 拒绝；
+        // 诊断里保留 claim type/purpose/ref/report 时间/wake 时间（不含正文）。
+        {
+            const auto claim = purposeClaim(
+                QStringLiteral("reported_fact"), QStringLiteral("主人今天说喜欢下雨天"),
+                {ref}, true);
+            QString error;
+            const auto result = policy.validateActionProposal(
+                buildProposal(QJsonArray{claim}, QStringLiteral("你刚说喜欢下雨天")), &error);
+            QCOMPARE(result.value(QStringLiteral("allowed")).toBool(), false);
+            QCOMPARE(result.value(QStringLiteral("reason")).toString(),
+                     QStringLiteral("stale_ref"));
+            const auto validation = policy.validateClaimForPurpose(
+                Channel::kPet, Channel::kDefaultSession, origin, EvidencePurpose::NewEvidence,
+                claim);
+            QCOMPARE(validation.reason, QStringLiteral("stale_ref"));
+            QCOMPARE(validation.evidenceRef, ref);
+            QVERIFY(!validation.evidenceReported.isEmpty());
+            // wake 时间基准：早于 wake 的证据被时序拒绝，而不是被当成新证据。
+            QVERIFY(!validation.originReported.isEmpty());
+        }
+        // V14：self_desire 无外部事实（claims=[]）不要求任何新证据，也不触发语义核验。
+        {
+            QString error;
+            const auto result = policy.validateActionProposal(
+                buildProposal(QJsonArray{}, QStringLiteral("在忙吗")), &error);
+            QVERIFY2(result.value(QStringLiteral("allowed")).toBool(),
+                     qPrintable(result.value(QStringLiteral("reason")).toString()));
+            QCOMPARE(result.value(QStringLiteral("needs_verifier")).toBool(), false);
+            QCOMPARE(result.value(QStringLiteral("semantic_status")).toString(),
+                     QStringLiteral("not_required"));
+        }
+    }
+
     // R12-2c-1：verifier 响应严格白名单解析（request_id/封闭枚举/类型检查），
     // semantic_status 只认服务端正式枚举；模型输出不能决定 verified 终态。
     void verifierVerdictStrictWhitelist()

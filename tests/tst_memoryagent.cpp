@@ -13,6 +13,7 @@
 #include <memory>
 #include "llmservice.h"
 #include "actionorigin.h"
+#include "actionpolicy.h"
 #include "configmanager.h"
 #include "cognitivecoordinator.h"
 #include "cognitivesnapshot.h"
@@ -66,11 +67,12 @@ private:
 };
 
 void serveCompletions(QTcpServer &server,QList<QByteArray> &bodies,std::function<QString(int)> respond,
-                      std::function<QString(int)> finish=[](int){return QString("stop");})
+                      std::function<QString(int)> finish=[](int){return QString("stop");},
+                      std::function<QJsonObject(int)> usage=[](int){return QJsonObject{};})
 {
-    QObject::connect(&server,&QTcpServer::newConnection,&server,[&server,&bodies,respond,finish] {
+    QObject::connect(&server,&QTcpServer::newConnection,&server,[&server,&bodies,respond,finish,usage] {
         auto *socket = server.nextPendingConnection();
-        QObject::connect(socket,&QTcpSocket::readyRead,socket,[socket,&bodies,respond,finish] {
+        QObject::connect(socket,&QTcpSocket::readyRead,socket,[socket,&bodies,respond,finish,usage] {
             const auto bytes = socket->peek(socket->bytesAvailable());
             const auto header = bytes.indexOf("\r\n\r\n");
             if (header < 0)
@@ -83,7 +85,12 @@ void serveCompletions(QTcpServer &server,QList<QByteArray> &bodies,std::function
             bodies.append(bytes.mid(header+4));
             const QString answer = respond(bodies.size());
             QJsonObject msg{{"finish_reason",finish(bodies.size())},{"message",QJsonObject{{"content",answer}}}};
-            const auto body = QJsonDocument(QJsonObject{{"choices",QJsonArray{msg}}}).toJson();
+            QJsonObject envelope{{"choices",QJsonArray{msg}}};
+            // R12-2c-final-1：可选 usage（prompt/completion/reasoning tokens），用于验证
+            // verifier 完成诊断日志字段；缺省不改变既有 mock 行为。
+            const QJsonObject usageObj = usage(bodies.size());
+            if (!usageObj.isEmpty()) envelope.insert(QStringLiteral("usage"), usageObj);
+            const auto body = QJsonDocument(envelope).toJson();
             socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "
                           + QByteArray::number(body.size()) + "\r\n\r\n" + body);
             socket->disconnectFromHost();
@@ -2517,6 +2524,23 @@ private slots:
                 found = true;
             }
             QVERIFY(found);
+            // R12-2c-final-1（V10）：并行分享/联系的 VerificationBinding 也按 request_id /
+            // action_key 各自绑定，绝不能串到另一条核验请求上。
+            VerificationBinding binding;
+            QString bindingError;
+            QVERIFY2(VerificationBinding::fromJson(
+                         result.value(QStringLiteral("verification_binding")).toObject(),
+                         &binding, &bindingError),
+                     qPrintable(bindingError));
+            QCOMPARE(binding.requestId, requestId);
+            QCOMPARE(binding.actionKey,
+                     actionKey);
+            // 各自 binding 的 origin/kind 必须与自己的动作类型一致。
+            const bool isShare = actionKey.endsWith(QStringLiteral(":share"));
+            QCOMPARE(binding.kind, isShare ? QStringLiteral("activity_share")
+                                           : QStringLiteral("contact"));
+            QCOMPARE(binding.originKind, isShare ? QStringLiteral("activity")
+                                                 : QStringLiteral("concern"));
         }
         QCOMPARE(requestIds.size(), 2);
         QCOMPARE(actionKeys.size(), 2);
@@ -3107,6 +3131,49 @@ private slots:
                  QStringLiteral("wake:%1:%2:contact").arg(wakeId).arg(wakeVersion));
         QCOMPARE(action.value(QStringLiteral("semantic_status")).toString(),
                  QStringLiteral("entailed_coverage"));
+        // R12-2c-final-1（V05）：verified 计划必须携带服务端 VerificationBinding，且与本次
+        // verifier 输入/来源/target/fence 完全一致；持久化层以它证明"核验的就是这份内容"。
+        {
+            VerificationBinding binding;
+            QString bindingError;
+            QVERIFY2(VerificationBinding::fromJson(
+                         action.value(QStringLiteral("verification_binding")).toObject(),
+                         &binding, &bindingError),
+                     qPrintable(bindingError));
+            QCOMPARE(binding.state, QStringLiteral("verified"));
+            QCOMPARE(binding.semanticStatus, QStringLiteral("entailed_coverage"));
+            QCOMPARE(binding.requestId,
+                     actionVerifierInput.value(QStringLiteral("request_id")).toString());
+            QCOMPARE(binding.actionKey,
+                     QStringLiteral("wake:%1:%2:contact").arg(wakeId).arg(wakeVersion));
+            QCOMPARE(binding.kind, QStringLiteral("contact"));
+            QCOMPARE(binding.originKind, QStringLiteral("wake"));
+            QCOMPARE(binding.originRef, QStringLiteral("wake/%1").arg(wakeId));
+            QCOMPARE(binding.originId, wakeId);
+            QCOMPARE(binding.originVersion, wakeVersion);
+            QCOMPARE(binding.payloadDigest,
+                     actionVerifierInput.value(QStringLiteral("payload_digest")).toString());
+            QCOMPARE(binding.claimsDigest,
+                     ActionPolicy::canonicalProposalClaimsDigest(QJsonArray{}));
+            QCOMPARE(binding.targetChannel, QString(Channel::kPet));
+            QCOMPARE(binding.targetSession, QString(Channel::kDefaultSession));
+            // evidence digest 可用服务端唯一选择函数从权威内容重算（claims=[] → sources=[]）。
+            {
+                ActionPolicy policy(&db);
+                const QJsonArray sources = policy.claimSources(
+                    binding.targetChannel, binding.targetSession, 0,
+                    ActionPolicy::factualClaimsForVerification(QJsonArray{}));
+                QCOMPARE(binding.evidenceDigest,
+                         ActionPolicy::canonicalEvidenceDigest(QJsonArray{}, sources));
+            }
+            QCOMPARE(binding.actionContextEpoch, db.actionContextEpoch());
+            QCOMPARE(binding.verifierInputDigest.size(), 16);
+            QVERIFY(ActionOrigin::isValidActionKeyFormat(binding.actionKey));
+        }
+        // 输出协议已提供 historical_fact 类型（旧协议只有 reported_fact，导致历史回忆被
+        // 当成"新证据"而 stale_ref）；内部唤醒提示词同时明确历史事实不要求新证据。
+        QVERIFY(QString::fromUtf8(bodies.at(0)).contains(QStringLiteral("historical_fact")));
+        QVERIFY(QString::fromUtf8(bodies.at(0)).contains(QStringLiteral("主人过去说过的话属于历史事实")));
 
         // PrivateReview 接线：persist → proposed→verified → commit（只入 Outbox）。
         review.receive(wakeId, wakeVersion, proposal, {});
@@ -3149,6 +3216,440 @@ private slots:
         QCOMPARE(textMemorySql(QStringLiteral(
                      "SELECT last_outcome FROM open_wake_state WHERE scope_key='owner'")),
                  QStringLiteral("contact_handed_off"));
+    }
+
+    // ===== R12-2c-final-1：verifier 输出预算/完整诊断/内容绑定 =====
+
+    // V01：verifier 请求输出预算提高到 1024（真实 provider 默认 thinking 下 reasoning 也占
+    // 输出预算；256 时生产日志 9 次核验 8 次 truncated），且绝不发送 thinking:{disabled}
+    // （真实 provider 会连接重置）。每个动作仍只有 1 次 verifier 请求。
+    void verifierOutputBudgetIs1024WithoutThinkingParam()
+    {
+        SemanticReviewConfigGuard config;
+        QVERIFY(config.enable());
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager db(dir.filePath(QStringLiteral("verifier-budget.db")));
+        int version = 0;
+        const qlonglong turn = seedDueConcernForSemanticReview(
+            db, dir.filePath(QStringLiteral("verifier-budget.db")),
+            QStringLiteral("verifier-budget"), &version);
+        QVERIFY(turn > 0);
+        QVERIFY(version > 0);
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QByteArray> bodies;
+        int verifierCalls = 0;
+        // "256 截断 vs 1024 成功"：mock 按请求实际 max_tokens 决定是否模拟被截断的响应。
+        // 若输出预算回退到 256，测试会在 verified 断言处失败（truncated → withheld）。
+        serveCompletions(
+            server, bodies,
+            [&](int) -> QString {
+                ++verifierCalls;
+                const QJsonObject request = QJsonDocument::fromJson(bodies.last()).object();
+                if (request.value(QStringLiteral("max_tokens")).toInt()
+                    < LLMService::kVerifierMaxTokens)
+                    return QStringLiteral(R"({"request_id":)");
+                return verifierAnswer(bodies.last(), QStringLiteral("complete"),
+                                      QStringLiteral("entailed"), QStringLiteral("ok"));
+            },
+            [&](int) -> QString {
+                const QJsonObject request = QJsonDocument::fromJson(bodies.last()).object();
+                return request.value(QStringLiteral("max_tokens")).toInt()
+                           < LLMService::kVerifierMaxTokens
+                    ? QStringLiteral("length") : QStringLiteral("stop");
+            });
+        LLMService model(QStringLiteral("test"), nullptr,
+                         QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.serverPort())));
+        model.setMemoryManager(&db);
+        QSignalSpy finished(&model, &LLMService::actionProposalVerificationFinished);
+        const auto origin = ActionOrigin::forConcern(
+            turn, version, QStringLiteral("owner"), Channel::kPet, Channel::kDefaultSession);
+        model.requestActionProposalVerification(QJsonObject{
+            {QStringLiteral("kind"), QStringLiteral("contact")},
+            {QStringLiteral("origin"), origin.toJson()},
+            {QStringLiteral("target"),
+             QJsonObject{{QStringLiteral("channel"), Channel::kPet},
+                         {QStringLiteral("session_id"), Channel::kDefaultSession}}},
+            {QStringLiteral("payload"),
+             QJsonObject{{QStringLiteral("message"), QStringLiteral("在忙吗")},
+                         {QStringLiteral("reason"), QStringLiteral("自己想到")}}},
+            {QStringLiteral("claims"), QJsonArray{}}});
+        QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 1, 8000);
+        const auto result = finished.takeFirst().at(0).toJsonObject();
+        QCOMPARE(result.value(QStringLiteral("state")).toString(), QStringLiteral("verified"));
+        QCOMPARE(verifierCalls, 1); // 每个动作最多 1 次 verifier
+        QCOMPARE(bodies.size(), 1);
+        const QJsonObject requestBody = QJsonDocument::fromJson(bodies.first()).object();
+        QCOMPARE(requestBody.value(QStringLiteral("max_tokens")).toInt(),
+                 LLMService::kVerifierMaxTokens);
+        QCOMPARE(requestBody.value(QStringLiteral("max_tokens")).toInt(), 1024);
+        QCOMPARE(requestBody.value(QStringLiteral("model")).toString(),
+                 QStringLiteral("deepseek-v4-flash"));
+        QCOMPARE(requestBody.value(QStringLiteral("response_format")).toObject()
+                     .value(QStringLiteral("type")).toString(),
+                 QStringLiteral("json_object"));
+        // 默认 thinking 保留；绝不能发送会导致连接重置的 thinking:{type:disabled}。
+        QVERIFY(!requestBody.contains(QStringLiteral("thinking")));
+    }
+
+    // V02：verifier 完成日志记录 finish_reason/usage（prompt/completion/reasoning）/
+    // 输入输出预算/延迟/诊断码，且不记录 message/reason 正文。
+    void verifierCompletionLogsUsageWithoutContent()
+    {
+        SemanticReviewConfigGuard config;
+        QVERIFY(config.enable());
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath(QStringLiteral("verifier-usage.db"));
+        MemoryManager db(path);
+        int version = 0;
+        const qlonglong turn = seedDueConcernForSemanticReview(
+            db, path, QStringLiteral("verifier-usage"), &version);
+        QVERIFY(turn > 0);
+        QVERIFY(version > 0);
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QByteArray> bodies;
+        const QString distinctiveMessage = QStringLiteral("独有的正文内容用于断言不落日志");
+        const QString distinctiveReason = QStringLiteral("独有的理由内容不落日志");
+        serveCompletions(
+            server, bodies,
+            [&](int) -> QString {
+                return verifierAnswer(bodies.last(), QStringLiteral("complete"),
+                                      QStringLiteral("entailed"), QStringLiteral("ok"));
+            },
+            [](int) { return QStringLiteral("stop"); },
+            [](int) {
+                return QJsonObject{
+                    {QStringLiteral("prompt_tokens"), 812},
+                    {QStringLiteral("completion_tokens"), 173},
+                    {QStringLiteral("completion_tokens_details"),
+                     QJsonObject{{QStringLiteral("reasoning_tokens"), 124}}}};
+            });
+        LLMService model(QStringLiteral("test"), nullptr,
+                         QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.serverPort())));
+        model.setMemoryManager(&db);
+        QSignalSpy finished(&model, &LLMService::actionProposalVerificationFinished);
+        const auto origin = ActionOrigin::forConcern(
+            turn, version, QStringLiteral("owner"), Channel::kPet, Channel::kDefaultSession);
+        bool sawCompletionLog = false;
+        bool leakedContent = false;
+        {
+            MessageCapture capture;
+            model.requestActionProposalVerification(QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("contact")},
+                {QStringLiteral("origin"), origin.toJson()},
+                {QStringLiteral("target"),
+                 QJsonObject{{QStringLiteral("channel"), Channel::kPet},
+                             {QStringLiteral("session_id"), Channel::kDefaultSession}}},
+                {QStringLiteral("payload"),
+                 QJsonObject{{QStringLiteral("message"), distinctiveMessage},
+                             {QStringLiteral("reason"), distinctiveReason}}},
+                {QStringLiteral("claims"), QJsonArray{}}});
+            QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 1, 8000);
+            for (const auto &line : capture.lines()) {
+                if (line.message.contains(QStringLiteral("[Semantic] action verifier"))) {
+                    sawCompletionLog = true;
+                    QVERIFY(line.message.contains(QStringLiteral("finish_reason=stop")));
+                    QVERIFY(line.message.contains(QStringLiteral("prompt_tokens=812")));
+                    QVERIFY(line.message.contains(QStringLiteral("completion_tokens=173")));
+                    QVERIFY(line.message.contains(QStringLiteral("reasoning_tokens=124")));
+                    QVERIFY(line.message.contains(QStringLiteral("input_chars=")));
+                    QVERIFY(line.message.contains(QStringLiteral("output_chars=")));
+                    QVERIFY(line.message.contains(QStringLiteral("max_tokens=1024")));
+                    QVERIFY(line.message.contains(QStringLiteral("latency_ms=")));
+                    QVERIFY(line.message.contains(QStringLiteral("provider=deepseek")));
+                    QVERIFY(line.message.contains(QStringLiteral("model=deepseek-v4-flash")));
+                    QVERIFY(line.message.contains(QStringLiteral("diagnostic=ok")));
+                }
+                if (line.message.contains(distinctiveMessage)
+                    || line.message.contains(distinctiveReason))
+                    leakedContent = true;
+            }
+        }
+        QVERIFY(sawCompletionLog);
+        QVERIFY(!leakedContent);
+        const auto result = finished.takeFirst().at(0).toJsonObject();
+        QCOMPARE(result.value(QStringLiteral("state")).toString(), QStringLiteral("verified"));
+    }
+
+    // V03：verifier 响应 finish_reason=length（截断）→ 明确诊断并 fail closed（withheld），
+    // 绝不用残缺内容核验通过；每个动作仍只有 1 次请求。
+    void verifierTruncatedResponseFailsClosed()
+    {
+        SemanticReviewConfigGuard config;
+        QVERIFY(config.enable());
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath(QStringLiteral("verifier-truncated.db"));
+        MemoryManager db(path);
+        int version = 0;
+        const qlonglong turn = seedDueConcernForSemanticReview(
+            db, path, QStringLiteral("verifier-truncated"), &version);
+        QVERIFY(turn > 0);
+        QVERIFY(version > 0);
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QByteArray> bodies;
+        int verifierCalls = 0;
+        serveCompletions(
+            server, bodies,
+            [&](int) -> QString {
+                ++verifierCalls;
+                // 部分 JSON（模拟 reasoning+输出把 256 预算用尽后的截断）。
+                return QStringLiteral(R"({"request_id":)");
+            },
+            [](int) { return QStringLiteral("length"); });
+        LLMService model(QStringLiteral("test"), nullptr,
+                         QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.serverPort())));
+        model.setMemoryManager(&db);
+        QSignalSpy finished(&model, &LLMService::actionProposalVerificationFinished);
+        const auto origin = ActionOrigin::forConcern(
+            turn, version, QStringLiteral("owner"), Channel::kPet, Channel::kDefaultSession);
+        bool sawTruncatedLog = false;
+        {
+            MessageCapture capture;
+            model.requestActionProposalVerification(QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("contact")},
+                {QStringLiteral("origin"), origin.toJson()},
+                {QStringLiteral("target"),
+                 QJsonObject{{QStringLiteral("channel"), Channel::kPet},
+                             {QStringLiteral("session_id"), Channel::kDefaultSession}}},
+                {QStringLiteral("payload"),
+                 QJsonObject{{QStringLiteral("message"), QStringLiteral("在忙吗")},
+                             {QStringLiteral("reason"), QStringLiteral("自己想到")}}},
+                {QStringLiteral("claims"), QJsonArray{}}});
+            QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 1, 8000);
+            for (const auto &line : capture.lines())
+                if (line.message.contains(QStringLiteral("[Semantic] action verifier"))
+                    && line.message.contains(QStringLiteral("finish_reason=length"))
+                    && line.message.contains(QStringLiteral("diagnostic=truncated")))
+                    sawTruncatedLog = true;
+        }
+        QVERIFY(sawTruncatedLog);
+        QCOMPARE(verifierCalls, 1);
+        const auto result = finished.takeFirst().at(0).toJsonObject();
+        QCOMPARE(result.value(QStringLiteral("state")).toString(), QStringLiteral("withheld"));
+        QCOMPARE(result.value(QStringLiteral("withhold_reason")).toString(),
+                 QStringLiteral("truncated"));
+        // withheld 结果里的 binding 也只能是 withheld（不能用来提升提案）。
+        const auto binding = result.value(QStringLiteral("verification_binding")).toObject();
+        QCOMPARE(binding.value(QStringLiteral("state")).toString(), QStringLiteral("withheld"));
+    }
+
+    // V04：verifier 网络失败（连接被关闭）→ network_error 诊断并 fail closed。
+    void verifierNetworkErrorFailsClosed()
+    {
+        SemanticReviewConfigGuard config;
+        QVERIFY(config.enable());
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath(QStringLiteral("verifier-network.db"));
+        MemoryManager db(path);
+        int version = 0;
+        const qlonglong turn = seedDueConcernForSemanticReview(
+            db, path, QStringLiteral("verifier-network"), &version);
+        QVERIFY(turn > 0);
+        QVERIFY(version > 0);
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        int connections = 0;
+        QObject::connect(&server, &QTcpServer::newConnection, &server, [&server, &connections] {
+            ++connections;
+            auto *socket = server.nextPendingConnection();
+            socket->disconnectFromHost();
+        });
+        LLMService model(QStringLiteral("test"), nullptr,
+                         QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.serverPort())));
+        model.setMemoryManager(&db);
+        QSignalSpy finished(&model, &LLMService::actionProposalVerificationFinished);
+        const auto origin = ActionOrigin::forConcern(
+            turn, version, QStringLiteral("owner"), Channel::kPet, Channel::kDefaultSession);
+        model.requestActionProposalVerification(QJsonObject{
+            {QStringLiteral("kind"), QStringLiteral("contact")},
+            {QStringLiteral("origin"), origin.toJson()},
+            {QStringLiteral("target"),
+             QJsonObject{{QStringLiteral("channel"), Channel::kPet},
+                         {QStringLiteral("session_id"), Channel::kDefaultSession}}},
+            {QStringLiteral("payload"),
+             QJsonObject{{QStringLiteral("message"), QStringLiteral("在忙吗")},
+                         {QStringLiteral("reason"), QStringLiteral("自己想到")}}},
+            {QStringLiteral("claims"), QJsonArray{}}});
+        QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 1, 8000);
+        const auto result = finished.takeFirst().at(0).toJsonObject();
+        QCOMPARE(result.value(QStringLiteral("state")).toString(), QStringLiteral("withheld"));
+        QCOMPARE(result.value(QStringLiteral("withhold_reason")).toString(),
+                 QStringLiteral("network_error"));
+        // 传输层可能因连接关闭重连；verifier 请求预算由成功路径的 bodies 计数断言保证。
+        QVERIFY(connections >= 1);
+    }
+
+    // V08：verifier 核验的是 B，但库里同 key 已存在冲突内容 A → A 绝不能被标成 verified
+    //（旧实现把 persist conflict 当成功，随后把库内 A 标 verified 并提交）。
+    void openWakePersistConflictDoesNotPromoteOtherContent()
+    {
+        OpenWakeConfigGuard config;
+        auto openWakeConfig = openWakeTestJson(true, 12, 3);
+        openWakeConfig.insert(QStringLiteral("allow_contact"), true);
+        QVERIFY(config.write(
+            openWakeConfig,
+            QJsonObject{{QStringLiteral("enabled"), true},
+                        {QStringLiteral("private_writing"), false},
+                        {QStringLiteral("cooldown_seconds"), 0},
+                        {QStringLiteral("quiet_hours"),
+                         QJsonObject{{QStringLiteral("start"), QStringLiteral("00:00")},
+                                     {QStringLiteral("end"), QStringLiteral("00:00")}}},
+                        {QStringLiteral("targets"),
+                         QJsonArray{QJsonObject{{QStringLiteral("channel"), Channel::kPet},
+                                                {QStringLiteral("session_id"),
+                                                 Channel::kDefaultSession}}}},
+                        {QStringLiteral("contact_daily_limit"), 3}}));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath(QStringLiteral("openwake-conflict.db"));
+        MemoryManager db(path);
+        QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QByteArray> bodies;
+        serveCompletions(server, bodies, [&](int) -> QString {
+            const QByteArray body = bodies.last();
+            if (body.contains("【语义核验】"))
+                return verifierAnswer(body, QStringLiteral("complete"),
+                                      QStringLiteral("entailed"),
+                                      QStringLiteral("pure_self_desire"));
+            return QStringLiteral(
+                R"({"schema_version":1,"decision":"contact","note":"想问候一下",)"
+                R"("next_wake":{"mode":"after","after_minutes":30},)"
+                R"("contact":{"reason":"突然想到你","message":"在忙吗？",)"
+                R"("motivation":{"type":"self_desire","summary":"想问候主人"},)"
+                R"("claims":[],"core_claim_ids":[]}})");
+        });
+        LLMService model(QStringLiteral("test"), nullptr,
+                         QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.serverPort())));
+        model.setMemoryManager(&db);
+        QSignalSpy finished(&model, &LLMService::privateReviewFinished);
+        PrivateReview review(db);
+        QSignalSpy requested(&review, &PrivateReview::requested);
+        const auto openWake = ConfigManager::instance().getOpenWakeConfig();
+        const auto wake = review.wake(12, 60, openWake);
+        QVERIFY2(wake.started, qPrintable(wake.reason));
+        const qlonglong wakeId = requested.last().at(0).toLongLong();
+        const int wakeVersion = requested.last().at(1).toInt();
+        const auto context = requested.last().at(2).toJsonObject();
+        const auto originJson = context.value(QStringLiteral("origin")).toObject();
+        const auto wakeOrigin = ActionOrigin::forWake(
+            wakeId, wakeVersion, originJson.value(QStringLiteral("run_id")).toString(),
+            originJson.value(QStringLiteral("scope")).toString(),
+            originJson.value(QStringLiteral("epoch")).toInteger(), Channel::kPet,
+            Channel::kDefaultSession);
+        const QString actionKey = wakeOrigin.actionKey(QStringLiteral("contact"));
+        // 库里已存在同 key 的另一份内容 A（例如上一轮持久化的旧提案）。
+        const QJsonObject conflictingProposal{
+            {QStringLiteral("kind"), QStringLiteral("contact")},
+            {QStringLiteral("origin"), wakeOrigin.toJson()},
+            {QStringLiteral("target"),
+             QJsonObject{{QStringLiteral("channel"), Channel::kPet},
+                         {QStringLiteral("session_id"), Channel::kDefaultSession}}},
+            {QStringLiteral("payload"),
+             QJsonObject{{QStringLiteral("message"), QStringLiteral("另一份旧提案内容")},
+                         {QStringLiteral("reason"), QStringLiteral("旧理由")}}},
+            {QStringLiteral("claims"), QJsonArray{}},
+            {QStringLiteral("expires_at"), 0}};
+        QString persistError;
+        const auto conflictingStored =
+            db.persistActionProposal(conflictingProposal, &persistError);
+        QVERIFY2(!conflictingStored.contains(QStringLiteral("error")), qPrintable(persistError));
+        QCOMPARE(db.actionProposal(actionKey).value(QStringLiteral("state")).toString(),
+                 QStringLiteral("proposed"));
+
+        model.requestPrivateReview(wakeId, wakeVersion, context);
+        QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 1, 8000);
+        const auto proposal = finished.takeFirst().at(2).toJsonObject();
+        QCOMPARE(proposal.value(QStringLiteral("_action")).toObject()
+                     .value(QStringLiteral("state")).toString(),
+                 QStringLiteral("verified"));
+        // 核验结果 B 与库里 A 冲突：persist conflict 不放行 → A 保持 proposed、不 verified，
+        // wake 按 reflect 收口，绝不提交/不建 Outbox。
+        review.receive(wakeId, wakeVersion, proposal, {});
+        QCOMPARE(db.actionProposal(actionKey).value(QStringLiteral("state")).toString(),
+                 QStringLiteral("proposed"));
+        QCOMPARE(db.actionProposal(actionKey).value(QStringLiteral("payload")).toObject()
+                     .value(QStringLiteral("message")).toString(),
+                 QStringLiteral("另一份旧提案内容"));
+        const auto row = db.actionProposal(actionKey);
+        QVERIFY(row.value(QStringLiteral("verified_request_id")).toString().isEmpty());
+        QCOMPARE(textMemorySql(QStringLiteral("SELECT decision FROM open_wake WHERE id=")
+                                   + QString::number(wakeId)),
+                 QStringLiteral("reflect"));
+        QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM action_outbox")), qint64(0));
+        QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM cognitive_action")), qint64(0));
+    }
+
+    // V11：verifier 结果迟到（核验期间 Action Context Fence 已推进）→ 不得创建/提升提案。
+    void lateVerifierResultAfterEpochBumpCannotPromote()
+    {
+        OpenWakeConfigGuard config;
+        auto openWakeConfig = openWakeTestJson(true, 12, 3);
+        openWakeConfig.insert(QStringLiteral("allow_contact"), true);
+        QVERIFY(config.write(
+            openWakeConfig,
+            QJsonObject{{QStringLiteral("enabled"), true},
+                        {QStringLiteral("private_writing"), false},
+                        {QStringLiteral("cooldown_seconds"), 0},
+                        {QStringLiteral("quiet_hours"),
+                         QJsonObject{{QStringLiteral("start"), QStringLiteral("00:00")},
+                                     {QStringLiteral("end"), QStringLiteral("00:00")}}},
+                        {QStringLiteral("targets"),
+                         QJsonArray{QJsonObject{{QStringLiteral("channel"), Channel::kPet},
+                                                {QStringLiteral("session_id"),
+                                                 Channel::kDefaultSession}}}},
+                        {QStringLiteral("contact_daily_limit"), 3}}));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath(QStringLiteral("openwake-late.db"));
+        MemoryManager db(path);
+        QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+        DeferredCompletionServer server;
+        QVERIFY(server.listen());
+        LLMService model(QStringLiteral("test"), nullptr,
+                         QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.port())));
+        model.setMemoryManager(&db);
+        QSignalSpy finished(&model, &LLMService::privateReviewFinished);
+        PrivateReview review(db);
+        QSignalSpy requested(&review, &PrivateReview::requested);
+        const auto openWake = ConfigManager::instance().getOpenWakeConfig();
+        const auto wake = review.wake(12, 60, openWake);
+        QVERIFY2(wake.started, qPrintable(wake.reason));
+        const qlonglong wakeId = requested.last().at(0).toLongLong();
+        const int wakeVersion = requested.last().at(1).toInt();
+        const auto context = requested.last().at(2).toJsonObject();
+        model.requestPrivateReview(wakeId, wakeVersion, context);
+        QTRY_COMPARE_WITH_TIMEOUT(server.bodies.size(), 1, 8000);
+        server.respond(0, QStringLiteral(
+            R"({"schema_version":1,"decision":"contact","note":"想问候一下",)"
+            R"("next_wake":{"mode":"after","after_minutes":30},)"
+            R"("contact":{"reason":"突然想到你","message":"在忙吗？",)"
+            R"("motivation":{"type":"self_desire","summary":"想问候主人"},)"
+            R"("claims":[],"core_claim_ids":[]}})"));
+        QTRY_COMPARE_WITH_TIMEOUT(server.bodies.size(), 2, 8000);
+        // 核验在途：主人私聊插话推进 Action Context Fence。
+        QVERIFY(db.bumpActionContextEpoch(QStringLiteral("owner_private_input")) > 0);
+        server.respond(1, verifierAnswer(server.bodies.at(1), QStringLiteral("complete"),
+                                         QStringLiteral("entailed"), QStringLiteral("ok")));
+        QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 1, 8000);
+        const auto proposal = finished.takeFirst().at(2).toJsonObject();
+        review.receive(wakeId, wakeVersion, proposal, {});
+        const QString actionKey = QStringLiteral("wake:%1:%2:contact")
+                                      .arg(wakeId)
+                                      .arg(wakeVersion);
+        QVERIFY(db.actionProposal(actionKey).isEmpty());
+        QCOMPARE(textMemorySql(QStringLiteral("SELECT decision FROM open_wake WHERE id=")
+                                   + QString::number(wakeId)),
+                 QStringLiteral("reflect"));
+        QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM action_outbox")), qint64(0));
+        QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM cognitive_action")), qint64(0));
     }
 
     // R12-1b：OpenWake 可以 start_activity。只在 private_writing=true 时接受；同一事务创建

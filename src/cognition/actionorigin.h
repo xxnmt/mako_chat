@@ -1,6 +1,7 @@
 #ifndef ACTIONORIGIN_H
 #define ACTIONORIGIN_H
 
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QRegularExpression>
 #include <QString>
@@ -356,6 +357,214 @@ struct ActionOrigin
         }
         origin.ref = refFor(origin.kind, origin.id);
         return origin;
+    }
+};
+
+// R12-2c-final-1：服务端 VerificationBinding（核验内容绑定，header-only）。
+//
+// 背景：R12-2c-2 只在 proposed→verified 的事务内重新读取 DB 内容计算 verified_payload_hash，
+// 这只能证明"库里这份内容有指纹"，不能证明"verifier 实际核验的就是这份内容"：
+// 若持久化时同 key 已存在另一份内容（persist 冲突）、或库内容在核验返回后被改写，
+// 旧实现仍会把库里的内容标成 verified。本结构把"这次核验究竟核验了哪份内容"固化成
+// 随异步回调传递的服务端对象，模型输出只回显 request_id，不能签发/改写 binding。
+//
+// 生命周期：
+//   * LLMService 在**构建 verifier 请求时**生成 binding（request_id/action_key/来源身份/
+//     target/两级 epoch/payload/claims/evidence 集合摘要/verifier 输入摘要）；
+//   * verifier 通过后由服务端映射终态（state=verified + semantic_status），随
+//     actionProposalVerificationFinished 回到 PrivateReview；
+//   * PrivateReview 把它交给 MemoryManager::markActionProposalVerified：事务内读权威提案行，
+//     逐项比较 binding，再 CAS proposed→verified；任何不一致（同 key 被替换、epoch 前进、
+//     evidence 集合变化）都 fail closed。
+//
+// 字段语义（全部服务端生成）：
+//   * payloadDigest  = {message,reason,[draft],claims} 规范化 SHA-256 前 16 位
+//                      （与 ActionPolicy::canonicalProposalPayloadDigest 同一算法）；
+//   * claimsDigest   = claims 数组规范化摘要（ActionPolicy::canonicalProposalClaimsDigest）；
+//   * evidenceDigest = verifier 输入里实际使用的 declared_claims + sources 选择集合的规范化
+//                      摘要（ActionPolicy::canonicalEvidenceDigest）。持久化层会用权威提案
+//                      与当前库内证据重算，变化即拒绝（fail closed）；
+//   * verifierInputDigest = 实际发送给 verifier 的 user JSON 文本摘要（只做审计，不含正文）；
+//   * originContextEpoch  = ActionOrigin.contextEpoch（open_wake.current_context_epoch）；
+//   * actionContextEpoch  = 构建核验请求时的 Action Context Fence epoch
+//                           （MemoryManager::actionContextEpoch），与提案快照比较。
+struct VerificationBinding
+{
+    static constexpr int kSchemaVersion = 1;
+
+    int schemaVersion = kSchemaVersion;
+    QString requestId;          // verifier 请求的服务端唯一关联 id
+    QString actionKey;          // origin+kind 派生（服务端权威）
+    QString kind;               // contact | activity_share
+    QString originKind;         // wake | reflection | concern | thought | activity
+    QString originRef;          // wake/<id> 等规范引用
+    qlonglong originId = 0;
+    int originVersion = 0;      // 来源/成果版本
+    QString runId;
+    QString scope;
+    qint64 originContextEpoch = 0;
+    qint64 actionContextEpoch = 0;
+    QString targetChannel;
+    QString targetSession;
+    QString payloadDigest;
+    QString claimsDigest;
+    QString evidenceIdentity = QStringLiteral("claims+sources");
+    int evidenceVersion = 1;
+    QString evidenceDigest;
+    QString verifierInputDigest;
+    QString state;              // verified | withheld（服务端映射的终态）
+    QString semanticStatus;     // 服务端封闭枚举；verified 时不得为 withheld
+    QString withholdReason;     // 仅 withheld 审计
+
+    // 规范化摘要统一为 SHA-256 前 16 位小写 hex。
+    static bool isDigestText(const QString &text)
+    {
+        if (text.size() != 16) return false;
+        for (const QChar ch : text) {
+            if (!((ch >= QLatin1Char('0') && ch <= QLatin1Char('9'))
+                  || (ch >= QLatin1Char('a') && ch <= QLatin1Char('f'))))
+                return false;
+        }
+        return true;
+    }
+
+    // 结构合法性（不含"与某份提案是否一致"——那必须由持久化层在同一事务内逐项比较）。
+    // error 输出：missing_verification_request_id / invalid_action_key /
+    //             invalid_binding_kind / invalid_binding_origin / invalid_binding_target /
+    //             invalid_binding_digest / invalid_binding_state / invalid_binding_semantic。
+    bool isValid(QString *error = nullptr) const
+    {
+        const auto fail = [error](const QString &code) {
+            if (error) *error = code;
+            return false;
+        };
+        if (error) error->clear();
+        if (schemaVersion != kSchemaVersion) return fail(QStringLiteral("invalid_binding_schema"));
+        if (requestId.trimmed().isEmpty() || requestId.size() > 120)
+            return fail(QStringLiteral("missing_verification_request_id"));
+        if (!ActionOrigin::isValidActionKeyFormat(actionKey))
+            return fail(QStringLiteral("invalid_action_key"));
+        if (kind != QStringLiteral("contact") && kind != QStringLiteral("activity_share"))
+            return fail(QStringLiteral("invalid_binding_kind"));
+        if (originId <= 0 || originVersion <= 0 || originRef.isEmpty())
+            return fail(QStringLiteral("invalid_binding_origin"));
+        ActionOrigin::Kind parsedOrigin = ActionOrigin::Reflection;
+        if (!ActionOrigin::kindFromName(originKind, &parsedOrigin))
+            return fail(QStringLiteral("invalid_binding_origin"));
+        if (originRef != ActionOrigin::refFor(parsedOrigin, originId))
+            return fail(QStringLiteral("invalid_binding_origin"));
+        // 动作类型与来源类型必须自洽（contact 只来自 wake/reflection/concern；share 只来自 thought/activity）。
+        if (kind == QStringLiteral("contact")) {
+            if (parsedOrigin == ActionOrigin::Thought || parsedOrigin == ActionOrigin::Activity)
+                return fail(QStringLiteral("invalid_binding_origin"));
+            if (!actionKey.endsWith(QStringLiteral(":contact")))
+                return fail(QStringLiteral("invalid_binding_origin"));
+        } else {
+            if (parsedOrigin != ActionOrigin::Thought && parsedOrigin != ActionOrigin::Activity)
+                return fail(QStringLiteral("invalid_binding_origin"));
+            if (!actionKey.endsWith(QStringLiteral(":share")))
+                return fail(QStringLiteral("invalid_binding_origin"));
+        }
+        if (scope.trimmed().isEmpty()) return fail(QStringLiteral("invalid_binding_origin"));
+        if (parsedOrigin == ActionOrigin::Wake && runId.trimmed().isEmpty())
+            return fail(QStringLiteral("invalid_binding_origin"));
+        if (targetChannel.trimmed().isEmpty() || targetSession.trimmed().isEmpty())
+            return fail(QStringLiteral("invalid_binding_target"));
+        if (originContextEpoch < 0 || actionContextEpoch < 0)
+            return fail(QStringLiteral("invalid_binding_origin"));
+        if (!isDigestText(payloadDigest) || !isDigestText(claimsDigest)
+            || !isDigestText(evidenceDigest) || !isDigestText(verifierInputDigest))
+            return fail(QStringLiteral("invalid_binding_digest"));
+        if (evidenceIdentity != QStringLiteral("claims+sources") || evidenceVersion != 1)
+            return fail(QStringLiteral("invalid_binding_digest"));
+        if (state != QStringLiteral("verified") && state != QStringLiteral("withheld"))
+            return fail(QStringLiteral("invalid_binding_state"));
+        if (semanticStatus.trimmed().isEmpty()
+            || (state == QStringLiteral("verified")
+                && semanticStatus == QStringLiteral("withheld")))
+            return fail(QStringLiteral("invalid_binding_semantic"));
+        return true;
+    }
+
+    QJsonObject toJson() const
+    {
+        QJsonObject json{
+            {QStringLiteral("schema_version"), schemaVersion},
+            {QStringLiteral("request_id"), requestId},
+            {QStringLiteral("action_key"), actionKey},
+            {QStringLiteral("kind"), kind},
+            {QStringLiteral("origin_kind"), originKind},
+            {QStringLiteral("origin_ref"), originRef},
+            {QStringLiteral("origin_id"), originId},
+            {QStringLiteral("origin_version"), originVersion},
+            {QStringLiteral("run_id"), runId},
+            {QStringLiteral("scope"), scope},
+            {QStringLiteral("origin_context_epoch"), originContextEpoch},
+            {QStringLiteral("action_context_epoch"), actionContextEpoch},
+            {QStringLiteral("target_channel"), targetChannel},
+            {QStringLiteral("target_session"), targetSession},
+            {QStringLiteral("payload_digest"), payloadDigest},
+            {QStringLiteral("claims_digest"), claimsDigest},
+            {QStringLiteral("evidence_identity"), evidenceIdentity},
+            {QStringLiteral("evidence_version"), evidenceVersion},
+            {QStringLiteral("evidence_digest"), evidenceDigest},
+            {QStringLiteral("verifier_input_digest"), verifierInputDigest},
+            {QStringLiteral("state"), state},
+            {QStringLiteral("semantic_status"), semanticStatus}};
+        if (!withholdReason.isEmpty())
+            json.insert(QStringLiteral("withhold_reason"), withholdReason);
+        return json;
+    }
+
+    // 严格解析（字段类型/缺失都失败）；只解析结构，不判断提案一致性。
+    static bool fromJson(const QJsonObject &json, VerificationBinding *binding,
+                         QString *error = nullptr)
+    {
+        if (error) error->clear();
+        const auto fail = [error](const QString &code) {
+            if (error) *error = code;
+            return false;
+        };
+        if (!binding) return fail(QStringLiteral("invalid_binding_json"));
+        if (json.isEmpty()) return fail(QStringLiteral("invalid_binding_json"));
+        VerificationBinding parsed;
+        parsed.schemaVersion = json.value(QStringLiteral("schema_version")).toInt(-1);
+        const auto stringField = [&json](const char *name) {
+            return json.value(QString::fromLatin1(name)).toString();
+        };
+        parsed.requestId = stringField("request_id");
+        parsed.actionKey = stringField("action_key");
+        parsed.kind = stringField("kind");
+        parsed.originKind = stringField("origin_kind");
+        parsed.originRef = stringField("origin_ref");
+        const QJsonValue originIdValue = json.value(QStringLiteral("origin_id"));
+        if (!originIdValue.isDouble()) return fail(QStringLiteral("invalid_binding_origin"));
+        parsed.originId = originIdValue.toInteger();
+        parsed.originVersion = json.value(QStringLiteral("origin_version")).toInt(0);
+        parsed.runId = stringField("run_id");
+        parsed.scope = stringField("scope");
+        parsed.originContextEpoch =
+            json.value(QStringLiteral("origin_context_epoch")).toInteger(-1);
+        parsed.actionContextEpoch =
+            json.value(QStringLiteral("action_context_epoch")).toInteger(-1);
+        parsed.targetChannel = stringField("target_channel");
+        parsed.targetSession = stringField("target_session");
+        parsed.payloadDigest = stringField("payload_digest");
+        parsed.claimsDigest = stringField("claims_digest");
+        parsed.evidenceIdentity = stringField("evidence_identity");
+        parsed.evidenceVersion =
+            json.value(QStringLiteral("evidence_version")).toInt(0);
+        parsed.evidenceDigest = stringField("evidence_digest");
+        parsed.verifierInputDigest = stringField("verifier_input_digest");
+        parsed.state = stringField("state");
+        parsed.semanticStatus = stringField("semantic_status");
+        parsed.withholdReason = stringField("withhold_reason");
+        QString validationError;
+        if (!parsed.isValid(&validationError))
+            return fail(validationError.isEmpty() ? QStringLiteral("invalid_binding")
+                                                  : validationError);
+        *binding = parsed;
+        return true;
     }
 };
 
