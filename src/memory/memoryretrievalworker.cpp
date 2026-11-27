@@ -4,7 +4,9 @@
 #include "memoryretrieval.h"
 #include "memorydashscope.h"
 
-#include <QThread>
+#include <QScopeGuard>
+#include <QUuid>
+#include <QSqlDatabase>
 
 #include <memory>
 
@@ -30,8 +32,9 @@ void MemoryRetrievalWorker::run()
         emit finished(result);
         return;
     }
-    const QString connection = QStringLiteral("memory_retrieval_worker_%1")
-        .arg(quintptr(QThread::currentThreadId()));
+    const QString connection = QStringLiteral("memory_retrieval_worker_")
+        + QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const auto cleanup = qScopeGuard([&] { QSqlDatabase::removeDatabase(connection); });
     MemoryManager memory(m_memoryPath, nullptr, connection);
     MemoryRetrievalService service(&memory);
     if (!m_embeddingEndpoint.isEmpty() && !m_embeddingApiKey.isEmpty()) {

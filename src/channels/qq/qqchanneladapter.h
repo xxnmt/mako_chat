@@ -2,7 +2,9 @@
 #define QQCHANNELADAPTER_H
 
 #include <QObject>
+#include <functional>
 #include <QJsonArray>
+#include <QJsonObject>
 #include "ichanneladapter.h"
 
 class QQProtocolClient;
@@ -18,11 +20,13 @@ public:
     void setClient(QQProtocolClient *client);
     QString channelName() const override;
     bool sendUtterance(const Utterance &u) override;
+    bool sendOutboxUtterance(const Utterance &u, std::function<QJsonObject()> guard);
 
     // 纯格式化：文字消息段（供单测/复用）
     static QJsonArray buildTextMessage(const QString &text);
 
 private:
+    bool submit(const Utterance &u, std::function<QJsonObject()> guard);
     QQProtocolClient *m_client = nullptr;  // 非所有权
 };
 

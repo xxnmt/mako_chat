@@ -70,6 +70,40 @@ QString privacyRulesJson(const QStringList &ruleIds)
     return QString::fromUtf8(QJsonDocument(rules).toJson(QJsonDocument::Compact));
 }
 
+void reconcileActionPermissions(MemoryManager &memory)
+{
+    auto &config = ConfigManager::instance();
+    const auto proactive = config.getProactiveConfig();
+    const auto policy = config.getMemoryPolicyConfig();
+    QSet<QString> permissions;
+    if (proactive.enabled && policy.longTermMemoryEnabled) {
+        if (config.openWakeAllowContact()) permissions.insert(QStringLiteral("open_wake_contact"));
+        if (proactive.privateWriting) permissions.insert(QStringLiteral("private_writing"));
+        if (policy.agent.ownerCrossChannelPrivate)
+            permissions.insert(QStringLiteral("owner_cross_channel_private"));
+        for (const auto &target : proactive.targets) {
+            if (config.isBlindZone(target.first, target.second)) continue;
+            if (target.first == Channel::kPet && target.second == Channel::kDefaultSession)
+                permissions.insert(target.first + QLatin1Char('/') + target.second);
+            if (target.first == Channel::kQQPrivate && config.isMasterQQ(target.second))
+                permissions.insert(target.first + QLatin1Char('/') + target.second);
+        }
+    }
+
+    const auto previous = QJsonDocument::fromJson(
+        memory.attentionState(QStringLiteral("action_permissions")).toUtf8()).array();
+    for (const auto &permission : previous) {
+        if (permissions.contains(permission.toString())) continue;
+        if (memory.bumpActionContextEpoch(QStringLiteral("action_permissions_reduced")) < 0)
+            return;
+        break;
+    }
+    auto sorted = permissions.values();
+    sorted.sort();
+    memory.setAttentionState(QStringLiteral("action_permissions"),
+        QString::fromUtf8(QJsonDocument(QJsonArray::fromStringList(sorted)).toJson(QJsonDocument::Compact)));
+}
+
 } // namespace
 
 AppController::AppController(QObject *parent)
@@ -230,7 +264,7 @@ AppController::AppController(QObject *parent)
     // R12-2c-2：这里也是"真正入渠道队列"的最后一个可取消边界——dispatcher 已在 sender 前
     // 复验过一次，但领取到这里的窗口里主人仍可能插话/关闭权限/撤回成果，因此入队前再复验。
     m_actionOutbox->setSender([this](const Utterance &u) {
-        const auto guard = m_memoryManager->validateOutboxActionBeforeSend(u.deliveryEcho);
+        const auto guard = m_memoryManager->validateOutboxActionBeforeSend(u.deliveryEcho, true);
         if (!guard.value(QStringLiteral("ok")).toBool()) {
             qInfo() << "[Outbox] channel_boundary_blocked" << u.deliveryEcho
                     << guard.value(QStringLiteral("reason")).toString()
@@ -242,7 +276,9 @@ AppController::AppController(QObject *parent)
         if (u.channel == Channel::kQQPrivate
             && ConfigManager::instance().isMasterQQ(u.sessionId)
             && m_qqClient->isConnected())
-            return m_qqChannel->sendUtterance(u);
+            return m_qqChannel->sendOutboxUtterance(u, [this, key = u.deliveryEcho] {
+                return m_memoryManager->validateOutboxActionBeforeSend(key, true);
+            });
         return false;
     });
     connect(m_actionOutbox, &ActionOutboxDispatcher::actionSettled, this,
@@ -493,6 +529,7 @@ AppController::~AppController()
 
 void AppController::startApp()
 {
+    reconcileActionPermissions(*m_memoryManager);
     // 切片 B：启动恢复先于轮询，且这里是唯一的启动恢复点。上一进程留在 dispatching 的
     // 主动外发无法确认是否已送达，按 at-most-once 冻结为 unknown（绝不自动重发）；
     // 随后启动 outbox 唯一发送循环（dispatcher.start 不再隐式恢复，避免覆盖 600s 阈值）。
@@ -760,6 +797,7 @@ void AppController::initConnections()
     connect(m_character, &CharacterWidget::settingsRequested, m_settingsWidget, &SettingsWidget::show);
     connect(m_settingsWidget, &SettingsWidget::settingsSaved, this, [this](){
         auto &config = ConfigManager::instance();
+        reconcileActionPermissions(*m_memoryManager);
         QString logError;
         if (!RuntimeLog::configure(config.logDirectory(),config.separateLogRuns(),&logError))
             qWarning().noquote() << "[RuntimeLog] could not switch directory:" << logError;

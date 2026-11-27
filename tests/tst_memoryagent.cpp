@@ -1,3 +1,4 @@
+#include "actionoutboxdispatcher.h"
 #include <QtTest>
 #include <QDateTime>
 #include <QSqlQuery>
@@ -3218,14 +3219,151 @@ private slots:
                  QStringLiteral("contact_handed_off"));
     }
 
+    void realActionAcceptance_data()
+    {
+        QTest::addColumn<QString>("scenario");
+        QTest::newRow("A-contact") << QStringLiteral("contact");
+        QTest::newRow("B-quiet") << QStringLiteral("quiet");
+        QTest::newRow("D-share") << QStringLiteral("share");
+    }
+
+    void realActionAcceptance()
+    {
+        const auto key = qEnvironmentVariable("MAKO_R12_ACCEPTANCE_KEY");
+        const auto url = qEnvironmentVariable("MAKO_R12_ACCEPTANCE_URL");
+        if (key.isEmpty() || url.isEmpty()) QSKIP("Opt-in real model acceptance.");
+        QFETCH(QString, scenario);
+        const bool share = scenario == QStringLiteral("share");
+        const bool quiet = scenario == QStringLiteral("quiet");
+        OpenWakeConfigGuard config;
+        auto options = openWakeTestJson(!share, 12, 3);
+        options.insert("allow_contact", !quiet);
+        QVERIFY(config.write(options, QJsonObject{
+            {"enabled", true}, {"private_writing", true}, {"contact_daily_limit", 0},
+            {"quiet_hours", QJsonObject{{"start", "00:00"}, {"end", "00:00"}}},
+            {"targets", QJsonArray{QJsonObject{{"channel", Channel::kPet},
+                                             {"session_id", Channel::kDefaultSession}}}}}));
+        QTemporaryDir temp;
+        QVERIFY(temp.isValid());
+        MemoryManager db(temp.filePath(QStringLiteral("real-action.db")));
+        QString ref;
+        if (share) {
+            const auto activity = db.createActivity(
+                QStringLiteral("owner"), Channel::kPet, Channel::kDefaultSession,
+                QStringLiteral("写一则两句的雨声故事。我想写完后给主人看。"),
+                QStringLiteral("现在完成正文，留下一句分享意愿。"),
+                QStringLiteral("foreground"), QStringLiteral("chat/1"),
+                QStringLiteral("real-activity-acceptance"));
+            ref = activity.value("ref").toString();
+            QVERIFY(!ref.isEmpty());
+            QVERIFY(execMemorySql(QStringLiteral("UPDATE internal_activity SET review_after=unixepoch()-1")));
+        } else {
+            QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+        }
+        PrivateReview review(db);
+        LLMService model(key, nullptr, QUrl(url));
+        model.setMemoryManager(&db);
+        QObject::connect(&review, &PrivateReview::internalShareProposalReady,
+                         &model, &LLMService::requestActionProposalVerification);
+        QObject::connect(&model, &LLMService::actionProposalVerificationFinished,
+                         &review, &PrivateReview::receiveShareProposalResult);
+        QSignalSpy requested(&review, &PrivateReview::requested);
+        QSignalSpy completed(&model, &LLMService::privateReviewFinished);
+        const auto wake = review.wake(12, 60, ConfigManager::instance().getOpenWakeConfig());
+        QVERIFY2(wake.started, qPrintable(wake.reason));
+        const auto job = requested.first();
+        auto context = job.at(2).toJsonObject();
+        if (!share && !quiet) {
+            context.insert("recent_open_wake_notes", QJsonArray{QJsonObject{
+                {"note", QStringLiteral("突然想到一个有趣的小话题，想问主人下雨天会读什么书。")},
+                {"decision", QStringLiteral("reflect")}}});
+        }
+        model.requestPrivateReview(job.at(0).toLongLong(), job.at(1).toInt(), context);
+        QTRY_COMPARE_WITH_TIMEOUT(completed.size(), 1, 65000);
+        const auto completion = completed.first();
+        QVERIFY2(completion.at(3).toString().isEmpty(), qPrintable(completion.at(3).toString()));
+        const auto proposal = completion.at(2).toJsonObject();
+        review.receive(job.at(0).toLongLong(), job.at(1).toInt(), proposal, {});
+        if (quiet) {
+            QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM open_wake WHERE state='committed'")),
+                     qint64(1));
+            QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM action_outbox")), qint64(0));
+            QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM review_failure")), qint64(0));
+            return;
+        }
+        if (share) QCOMPARE(db.activityByRef(ref).value("status").toString(), QStringLiteral("completed"));
+        QTRY_COMPARE_WITH_TIMEOUT(scalarMemorySql(QStringLiteral("SELECT count(*) FROM action_outbox")),
+                                  qint64(1), (share ? 45000 : 1000));
+        int sends = 0;
+        ActionOutboxDispatcher dispatcher(&db);
+        dispatcher.setSender([&](const Utterance &out) {
+            ++sends;
+            return out.channel == Channel::kPet && !out.text.trimmed().isEmpty();
+        });
+        connect(&dispatcher, &ActionOutboxDispatcher::actionSettled, &dispatcher,
+                [&](const QString &actionKey, const QString &outcome) {
+            QVERIFY(db.recordActionReceipt(actionKey, outcome));
+        });
+        dispatcher.pollOnce();
+        QCOMPARE(sends, 1);
+        QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM chat_history WHERE turn_kind='proactive'")),
+                 qint64(1));
+        db.reconcileActionReceipts();
+        if (share) QCOMPARE(review.recoverPendingShareIntents(true, 4), 0);
+        dispatcher.pollOnce();
+        QCOMPARE(sends, 1);
+    }
+
+    void realVerifierRejectsUnsupportedClaim()
+    {
+        const auto key = qEnvironmentVariable("MAKO_R12_ACCEPTANCE_KEY");
+        const auto url = qEnvironmentVariable("MAKO_R12_ACCEPTANCE_URL");
+        if (key.isEmpty() || url.isEmpty()) QSKIP("Opt-in real model acceptance.");
+        SemanticReviewConfigGuard config;
+        QVERIFY(config.enable());
+        QTemporaryDir temp;
+        QVERIFY(temp.isValid());
+        const auto path = temp.filePath(QStringLiteral("real-rejection.db"));
+        MemoryManager db(path);
+        int version = 0;
+        const auto turn = seedDueConcernForSemanticReview(db, path, QStringLiteral("real-rejection"),
+                                                          &version);
+        QVERIFY(turn > 0);
+        const auto origin = ActionOrigin::forConcern(turn, version, QStringLiteral("owner"),
+                                                     Channel::kPet, Channel::kDefaultSession);
+        const QJsonObject fakeClaim{{"id", "history"}, {"type", "historical_fact"},
+            {"text", QStringLiteral("主人以前明确告诉我他养了两只熊猫。")}, {"core", true},
+            {"refs", QJsonArray{QStringLiteral("chat/%1").arg(turn)}}};
+        LLMService model(key, nullptr, QUrl(url));
+        model.setMemoryManager(&db);
+        QSignalSpy finished(&model, &LLMService::actionProposalVerificationFinished);
+        model.requestActionProposalVerification(QJsonObject{
+            {"kind", "contact"}, {"origin", origin.toJson()}, {"claims", QJsonArray{fakeClaim}},
+            {"payload", QJsonObject{{"message", QStringLiteral("你以前说养了两只熊猫。")},
+                                    {"reason", QStringLiteral("想聊一聊")},
+                                    {"core_claim_ids", QJsonArray{"history"}}}}});
+        QTRY_COMPARE_WITH_TIMEOUT(finished.size(), 1, 35000);
+        const auto result = finished.first().at(0).toJsonObject();
+        QCOMPARE(result.value("state").toString(), QStringLiteral("withheld"));
+        QVERIFY(result.value("verification_binding").isObject());
+        const auto reason = result.value("withhold_reason").toString();
+        QVERIFY2(reason == QStringLiteral("verifier_contradicted")
+                  || reason == QStringLiteral("verifier_insufficient")
+                  || reason == QStringLiteral("claim_coverage_incomplete"), qPrintable(reason));
+        QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM action_outbox")), qint64(0));
+    }
+
     void actionEvidenceBinding_data()
     {
         QTest::addColumn<QString>("scenario");
         QTest::addColumn<int>("length");
         QTest::newRow("normal") << QStringLiteral("pass") << 30;
-        QTest::newRow("near-budget") << QStringLiteral("pass") << 1350;
+        QTest::newRow("near-budget") << QStringLiteral("pass") << 1780;
+        QTest::newRow("different-sql-scan-order") << QStringLiteral("reordered") << 30;
         QTest::newRow("over-budget") << QStringLiteral("budget") << 3000;
         QTest::newRow("changed-during-verification") << QStringLiteral("changed") << 30;
+        QTest::newRow("changed-before-commit") << QStringLiteral("before-commit") << 30;
+        QTest::newRow("changed-after-commit") << QStringLiteral("after-commit") << 30;
         QTest::newRow("missing-during-verification") << QStringLiteral("missing") << 30;
     }
 
@@ -3254,6 +3392,15 @@ private slots:
         QVERIFY(turn > 0);
         QVERIFY(db.recordQuiet(turn, QStringLiteral("close")));
         QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+        QJsonArray refs{QStringLiteral("chat/%1").arg(turn)};
+        if (scenario == QStringLiteral("reordered")) {
+            // Independent source rows are keyed by ref, not by SQL traversal order.
+            meta.eventId = meta.runId = QStringLiteral("second-binding-evidence");
+            const qint64 other = db.recordInput(QStringLiteral("It was a sunny day."), meta, true);
+            QVERIFY(other > 0);
+            QVERIFY(db.recordQuiet(other, QStringLiteral("close")));
+            refs.prepend(QStringLiteral("chat/%1").arg(other));
+        }
         const auto wake = db.claimOpenWake(12, 60, 12, 50, 3);
         QVERIFY(!wake.isEmpty());
         const auto origin = ActionOrigin::forWake(
@@ -3267,7 +3414,7 @@ private slots:
                 {"motivation", QJsonObject{{"type", "self_desire"}, {"summary", "Curious"}}}}},
             {"claims", QJsonArray{QJsonObject{{"id", "past"}, {"type", "historical_fact"},
                 {"text", "The owner visited the coast."},
-                {"refs", QJsonArray{QStringLiteral("chat/%1").arg(turn)}}}}}};
+                {"refs", refs}}}}};
         QString error;
         const auto stored = db.persistActionProposal(proposal, &error);
         QVERIFY2(!stored.contains(QStringLiteral("error")), qPrintable(error));
@@ -3291,6 +3438,8 @@ private slots:
                      qPrintable(finished.first().at(0).toJsonObject().value("withhold_reason").toString()));
         const auto input = verifierUserInput(server.bodies.first());
         QCOMPARE(input.value("sources").toArray().first().toObject().value("text").toString(), evidence);
+        if (scenario == QStringLiteral("reordered"))
+            QVERIFY(execMemorySql(QStringLiteral("PRAGMA reverse_unordered_selects=ON")));
         if (scenario == QStringLiteral("changed"))
             QVERIFY(execMemorySql(QStringLiteral("UPDATE chat_history SET user_input='changed' WHERE id=%1").arg(turn)));
         if (scenario == QStringLiteral("missing"))
@@ -3302,7 +3451,7 @@ private slots:
         VerificationBinding binding;
         QVERIFY2(VerificationBinding::fromJson(outcome.value("verification_binding").toObject(),
                                                &binding, &error), qPrintable(error));
-        if (scenario != QStringLiteral("pass")) {
+        if (scenario == QStringLiteral("changed") || scenario == QStringLiteral("missing")) {
             QVERIFY(!db.markActionProposalVerified(key, binding, &error));
             QCOMPARE(error, scenario == QStringLiteral("changed")
                        ? QStringLiteral("verification_evidence_mismatch")
@@ -3311,9 +3460,24 @@ private slots:
             return;
         }
         QVERIFY2(db.markActionProposalVerified(key, binding, &error), qPrintable(error));
+        const auto changeEvidence = [&] {
+            return execMemorySql(QStringLiteral("UPDATE chat_history SET user_input='changed' WHERE id=%1")
+                                 .arg(turn));
+        };
+        if (scenario == QStringLiteral("before-commit")) QVERIFY(changeEvidence());
         const auto committed = db.commitVerifiedActionProposal(key, &error);
+        if (scenario == QStringLiteral("before-commit")) {
+            QCOMPARE(committed.value("detail").toString(), QStringLiteral("verified_content_mismatch"));
+            return;
+        }
         QVERIFY2(!committed.contains(QStringLiteral("error")),
                  QJsonDocument(committed).toJson(QJsonDocument::Compact).constData());
+        if (scenario == QStringLiteral("after-commit")) {
+            QVERIFY(changeEvidence());
+            const auto guard = db.validateOutboxActionBeforeSend(key);
+            QCOMPARE(guard.value("ok").toBool(), false);
+            QCOMPARE(guard.value("reason").toString(), QStringLiteral("verified_content_mismatch"));
+        }
     }
 
     // ===== R12-2c-final-1：verifier 输出预算/完整诊断/内容绑定 =====

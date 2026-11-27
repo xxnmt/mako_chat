@@ -763,6 +763,28 @@ class TestMemoryManager : public QObject
     Q_OBJECT
 
 private slots:
+    void retrievalDistinguishesFailedIndexFromEmptyIndex()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager db(dir.filePath(QStringLiteral("retrieval-error.db")));
+        RetrievalRequest request;
+        request.query = QStringLiteral("coast");
+        request.includeAuxiliarySources = false;
+        const MemoryRetrievalService service(&db);
+        const auto empty = service.retrieve(request);
+        QCOMPARE(empty.status, QStringLiteral("complete"));
+        QVERIFY(empty.evidence.isEmpty());
+
+        QSqlQuery query(QSqlDatabase::database(QStringLiteral("memory_db_connection")));
+        QVERIFY2(query.exec(QStringLiteral("DROP TABLE memory_chunks")),
+                 qPrintable(query.lastError().text()));
+        const auto failed = service.retrieve(request);
+        QCOMPARE(failed.status, QStringLiteral("degraded"));
+        QCOMPARE(failed.degradedReason, QStringLiteral("index_read_failed"));
+        QVERIFY(failed.evidence.isEmpty());
+    }
+
     void interruptedV11MigrationRollsBack()
     {
         QTemporaryDir dir;
@@ -4257,7 +4279,6 @@ private slots:
         QVERIFY(turn > 0);
         const auto claim = reclaimDueConcern(db, path, turn, QStringLiteral("basis-missing"));
         QCOMPARE(claim["id"].toInteger(), turn);
-        const auto before = QDateTime::currentSecsSinceEpoch();
         QVERIFY(db.finishConcernReview(turn, claim["version"].toInt(),
                                        QJsonObject{{"concern_action", "contact"},
                                                    {"contact", contactNow(QStringLiteral("到点了"),
@@ -4270,9 +4291,9 @@ private slots:
                                 .arg(turn)).toString(), QStringLiteral("consider"));
         QCOMPARE(raw.scalar(QStringLiteral("SELECT claimed_by IS NULL FROM private_reflection WHERE turn_id=%1")
                                 .arg(turn)).toInt(), 1);
-        // 按 keep 落库：约 30 分钟后可再检查，而不是卡在 pending。
-        QVERIFY(raw.scalar(QStringLiteral("SELECT next_check_at FROM private_reflection WHERE turn_id=%1")
-                               .arg(turn)).toLongLong() >= before + 1700);
+        QCOMPARE(raw.scalar(QStringLiteral("SELECT next_check_at FROM private_reflection WHERE turn_id=%1")
+                                .arg(turn)).toLongLong(), qint64(0));
+        QVERIFY(db.claimDueConcern(12, 0).isEmpty());
         QCOMPARE(raw.scalar(QStringLiteral("SELECT action FROM concern_revision WHERE turn=%1 "
                                            "ORDER BY id DESC LIMIT 1").arg(turn)).toString(),
                  QStringLiteral("contact_rejected"));
@@ -5265,6 +5286,16 @@ private slots:
         const auto persisted = reopened.attentionBacklog();
         QCOMPARE(persisted["by_state"].toObject()["done"].toInt(), 1);
         QCOMPARE(persisted["by_state"].toObject()["claimed"].toInt(), 2);
+        const auto activity = reopened.enqueueAttentionEvent(QStringLiteral("activity_result"),
+                                                              QStringLiteral("activity/1:2"));
+        QVERIFY(activity > 0);
+        QCOMPARE(reopened.reconcileAttentionNotifications(), 2);
+        QCOMPARE(reopened.reconcileAttentionNotifications(), 0);
+        const auto reconciled = reopened.attentionBacklog();
+        QCOMPARE(reconciled["by_state"].toObject()["abandoned"].toInt(), 1);
+        QCOMPARE(reconciled["by_state"].toObject()["done"].toInt(), 2);
+        QCOMPARE(reconciled["by_state"].toObject()["claimed"].toInt(), 1);
+        QVERIFY(reopened.claimAttentionEvent(QStringLiteral("message")).isEmpty());
     }
 
     // B1：崩溃恢复。received 轮次超时后幂等入队 recovery（最高优先级），可被中断并落终态。
@@ -6253,7 +6284,7 @@ private slots:
             QCOMPARE(row.value(QStringLiteral("verified_payload_hash")).toString(),
                      binding.payloadDigest);
             QCOMPARE(row.value(QStringLiteral("verified_claims_hash")).toString(),
-                     binding.claimsDigest);
+                     binding.evidenceDigest);
             QCOMPARE(row.value(QStringLiteral("verified_request_id")).toString(),
                      QStringLiteral("req-binding-1"));
         }

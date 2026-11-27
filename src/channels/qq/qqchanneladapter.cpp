@@ -35,6 +35,16 @@ void QQChannelAdapter::setClient(QQProtocolClient *client)
 
 bool QQChannelAdapter::sendUtterance(const Utterance &u)
 {
+    return submit(u, {});
+}
+
+bool QQChannelAdapter::sendOutboxUtterance(const Utterance &u, std::function<QJsonObject()> guard)
+{
+    return guard && submit(u, std::move(guard));
+}
+
+bool QQChannelAdapter::submit(const Utterance &u, std::function<QJsonObject()> guard)
+{
     if (!m_client || !m_client->isConnected()) {
         qDebug() << "[QQChannel]未连接，消息未发送:" << u.channel << u.sessionId;
         return false;
@@ -59,7 +69,8 @@ bool QQChannelAdapter::sendUtterance(const Utterance &u)
 
     params["message"] = buildTextMessage(u.text);
     // 群聊场景可带 auto_escape，保持纯文本
-    if (!m_client->sendAction(action, params, u.deliveryEcho, simulatedTextPlaybackMs(u.text))) return false;
+    if (!m_client->sendAction(action, params, u.deliveryEcho, simulatedTextPlaybackMs(u.text),
+                              std::move(guard))) return false;
     qDebug() << "[QQChannel]已接受发送请求（非送达确认）:" << u.channel << u.sessionId
              << "chars=" << u.text.size();
     if (debugFullLogsEnabled()) {

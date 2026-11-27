@@ -57,4 +57,3 @@ inline bool markTestActionProposalVerified(MemoryManager &store, const QString &
     binding.semanticStatus = semantic;
     return store.markActionProposalVerified(key, binding, error);
 }
-

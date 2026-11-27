@@ -147,6 +147,7 @@ add_phase0_test(tst_memoryagent
     ${PROJECT_SOURCE_DIR}/src/app/privatereview.cpp
     ${PROJECT_SOURCE_DIR}/src/app/cognitivecoordinator.cpp
     tst_memoryagent.cpp
+    ${PROJECT_SOURCE_DIR}/src/app/actionoutboxdispatcher.cpp
     ${PROJECT_SOURCE_DIR}/src/cognition/imageperception.cpp
     ${PROJECT_SOURCE_DIR}/src/cognition/cognitivesnapshot.h
     ${PROJECT_SOURCE_DIR}/src/cognition/cognitivesnapshot.cpp
@@ -358,8 +359,11 @@ add_phase0_test(tst_actionoutbox
     ${PROJECT_SOURCE_DIR}/src/cognition/actioncommitter.cpp
     ${PROJECT_SOURCE_DIR}/src/app/actionoutboxdispatcher.h
     ${PROJECT_SOURCE_DIR}/src/app/actionoutboxdispatcher.cpp
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqprotocolclient.cpp
+    ${PROJECT_SOURCE_DIR}/src/channels/qq/qqchanneladapter.cpp
     ${PHASE0_CORE_SOURCES}
 )
+target_link_libraries(tst_actionoutbox PRIVATE Qt6::WebSockets)
 
 # 主动联系策略（报告切片 C）：动机/事实分离、确定性 claim 校验 + 可注入语义验证器。
 # 用临时 MemoryManager 造真实数据，验证器用假函数注入，覆盖允许/压下/修复/降级路径。

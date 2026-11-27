@@ -1572,6 +1572,9 @@ void LLMService::requestPrivateReview(qlonglong id, int version, const QJsonObje
         for (const auto &item : result.evidence)
             turns.append(item.sourceRef.mid(5).section(':',0,0).toLongLong());
         auto context=thread;
+        context.insert(QStringLiteral("history_retrieval_status"), result.status);
+        if (!result.degradedReason.isEmpty())
+            context.insert(QStringLiteral("history_retrieval_incomplete"), true);
         // source_session 仍保留在 thread 里供认知快照定位来源渠道/会话；
         // 模型看到的 modelThread 会单独剥掉它，提示词形状保持不变。
         const QStringList terms=RecentContextPlanner::extractTerms(thread["owner_statement"].toString().left(100));
@@ -2936,10 +2939,14 @@ void LLMService::verifyActionProposal(const QJsonObject &request,
         done(actionWithheldOutcome(stamped, QStringLiteral("source_unavailable")));
         return;
     }
-    // R12-2c-final-1：Action Context Fence epoch 由服务端在构建核验时权威快照，调用方
-    // （含自己组装 request 的路径）传入的值一律覆盖；binding/持久化/提交都用这个值比较。
-    stamped.insert(QStringLiteral("action_context_epoch"),
-                   m_memoryManager->actionContextEpoch());
+    const auto currentEpoch = m_memoryManager->actionContextEpoch();
+    const auto originalEpoch = stamped.value(QStringLiteral("action_context_epoch"));
+    if (originalEpoch.isUndefined())
+        stamped.insert(QStringLiteral("action_context_epoch"), currentEpoch);
+    else if (originalEpoch.toInteger(-1) != currentEpoch) {
+        done(actionWithheldOutcome(stamped, QStringLiteral("context_epoch_changed")));
+        return;
+    }
     ActionPolicy policy(m_memoryManager);
     QString policyError;
     const QJsonObject deterministic = policy.validateActionProposal(stamped, &policyError);
@@ -3178,13 +3185,15 @@ void LLMService::verifyOpenWakeContactProposal(qlonglong id, int version,
     }
     const QString message = contact.value(QStringLiteral("message")).toString().trimmed();
     QJsonObject target = m_memoryManager->chooseProactiveTarget(message, false);
+    const auto actionEpoch = thread.value(QStringLiteral("action_context_epoch"));
     const auto buildRequest = [wakeId, wakeVersion, wakeRunId, wakeScope, wakeEpoch, contact,
-                               message](const QString &channel, const QString &session) {
+                               message, actionEpoch](const QString &channel, const QString &session) {
         const ActionOrigin wakeOrigin = ActionOrigin::forWake(
             wakeId, wakeVersion, wakeRunId, wakeScope, wakeEpoch, channel, session);
         return QJsonObject{
             {QStringLiteral("kind"), QStringLiteral("contact")},
             {QStringLiteral("action_key"), wakeOrigin.actionKey(QStringLiteral("contact"))},
+            {QStringLiteral("action_context_epoch"), actionEpoch},
             {QStringLiteral("origin"), wakeOrigin.toJson()},
             {QStringLiteral("target"),
              QJsonObject{{QStringLiteral("channel"), channel},

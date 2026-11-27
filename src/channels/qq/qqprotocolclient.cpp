@@ -156,7 +156,7 @@ void QQProtocolClient::scheduleReconnect()
 }
 
 bool QQProtocolClient::sendAction(const QString &action, const QJsonObject &params,
-                                  const QString &echo, int playbackMs)
+                                  const QString &echo, int playbackMs, SubmissionGuard guard)
 {
     if (!isConnected()) {
         qDebug() << "[QQ]动作发送失败（未连接）:" << action;
@@ -167,9 +167,14 @@ bool QQProtocolClient::sendAction(const QString &action, const QJsonObject &para
         : echo;
     if (action.startsWith(QStringLiteral("send_"))) {
         if (m_pendingActions.contains(actualEcho)) return false;
-        m_pendingActions.insert(actualEcho, PendingAction{action, params, 0, false, qMax(0,playbackMs)});
+        const bool outbox = bool(guard);
+        m_pendingActions.insert(actualEcho, PendingAction{action, params, 0, false,
+                                                          qMax(0,playbackMs), std::move(guard)});
         m_sendQueue.enqueue(actualEcho);
-        if (m_sendQueue.size() == 1) sendNextAction();
+        if (m_sendQueue.size() == 1) {
+            if (outbox) QTimer::singleShot(0, this, &QQProtocolClient::sendNextAction);
+            else sendNextAction();
+        }
         return m_pendingActions.contains(actualEcho);
     }
     qDebug() << "[QQ]发送动作:" << action << "echo=" << actualEcho;
@@ -180,7 +185,7 @@ bool QQProtocolClient::sendAction(const QString &action, const QJsonObject &para
 
 void QQProtocolClient::sendNextAction()
 {
-    if (m_sendQueue.isEmpty()) return;
+    if (m_sendQueue.isEmpty() || (!m_activeSend.isEmpty() && m_sendTimeout.isActive())) return;
     const auto echo = m_sendQueue.head();
     const auto pending = m_pendingActions.value(echo);
     if (pending.attempts == 0 && m_lastSubmission.isValid()) {
@@ -193,6 +198,17 @@ void QQProtocolClient::sendNextAction()
     }
     m_pacingTimer.stop();
     m_activeSend = echo;
+    if (pending.guard) {
+        const auto check = pending.guard();
+        if (!check.value(QStringLiteral("ok")).toBool()) {
+            qInfo() << "[QQ] outbox_submission_blocked" << echo
+                    << check.value(QStringLiteral("reason")).toString();
+            finishSendAction();
+            emit sendResult(echo, check.value(QStringLiteral("permanent")).toBool()
+                ? QStringLiteral("withheld") : QStringLiteral("deferred"));
+            return;
+        }
+    }
     qDebug() << "[QQ] submitting queued action" << pending.action << "echo=" << echo;
     if (!isConnected() || !sendPayload(pending.action,pending.params,echo)) {
         qWarning() << "[QQ] queued action submission failed" << echo;
@@ -252,14 +268,15 @@ void QQProtocolClient::onTextMessageReceived(const QString &message)
         }
 
         auto it = m_pendingActions.find(echo);
-        if (it == m_pendingActions.end() || m_sendQueue.isEmpty() || m_sendQueue.head()!=echo)
-            return; // Late/duplicate/unrelated acknowledgements cannot advance the queue.
+        if (it == m_pendingActions.end() || m_sendQueue.isEmpty() || m_sendQueue.head()!=echo
+            || m_activeSend != echo)
+            return; // A response cannot acknowledge an action that is still waiting to submit.
         if (it->waitingRetry && !ok) return;
         if (!ok) {
             qDebug() << "[QQ]动作失败:" << echo
                      << QString::fromUtf8(QJsonDocument(obj).toJson(QJsonDocument::Compact));
             const int retcode = obj.value("retcode").toInt();
-            if (it != m_pendingActions.end() && retcode == 100 && it->attempts < 1
+            if (it != m_pendingActions.end() && retcode == 100 && it->attempts < 1 && !it->guard
                 && it->action.startsWith(QStringLiteral("send_"))) {
                 it->attempts++;
                 it->waitingRetry = true;

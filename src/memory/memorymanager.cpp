@@ -869,16 +869,34 @@ qlonglong MemoryManager::enqueueAttentionEvent(const QString &kind, const QStrin
     return existing.value(0).toLongLong();
 }
 
-QJsonObject MemoryManager::claimAttentionEvent()
+int MemoryManager::reconcileAttentionNotifications()
+{
+    if (!m_db.isOpen()) return -1;
+    QSqlQuery update(m_db);
+    // At startup there is no live message queue. Received turns are reconciled separately.
+    // Activity notifications are audit projections of results that were already committed.
+    if (!update.exec("UPDATE attention_event SET "
+                     "state=CASE kind WHEN 'message' THEN 'abandoned' ELSE 'done' END,"
+                     "done_at=unixepoch(),"
+                     "reason=CASE kind WHEN 'message' THEN 'restart_notification' "
+                     "ELSE 'activity_result_recorded' END "
+                     "WHERE state IN ('pending','claimed') AND kind IN ('message','activity_result')"))
+        return -1;
+    return update.numRowsAffected();
+}
+
+QJsonObject MemoryManager::claimAttentionEvent(const QString &kind)
 {
     if (!m_db.isOpen() || !m_db.transaction())
         return {};
     QJsonObject event;
     {
         QSqlQuery select(m_db);
-        if (!select.exec("SELECT id,kind,ref,payload,priority,created_at FROM attention_event "
-                         "WHERE state='pending' ORDER BY priority,id LIMIT 1")
-            || !select.next()) {
+        select.prepare("SELECT id,kind,ref,payload,priority,created_at FROM attention_event "
+                       "WHERE state='pending' AND (?='' OR kind=?) ORDER BY priority,id LIMIT 1");
+        select.addBindValue(kind.isNull() ? QStringLiteral("") : kind);
+        select.addBindValue(kind.isNull() ? QStringLiteral("") : kind);
+        if (!select.exec() || !select.next()) {
             m_db.rollback();
             return {};
         }
@@ -1450,8 +1468,9 @@ QJsonArray MemoryManager::searchMemoryChunks(const QStringList &terms, int limit
     return result;
 }
 
-QJsonArray MemoryManager::memoryChunksForEmbedding(int limit) const
+QJsonArray MemoryManager::memoryChunksForEmbedding(int limit, QString *error) const
 {
+    if (error) error->clear();
     QJsonArray result;
     QSqlQuery q(m_db);
     QString sql = QStringLiteral(
@@ -1465,8 +1484,10 @@ QJsonArray MemoryManager::memoryChunksForEmbedding(int limit) const
     q.prepare(sql);
     if (limit > 0)
         q.addBindValue(limit);
-    if (!q.exec())
+    if (!q.exec()) {
+        if (error) *error = q.lastError().text();
         return result;
+    }
     while (q.next()) {
         result.append(QJsonObject{
             {"id",q.value(0).toLongLong()},{"source_type",q.value(1).toString()},
@@ -9821,7 +9842,7 @@ struct OutboxSendBlock
 //   开关/权限/覆盖范围（ActionPolicy 确定性复核）；安静时段与共享额度。
 // legacy（reminder/reflection/thought）保留既有领域有效期语义，只做状态一致性复验。
 OutboxSendBlock outboxSendGuard(MemoryManager &memory,const QSqlDatabase &db,
-                                const QString &actionKey)
+                                const QString &actionKey, bool atChannel = false)
 {
     OutboxSendBlock block;
     const auto stop = [&block](bool permanent,const QString &reason) {
@@ -9875,9 +9896,47 @@ OutboxSendBlock outboxSendGuard(MemoryManager &memory,const QSqlDatabase &db,
         if (outboxState == QStringLiteral("failed")
             && (actionState != QStringLiteral("rejected") || outboxAttempts >= 2))
             return stop(true, QStringLiteral("outbox_terminal"));
-        // legacy（reminder/reflection/thought）保留既有领域有效期/取消语义：
-        // 用户提醒有自己独立的 due/expires（在 commit 与领域状态机里校验），
-        // 不因主人插话统一取消；这里只排除终态/不可重试行，不改变旧行为。
+        if (!atChannel) return block;
+        if (!actionReminderAllowed(channel, session))
+            return stop(true, QStringLiteral("legacy_target_not_allowed"));
+        const auto parts = actionKey.split(QLatin1Char(':'));
+        const auto id = parts.value(1).toLongLong();
+        const auto version = parts.value(2).toInt();
+        if (actionPayloadJson != outboxPayloadJson && kind != QStringLiteral("SpontaneousContact"))
+            return stop(true, QStringLiteral("legacy_payload_mismatch"));
+        const auto outgoing = QJsonDocument::fromJson(outboxPayloadJson.toUtf8()).object();
+        QSqlQuery domain(db);
+        if (kind == QStringLiteral("ReminderDelivery")) {
+            domain.prepare("SELECT 1 FROM reminder WHERE id=? AND state='dispatching' "
+                           "AND due<=unixepoch() AND expires>unixepoch() AND channel=? AND session=? AND message=?");
+            domain.addBindValue(id);
+            domain.addBindValue(channel);
+            domain.addBindValue(session);
+            domain.addBindValue(outgoing.value(QStringLiteral("message")).toString());
+        } else if (kind == QStringLiteral("SpontaneousContact")) {
+            domain.prepare("SELECT 1 FROM reflection_contact c JOIN private_reflection r "
+                           "ON c.turn_id=r.turn_id WHERE c.turn_id=? AND c.version=? "
+                           "AND c.outcome='dispatching' AND r.state='consider' AND r.version=? AND c.message=?");
+            domain.addBindValue(id);
+            domain.addBindValue(version);
+            domain.addBindValue(version);
+            const auto sentences = outgoing.value(QStringLiteral("sentences")).toArray();
+            if (sentences.size() != 1)
+                return stop(true, QStringLiteral("legacy_payload_mismatch"));
+            domain.addBindValue(sentences.first().toObject()
+                                    .value(QStringLiteral("zh_text")).toString());
+        } else if (kind == QStringLiteral("ActivityShare")) {
+            if (!memory.canShareThought(id, version))
+                return stop(true, QStringLiteral("legacy_activity_not_shareable"));
+            domain.prepare("SELECT 1 FROM chat_history WHERE id=? AND "
+                           "json_extract(thought_result,'$.draft')=?");
+            domain.addBindValue(id);
+            domain.addBindValue(outgoing.value(QStringLiteral("draft")).toString());
+        } else {
+            return stop(true, QStringLiteral("unsupported_legacy_action"));
+        }
+        if (!domain.exec() || !domain.next())
+            return stop(true, QStringLiteral("legacy_action_no_longer_valid"));
         return block;
     }
     // 2) 提案状态 / 取消审计 / 有效期。
@@ -9908,7 +9967,7 @@ OutboxSendBlock outboxSendGuard(MemoryManager &memory,const QSqlDatabase &db,
         || proposal.value(QStringLiteral("verified_request_id")).toString().trimmed().isEmpty())
         return stop(true, QStringLiteral("verified_binding_missing"));
     if (ActionPolicy::canonicalProposalPayloadDigest(payload, claims) != verifiedPayloadHash
-        || ActionPolicy::canonicalProposalClaimsDigest(claims) != verifiedClaimsHash)
+        || ActionPolicy(&memory).proposalEvidenceDigest(claims) != verifiedClaimsHash)
         return stop(true, QStringLiteral("verified_content_mismatch"));
     // 5) target 三方绑定：提案 target = 动作行 = Outbox，且仍是允许的主人私聊渠道。
     const QString targetChannel = proposal.value(QStringLiteral("target_channel")).toString();
@@ -10581,14 +10640,14 @@ QJsonObject MemoryManager::claimOutbox(const QString &owner,int leaseSeconds)
     return {};
 }
 
-QJsonObject MemoryManager::validateOutboxActionBeforeSend(const QString &actionKey)
+QJsonObject MemoryManager::validateOutboxActionBeforeSend(const QString &actionKey, bool atChannel)
 {
     const QString key = actionKey.trimmed();
     QJsonObject result{{QStringLiteral("ok"),false},
                        {QStringLiteral("permanent"),false},
                        {QStringLiteral("reason"),QStringLiteral("db_error")}};
     if (!m_db.isOpen() || key.isEmpty()) return result;
-    const OutboxSendBlock block = outboxSendGuard(*this, m_db, key);
+    const OutboxSendBlock block = outboxSendGuard(*this, m_db, key, atChannel);
     result[QStringLiteral("ok")] = !block.blocked;
     result[QStringLiteral("permanent")] = block.permanent;
     result[QStringLiteral("reason")] = block.reason;
@@ -11252,7 +11311,7 @@ bool MemoryManager::markActionProposalVerified(const QString &actionKey,
         // 产物（内容/request_id 不同），说明是另一份核验结果，绝不覆盖首次绑定。
         const bool sameBinding =
             row.value(QStringLiteral("verified_payload_hash")).toString() == binding.payloadDigest
-            && row.value(QStringLiteral("verified_claims_hash")).toString() == binding.claimsDigest
+            && row.value(QStringLiteral("verified_claims_hash")).toString() == binding.evidenceDigest
             && row.value(QStringLiteral("verified_request_id")).toString() == binding.requestId;
         m_db.rollback();
         rollback.dismiss();
@@ -11338,8 +11397,8 @@ bool MemoryManager::markActionProposalVerified(const QString &actionKey,
     }
     // 5) 不在这里判 expires_at：过期是提交层/Drain 的职责（历史行为保持不变：
     //    verified 但已过期的提案由 commit 落 expired，而不是拒绝写 verified 绑定）。
-    // 6) CAS proposed→verified：把 binding 的 payload/claims 摘要与 request_id 写入 v33 既有列
-    //    （verified_evidence 不新增列；binding 的 evidence digest 已在上面事务内复核）。
+    // Store the digest of claims and their evidence in the existing verified_claims_hash.
+    // Pre-existing claims-only digests fail closed for actions still awaiting delivery.
     QSqlQuery update(m_db);
     update.prepare(QStringLiteral(
         "UPDATE action_proposal SET state='verified',semantic_status=?,"
@@ -11348,7 +11407,7 @@ bool MemoryManager::markActionProposalVerified(const QString &actionKey,
         "WHERE action_key=? AND state='proposed'"));
     update.addBindValue(semantic);
     update.addBindValue(binding.payloadDigest);
-    update.addBindValue(binding.claimsDigest);
+    update.addBindValue(binding.evidenceDigest);
     update.addBindValue(binding.requestId);
     update.addBindValue(QDateTime::currentSecsSinceEpoch());
     update.addBindValue(key);
@@ -11856,11 +11915,10 @@ QJsonObject MemoryManager::commitVerifiedActionProposal(const QString &actionKey
     }
 
     // R12-2c-2/R12-2c-final-1：即将提交的 payload/claims 必须与"核验时的内容指纹"完全一致。
-    // 这里的 verified_payload_hash/verified_claims_hash 就是 VerificationBinding 的
-    // payloadDigest/claimsDigest（binding 已在 mark 时与权威提案逐项复核）；内容在核验后
+    // 两列分别保存 payloadDigest 和 evidenceDigest。内容在核验后
     // 被改写（含 claims 集合变化）就拒绝，绝不发送"核验的是 A、发送的是 B"。
     // 这里按提交内容重算；进入事务后再用权威提案行复核一次（双重复验）。
-    const QString commitClaimsDigest = ActionPolicy::canonicalProposalClaimsDigest(claims);
+    const QString commitClaimsDigest = policy.proposalEvidenceDigest(claims);
     if (ActionPolicy::canonicalProposalPayloadDigest(payload, claims) != verifiedPayloadHash
         || commitClaimsDigest != verifiedClaimsHash) {
         updateActionProposalState(key, QStringLiteral("verified"), QStringLiteral("withheld"),
@@ -11936,7 +11994,7 @@ QJsonObject MemoryManager::commitVerifiedActionProposal(const QString &actionKey
     if (ActionPolicy::canonicalProposalPayloadDigest(
             fresh.value(QStringLiteral("payload")).toObject(),
             fresh.value(QStringLiteral("claims")).toArray()) != verifiedPayloadHash
-        || ActionPolicy::canonicalProposalClaimsDigest(
+        || policy.proposalEvidenceDigest(
                fresh.value(QStringLiteral("claims")).toArray()) != verifiedClaimsHash) {
         m_db.rollback();
         rollback.dismiss();
@@ -12448,6 +12506,26 @@ int MemoryManager::reconcileActionReceipts()
             }
         }
         if (batchProcessed == 0) break;
+    }
+    // A receipt transaction can commit just before the process exits without indexing the turn.
+    // Recreate the missing assistant chunk without adding any new history.
+    QList<qint64> missingChunks;
+    {
+        QSqlQuery query(m_db);
+        if (query.exec("SELECT h.id FROM chat_history h WHERE h.turn_kind='proactive' "
+                       "AND h.sensitive=0 AND h.turn_state='handed_off' "
+                       "AND NOT EXISTS (SELECT 1 FROM memory_chunks c WHERE c.source_type='chat' "
+                       "AND c.source_ref='chat/'||h.id||':assistant' AND c.status='active') "
+                       "ORDER BY h.id DESC LIMIT 64")) {
+            while (query.next()) missingChunks.append(query.value(0).toLongLong());
+        }
+    }
+    int reindexed = 0;
+    for (const auto turn : missingChunks)
+        if (indexChatTurn(turn)) ++reindexed;
+    if (reindexed > 0) {
+        qInfo() << "[Receipt] proactive_chunks_recovered=" << reindexed;
+        emit searchChunksChanged();
     }
     if (processed > 0) qInfo() << "[Receipt] reconciled=" << processed;
     return processed;

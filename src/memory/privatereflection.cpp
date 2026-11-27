@@ -1097,7 +1097,7 @@ bool MemoryManager::finishConcernReview(qlonglong turn,int version,const QJsonOb
                 qInfo()<<"[Concern] new_contract_withheld turn="<<turn<<"version="<<version
                        <<"reason="<<newCheck.reason;
                 sql=QStringLiteral("UPDATE private_reflection SET state='consider',claimed_by=NULL,"
-                                   "next_check_at=unixepoch()+1800,updated_at=unixepoch() "
+                                   "next_check_at=0,updated_at=unixepoch() "
                                    "WHERE turn_id=? AND version=? AND state='pending'");
                 bindings<<turn<<version;
                 contactBasisRejected=true;
@@ -1112,12 +1112,12 @@ bool MemoryManager::finishConcernReview(qlonglong turn,int version,const QJsonOb
             const auto rejection=validateContactBasis(channel,session,turn,contact);
             if (!rejection.isEmpty()) {
                 // 依据核验不过：不要投递，但也不能让关注卡在 pending 里无限 defer。
-                // 按 keep 语义放回关注队列（30 分钟后可再检查），并留一条可审计的修订。
+                // 保留关注，等待新的依据，并留一条可审计的修订。
                 const auto declaredType=contact["basis"].toObject()["type"].toString();
                 qInfo()<<"[Concern] contact_rejected turn="<<turn<<"version="<<version
                        <<"type="<<declaredType<<"reason="<<rejection;
                 sql=QStringLiteral("UPDATE private_reflection SET state='consider',claimed_by=NULL,"
-                                   "next_check_at=unixepoch()+1800,updated_at=unixepoch() "
+                                   "next_check_at=0,updated_at=unixepoch() "
                                    "WHERE turn_id=? AND version=? AND state='pending'");
                 bindings<<turn<<version;
                 contactBasisRejected=true;

@@ -115,6 +115,7 @@ CognitiveCoordinator::CognitiveCoordinator(MemoryManager &memory, LLMService &mo
     connect(&service,&LLMService::internetErrorSignal,this,[this] { interrupt("network_error"); });
     // B1：进程启动时把崩溃遗留的 received 轮次登记为 recovery 事件（reference 幂等），
     // 由 reviewIfDue 在启动后的第一轮优先恢复；同时记录本次启动时刻供观测。
+    qInfo() << "[Attention] notifications_reconciled=" << store.reconcileAttentionNotifications();
     qInfo() << "[Attention] recovery_queued=" << store.enqueueRecoveryEvents(120);
     // 上次运行若在回顾中退出，会留下 pending 的关注回顾；租约过期后放回可重领状态。
     const int staleReflections = store.recoverStaleReflections(1800);
@@ -198,7 +199,7 @@ void CognitiveCoordinator::reviewIfDue()
         bool recoveredAny = false;
         // 单次 tick 最多恢复 16 轮，防止异常数据把一次 tick 拖成长事务。
         for (int recovered = 0; recovered < 16; ++recovered) {
-            const auto event = store.claimAttentionEvent();
+            const auto event = store.claimAttentionEvent(QStringLiteral("recovery"));
             if (event.value(QStringLiteral("kind")).toString() != QStringLiteral("recovery"))
                 break;
             const auto turn = event.value(QStringLiteral("payload")).toObject()
@@ -315,7 +316,9 @@ void CognitiveCoordinator::submit(const QString &input, const RequestMeta &meta)
         turn.turnId = id;
         turn.sequence = sequence;
         turn.readyAt = qMin(now + quietWindowMs, turn.firstArrival + maximumWindowMs);
-        // 合并后的轮次以最后一次提交的事件为代表（之前的事件自然留在 backlog 里可观测）。
+        // The grouped reply owns the latest notification. Retain the previous event as audit.
+        store.completeAttentionEvent(turn.attentionEvent, QStringLiteral("done"),
+                                     QStringLiteral("grouped"));
         turn.attentionEvent = attention;
         qInfo() << "[Conversation] grouped inputs" << turn.firstTurn << id;
     } else {

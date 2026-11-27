@@ -168,6 +168,13 @@ void ActionOutboxDispatcher::onSendResult(const QString &echo,const QString &out
 {
     if (!m_memory || echo.isEmpty() || outcome.isEmpty()) return;
     const auto payload=m_inflight.take(echo);
+    if (outcome == QStringLiteral("deferred")) {
+        const auto check = m_memory->validateOutboxActionBeforeSend(echo);
+        if (m_memory->deferOutboxAction(echo, check.value(QStringLiteral("reason")).toString()))
+            return;
+        qWarning() << "[Outbox] could not return unsent action to queue" << echo;
+        return;
+    }
     if (!m_memory->settleOutboxAction(echo,outcome)) {
         qWarning()<<"[Outbox] receipt not recorded"<<echo<<outcome;
         return;

@@ -355,7 +355,14 @@ QList<MemoryEvidence> MemoryRetrievalService::retrieveIndexed(const RetrievalReq
 
     const bool original = request.sourceKinds.isEmpty() || request.sourceKinds.contains("chat")
         || request.sourceKinds.contains("raw");
-    const auto allRows = original && request.useIndex ? m_manager->memoryChunksForEmbedding(0) : QJsonArray{};
+    QString indexError;
+    const auto allRows = original && request.useIndex
+        ? m_manager->memoryChunksForEmbedding(0, &indexError) : QJsonArray{};
+    if (!indexError.isEmpty()) {
+        result->status = QStringLiteral("degraded");
+        result->degradedReason = QStringLiteral("index_read_failed");
+        qWarning() << "[Retrieval] index read failed" << indexError;
+    }
     QJsonArray lexicalRows = allRows;
     if (request.includeAuxiliarySources) {
         const auto structured = m_manager->structuredMemoryRows(request.sourceKinds, request.subject,

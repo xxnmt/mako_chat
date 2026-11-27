@@ -96,8 +96,9 @@ bool visibleSession(const QString &channel, const QString &session,
                     const QString &viewerChannel, const QString &viewerSession)
 {
     if (channel.isEmpty() || session.isEmpty()) return false;
-    if (channel == viewerChannel && session == viewerSession) return true;
     auto &cfg = ConfigManager::instance();
+    if (cfg.isBlindZone(channel, session)) return false;
+    if (channel == viewerChannel && session == viewerSession) return true;
     return cfg.getMemoryPolicyConfig().agent.ownerCrossChannelPrivate
            && ((channel == Channel::kPet && session == Channel::kDefaultSession)
                || (channel == Channel::kQQPrivate && cfg.isMasterQQ(session)));
@@ -1150,27 +1151,49 @@ QString ActionPolicy::refExcerpt(const QString &ref, int maxChars) const
     if (ref.startsWith(QStringLiteral("delivery/"))) {
         const auto key = ref.mid(QStringLiteral("delivery/").size());
         QSqlQuery row(m_memory->m_db);
-        row.prepare("SELECT payload_json FROM action_outbox WHERE action_key=? LIMIT 1");
+        row.prepare("SELECT payload_json FROM action_outbox WHERE action_key=? OR id=? "
+                    "ORDER BY action_key=? DESC LIMIT 1");
+        row.addBindValue(key);
+        row.addBindValue(key.toLongLong());
         row.addBindValue(key);
         return row.exec() && row.next() ? truncate(row.value(0).toString()) : QString();
     }
     return {};
 }
 
+QString ActionPolicy::proposalEvidenceDigest(const QJsonArray &claims) const
+{
+    QJsonArray sources;
+    return proposalEvidence(claims, &sources) ? canonicalEvidenceDigest(claims, sources) : QString();
+}
+
 bool ActionPolicy::proposalEvidence(const QJsonArray &claims, QJsonArray *sources) const
 {
-    QSet<QString> references;
+    QMap<QString, bool> references;
     for (const auto &claim : factualClaimsForVerification(claims)) {
-        for (const auto &value : claim.toObject().value(QStringLiteral("refs")).toArray())
-            references.insert(value.toString().trimmed());
+        const auto fields = claim.toObject();
+        const bool execution = fields.value(QStringLiteral("type")).toString().trimmed() == kExecutionResult;
+        for (const auto &value : fields.value(QStringLiteral("refs")).toArray()) {
+            const auto ref = value.toString().trimmed();
+            if (references.contains(ref) && references.value(ref) != execution)
+                return false;
+            references.insert(ref, execution);
+        }
     }
-    auto sorted = references.values();
-    sorted.sort();
     QJsonArray evidence;
-    for (const auto &ref : sorted) {
-        const auto excerpt = refExcerpt(ref, std::numeric_limits<int>::max());
+    for (auto ref = references.cbegin(); ref != references.cend(); ++ref) {
+        QString excerpt;
+        if (ref.value() && ref.key().startsWith(QStringLiteral("chat/"))) {
+            QSqlQuery row(m_memory->m_db);
+            row.prepare("SELECT raw_reply FROM chat_history WHERE id=? AND turn_state='handed_off'");
+            row.addBindValue(ref.key().mid(5).section(':', 0, 0).toLongLong());
+            if (!row.exec() || !row.next()) return false;
+            excerpt = replyText(row.value(0).toString());
+        } else {
+            excerpt = refExcerpt(ref.key(), std::numeric_limits<int>::max());
+        }
         if (excerpt.trimmed().isEmpty()) return false;
-        evidence.append(QJsonObject{{QStringLiteral("ref"), ref},
+        evidence.append(QJsonObject{{QStringLiteral("ref"), ref.key()},
                                     {QStringLiteral("text"), excerpt}});
     }
     *sources = evidence;

@@ -1,3 +1,7 @@
+#include <QScopeGuard>
+#include <QWebSocketServer>
+#include "qqchanneladapter.h"
+#include "qqprotocolclient.h"
 #include "testactionverification.h"
 #include <QtTest>
 #include <QTemporaryDir>
@@ -216,17 +220,19 @@ static qlonglong seedOpenWakeRow(const QString &dbPath, const QString &tag,
 
 // 服务端组装一条 wake contact 提案（claims 为空=纯 self_desire/问候）。
 static QJsonObject wakeContactProposal(qlonglong wakeId, int version, const QString &runId,
-                                       const QString &message, qint64 epoch = 0)
+                                       const QString &message, qint64 epoch = 0,
+                                       const QString &channel = Channel::kPet,
+                                       const QString &session = Channel::kDefaultSession)
 {
     const ActionOrigin origin = ActionOrigin::forWake(
         wakeId, version, runId, QStringLiteral("owner"), epoch,
-        Channel::kPet, Channel::kDefaultSession);
+        channel, session);
     return QJsonObject{
         {QStringLiteral("kind"), QStringLiteral("contact")},
         {QStringLiteral("origin"), origin.toJson()},
         {QStringLiteral("target"),
-         QJsonObject{{QStringLiteral("channel"), Channel::kPet},
-                     {QStringLiteral("session_id"), Channel::kDefaultSession}}},
+         QJsonObject{{QStringLiteral("channel"), channel},
+                     {QStringLiteral("session_id"), session}}},
         {QStringLiteral("payload"),
          QJsonObject{{QStringLiteral("message"), message},
                      {QStringLiteral("reason"), QStringLiteral("想问候")},
@@ -472,6 +478,153 @@ class TestActionOutbox : public QObject
 {
     Q_OBJECT
 private slots:
+    void qqOutboxProtocolBoundary_data()
+    {
+        QTest::addColumn<QString>("change");
+        QTest::newRow("Q01-accepted") << QStringLiteral("none");
+        QTest::newRow("Q02-Q05-revoked") << QStringLiteral("revoke");
+        QTest::newRow("Q03-context") << QStringLiteral("context");
+        QTest::newRow("Q04-retry-revoked") << QStringLiteral("retry");
+    }
+
+    void qqOutboxProtocolBoundary()
+    {
+        QFETCH(QString, change);
+        ProactiveIdentityGuard identityGuard;
+        auto &config = ConfigManager::instance();
+        QFile settings(QDir(config.getConfigDirPath()).filePath(QStringLiteral("setting.json")));
+        const bool hadSettings = settings.open(QIODevice::ReadOnly);
+        const auto original = hadSettings ? settings.readAll() : QByteArray("{}");
+        settings.close();
+        const auto restoreSettings = qScopeGuard([&] {
+            config.writeConfigDocument(QStringLiteral("setting.json"), original, nullptr);
+            if (!hadSettings) settings.remove();
+        });
+        const auto setCrossChannel = [&](bool enabled) {
+            auto document = QJsonDocument::fromJson(original).object();
+            auto memory = document.value("memory").toObject();
+            memory.insert("owner_cross_channel_private", enabled);
+            document.insert("memory", memory);
+            return config.writeConfigDocument(QStringLiteral("setting.json"),
+                QJsonDocument(document).toJson(QJsonDocument::Compact), nullptr);
+        };
+        const QString channel = Channel::kQQPrivate;
+        const QString session = QStringLiteral("10001");
+        QJsonObject identity{
+            {"identity", QJsonObject{{"master", QJsonObject{{"qq", QJsonArray{session}}}}}},
+            {"proactive", QJsonObject{{"enabled", true}, {"contact_daily_limit", 0},
+                {"quiet_hours", QJsonObject{{"start", "00:00"}, {"end", "00:00"}}},
+                {"targets", QJsonArray{QJsonObject{{"channel", channel}, {"session_id", session}}}}}},
+            {"cognition", QJsonObject{{"open_wake", QJsonObject{{"enabled", true}, {"allow_contact", true}}}}}};
+        const auto writeIdentity = [&] {
+            return config.writeConfigDocument(QStringLiteral("identity.json"),
+                QJsonDocument(identity).toJson(QJsonDocument::Compact), nullptr);
+        };
+        QVERIFY(writeIdentity());
+        QVERIFY(setCrossChannel(true));
+        QVERIFY(config.isMasterQQ(session));
+        QVERIFY(config.getMemoryPolicyConfig().agent.ownerCrossChannelPrivate);
+        QVERIFY(config.getProactiveConfig().targets.contains(qMakePair(channel, session)));
+
+        QTemporaryDir temp;
+        QVERIFY(temp.isValid());
+        const auto path = temp.filePath(QStringLiteral("qq-outbox.db"));
+        MemoryManager db(path);
+        const auto run = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        const auto wake = seedOpenWakeRow(path, QStringLiteral("qq-outbox"), run);
+        QVERIFY(wake > 0);
+        const auto proposal = wakeContactProposal(wake, 1, run, QStringLiteral("Hello"),
+                                                   0, channel, session);
+        const auto key = persistVerifiedProposal(db, proposal);
+        QVERIFY(!key.isEmpty());
+        if (change == QStringLiteral("none")) {
+            QVERIFY(setCrossChannel(false));
+            const auto denied = db.commitVerifiedActionProposal(key);
+            QCOMPARE(denied.value("error").toString(), QStringLiteral("target_unreachable"));
+            QCOMPARE(denied.value("detail").toString(), QStringLiteral("target_not_visible"));
+            QVERIFY(setCrossChannel(true));
+        }
+        const auto result = db.commitVerifiedActionProposal(key);
+        const auto diagnostic = QJsonDocument(QJsonObject{
+            {"result", result}, {"action_key", key}, {"origin", proposal.value("origin")},
+            {"target", proposal.value("target")}, {"state", db.actionProposal(key).value("state")}
+        }).toJson(QJsonDocument::Compact);
+        QVERIFY2(!result.contains("error"), diagnostic.constData());
+
+        QWebSocketServer server(QStringLiteral("outbox"), QWebSocketServer::NonSecureMode);
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QStringList frames;
+        connect(&server, &QWebSocketServer::newConnection, &server, [&] {
+            auto *peer = server.nextPendingConnection();
+            peer->setParent(&server);
+            connect(peer, &QWebSocket::textMessageReceived, &server, [&, peer](const QString &text) {
+                const auto frame = QJsonDocument::fromJson(text.toUtf8()).object();
+                if (frame.value("action") != QStringLiteral("send_private_msg")) return;
+                const auto echo = frame.value("echo").toString();
+                frames.append(echo);
+                const bool reject = echo == key && change == QStringLiteral("retry");
+                peer->sendTextMessage(QString::fromUtf8(QJsonDocument(QJsonObject{
+                    {"echo", echo}, {"status", reject ? "failed" : "ok"},
+                    {"retcode", reject ? 100 : 0}}).toJson(QJsonDocument::Compact)));
+            });
+        });
+        QQProtocolClient client;
+        QQConfig qq;
+        qq.enabled = true;
+        qq.wsUrl = QStringLiteral("ws://127.0.0.1:%1").arg(server.serverPort());
+        client.setConfig(qq);
+        client.start();
+        QTRY_VERIFY(client.isConnected());
+        QQChannelAdapter adapter;
+        adapter.setClient(&client);
+        ActionOutboxDispatcher dispatcher(&db);
+        dispatcher.setSender([&](const Utterance &u) {
+            return adapter.sendOutboxUtterance(u, [&, actionKey = u.deliveryEcho] {
+                return db.validateOutboxActionBeforeSend(actionKey);
+            });
+        });
+        connect(&client, &QQProtocolClient::sendResult, &dispatcher,
+                [&](const QString &echo, const QString &outcome) {
+            if (echo == key) dispatcher.onSendResult(echo, outcome);
+        });
+        QSignalSpy settled(&dispatcher, &ActionOutboxDispatcher::actionSettled);
+        const bool paced = change == QStringLiteral("revoke") || change == QStringLiteral("context");
+        if (paced) {
+            QVERIFY(client.sendAction(QStringLiteral("send_private_msg"), {}, QStringLiteral("lead"), 800));
+            QTRY_VERIFY(frames.contains(QStringLiteral("lead")));
+        }
+        dispatcher.pollOnce();
+        if (change == QStringLiteral("none")) {
+            QTRY_COMPARE(settled.size(), 1);
+            QCOMPARE(frames.count(key), 1);
+            QCOMPARE(settled.first().at(1).toString(), QStringLiteral("protocol_accepted"));
+            return;
+        }
+        if (change == QStringLiteral("context")) {
+            RequestMeta owner;
+            owner.subject = QStringLiteral("user");
+            owner.eventId = owner.runId = QStringLiteral("interrupt-pacing");
+            QVERIFY(db.recordInput(QStringLiteral("New owner input"), owner, true) > 0);
+        } else {
+            if (!paced) QTRY_COMPARE(settled.size(), 1);
+            auto cognition = identity.value("cognition").toObject();
+            auto openWake = cognition.value("open_wake").toObject();
+            openWake.insert("allow_contact", false);
+            cognition.insert("open_wake", openWake);
+            identity.insert("cognition", cognition);
+            QVERIFY(writeIdentity());
+        }
+        if (paced) {
+            QVERIFY(client.sendAction(QStringLiteral("send_private_msg"), {}, QStringLiteral("tail")));
+            QTRY_VERIFY(frames.contains(QStringLiteral("tail")));
+            QCOMPARE(frames.count(key), 0);
+        } else {
+            dispatcher.pollOnce();
+            QTest::qWait(4200);
+            QCOMPARE(frames.count(key), 1);
+        }
+    }
+
     // 1. contact 合法提交后同时存在 cognitive_action/action_outbox/reflection_contact=dispatching；
     //    失败提交（无 basis / 无提醒）不产生任何行。
     void commitIsAtomicWithOutbox()
@@ -2124,6 +2277,11 @@ private slots:
             QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM chat_history "
                                                "WHERE turn_kind='proactive'")).toInt(),
                      1);
+            QVERIFY(raw.exec(QStringLiteral("DELETE FROM memory_chunks WHERE source_type='chat'")));
+            QCOMPARE(again.reconcileActionReceipts(), 0);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM memory_chunks WHERE "
+                                               "source_type='chat' AND chunk_kind='turn_assistant'")).toInt(), 1);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM chat_history")).toInt(), 1);
         }
     }
 

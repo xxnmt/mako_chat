@@ -150,7 +150,7 @@ public:
     int memoryChunkCount() const;
     QJsonArray searchMemoryChunks(const QStringList &terms, int limit = 40,
                                   const QString &exactQuery = {}) const;
-    QJsonArray memoryChunksForEmbedding(int limit = 2000) const;
+    QJsonArray memoryChunksForEmbedding(int limit = 2000, QString *error = nullptr) const;
     QJsonArray memoryChunksMissingEmbedding(int limit, const QString &model,
                                            qlonglong afterId = 0, QString *error = nullptr) const;
     bool storeChunkEmbedding(qlonglong chunkId, const QString &model, int dimension,
@@ -249,7 +249,8 @@ public:
                                     const QJsonObject &payload = {}, const QString &reason = {},
                                     int priority = 50);
     // 领取 pending 中 priority 最小（最高）且 id 最早的一条，置 claimed。
-    QJsonObject claimAttentionEvent();
+    QJsonObject claimAttentionEvent(const QString &kind = {});
+    int reconcileAttentionNotifications();
     // 只允许 pending/claimed → done/abandoned；影响 1 行才成功。
     bool completeAttentionEvent(qlonglong id, const QString &state, const QString &reason = {});
     QJsonObject attentionBacklog() const;
@@ -306,7 +307,7 @@ public:
     // verified_claims_hash 与权威 payload/claims、target/开关/权限/安静时段/共享额度、
     // 来源版本/runId/scope/target、成果 artifact_ref/version/hash/share_intent。
     // legacy（reminder/reflection/thought）保留既有领域有效期语义，只做状态一致性复验。
-    QJsonObject validateOutboxActionBeforeSend(const QString &actionKey);
+    QJsonObject validateOutboxActionBeforeSend(const QString &actionKey, bool atChannel = false);
     // 可恢复阻塞：把刚领取的 dispatching 行放回 queued（attempts 回退，不算一次发送），
     // action 回 queued；用于安静时段/额度/目标暂不可达。仅用于新来源动作。
     bool deferOutboxAction(const QString &actionKey,const QString &reason);
@@ -550,10 +551,9 @@ public:
     // 内容"当成"verifier 核验过的内容"。通过后 CAS proposed→verified，并把
     // binding.payloadDigest/claimsDigest/requestId 写入 v33 既有列：
     //   verified_payload_hash=binding.payloadDigest；
-    //   verified_claims_hash=binding.claimsDigest；
+    //   verified_claims_hash=binding.evidenceDigest（claims 与核验证据集合）；
     //   verified_request_id=binding.requestId；verified_at=now。
-    // evidence digest 不新增列：它在本次事务内被复核（库里已有权威 payload/claims + 证据
-    // 可由 claimSources 重算），提交时再复核两个持久化 hash 与提交内容一致。
+    // 提交与投递前都从当前权威提案和依赖的来源重算两项摘要。
     bool markActionProposalVerified(const QString &actionKey, const VerificationBinding &binding,
                                     QString *error = nullptr);
     // 取消审计（幂等、单事务）：未终态（proposed/verified）→ expired；committed 保持 committed

@@ -206,6 +206,7 @@ public:
                                                         const QJsonObject &contact) const;
 
     // 把 claim refs 对应的库内原文摘要收集成 verifier sources（去重、最多 4 条、总字符有上限）。
+    QString proposalEvidenceDigest(const QJsonArray &claims) const;
     bool proposalEvidence(const QJsonArray &claims, QJsonArray *sources) const;
     QJsonArray claimSources(const QString &channel, const QString &session,
                             qlonglong concernTurn, const QJsonArray &claims) const;

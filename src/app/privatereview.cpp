@@ -751,6 +751,7 @@ WakeResult PrivateReview::wakeOpenWake(const OpenWakeConfig &openWake, int daily
     // R12-2b 起 allow_contact 来自独立配置（默认 false）：false 时 contact 一律不发送，
     // true 时才允许模型输出 contact 提案（仍要经过确定性+语义核验与提交层复核）。
     context.insert(QStringLiteral("kind"), QStringLiteral("open_wake"));
+    context.insert(QStringLiteral("action_context_epoch"), store.actionContextEpoch());
     context.insert(QStringLiteral("origin"), origin.toJson());
     context.insert(QStringLiteral("current_input"), QJsonValue::Null);
     const bool allowContact = ConfigManager::instance().openWakeAllowContact();
@@ -961,7 +962,7 @@ void PrivateReview::receive(qlonglong id, int version, const QJsonObject &propos
     store.setAttentionState(QStringLiteral("current_activity"), ref);
     store.setAttentionState(QStringLiteral("last_activity_result"),
                             QStringLiteral("%1:%2:%3").arg(ref).arg(version).arg(resultStatus));
-    store.enqueueAttentionEvent(QStringLiteral("activity_result"),
+    const auto activityEvent = store.enqueueAttentionEvent(QStringLiteral("activity_result"),
                                 QStringLiteral("%1:%2").arg(ref).arg(version),
                                 QJsonObject{{QStringLiteral("status"), resultStatus},
                                             {QStringLiteral("activity_ref"), ref},
@@ -970,6 +971,8 @@ void PrivateReview::receive(qlonglong id, int version, const QJsonObject &propos
                                                  ? QStringLiteral("internal")
                                                  : QStringLiteral("legacy")}},
                                 QStringLiteral("activity"), 40);
+    store.completeAttentionEvent(activityEvent, QStringLiteral("done"),
+                                 QStringLiteral("activity_result_recorded"));
     qInfo() << "[Attention] current_activity=" << ref << "result=" << resultStatus;
     store.clearReviewFailure(kindName(attempt.origin.kind), ref);
     logResult(resultStatus.isEmpty() ? QStringLiteral("none") : resultStatus,

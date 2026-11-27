@@ -2,6 +2,7 @@
 #define QQPROTOCOLCLIENT_H
 
 #include <QObject>
+#include <functional>
 #include <QWebSocket>
 #include <QTimer>
 #include <QJsonObject>
@@ -27,8 +28,10 @@ public:
     bool isConnected() const;
 
     // 发送 OneBot 动作（唯一 echo）。send_* 按回执串行；true 表示接受提交/入队，非送达证明。
+    using SubmissionGuard = std::function<QJsonObject()>;
     bool sendAction(const QString &action, const QJsonObject &params = QJsonObject(),
-                    const QString &echo = QString(), int playbackMs = 0);
+                    const QString &echo = QString(), int playbackMs = 0,
+                    SubmissionGuard guard = {});
 
 signals:
     void connected();
@@ -65,6 +68,7 @@ private:
         int attempts = 0;
         bool waitingRetry = false;
         int playbackMs = 0;
+        SubmissionGuard guard;
     };
     QHash<QString, PendingAction> m_pendingActions;
     QQueue<QString> m_sendQueue;
