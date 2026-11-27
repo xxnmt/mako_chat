@@ -3236,10 +3236,10 @@ private slots:
         const bool share = scenario == QStringLiteral("share");
         const bool quiet = scenario == QStringLiteral("quiet");
         OpenWakeConfigGuard config;
-        auto options = openWakeTestJson(!share, 12, 3);
+        auto options = openWakeTestJson(!share, 12, 0);
         options.insert("allow_contact", !quiet);
         QVERIFY(config.write(options, QJsonObject{
-            {"enabled", true}, {"private_writing", true}, {"contact_daily_limit", 0},
+            {"enabled", true}, {"private_writing", share}, {"contact_daily_limit", 0},
             {"quiet_hours", QJsonObject{{"start", "00:00"}, {"end", "00:00"}}},
             {"targets", QJsonArray{QJsonObject{{"channel", Channel::kPet},
                                              {"session_id", Channel::kDefaultSession}}}}}));
@@ -3258,6 +3258,16 @@ private slots:
             QVERIFY(!ref.isEmpty());
             QVERIFY(execMemorySql(QStringLiteral("UPDATE internal_activity SET review_after=unixepoch()-1")));
         } else {
+            if (!quiet) {
+                RequestMeta owner;
+                owner.subject = QStringLiteral("user");
+                owner.eventId = owner.runId = QStringLiteral("isolated-open-wake-history");
+                const auto turn = db.recordInput(
+                    QStringLiteral("我今天还醒着，正想聊点轻松的。"
+                                   "你有突然想聊的事，随时可以来找我。"), owner, true);
+                QVERIFY(turn > 0);
+                QVERIFY(db.recordQuiet(turn, QStringLiteral("close")));
+            }
             QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
         }
         PrivateReview review(db);
@@ -3271,6 +3281,7 @@ private slots:
         QSignalSpy completed(&model, &LLMService::privateReviewFinished);
         const auto wake = review.wake(12, 60, ConfigManager::instance().getOpenWakeConfig());
         QVERIFY2(wake.started, qPrintable(wake.reason));
+        QCOMPARE(wake.kind, share ? QStringLiteral("activity") : QStringLiteral("open_wake"));
         const auto job = requested.first();
         auto context = job.at(2).toJsonObject();
         if (!share && !quiet) {
