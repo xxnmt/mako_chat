@@ -266,3 +266,130 @@ matched/missing/extra、跨模块重复身份数、同事件多 facet 数、同 
 每步的前置条件：`tst_cognitivecontext` + 对应入口测试 + 全量 ctest 通过；shadow 指标
 `missing_in_unified=0`、`identity_conflicts=0`、`privacy_leaks=0`；预算变化有解释；
 不新增模型请求；不扩大读取权限。
+
+---
+
+## 9. R12-3a 第二切片：实际模型输入接管（2026-11-28 提交）
+
+本节记录第二切片：把统一证据目录**实际投影进模型输入**（默认关闭、可回退），
+不是只做 shadow。基线：`f0824d2`（第一切片）之上。
+
+### 9.1 实际接管的路径（替换了哪些旧调用路径）
+
+| 入口 | 原路径 | 接管后 |
+|---|---|---|
+| 前台 `prepareReply` | `cognitiveSnapshotMessage()` 旧快照 JSON 直接进 messages；`privateEvidence` 原样 JSON 进“跨渠道记忆资料”消息 | 用 `projectModelInput()` 生成：①同域形状快照块（已由历史/最近群消息/当前输入完整序列化的身份只给 `ref`+`duplicate_note`）；②跨渠道证据块（同上）；③新增一条“统一时间与权限”最小 system 说明 |
+| 私下回顾 `generatePrivateReview`（Reflection/Concern/OpenWake/ActivityReview 共用） | 旧快照 JSON + thread 各一份来源/历史 | 快照块改为统一目录投影：thread 已完整携带的来源/历史/prior/concern/consulted/reminder 在快照中只给 `ref`；时间语义继续使用既有服务端 `time_context`（不重复插入时间块） |
+
+代码：`cognitivecontext.h/cpp` 的 `projectModelInput()`/`CognitiveProjection`/`CognitiveProjectionStats`；
+`LLMService::setCognitiveContextActualEnabled()`（环境变量 `MAKO_COGNITIVE_CONTEXT_ACTUAL=1`，
+默认关闭）；前台接入点 `llmservice.cpp` prepareReply（约 1397 起），回顾接入点
+`generatePrivateReview`（约 2194 起）；报告通过 `lastCognitiveShadowReport()` 读取
+（`actual_mode=true`、`projection` 子对象）。
+
+### 9.2 未接管的路径（保留旧逻辑及原因）
+
+| 保留项 | 原因 |
+|---|---|
+| `CURRENT_UNDERSTANDING` catalog 组装 | 其证据编号 `ref:N`、`evidence` 字段与 `evidence_decision`/consult 契约强绑定；改为统一目录生成需要单独迁移编号契约，R12-3b 处理 |
+| `MEMORY_DATA`（PromptAssembler） | 派生语义记录（profile/episodic/summary/claim/relationship），与原始事件不是同一身份；旧 shapes 与模型引用习惯稳定，先不动 |
+| 短期历史 / `RECENT_GROUP_CONTEXT` | 它们是原始事实的“权威全文”位置；actual 投影正是以它们为 `alreadySerialized` 基准，保留全量 |
+| 关注/活动/提醒/能力清单消息 | 内部语义记录（各自有独立身份），不是同一原始事件的重复；保留现有注入与写回契约 |
+| 工具协议 `memory_recall`/`memory_read`、matter consult、`verifyActionProposal`/`VerificationBinding`/`ActionPolicy` | 服务端数据通路；本切片不改变其输入输出。actual 模式只改模型数据块的文本位置，不删除任何 evidence 引用 |
+| Outbox/Reminder 发送与回执 | 独立执行链，本切片未触碰 |
+
+### 9.3 资源与重复度实测（自动测试，非生产数据）
+
+**(a) 前台 mock fixture**（3 轮同主题历史；`unifiedContextActualForeground`）：
+
+| 指标 | 结果 |
+|---|---|
+| 旧组装 chars → 投影后 chars | 8145 → 7666（saved_chars=479） |
+| 重复证据身份数 / 改写为引用的条目 | 6 / 10 |
+| 去重后完整证据（本投影内） | 0（正文全部已在历史中，引用替代） |
+| 引用解析 | 3 emitted / 3 resolved / 0 unresolved |
+| 隐私过滤 / 泄漏 | 0 / 0 |
+| 模型主请求数（baseline 一轮 + actual 一轮） | 各 1，无额外请求 |
+| 预算 | snapshot_budget_bytes=4096，未触发裁剪 |
+
+**(b) 回顾四来源**（`unifiedContextActualReviewKinds`：reflection/concern/open_wake/activity）：
+每个来源 `actual_mode=true`、`refs_unresolved=0`、`privacy_leaks=0`、回顾请求数各 1；
+快照投影出现“去重项只给 ref”说明，时间语义由既有 `time_context` 提供。
+
+**(c) 真实模型集成**（隔离临时库，DeepSeek 真实 provider，不发渠道消息；
+`realModelUnifiedContextIntegration`）：
+
+| 指标 | 前台 | 回顾 |
+|---|---:|---:|
+| 实际 input chars / baseline chars | 6560 / 6763（saved 203） | 4478 / 4403（saved −75） |
+| 实际 input bytes / baseline bytes | 12396 / 12163（saved −233） | 7530 / 7329（saved −201） |
+| duplicate evidence / 改写为引用 | 2 / 4 | 2 / 2 |
+| refs resolved | 1/1 | 2/2 |
+| privacy filtered / leaks | 0 / 0 | 0 / 0 |
+| prompt_tokens（provider usage） | 3403 | 1980 |
+| 模型请求 | 真实请求各 1（前台/回顾），无 shadow 增量 | 同左 |
+| 结果 | provider 接受投影后的输入并返回可解析 JSON；输出格式（tags）被既有输出守卫生效，属模型随机性，不计本切片回归 | 回顾完成，无网络错误 |
+
+**关于 saved_bytes 为负的说明**：本切片新增的“统一时间与权限”说明（前台）与 JSON 引用项
+（`dedup`/`duplicate_note`/`policy_view`）带来固定开销；在“历史很短、重复只有几条”的 fixture 里，
+字符节省可能小于这些开销，因此按字节看未必下降。验收口径是**重复正文只在最原始位置序列化一次**
+（出现次数/改写条目数/引用解析率），不是强行压缩总字节；真实长会话下节省应更明显，需后续运行观察。
+不通过删除必要资料来换取缩减。
+
+### 9.4 12 条验收条件 → 证据映射
+
+| # | 条件 | 证据 |
+|---|---|---|
+| 1 | 前台与后台引用同一原始证据身份一致 | `snapshotBuilderMaterialsShareIdentity`、`cognitiveShadowSharesIdentityAcrossEntries`、actual 回顾来源轮次 dedup |
+| 2 | 实际输入重复证据减少 | `unifiedContextActualForeground`：重复文本出现次数下降（baseline≥2 → actual 更少）、dup_omitted=10 |
+| 3 | 去重后引用仍可解析 | 报告 `refs_unresolved=0`；测试逐条按 `lastEvidenceDirectory()`/统一身份回查 |
+| 4 | 历史事实与当前状态不混淆 | 保留 CURRENT_UNDERSTANDING/回顾 thread 语义；时间说明明确资料时间；slice1 matter/version 测试 |
+| 5 | 跨午夜时间表达正确 | `timeSemanticsAreServerOwned`（今天/昨天/明天由服务端 now 计算）；actual 时间块规则明确旧相对时间不是当前时间 |
+| 6 | 私有资料不泄露 | `projectionGroupHasNoPrivateDomains`、`memoryDataClaimsReuseAccessPolicy`、actual 报告 privacy_leaks=0 |
+| 7 | 检索失败不伪装 empty | `retrievalFailureIsNotEmptyHistory`（degraded/error/not_queried/empty 四态） |
+| 8 | 记忆工具与 Matter consult 无回归 | 全量 ctest（tool/matter 用例）；actual 未改工具协议与 consult 数据通路（风险：actual+tool 运行时未单独覆盖，见 §9.6） |
+| 9 | 主动联系/分享/核验无回归 | 全量 ctest（`tst_actionoutbox`/`tst_actionpolicy`/`tst_memoryagent` 行动链）；verifier/binding 服务端路径未改 |
+| 10 | 用户委托提醒无回归 | 全量 ctest（reminder 链）；actual 仅把快照 commitments 重复项改为 ref，提醒消息仍完整 |
+| 11 | 普通前台回复无回归 | actual 关闭时旧 messages 逐字节不变；actual 开启 mock/真实模型均能完成回复；全量 ctest |
+| 12 | 不额外增加模型请求 | actual 前后 main 请求计数 1/1；回顾四来源各 1；`modelRequestCount()` 只统计真实 post |
+
+### 9.5 本轮验证与构建
+
+- 构建：`build/stage-b`（Ninja Debug，Qt 6.11.1 / MinGW 13.1）全量通过
+  （日志 `build/stage-b/r12-3a2-build.log`）。
+- 全量 `ctest`：**24/24 通过**，127.23s（`build/stage-b/r12-3a2-ctest.log`）。
+- `tst_cognitivecontext 20 passed`（新增 4 个投影单测）；
+  `tst_memoryagent 120 passed / 5 skipped`（5 个 opt-in：真实模型/真实库）；
+  `tst_memorymanager 157 passed / 1 skipped`。
+- 真实模型集成：`build/stage-b/r12-3a2-real-model.log`（隔离库，未发真实渠道消息）。
+- 生产库/配置未修改（v33、`contact_daily_limit=0`、`snapshot_budget_bytes=4096`；
+  SHA-256 与 mtime 与基线核对一致）；未启动生产应用。
+- 顺带修复既有测试的时间边界脆弱性：`tst_actionoutbox::verifiedContactHonorsSwitchesAndGate`
+  原先固定 00:00–23:59 安静窗口，在 23:59 分钟会失败；改为按当前时刻 ±2 分钟动态构造。
+
+### 9.6 剩余风险与未验证项
+
+1. **actual+tool 模式运行时未单独覆盖**：actual 投影发生在 tool 分支之前，工具协议/工具结果追加
+   未改；但“actual 开启 + memory_recall 工具轮”没有专门集成用例，建议真实运行观察。
+2. **actual 开启时的真实行动链（contact/share/verifier）未单独跑真实模型**：服务端核验与
+   Outbox 路径未改；全量测试在 actual 关闭下通过，actual 只影响模型输入块。
+3. **saved_bytes 在短上下文可能为负**（见 9.3）：本切片以“重复正文单次序列化”与引用解析为
+   验收口径；真实长会话收益待运行观察。
+4. **回顾快照块与 thread 的语义分工**：thread 保留全量、快照只给引用；若模型更依赖快照字段，
+   需观察回答质量。
+5. **统一时间块只在无 `time_context` 时补充**：前台新增、回顾沿用既有 time_context；
+   两处文案不同但语义一致，后续可统一（不影响本切片验收）。
+6. **生产默认关闭**：`MAKO_COGNITIVE_CONTEXT_ACTUAL` 未开启时行为与第一切片/旧逻辑一致；
+   真正切生产默认需单独授权与运行观察。
+
+### 9.7 可退役的旧机制（现在不删，等 R12 完成/B5 自然运行验收后集中处理）
+
+| 旧机制 | 退役条件 |
+|---|---|
+| `cognitiveSnapshotMessage` 内“直接序列化快照 JSON”的旧路径 | actual 模式在生产观察期无质量回退，且 R12-3b 把 CURRENT_UNDERSTANDING/MEMORY_DATA 也接入统一目录后 |
+| “跨渠道记忆资料”块的原样 JSON 序列化 | 同上；需确认工具/consult 仍能拿到等价来源 |
+| `CognitiveContextBuilder` 的 shadow 对照分支 | actual 成为默认且覆盖指标稳定后，保留只读统计即可 |
+| 旧 `m_run.evidence` 临时引用表 | 统一目录提供稳定引用解析且工具/action 全链路迁移后 |
+
+**新增模块职责边界**：`cognitivecontext.*` 只负责“证据身份/语义/时间/覆盖/投影/对照”；
+不持有数据库、不发请求、不写库、不做调度；LLMService 仍负责消息组装与模型调用。

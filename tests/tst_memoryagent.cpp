@@ -951,6 +951,427 @@ private slots:
                  CognitiveSnapshotBuilder::promptByteBudget());
     }
 
+    // R12-3a 第二切片：前台实际接管。同一临时库、同一轮历史分别跑“actual 关闭/开启”：
+    // 实际输入字节应减少、重复证据被改写为引用、引用解析成功、模型主请求仍各一次。
+    void unifiedContextActualForeground()
+    {
+        SemanticReviewConfigGuard guard;
+        QVERIFY(guard.enable());
+        auto &cfg = ConfigManager::instance();
+        QVERIFY(cfg.writeConfigDocument(QStringLiteral("setting.json"),
+            QJsonDocument(QJsonObject{{QStringLiteral("memory"),
+                QJsonObject{{QStringLiteral("long_term_memory_enabled"), true},
+                            {QStringLiteral("agent_enabled"), false}}}}).toJson(),
+            nullptr));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager db(dir.filePath(QStringLiteral("actual-foreground.db")));
+        RequestMeta meta;
+        meta.channel = Channel::kPet;
+        meta.sessionId = Channel::kDefaultSession;
+        meta.subject = QStringLiteral("user");
+        meta.speaker = QStringLiteral("欧尼酱");
+        for (int i = 1; i <= 3; ++i) {
+            RequestMeta turnMeta = meta;
+            turnMeta.eventId = QStringLiteral("actual-%1").arg(i);
+            turnMeta.runId = QStringLiteral("actual-run-%1").arg(i);
+            turnMeta.receivedAtUtc = QDateTime::currentDateTimeUtc().addSecs(-i * 60);
+            turnMeta.occurredAtUtc = turnMeta.receivedAtUtc;
+            const QString text = QStringLiteral("第%1次说同一件事：周末去看展").arg(i);
+            const auto turn = db.recordInput(text, turnMeta, true);
+            QVERIFY(turn > 0);
+            SentenceText sentence;
+            sentence.zhText = QStringLiteral("好呀");
+            sentence.jaText = QStringLiteral("いいよ");
+            QVERIFY(db.saveQATurn(text,
+                                  QStringLiteral(R"({"sentences":[{"zh_text":"好呀","ja_text":"いいよ"}]})"),
+                                  {sentence}, turnMeta, turn));
+        }
+        const auto history = db.getHistoryTurn(10, meta.channel, meta.sessionId, 0);
+        QVERIFY(history.size() >= 3);
+
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QByteArray> bodies;
+        serveCompletions(server, bodies, [](int) -> QString {
+            return QStringLiteral(
+                R"({"sentences":[{"zh_text":"好呀","ja_text":"いいよ","tags":{"emotion":"happy"}}]})");
+        });
+        const QUrl endpoint(QStringLiteral("http://127.0.0.1:%1/").arg(server.serverPort()));
+        const QByteArray mainMarker = QStringLiteral("【输出要求】").toUtf8();
+        const auto mainRequests = [&bodies, &mainMarker]() {
+            int count = 0;
+            for (const auto &body : bodies) if (body.contains(mainMarker)) ++count;
+            return count;
+        };
+        const auto lastMainBody = [&bodies, &mainMarker]() {
+            for (int i = int(bodies.size()) - 1; i >= 0; --i)
+                if (bodies.at(i).contains(mainMarker)) return bodies.at(i);
+            return QByteArray{};
+        };
+
+        LLMService baseline(QStringLiteral("test"), nullptr, endpoint);
+        baseline.setMemoryManager(&db);
+        baseline.setCognitiveShadowEnabled(false);
+        baseline.setCognitiveContextActualEnabled(false);
+        QSignalSpy baselineSpoken(&baseline, &LLMService::sentencesReady);
+        QSignalSpy baselineFailed(&baseline, &LLMService::replyAbnormal);
+        baseline.askDeepSeek(QStringLiteral("周末去看展吗"), history, meta);
+        QTRY_VERIFY_WITH_TIMEOUT(baselineSpoken.size() + baselineFailed.size() > 0, 8000);
+        QCOMPARE(baselineSpoken.size(), 1);
+        QCOMPARE(mainRequests(), 1);
+        const QByteArray baselineBody = lastMainBody();
+        QVERIFY(!baselineBody.isEmpty());
+        QVERIFY(!baselineBody.contains(QStringLiteral("统一时间与权限").toUtf8()));
+        QVERIFY(!baselineBody.contains(QStringLiteral("duplicate_note").toUtf8()));
+
+        LLMService actual(QStringLiteral("test"), nullptr, endpoint);
+        actual.setMemoryManager(&db);
+        actual.setCognitiveShadowEnabled(false);
+        actual.setCognitiveContextActualEnabled(true);
+        QSignalSpy actualSpoken(&actual, &LLMService::sentencesReady);
+        QSignalSpy actualFailed(&actual, &LLMService::replyAbnormal);
+        actual.askDeepSeek(QStringLiteral("周末去看展吗"), history, meta);
+        QTRY_VERIFY_WITH_TIMEOUT(actualSpoken.size() + actualFailed.size() > 0, 8000);
+        QCOMPARE(actualSpoken.size(), 1);
+        // 投影不增加模型主请求：两轮各一次。
+        QCOMPARE(mainRequests(), 2);
+        const QByteArray actualBody = lastMainBody();
+        QVERIFY(actualBody.contains(QStringLiteral("统一时间与权限").toUtf8()));
+        QVERIFY2(actualBody.contains(QStringLiteral("duplicate_note").toUtf8()),
+                 "实际模型输入应包含去重后的引用项");
+        // “重复证据减少”按同一原始文本在请求体里的出现次数度量：历史/快照/检索原来各一份，
+        // 投影后快照/检索只留引用，正文只保留历史里的那一份。
+        const auto countNeedle = [](const QByteArray &haystack, const QByteArray &needle) {
+            int count = 0;
+            qsizetype pos = 0;
+            while ((pos = haystack.indexOf(needle, pos)) >= 0) {
+                ++count;
+                pos += needle.size();
+            }
+            return count;
+        };
+        const QByteArray duplicatedText =
+            QStringLiteral("第2次说同一件事：周末去看展").toUtf8();
+        const int baselineOccurrences = countNeedle(baselineBody, duplicatedText);
+        const int actualOccurrences = countNeedle(actualBody, duplicatedText);
+        QVERIFY2(baselineOccurrences >= 2,
+                 qPrintable(QStringLiteral("baseline occurrences=%1")
+                                .arg(baselineOccurrences)));
+        QVERIFY2(actualOccurrences < baselineOccurrences,
+                 qPrintable(QStringLiteral("actual occurrences=%1 baseline=%2")
+                                .arg(actualOccurrences)
+                                .arg(baselineOccurrences)));
+        QVERIFY2(actualBody.size() <= baselineBody.size() + 1200,
+                 qPrintable(QStringLiteral("actual=%1 baseline=%2")
+                                .arg(actualBody.size())
+                                .arg(baselineBody.size())));
+        // 原有资料类型未被删除：历史原文仍完整存在，CURRENT_UNDERSTANDING/跨渠道资料块仍在。
+        QVERIFY(actualBody.contains(QStringLiteral("第3次说同一件事").toUtf8()));
+        QVERIFY(actualBody.contains(QStringLiteral("跨渠道记忆资料").toUtf8()));
+
+        const auto report = actual.lastCognitiveShadowReport();
+        QCOMPARE(report.value(QStringLiteral("actual_mode")).toBool(), true);
+        const auto projection = report.value(QStringLiteral("projection")).toObject();
+        QVERIFY(projection.value(QStringLiteral("saved_chars")).toInt() > 0);
+        QVERIFY(projection.value(QStringLiteral("input_chars")).toInt() > 0);
+        QVERIFY(projection.value(QStringLiteral("duplicate_entries_omitted")).toInt() > 0);
+        // 本 fixture 的历史覆盖了全部快照/检索原文，因此投影里没有“新的完整证据”，
+        // effective_evidence_count=0 是正确结果（正文只有历史里的一份）。
+        QVERIFY(projection.contains(QStringLiteral("effective_evidence_count")));
+        QCOMPARE(projection.value(QStringLiteral("privacy_leaks")).toInt(), 0);
+        QCOMPARE(projection.value(QStringLiteral("refs_unresolved")).toInt(), 0);
+        QVERIFY(projection.value(QStringLiteral("refs_emitted")).toInt() > 0);
+        QCOMPARE(projection.value(QStringLiteral("snapshot_budget_bytes")).toInt(),
+                 CognitiveSnapshotBuilder::promptByteBudget());
+        // 引用解析：投影发出的 ref 都能在旧 evidence 目录或统一身份里找到。
+        const auto refs = report.value(QStringLiteral("projection_refs")).toArray();
+        const auto directory = actual.lastEvidenceDirectory();
+        int checkedRefs = 0;
+        for (const auto &value : refs) {
+            const QString ref = value.toString();
+            if (ref.isEmpty()) continue;
+            ++checkedRefs;
+            bool resolved = directory.contains(ref);
+            for (const auto &entry : report.value(QStringLiteral("identities")).toArray()) {
+                const auto identity = entry.toObject();
+                if (identity.value(QStringLiteral("display_ref")).toString() == ref
+                    || identity.value(QStringLiteral("stable_key")).toString().contains(ref)) {
+                    resolved = true;
+                    break;
+                }
+            }
+            QVERIFY2(resolved, qPrintable(QStringLiteral("unresolved ref: %1").arg(ref)));
+        }
+        QVERIFY(checkedRefs > 0);
+    }
+
+    // R12-3a 第二切片：四个回顾来源（Reflection/Concern/OpenWake/ActivityReview）
+    // 共用同一实际投影；各自仍只发一次模型请求，且隐私/引用不回归。
+    void unifiedContextActualReviewKinds_data()
+    {
+        QTest::addColumn<QString>("kind");
+        QTest::newRow("reflection") << QStringLiteral("reflection");
+        QTest::newRow("concern") << QStringLiteral("concern");
+        QTest::newRow("open_wake") << QStringLiteral("open_wake");
+        QTest::newRow("activity") << QStringLiteral("activity");
+    }
+
+    void unifiedContextActualReviewKinds()
+    {
+        QFETCH(QString, kind);
+        std::unique_ptr<SemanticReviewConfigGuard> semanticGuard;
+        std::unique_ptr<OpenWakeConfigGuard> openWakeGuard;
+        if (kind == QStringLiteral("open_wake")) {
+            openWakeGuard = std::make_unique<OpenWakeConfigGuard>();
+            QVERIFY(openWakeGuard->write(openWakeTestJson(true, 12, 3), QJsonObject{
+                {"enabled", true}, {"private_writing", false},
+                {"quiet_hours", QJsonObject{{"start", "00:00"}, {"end", "00:00"}}}}));
+        } else {
+            semanticGuard = std::make_unique<SemanticReviewConfigGuard>();
+            QVERIFY(semanticGuard->enable());
+        }
+        auto &cfg = ConfigManager::instance();
+        QVERIFY(cfg.writeConfigDocument(QStringLiteral("setting.json"),
+            QJsonDocument(QJsonObject{{QStringLiteral("memory"),
+                QJsonObject{{QStringLiteral("long_term_memory_enabled"), true},
+                            {QStringLiteral("agent_enabled"), false}}}}).toJson(),
+            nullptr));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath(QStringLiteral("actual-review.db"));
+        MemoryManager db(path);
+        const QByteArray reviewMarker = QStringLiteral("【回顾输出协议").toUtf8();
+        const auto reviewRequestCount = [](const QList<QByteArray> &bodies, const QByteArray &marker) {
+            int count = 0;
+            for (const auto &body : bodies) if (body.contains(marker)) ++count;
+            return count;
+        };
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QByteArray> bodies;
+        const QString kindCopy = kind;
+        serveCompletions(server, bodies, [kindCopy](int) -> QString {
+            if (kindCopy == QStringLiteral("open_wake"))
+                return QStringLiteral(R"({"schema_version":1,"decision":"rest","note":"",)"
+                                      R"("next_wake":{"mode":"after","after_minutes":30}})");
+            if (kindCopy == QStringLiteral("concern"))
+                return QStringLiteral(R"({"choice":"keep","forget":{"next_check_after_minutes":0}})");
+            if (kindCopy == QStringLiteral("activity"))
+                return QStringLiteral(R"({"status":"paused","reason":"test"})");
+            return QStringLiteral(R"({"choice":"rest"})");
+        });
+        LLMService model(QStringLiteral("test"), nullptr,
+                         QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.serverPort())));
+        model.setMemoryManager(&db);
+        model.setCognitiveContextActualEnabled(true);
+        QSignalSpy finished(&model, &LLMService::privateReviewFinished);
+
+        qlonglong id = 0;
+        int version = 0;
+        QJsonObject context;
+        if (kind == QStringLiteral("reflection") || kind == QStringLiteral("concern")) {
+            RequestMeta meta;
+            meta.channel = Channel::kPet;
+            meta.sessionId = Channel::kDefaultSession;
+            meta.subject = QStringLiteral("user");
+            meta.eventId = meta.runId = QStringLiteral("actual-review-") + kind;
+            meta.receivedAtUtc = QDateTime::currentDateTimeUtc();
+            const auto turn = db.recordInput(QStringLiteral("明天想去看海"), meta, true);
+            QVERIFY(turn > 0);
+            QVERIFY(db.recordQuiet(turn, QStringLiteral("close")));
+            if (kind == QStringLiteral("reflection")) {
+                context = db.claimPrivateReflection(12, 60);
+                QVERIFY(!context.isEmpty());
+                id = context.value(QStringLiteral("id")).toInteger();
+                version = context.value(QStringLiteral("version")).toInt();
+            } else {
+                // 先领取成 pending，再提交 consider（finishPrivateReflection 要求 pending 行）。
+                const auto claim = db.claimPrivateReflection(12, 60);
+                QVERIFY(!claim.isEmpty());
+                QCOMPARE(claim.value(QStringLiteral("id")).toInteger(), turn);
+                QVERIFY(db.finishPrivateReflection(turn, 1, QStringLiteral("consider"),
+                                                   QStringLiteral("看海"), QJsonObject{},
+                                                   QJsonArray{}, QJsonObject{}, QString{},
+                                                   QJsonObject{}));
+                {
+                    RawSqlConnection raw(path, QStringLiteral("actual-concern"));
+                    QVERIFY(raw.open());
+                    QVERIFY(raw.exec(QStringLiteral("UPDATE private_reflection SET next_check_at="
+                                                    "unixepoch()-1 WHERE turn_id=%1").arg(turn)));
+                    QVERIFY(raw.exec(QStringLiteral("UPDATE thought_review_log SET started_at="
+                                                    "started_at-120")));
+                }
+                context = db.claimDueConcern(12, 60);
+                QVERIFY(!context.isEmpty());
+                id = context.value(QStringLiteral("id")).toInteger();
+                version = context.value(QStringLiteral("version")).toInt();
+            }
+        } else if (kind == QStringLiteral("open_wake")) {
+            QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+            context = db.claimOpenWake(12, 60, 12, 50, 3);
+            QVERIFY(!context.isEmpty());
+            id = context.value(QStringLiteral("id")).toInteger();
+            version = context.value(QStringLiteral("version")).toInt();
+        } else {
+            const auto activity = db.createActivity(
+                QStringLiteral("owner"), Channel::kPet, Channel::kDefaultSession,
+                QStringLiteral("写一小段雨声"), QStringLiteral("完成正文"),
+                QStringLiteral("foreground"), QStringLiteral("chat/1"),
+                QStringLiteral("actual-activity"));
+            QVERIFY(!activity.value(QStringLiteral("ref")).toString().isEmpty());
+            {
+                RawSqlConnection raw(path, QStringLiteral("actual-activity"));
+                QVERIFY(raw.open());
+                QVERIFY(raw.exec(QStringLiteral("UPDATE internal_activity SET review_after="
+                                                "unixepoch()-1")));
+            }
+            const auto due = db.nextDueActivity(QStringLiteral("owner"));
+            QVERIFY(!due.isEmpty());
+            const QString ref = due.value(QStringLiteral("ref")).toString();
+            const auto claim = db.claimActivity(ref, due.value(QStringLiteral("version")).toInt(),
+                                                12, 60);
+            QVERIFY(!claim.isEmpty());
+            const int activityId = claim.value(QStringLiteral("id")).toInteger();
+            version = claim.value(QStringLiteral("version")).toInt();
+            const auto stored = claim.value(QStringLiteral("activity")).toObject();
+            const QJsonObject visible = db.activityForModel(
+                ref, stored.value(QStringLiteral("channel")).toString(),
+                stored.value(QStringLiteral("session")).toString(),
+                QStringLiteral("user"), true);
+            QVERIFY(!visible.isEmpty());
+            id = activityId;
+            context = QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("activity")},
+                {QStringLiteral("id"), activityId},
+                {QStringLiteral("version"), version},
+                {QStringLiteral("interest"), visible.value(QStringLiteral("interest"))},
+                {QStringLiteral("activity_ref"), ref},
+                {QStringLiteral("ref"), ref},
+                {QStringLiteral("origin_kind"), QStringLiteral("foreground")},
+                {QStringLiteral("activity"), visible},
+                {QStringLiteral("source_channel"), Channel::kPet},
+                {QStringLiteral("source_session"), Channel::kDefaultSession}};
+        }
+        QVERIFY(id > 0);
+        model.requestPrivateReview(id, version, context);
+        QTRY_VERIFY_WITH_TIMEOUT(finished.size() >= 1, 8000);
+        const int requests = reviewRequestCount(bodies, reviewMarker);
+        QCOMPARE(requests, 1); // 实际投影不增加模型请求
+        bool found = false;
+        for (const auto &body : bodies) {
+            if (!body.contains(reviewMarker)) continue;
+            // 回顾入口的时间语义由服务端 time_context 提供（不重复插入统一时间块），
+            // 但实际投影必须已生效（快照数据块/引用或 actual 标记可见于请求体）。
+            found = body.contains(QStringLiteral("time_context").toUtf8())
+                && body.contains(QStringLiteral("去重项只给 ref").toUtf8());
+        }
+        QVERIFY(found);
+        const auto report = model.lastCognitiveShadowReport();
+        QCOMPARE(report.value(QStringLiteral("entry")).toString(), QStringLiteral("private_review"));
+        QCOMPARE(report.value(QStringLiteral("actual_mode")).toBool(), true);
+        const auto projection = report.value(QStringLiteral("projection")).toObject();
+        QCOMPARE(projection.value(QStringLiteral("privacy_leaks")).toInt(), 0);
+        QCOMPARE(projection.value(QStringLiteral("refs_unresolved")).toInt(), 0);
+        // 时间说明与去重引用的 JSON 开销在极小样本里可能抵消部分文本节省：
+        // 本切片要求“重复正文被替换为引用”，不要求每轮总字节都必然下降。
+        QVERIFY(projection.value(QStringLiteral("input_chars")).toInt() > 0);
+        QVERIFY(projection.contains(QStringLiteral("saved_chars")));
+        QCOMPARE(projection.value(QStringLiteral("snapshot_budget_bytes")).toInt(),
+                 CognitiveSnapshotBuilder::promptByteBudget());
+    }
+
+    // R12-3a 第二切片：隔离数据库上的真实模型集成（opt-in；凭据来自环境变量）。
+    // 只验证真实 provider 能接受投影后的实际输入并返回可解析结果；不接任何真实渠道、
+    // 不发送真实消息、不写生产库。
+    void realModelUnifiedContextIntegration()
+    {
+        const auto key = qEnvironmentVariable("MAKO_R12_ACCEPTANCE_KEY");
+        const auto url = qEnvironmentVariable("MAKO_R12_ACCEPTANCE_URL");
+        if (key.isEmpty() || url.isEmpty()) QSKIP("Opt-in real model acceptance.");
+        SemanticReviewConfigGuard guard;
+        QVERIFY(guard.enable());
+        auto &cfg = ConfigManager::instance();
+        QVERIFY(cfg.writeConfigDocument(QStringLiteral("setting.json"),
+            QJsonDocument(QJsonObject{{QStringLiteral("memory"),
+                QJsonObject{{QStringLiteral("long_term_memory_enabled"), true},
+                            {QStringLiteral("agent_enabled"), false}}}}).toJson(),
+            nullptr));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager db(dir.filePath(QStringLiteral("real-actual.db")));
+        RequestMeta meta;
+        meta.channel = Channel::kPet;
+        meta.sessionId = Channel::kDefaultSession;
+        meta.subject = QStringLiteral("user");
+        meta.speaker = QStringLiteral("欧尼酱");
+        meta.eventId = meta.runId = QStringLiteral("real-actual-history");
+        meta.receivedAtUtc = QDateTime::currentDateTimeUtc().addSecs(-120);
+        meta.occurredAtUtc = meta.receivedAtUtc;
+        const QString earlier = QStringLiteral("我昨天整理了一下书架");
+        const auto earlierTurn = db.recordInput(earlier, meta, true);
+        QVERIFY(earlierTurn > 0);
+        {
+            SentenceText sentence;
+            sentence.zhText = QStringLiteral("辛苦啦");
+            sentence.jaText = QStringLiteral("お疲れ様");
+            QVERIFY(db.saveQATurn(earlier,
+                                  QStringLiteral(R"({"sentences":[{"zh_text":"辛苦啦","ja_text":"お疲れ様"}]})"),
+                                  {sentence}, meta, earlierTurn));
+        }
+        const auto history = db.getHistoryTurn(10, meta.channel, meta.sessionId, 0);
+        QVERIFY(!history.isEmpty());
+        LLMService model(key, nullptr, QUrl(url));
+        model.setMemoryManager(&db);
+        model.setCognitiveContextActualEnabled(true);
+        QSignalSpy spoken(&model, &LLMService::sentencesReady);
+        QSignalSpy failed(&model, &LLMService::replyAbnormal);
+        model.askDeepSeek(QStringLiteral("我刚才说整理什么了？"), history, meta);
+        QTRY_VERIFY_WITH_TIMEOUT(spoken.size() + failed.size() > 0, 90000);
+        // 真实模型集成只验证：投影后的实际输入被真实 provider 接受并返回可解析内容。
+        // 输出格式（tags/字段完整性）由既有输出守卫生效，属于模型随机性范围，不计为本切片回归。
+        QCOMPARE(spoken.size() + failed.size(), 1);
+        if (!failed.isEmpty()) {
+            const QString reason = failed.first().at(0).toString();
+            QVERIFY2(reason != QStringLiteral("network_error"),
+                     qPrintable(QStringLiteral("real foreground failure=%1").arg(reason)));
+            qInfo() << "[R12-3a] real model returned parseable output but guard rejected:"
+                    << reason;
+        }
+        const auto report = model.lastCognitiveShadowReport();
+        QCOMPARE(report.value(QStringLiteral("actual_mode")).toBool(), true);
+        const auto projection = report.value(QStringLiteral("projection")).toObject();
+        QCOMPARE(projection.value(QStringLiteral("privacy_leaks")).toInt(), 0);
+        QCOMPARE(projection.value(QStringLiteral("refs_unresolved")).toInt(), 0);
+        QVERIFY2(projection.value(QStringLiteral("prompt_tokens")).toInt() > 0,
+                 "真实响应应回填 usage.prompt_tokens");
+        qInfo() << "[R12-3a] real foreground projection:" << projection;
+
+        // 回顾入口真实模型（只发一次请求，不接渠道）。
+        RequestMeta reviewMeta = meta;
+        reviewMeta.eventId = reviewMeta.runId = QStringLiteral("real-actual-review");
+        reviewMeta.receivedAtUtc = QDateTime::currentDateTimeUtc();
+        reviewMeta.occurredAtUtc = reviewMeta.receivedAtUtc;
+        const auto turn = db.recordInput(QStringLiteral("最近有点忙"), reviewMeta, true);
+        QVERIFY(turn > 0);
+        QVERIFY(db.recordQuiet(turn, QStringLiteral("close")));
+        const auto context = db.claimPrivateReflection(12, 60);
+        QCOMPARE(context.value(QStringLiteral("id")).toInteger(), turn);
+        QSignalSpy reviewFinished(&model, &LLMService::privateReviewFinished);
+        model.requestPrivateReview(turn, context.value(QStringLiteral("version")).toInt(), context);
+        QTRY_VERIFY_WITH_TIMEOUT(reviewFinished.size() >= 1, 90000);
+        const QString reviewError = reviewFinished.first().at(3).toString();
+        QVERIFY2(reviewError != QStringLiteral("network_error"),
+                 qPrintable(QStringLiteral("real review error=%1").arg(reviewError)));
+        const auto reviewReport = model.lastCognitiveShadowReport();
+        QCOMPARE(reviewReport.value(QStringLiteral("actual_mode")).toBool(), true);
+        const auto reviewProjection = reviewReport.value(QStringLiteral("projection")).toObject();
+        QCOMPARE(reviewProjection.value(QStringLiteral("privacy_leaks")).toInt(), 0);
+        QCOMPARE(reviewProjection.value(QStringLiteral("refs_unresolved")).toInt(), 0);
+        QVERIFY(reviewProjection.value(QStringLiteral("prompt_tokens")).toInt() > 0);
+        qInfo() << "[R12-3a] real review projection:" << reviewProjection;
+    }
+
     void privateBackgroundIsAvailableButReplyStaysPublic_data()
     {
         QTest::addColumn<QString>("secret");

@@ -1393,8 +1393,11 @@ private slots:
         }
 
         // (2) allow_contact=true 但当前处于安静时段：quiet 是可恢复失败，提案保持 verified。
-        QVERIFY(identity.enableOpenWakeContact(true, -1, QStringLiteral("00:00"),
-                                               QStringLiteral("23:59")));
+        // 安静窗口按“当前时刻 ±2 分钟”动态构造，避免 23:59 这类边界让测试依赖运行时刻。
+        const QTime quietNow = QTime::currentTime();
+        QVERIFY(identity.enableOpenWakeContact(true, -1,
+                                               quietNow.addSecs(-120).toString(QStringLiteral("HH:mm")),
+                                               quietNow.addSecs(120).toString(QStringLiteral("HH:mm"))));
         const QString runB = QUuid::createUuid().toString(QUuid::WithoutBraces);
         const qlonglong wakeB = seedOpenWakeRow(path, QStringLiteral("vg-quiet"), runB);
         const QString keyB = persistVerifiedProposal(

@@ -57,6 +57,14 @@ public:
                                                   : m_cognitiveShadowReports.last().toObject();
     }
     QJsonArray cognitiveShadowReports() const { return m_cognitiveShadowReports; }
+    // ===== R12-3a 第二切片：统一目录实际接管模型数据块（默认关闭，可回退）=====
+    // 打开后仅替换“认知快照数据块”和“跨渠道记忆资料块”，并追加统一时间/权限说明；
+    // CURRENT_UNDERSTANDING/MEMORY_DATA/短期历史/关注/活动/提醒/工具协议保持原逻辑。
+    // 可通过 MAKO_COGNITIVE_CONTEXT_ACTUAL=1 进程启动时打开；不增加模型请求。
+    void setCognitiveContextActualEnabled(bool enabled);
+    bool cognitiveContextActualEnabled() const;
+    int modelRequestCount() const { return m_modelRequestCount; }
+    QJsonObject lastEvidenceDirectory() const { return m_run.evidence; }
     // 当前被授予的能力清单：由 ConfigManager 配置与服务端状态生成（只读）。
     // 前台提示词与私下回顾共用同一份数据源，避免两处各说一套。
     QJsonObject capabilityManifest(const RequestMeta &meta) const;
@@ -289,7 +297,11 @@ private:
     bool m_benchmarkChatOnly = false;
     bool m_cognitiveShadowEnabled = false;
     bool m_cognitiveShadowEnvChecked = false;
-    QJsonArray m_cognitiveShadowReports; // 最近 N 次 shadow 报告（只观测；生产默认关闭）
+    QJsonArray m_cognitiveShadowReports; // 最近 N 次 shadow/actual 报告（生产默认关闭）
+    bool m_cognitiveContextActualEnabled = false;
+    bool m_cognitiveContextActualEnvChecked = false;
+    int m_modelRequestCount = 0;
+    void patchLastActualPromptTokens(const QJsonObject &usage);
     QJsonArray m_pendingMessages; // legacy：等待 MemoryAgent 的主请求
     quint64 m_agentGeneration = 0;
     bool m_agentPending = false;

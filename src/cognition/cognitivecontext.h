@@ -269,6 +269,69 @@ struct ShadowComparison
     QJsonObject toJson() const;
 };
 
+// ===== R12-3a 第二切片：实际模型输入的投影 =====
+//
+// 第一切片只做 shadow；第二切片把统一证据目录投影成实际 messages 的数据块：
+//   * 快照数据块（同域形状）——同一身份若已由短期历史/最近群消息/当前输入完整序列化，
+//     这里只给 ref + 时间 + 语义说明，不重复完整文本；
+//   * 跨渠道私密证据块——同上，已完整出现过的只保留 ref；
+//   * MEMORY_DATA 继续由既有 PromptAssembler 生成（派生语义记录，与原始事件不是同一身份），
+//     本切片不重写它的形状，避免破坏 evidence_decision/consult 的既有契约；
+//   * 统一时间/权限最小说明。
+// 投影只改变“文本放哪里”，不删除任何证据引用，也不改变 evidence 目录（模型引用的
+// ref 仍按旧解析路径查得到）。
+struct CognitiveProjectionStats
+{
+    bool actualMode = false;
+    QString entry;
+    int baselineChars = 0;       // 同轮旧组装 messages 总字符
+    int baselineBytes = 0;
+    int inputChars = 0;          // 投影后实际 messages 总字符
+    int inputBytes = 0;
+    int savedChars = 0;
+    int savedBytes = 0;
+    int promptTokens = -1;       // 真实响应 usage.prompt_tokens（可获得时）
+    int duplicateEvidenceCount = 0;   // 目录中 usages>=2 的身份数
+    int duplicateEntriesOmitted = 0;  // 因已完整序列化而改写为引用的条目数
+    int effectiveEvidenceCount = 0;   // 实际完整给出文本的唯一身份数（本投影内）
+    int refsEmitted = 0;
+    int refsResolved = 0;
+    int refsUnresolved = 0;
+    int privacyFiltered = 0;
+    int privacyLeaks = 0;
+    qint64 buildMs = 0;
+    int modelRequests = 0;       // 由调用方填；用于断言“不额外增加请求”
+    int snapshotBudgetBytes = 4096;
+    bool snapshotBudgetTrimmed = false;
+    QHash<QString, int> domainKept; // 每域完整条目数
+    QJsonObject toJson() const;
+};
+
+struct CognitiveProjectionOptions
+{
+    QString entry;
+    bool ownerPrivate = true;
+    // 已经由更权威/更原始消息完整序列化的身份（stableKey）。投影遇到这些身份时只给 ref。
+    QSet<QString> alreadySerialized;
+    int snapshotBudgetBytes = 4096;
+};
+
+struct CognitiveProjection
+{
+    QJsonObject snapshotJson;        // 快照数据块（与 CognitiveSnapshotBuilder::toPromptJson 同域形状）
+    QJsonArray privateEvidenceItems; // 跨渠道私密证据 items（可含 duplicate_ref_only 项）
+    QString unifiedTimeBlock;        // 统一时间/权限最小 system 说明
+    CognitiveProjectionStats stats;
+    QJsonObject toJson() const;
+};
+
+// 计算实际模型输入投影。纯内存：不读库、不发请求、不写库。
+CognitiveProjection projectModelInput(const CognitiveContext &context,
+                                      const CognitiveProjectionOptions &options);
+
+// 从投影里收集模型可见的 ref 字符串（用于引用解析率统计/测试）。
+QStringList projectionRefs(const CognitiveProjection &projection);
+
 // shadow 输入。所有材料都来自调用方已经读取的视图；builder 不额外查库、不发请求。
 struct CognitiveContextRequest
 {

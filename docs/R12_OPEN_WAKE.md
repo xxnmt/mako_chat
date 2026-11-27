@@ -13,7 +13,8 @@
 | R12-2a 通用 ActionOrigin/Proposal、Evidence Purpose、统一核验 | **已完成（源码+测试已提交）** | v32 `action_proposal`；不发送、不接 Outbox；生产库仍 v31，待 R12-2b 受控迁移 |
 | R12-2b OpenWake 联系/内部活动分享提交、Outbox、回执 | **已完成（源码+测试已提交）** | v32；allow_contact 默认 false；只入 Outbox，受控测试用 mock；生产库已 v32、零新发送 |
 | R12-2c 行动一致性与认知连续性修正 | **已完成（源码+测试已提交）** | v33 仅代码/测试；生产库仍 v32 迁移待独立评审，2026-11-27 生产库备份副本已升 v33 验证 |
-| R12-3a 统一认知上下文与证据目录（第一切片） | **已完成（shadow；源码+测试已提交）** | 不替换生产 prompt、不新增 schema、不删除旧模块；见 [设计](R12_3A_CONTEXT_DESIGN.md)/[盘点](R12_3A_SOURCE_INVENTORY.md) |
+| R12-3a 第一切片（shadow） | **已完成（源码+测试已提交）** | 不替换生产 prompt、不新增 schema、不删除旧模块；见 [设计](R12_3A_CONTEXT_DESIGN.md)/[盘点](R12_3A_SOURCE_INVENTORY.md) |
+| R12-3a 第二切片（实际模型输入投影） | **已完成（默认关闭、可回退；源码+测试已提交）** | 仅接管前台/回顾的快照块与跨渠道证据块；CURRENT_UNDERSTANDING/MEMORY_DATA/历史/工具/行动链未改；见设计文档 §9 |
 | R12-3b 逐模块替换/状态连续性 | 未开始 | 按用户要求后置，不提前开始 |
 
 ## R12-1a 补充修正（已独立提交）
@@ -149,4 +150,31 @@
 - **未做/边界**：未替换 `CURRENT_UNDERSTANDING`/`MEMORY_DATA`/快照/旧历史；工具轮、matter consult、
   行动核验、Outbox 回执入口尚未运行时接 shadow；生产规模 shadow 数据待后续受控运行观察；
   逐模块替换建议见 [设计文档](R12_3A_CONTEXT_DESIGN.md) §8，需另行授权。
+
+## R12-3a 第二切片：统一目录实际投影（2026-11-28）
+
+在第一切片之上，把统一证据目录实际投影进模型输入；**默认关闭、可回退**，生产配置未改。
+
+- **开关**：`MAKO_COGNITIVE_CONTEXT_ACTUAL=1` 或 `LLMService::setCognitiveContextActualEnabled(true)`；
+  默认关闭时行为与旧逻辑一致。
+- **实际接管**：前台 `prepareReply` 的“认知快照数据块”和“跨渠道记忆资料块”改为
+  `projectModelInput()` 投影：已由短期历史/最近群消息/当前输入完整序列化的同一身份只给
+  `ref`+`duplicate_note`；跨渠道证据同理；前台新增一条统一时间/权限最小说明。
+  私下回顾（Reflection/Concern/OpenWake/ActivityReview 共用 `generatePrivateReview`）的快照块
+  同理改为引用，时间语义继续使用既有服务端 `time_context`。
+- **未接管**：`CURRENT_UNDERSTANDING`、`MEMORY_DATA`、短期历史、`RECENT_GROUP_CONTEXT`、
+  关注/活动/提醒/能力清单、`memory_recall`/`memory_read` 工具协议、matter consult、
+  `VerificationBinding`/`ActionPolicy`、Outbox/Reminder 执行链——保留原逻辑与引用契约；
+  actual 投影不删除任何 evidence 引用，去重后 `refs_unresolved=0`。
+- **指标**：报告 `lastCognitiveShadowReport()` 的 `actual_mode=true` + `projection`
+  （input chars/bytes、基线 chars/bytes、duplicate evidence、改写条目、refs emitted/resolved、
+  privacy、各域保留、build_ms、model_requests、prompt_tokens 真实回填）。
+- **验证**：全量 `ctest 24/24`（127s）；`tst_cognitivecontext 20 passed`；
+  `tst_memoryagent 120 passed/5 skipped`（opt-in 真实模型/真实库未设环境时 skip）；
+  `tst_memorymanager 157 passed/1 skipped`。新增前台/回顾四来源/真实模型隔离库集成测试：
+  前台 mock fixture saved_chars 479、dup_omitted 10、refs 3/3；真实 provider prompt_tokens
+  3403（前台）/1980（回顾），无网络错误、无真实渠道消息。
+- **风险**：短上下文下 saved_bytes 可能为负（统一时间说明/JSON 引用开销）；actual+tool
+  模式、actual 开启下的真实行动链未单独覆盖；生产默认仍关闭，需运行观察后再切默认。
+  旧机制退役条件见设计文档 §9.7，本轮不删除旧模块。
 

@@ -540,3 +540,32 @@ B5 节奏按报告修正：固定提交基线 → 2–4h 受控冒烟（self_des
   `docs/R12_3A_SOURCE_INVENTORY.md`、`docs/R12_3A_CONTEXT_DESIGN.md`。
   未替换/删除 `CURRENT_UNDERSTANDING`/`MEMORY_DATA`/快照/历史；未进入 R12-3b、Matter 重构、Vision、
   后台通用工具循环或完整 Attention 重构。
+
+---
+
+## 2026-11-28 · R12-3a 第二切片：统一目录实际投影（默认关闭）
+
+- **同步远端**：`d590531`（R12-2c-final 基线/覆盖文档）、`f0824d2`（R12-3a 第一切片）已确认
+  `origin/main=f0824d2`；本轮在其上继续。
+- **实际接管**：新增 `projectModelInput()`/`CognitiveProjection`（统一证据目录 → 实际模型输入）：
+  前台快照块与跨渠道证据块、回顾（Reflection/Concern/OpenWake/ActivityReview 共用）快照块改为
+  “已完整序列化的身份只给 ref + duplicate_note”，前台补统一时间/权限最小说明；
+  `LLMService::setCognitiveContextActualEnabled`（`MAKO_COGNITIVE_CONTEXT_ACTUAL=1`，默认关闭）。
+  未改 `CURRENT_UNDERSTANDING`/`MEMORY_DATA`/历史/工具/consult/行动核验/Outbox/Reminder 数据通路；
+  去重不删 evidence 引用，`refs_unresolved=0`。
+- **指标**：报告 `actual_mode=true` + `projection`：input/baseline chars+bytes、saved、duplicate
+  evidence/改写条目、refs emitted/resolved、privacy、域保留、build_ms、model_requests、
+  provider `prompt_tokens` 真实回填。
+- **测试**：`tst_cognitivecontext` 新增 4 个投影单测（20 passed）；`tst_memoryagent` 新增
+  前台 actual 对比、回顾四来源、隔离库真实模型集成（`realModelUnifiedContextIntegration`，
+  opt-in）；全量 `ctest 24/24`（127.23s），`tst_memoryagent 120 passed/5 skipped`、
+  `tst_memorymanager 157 passed/1 skipped`。
+  真实 provider：前台 prompt_tokens=3403、回顾=1980；mock 前台 saved_chars=479、dup_omitted=10、
+  refs 3/3；回顾四来源各 1 次请求、无隐私泄漏。短上下文 saved_bytes 可能为负（时间说明/JSON 引用
+  开销），验收口径为“重复正文只序列化一次 + 引用可解析”，不删必要资料。
+- **修复**：`tst_actionoutbox::verifiedContactHonorsSwitchesAndGate` 的固定 00:00–23:59 安静窗口
+  在 23:59 分钟会失败，改为当前时刻 ±2 分钟动态构造（测试脆弱性，非产品语义）。
+- **生产**：库/配置未改（v33、contact_daily_limit=0、snapshot_budget_bytes=4096，哈希/mtime 与
+  基线一致）；未启动应用、未发真实渠道消息；actual 默认关闭，可回退。
+- **未做/风险**：actual+tool 模式、actual 开启下真实行动链未单独覆盖；生产默认切换留待运行观察；
+  旧机制（旧快照 JSON/原样证据块/shadow 对照/`m_run.evidence`）按设计 §9.7 条件退役，本轮不删。
