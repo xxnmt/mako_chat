@@ -508,3 +508,13 @@ B5 节奏按报告修正：固定提交基线 → 2–4h 受控冒烟（self_des
 - internal share 绑定真实 completed artifact/version/hash，只入 Outbox；legacy 分享保留。
 - actionSettled 支持 wake/activity，recordActionReceipt 幂等回写；unknown 不重发；启动 drain/对账。
 - 验证：`ctest 23/23`；`tst_memorymanager 146/1 skipped`、`tst_memoryagent 94`、`tst_actionoutbox 20`、`tst_actionpolicy 17`、`tst_cognitivesnapshot 15`。生产 v31→v32 迁移，行数不变，默认零新发送。未做真实目标发送/R12-3/后台 tool loop。
+
+---
+
+## 2026-11-27 · R12-2c 行动一致性与认知连续性
+
+- c1 verifier/repair：完整证据预算/不截断 JSON、request_id/action_key/origin/runId/payload_digest 关联、严格枚举、迟到请求隔离、自由重写 repair 默认 fail closed、semantic_status 白名单。
+- c2 v33 + Fence：verified 指纹持久化、提交事务内重读复验、额度并发/ledger 回滚、action_key 幂等身份；action_context_epoch 持久 attention_state（主人私聊/事实更正/撤回 bump，群聊不 bump）；claimOutbox/sender/QQ 入队前逐层复验，withheld/unknown/failed 不可重领。
+- c3 回执/历史/恢复：DB 权威 receipt + 同事务历史投影 + history_projected 幂等；对账不饿死；旧 wake 不覆盖新；分享回执绑定成果版本/哈希；分享意图崩溃恢复有界/节流/失效；每尝试 run_id；迟到失败版本隔离；next_due UTC/local/epoch。
+- 集成修复：VerifierVerdict 命名空间；thought_review_log 无 id 列，runId 回填改用 rowid/来源 fallback。
+- 验证：`ctest 23/23`；`tst_memorymanager 154/1 skipped`、`tst_memoryagent 100`、`tst_actionoutbox 38`、`tst_actionpolicy 18`、`tst_cognitivesnapshot 15`。生产库仍 v32、应用未启动、无真实发送；v33 待独立评审迁移。

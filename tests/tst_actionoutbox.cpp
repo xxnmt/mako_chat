@@ -1945,6 +1945,493 @@ private slots:
         }
     }
 
+    // ===== R12-2c-3：回执与认知历史闭环 =====
+
+    // A17：同一 action_key 重复成功回执/对账只写一条主动历史；history_projected 置 1。
+    void receiptDuplicateProjectsHistoryOnce()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableOpenWakeContact(true));
+        const QString path = dir.filePath(QStringLiteral("a17-receipt.db"));
+        MemoryManager db(path);
+        const QString message = QStringLiteral("晚安，早点睡。");
+        const QString key = seedCommittedWakeContact(db, path, QStringLiteral("a17-wake"), message);
+        QVERIFY(!key.isEmpty());
+        const auto job = db.claimOutbox(QStringLiteral("a17-sender"), 300);
+        QCOMPARE(job.value(QStringLiteral("action_key")).toString(), key);
+        QVERIFY(db.settleOutboxAction(key, QStringLiteral("handed_off")));
+        // 第一次回执写历史；随后重复回执 + 两次启动对账都不得重复写。
+        QVERIFY(db.recordActionReceipt(key, QStringLiteral("handed_off"), QStringLiteral("ok")));
+        QVERIFY(db.recordActionReceipt(key, QStringLiteral("handed_off"), QStringLiteral("ok")));
+        QVERIFY(db.reconcileActionReceipts() >= 0);
+        {
+            const QString historyRef = key.section(QLatin1Char(':'), 0, 2);
+            RawDb raw(path, QStringLiteral("a17-post"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT count(*) FROM chat_history WHERE turn_kind='proactive' "
+                         "AND json_extract(raw_reply,'$.delivery.kind')='contact' "
+                         "AND json_extract(raw_reply,'$.delivery.ref')='")
+                         + historyRef + QStringLiteral("'")).toInt(),
+                     1);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT history_projected FROM action_proposal "
+                                               "WHERE action_key='")
+                                    + key + QStringLiteral("'")).toInt(),
+                     1);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM delivery_ledger "
+                                               "WHERE kind='contact' AND ref='")
+                                    + key + QStringLiteral("'")).toString(),
+                     QStringLiteral("handed_off"));
+        }
+    }
+
+    // A18：unknown 冻结后迟到的成功回执不得写成功历史、也不得重发。
+    void lateSuccessAfterUnknownNeverWritesHistory()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableOpenWakeContact(true));
+        const QString path = dir.filePath(QStringLiteral("a18-unknown.db"));
+        MemoryManager db(path);
+        const QString key = seedCommittedWakeContact(db, path, QStringLiteral("a18-wake"),
+                                                     QStringLiteral("在吗？"));
+        QVERIFY(!key.isEmpty());
+        const auto job = db.claimOutbox(QStringLiteral("a18-sender"), 300);
+        QCOMPARE(job.value(QStringLiteral("action_key")).toString(), key);
+        QVERIFY(db.settleOutboxAction(key, QStringLiteral("unknown"),
+                                      QStringLiteral("timeout")));
+        QVERIFY(db.recordActionReceipt(key, QStringLiteral("unknown")));
+        {
+            RawDb raw(path, QStringLiteral("a18-before-late"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM chat_history "
+                                               "WHERE turn_kind='proactive'")).toInt(),
+                     0);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT history_projected FROM action_proposal "
+                                               "WHERE action_key='")
+                                    + key + QStringLiteral("'")).toInt(),
+                     0);
+        }
+        // 迟到的明确接受：状态机冻结（settle 返回 true 但不改状态）。
+        QVERIFY(db.settleOutboxAction(key, QStringLiteral("protocol_accepted")));
+        QVERIFY(db.recordActionReceipt(key, QStringLiteral("protocol_accepted")));
+        {
+            RawDb raw(path, QStringLiteral("a18-post"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM chat_history "
+                                               "WHERE turn_kind='proactive'")).toInt(),
+                     0);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT history_projected FROM action_proposal "
+                                               "WHERE action_key='")
+                                    + key + QStringLiteral("'")).toInt(),
+                     0);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM cognitive_action WHERE action_key='")
+                                    + key + QStringLiteral("'")).toString(),
+                     QStringLiteral("unknown"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT last_outcome FROM cognitive_action "
+                                               "WHERE action_key='")
+                                    + key + QStringLiteral("'")).toString(),
+                     QStringLiteral("unknown"));
+        }
+        // 不重发：unknown 行不可再领取。
+        QVERIFY(db.claimOutbox(QStringLiteral("a18-after"), 60).isEmpty());
+        // 不存在的动作：只审计，绝不写 ledger（存在性校验）。
+        {
+            RawDb raw(path, QStringLiteral("a18-missing-before"));
+            QVERIFY(raw.open());
+            const int ledgerBefore = raw.scalar(QStringLiteral(
+                "SELECT count(*) FROM delivery_ledger WHERE kind='contact'")).toInt();
+            QVERIFY(raw.open());
+            QVERIFY(!db.recordActionReceipt(QStringLiteral("wake:999999:1:contact"),
+                                            QStringLiteral("handed_off")));
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT count(*) FROM delivery_ledger WHERE kind='contact'")).toInt(),
+                     ledgerBefore);
+            // 未提交（无提案）的新来源动作：不能借回执把状态写进 ledger/历史。
+            const QString uncommittedKey = QStringLiteral("wake:888888:1:contact");
+            QVERIFY(raw.execPrepared(
+                QStringLiteral("INSERT INTO cognitive_action(action_key,kind,subject,channel,"
+                               "session_id,payload_json,state,last_outcome) "
+                               "VALUES(?,'OpenWakeContact','user','pet','default',"
+                               "'{\"message\":\"未提交\"}','handed_off','handed_off')"),
+                {uncommittedKey}));
+            QVERIFY(raw.execPrepared(
+                QStringLiteral("INSERT INTO action_outbox(action_id,action_key,channel,"
+                               "session_id,payload_json,state) "
+                               "SELECT id,?,'pet','default','{}','dispatched' FROM cognitive_action "
+                               "WHERE action_key=?"),
+                {uncommittedKey, uncommittedKey}));
+            QVERIFY(!db.recordActionReceipt(uncommittedKey, QStringLiteral("handed_off")));
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT count(*) FROM delivery_ledger WHERE kind='contact'")).toInt(),
+                     ledgerBefore);
+        }
+    }
+
+    // A19：回执已落库但历史投影前崩溃 → 重启对账补齐且唯一；已投影不回退、不重复。
+    void receiptHistoryCrashIsReconciledOnce()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableOpenWakeContact(true));
+        const QString path = dir.filePath(QStringLiteral("a19-crash.db"));
+        QString key;
+        {
+            MemoryManager db(path);
+            key = seedCommittedWakeContact(db, path, QStringLiteral("a19-wake"),
+                                           QStringLiteral("我出门了。"));
+            QVERIFY(!key.isEmpty());
+            const auto job = db.claimOutbox(QStringLiteral("a19-sender"), 300);
+            QCOMPARE(job.value(QStringLiteral("action_key")).toString(), key);
+            // settle 落库后进程崩溃：此时还没有调用 recordActionReceipt。
+            QVERIFY(db.settleOutboxAction(key, QStringLiteral("handed_off")));
+            RawDb raw(path, QStringLiteral("a19-crash-check"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM chat_history "
+                                               "WHERE turn_kind='proactive'")).toInt(),
+                     0);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT history_projected FROM action_proposal "
+                                               "WHERE action_key='")
+                                    + key + QStringLiteral("'")).toInt(),
+                     0);
+        }
+        {
+            // 重启：启动对账把未投影的成功回执补齐，且只补一次。
+            MemoryManager reopened(path);
+            QCOMPARE(reopened.reconcileActionReceipts(), 1);
+            QCOMPARE(reopened.reconcileActionReceipts(), 0);
+            RawDb raw(path, QStringLiteral("a19-reopened"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM chat_history "
+                                               "WHERE turn_kind='proactive'")).toInt(),
+                     1);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT history_projected FROM action_proposal "
+                                               "WHERE action_key='")
+                                    + key + QStringLiteral("'")).toInt(),
+                     1);
+        }
+        {
+            // 再次重启：已投影不回退、不重复。
+            MemoryManager again(path);
+            QCOMPARE(again.reconcileActionReceipts(), 0);
+            RawDb raw(path, QStringLiteral("a19-again"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM chat_history "
+                                               "WHERE turn_kind='proactive'")).toInt(),
+                     1);
+        }
+    }
+
+    // A20：成功回执数量超过固定 64 条时，后续行不得饿死；多批扫描全部投影且幂等。
+    void reconcileScansBeyondFirstBatch()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableOpenWakeContact(true));
+        const QString path = dir.filePath(QStringLiteral("a20-bulk.db"));
+        MemoryManager db(path);
+        const int total = 70;
+        {
+            RawDb raw(path, QStringLiteral("a20-seed"));
+            QVERIFY(raw.open());
+            for (int index = 0; index < total; ++index) {
+                const qlonglong wakeId = 90000 + index;
+                const QString key = QStringLiteral("wake:%1:1:contact").arg(wakeId);
+                const QString payload = QStringLiteral(
+                    R"({"message":"m%1","sentences":[{"zh_text":"m%1"}],)"
+                    R"("channel":"pet","session":"default"})").arg(index);
+                QVERIFY(raw.execPrepared(
+                    QStringLiteral("INSERT INTO cognitive_action(action_key,kind,subject,channel,"
+                                   "session_id,payload_json,state,last_outcome,attempts) "
+                                   "VALUES(?,'OpenWakeContact','user','pet','default',?,"
+                                   "'handed_off','handed_off',1)"),
+                    {key, payload}));
+                const qlonglong actionId =
+                    raw.scalar(QStringLiteral("SELECT last_insert_rowid()")).toLongLong();
+                QVERIFY(actionId > 0);
+                QVERIFY(raw.execPrepared(
+                    QStringLiteral("INSERT INTO action_outbox(action_id,action_key,channel,"
+                                   "session_id,payload_json,state,attempts) "
+                                   "VALUES(?,?,'pet','default',?,'dispatched',1)"),
+                    {actionId, key, payload}));
+                QVERIFY(raw.execPrepared(
+                    QStringLiteral("INSERT INTO action_proposal(action_key,kind,origin_kind,"
+                                   "origin_ref,origin_version,scope,target_channel,target_session,"
+                                   "payload_json,claims_json,state,committed_action_key,"
+                                   "history_projected,action_context_epoch,created_at,updated_at) "
+                                   "VALUES(?,'contact','wake',?,1,'owner','pet','default',"
+                                   "'{}','[]','committed',?,0,0,unixepoch(),unixepoch())"),
+                    {key, QStringLiteral("wake/%1").arg(wakeId), key}));
+            }
+        }
+        // 一次对账有界推进多批；70 条都应投影，不能只处理最早 64 条。
+        const int reconciled = db.reconcileActionReceipts();
+        QCOMPARE(reconciled, total);
+        {
+            RawDb raw(path, QStringLiteral("a20-post"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM chat_history "
+                                               "WHERE turn_kind='proactive'")).toInt(),
+                     total);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_proposal "
+                                               "WHERE history_projected=1")).toInt(),
+                     total);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_proposal "
+                                               "WHERE history_projected=0")).toInt(),
+                     0);
+        }
+        QCOMPARE(db.reconcileActionReceipts(), 0);
+    }
+
+    // A21：旧 wake 的迟到回执不得覆盖最新 wake 的 last_outcome；最新 wake 回执才写。
+    void oldWakeReceiptDoesNotOverwriteLatestState()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableOpenWakeContact(true));
+        const QString path = dir.filePath(QStringLiteral("a21-wake.db"));
+        MemoryManager db(path);
+        const QString firstKey = seedCommittedWakeContact(db, path, QStringLiteral("a21-wake-a"),
+                                                         QStringLiteral("第一次"));
+        QVERIFY(!firstKey.isEmpty());
+        const QString secondKey = seedCommittedWakeContact(db, path, QStringLiteral("a21-wake-b"),
+                                                          QStringLiteral("第二次"));
+        QVERIFY(!secondKey.isEmpty());
+        const qlonglong firstWakeId = firstKey.section(QLatin1Char(':'), 1, 1).toLongLong();
+        const qlonglong secondWakeId = secondKey.section(QLatin1Char(':'), 1, 1).toLongLong();
+        QVERIFY(firstWakeId > 0 && secondWakeId > 0 && firstWakeId != secondWakeId);
+        QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+        {
+            RawDb raw(path, QStringLiteral("a21-clock"));
+            QVERIFY(raw.open());
+            // 最新 wake 是 second；sentinel 用于证明旧回执没有覆盖。
+            QVERIFY(raw.exec(QStringLiteral(
+                "UPDATE open_wake_state SET last_wake_id=%1,last_outcome='wake_b_state' "
+                "WHERE scope_key='owner'").arg(secondWakeId)));
+        }
+        // 先处理旧 wake 的迟到成功回执。
+        QVERIFY(!db.claimOutbox(QStringLiteral("a21-sender"), 300).isEmpty());
+        QVERIFY(db.settleOutboxAction(firstKey, QStringLiteral("handed_off")));
+        QVERIFY(db.recordActionReceipt(firstKey, QStringLiteral("handed_off")));
+        {
+            RawDb raw(path, QStringLiteral("a21-after-old"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT last_outcome FROM open_wake_state "
+                                               "WHERE scope_key='owner'")).toString(),
+                     QStringLiteral("wake_b_state"));
+            // 历史仍应记录旧 wake 确实说过的话（只保护调度状态，不删除事实）。
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM chat_history "
+                                               "WHERE turn_kind='proactive' AND "
+                                               "json_extract(raw_reply,'$.delivery.ref')='wake:")
+                                    + QString::number(firstWakeId)
+                                    + QStringLiteral(":1'")).toInt(),
+                     1);
+        }
+        // 最新 wake 的回执才允许写 last_outcome。
+        QVERIFY(!db.claimOutbox(QStringLiteral("a21-sender-2"), 300).isEmpty());
+        QVERIFY(db.settleOutboxAction(secondKey, QStringLiteral("handed_off")));
+        QVERIFY(db.recordActionReceipt(secondKey, QStringLiteral("handed_off")));
+        {
+            RawDb raw(path, QStringLiteral("a21-after-new"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT last_outcome FROM open_wake_state "
+                                               "WHERE scope_key='owner'")).toString(),
+                     QStringLiteral("contact_handed_off"));
+        }
+    }
+
+    // ===== R12-2c-3：internal activity share 端到端恢复 =====
+
+    // A22：崩溃窗口恢复——已完成+saved 意图、无提案时被有界领取一次；已有提案/成功回执后
+    // 不重复自动分享。完整闭环：成果→意图→提案→verified→commit→Outbox→回执→历史→下一轮可见。
+    void shareRecoveryAndFullLoop()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableOpenWakeContact(true));
+        const QString path = dir.filePath(QStringLiteral("a22-share.db"));
+        QString draft = QStringLiteral("檐下风铃响了一声。");
+        QString hash;
+        qlonglong activityId = 0;
+        QString actionKey;
+        {
+            MemoryManager db(path);
+            activityId = seedInternalCompletedActivity(path, QStringLiteral("a22-seed"), draft,
+                                                       &hash);
+            QVERIFY(activityId > 0);
+            // 模拟 ActivityReview 已原子保存 share_intent，但在发出核验信号前崩溃。
+            const auto claimed = db.claimPendingActivityShareIntents(4, true);
+            QCOMPARE(claimed.size(), 1);
+            const QJsonObject row = claimed.first().toObject();
+            QCOMPARE(row.value(QStringLiteral("ref")).toString(),
+                     QStringLiteral("activity/%1").arg(activityId));
+            QCOMPARE(row.value(QStringLiteral("artifact_version")).toInt(), 2);
+            QCOMPARE(row.value(QStringLiteral("draft")).toString(), draft);
+            // 非 force + 节流窗口内不重复领取；不会把所有历史成果自动加入队列。
+            QCOMPARE(db.claimPendingActivityShareIntents(4, false).size(), 0);
+
+            // 正常 verifier→verified→commit 链（服务端组装提案；这里模拟核验通过）。
+            const QString key = persistVerifiedProposal(
+                db, internalShareProposal(activityId, 2, draft));
+            QVERIFY(!key.isEmpty());
+            actionKey = key;
+            ActionCommitter committer(&db);
+            const auto committed = committer.commitInternalActivityShare(key);
+            QVERIFY2(!committed.contains(QStringLiteral("error")),
+                     qPrintable(committed.value(QStringLiteral("error")).toString()));
+            // 已有同成果版本提案：恢复扫描不再重复自动分享。
+            QCOMPARE(db.claimPendingActivityShareIntents(4, true).size(), 0);
+            {
+                RawDb raw(path, QStringLiteral("a22-committed"));
+                QVERIFY(raw.open());
+                QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_outbox")).toInt(),
+                         1);
+                QCOMPARE(raw.scalar(QStringLiteral("SELECT status FROM internal_activity "
+                                                   "WHERE id=%1").arg(activityId)).toString(),
+                         QStringLiteral("completed"));
+            }
+
+            // Outbox 唯一发送 + 协议接受回执 + 历史投影；回执绑定原成果 ref/version/hash。
+            const auto job = db.claimOutbox(QStringLiteral("a22-sender"), 300);
+            QCOMPARE(job.value(QStringLiteral("action_key")).toString(), key);
+            QVERIFY(db.settleOutboxAction(key, QStringLiteral("protocol_accepted")));
+            QVERIFY(db.recordActionReceipt(key, QStringLiteral("protocol_accepted")));
+            {
+                RawDb raw(path, QStringLiteral("a22-receipt"));
+                QVERIFY(raw.open());
+                QCOMPARE(raw.scalar(QStringLiteral(
+                             "SELECT json_extract(result_json,'$.share_outcome') "
+                             "FROM internal_activity WHERE id=%1").arg(activityId)).toString(),
+                         QStringLiteral("protocol_accepted"));
+                QCOMPARE(raw.scalar(QStringLiteral(
+                             "SELECT json_extract(result_json,'$.share_artifact_ref') "
+                             "FROM internal_activity WHERE id=%1").arg(activityId)).toString(),
+                         QStringLiteral("activity/%1").arg(activityId));
+                QCOMPARE(raw.scalar(QStringLiteral(
+                             "SELECT json_extract(result_json,'$.share_artifact_version') "
+                             "FROM internal_activity WHERE id=%1").arg(activityId)).toInt(),
+                         2);
+                QCOMPARE(raw.scalar(QStringLiteral(
+                             "SELECT json_extract(result_json,'$.share_artifact_hash') "
+                             "FROM internal_activity WHERE id=%1").arg(activityId)).toString(),
+                         hash);
+                QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM chat_history "
+                                                   "WHERE turn_kind='proactive'")).toInt(),
+                         1);
+                // 成功分享后不再因无回应/重复扫描自动重发。
+                QCOMPARE(db.claimPendingActivityShareIntents(4, true).size(), 0);
+                QVERIFY(db.claimOutbox(QStringLiteral("a22-again"), 60).isEmpty());
+            }
+            // 下一轮快照可见性：活动仍是 completed，成果目录与模型投影仍能读到。
+            const auto recent = db.recentActivityResultsForModel(
+                8, Channel::kPet, Channel::kDefaultSession, QStringLiteral("user"), true);
+            bool found = false;
+            for (const auto &value : recent) {
+                if (value.toObject().value(QStringLiteral("ref")).toString()
+                    == QStringLiteral("activity/%1").arg(activityId))
+                    found = true;
+            }
+            QVERIFY(found);
+            QVERIFY(!db.activityForModel(QStringLiteral("activity/%1").arg(activityId),
+                                         Channel::kPet, Channel::kDefaultSession,
+                                         QStringLiteral("user"), true)
+                         .isEmpty());
+        }
+        // 重启后再次对账（已投影/已成功）不重复写历史、不重发。
+        {
+            MemoryManager reopened(path);
+            QCOMPARE(reopened.reconcileActionReceipts(), 0);
+            QCOMPARE(reopened.claimPendingActivityShareIntents(4, true).size(), 0);
+            RawDb raw(path, QStringLiteral("a22-reopen"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM chat_history "
+                                               "WHERE turn_kind='proactive'")).toInt(),
+                     1);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_outbox")).toInt(), 1);
+        }
+        // 另一个活动的意图在重启窗口里被恢复（force=true 立即重试）。
+        {
+            QString draft2 = QStringLiteral("雨停之前写完这一页。");
+            const qlonglong secondId = seedInternalCompletedActivity(
+                path, QStringLiteral("a22-seed-2"), draft2);
+            QVERIFY(secondId > 0);
+            MemoryManager reopened(path);
+            QCOMPARE(reopened.claimPendingActivityShareIntents(4, true).size(), 1);
+        }
+        Q_UNUSED(actionKey);
+    }
+
+    // A23：成果修改/撤回后旧意图失效（withheld 审计、不发送旧成果、不改完成状态）。
+    void staleShareIntentIsWithheld()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableOpenWakeContact(true));
+        const QString path = dir.filePath(QStringLiteral("a23-stale.db"));
+        const QString draft = QStringLiteral("旧成果的第一版。");
+        MemoryManager db(path);
+        const qlonglong activityId = seedInternalCompletedActivity(
+            path, QStringLiteral("a23-seed"), draft);
+        QVERIFY(activityId > 0);
+        {
+            // 成果版本前进（3），但旧 share_intent 仍绑定版本 2：旧意图失效。
+            RawDb raw(path, QStringLiteral("a23-revise"));
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral(
+                "UPDATE internal_activity SET result_json=json_set(result_json,"
+                "'$.artifact_version',3,'$.draft','新成果的第二版。'),"
+                "version=3 WHERE id=%1").arg(activityId)));
+        }
+        QCOMPARE(db.claimPendingActivityShareIntents(4, true).size(), 0);
+        {
+            RawDb raw(path, QStringLiteral("a23-post"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT json_extract(result_json,'$.share_intent.recovery_state') "
+                         "FROM internal_activity WHERE id=%1").arg(activityId)).toString(),
+                     QStringLiteral("withheld"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT status FROM internal_activity "
+                                               "WHERE id=%1").arg(activityId)).toString(),
+                     QStringLiteral("completed"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_proposal")).toInt(), 0);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_outbox")).toInt(), 0);
+            // 再次扫描不会再重复审计/发送。
+            QCOMPARE(db.claimPendingActivityShareIntents(4, true).size(), 0);
+        }
+        // 撤回的意图不自动恢复。
+        const QString draft2 = QStringLiteral("撤回后的成果。");
+        const qlonglong withdrawnId = seedInternalCompletedActivity(
+            path, QStringLiteral("a23-withdraw"), draft2);
+        QVERIFY(withdrawnId > 0);
+        {
+            RawDb raw(path, QStringLiteral("a23-withdraw-mark"));
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral(
+                "UPDATE internal_activity SET result_json=json_set(result_json,"
+                "'$.share_intent.state','withdrawn') WHERE id=%1").arg(withdrawnId)));
+        }
+        QCOMPARE(db.claimPendingActivityShareIntents(4, true).size(), 0);
+        {
+            RawDb raw(path, QStringLiteral("a23-withdraw-post"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT status FROM internal_activity "
+                                               "WHERE id=%1").arg(withdrawnId)).toString(),
+                     QStringLiteral("completed"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_proposal "
+                                               "WHERE origin_ref='activity/%1'")
+                                    .arg(withdrawnId)).toInt(),
+                     0);
+        }
+    }
+
 };
 
 QTEST_GUILESS_MAIN(TestActionOutbox)

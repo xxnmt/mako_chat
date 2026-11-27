@@ -18,6 +18,17 @@ bool sameInputStream(const RequestMeta &a, const RequestMeta &b)
         && a.persistTurn == b.persistTurn && a.longTermMemoryEnabled == b.longTermMemoryEnabled;
 }
 
+// R12-2c-3：next_due 同时记录 UTC / local / epoch（跨时区对账），不改变调度语义。
+QString wakeDueLogText(const QDateTime &due)
+{
+    if (!due.isValid())
+        return QStringLiteral("next_due_utc=- next_due_local=- next_due_epoch=0");
+    return QStringLiteral("next_due_utc=%1 next_due_local=%2 next_due_epoch=%3")
+        .arg(due.toUTC().toString(Qt::ISODate),
+             due.toLocalTime().toString(Qt::ISODate))
+        .arg(due.toSecsSinceEpoch());
+}
+
 // R12-0：[Wake] tick 是每轮 reviewIfDue 一行的结构化诊断。正常空转（no_candidate/no_idle/busy）
 // 用 DEBUG，真正领到回顾或出现可解释的阻塞原因才用 INFO，避免每分钟刷一条 INFO。
 void logWakeTick(const WakeResult &result)
@@ -28,13 +39,11 @@ void logWakeTick(const WakeResult &result)
             && result.reason != QStringLiteral("busy"));
     const QString selected = result.started && !result.kind.isEmpty()
         ? result.kind : QStringLiteral("none");
-    const auto line = QStringLiteral("[Wake] tick selected=%1 reason=%2 source=%3 next_due=%4")
+    const auto line = QStringLiteral("[Wake] tick selected=%1 reason=%2 source=%3 %4")
         .arg(selected,
              result.reason.isEmpty() ? QStringLiteral("no_candidate") : result.reason,
              result.sourceRef.isEmpty() ? QStringLiteral("-") : result.sourceRef,
-             result.nextEligibleAt.isValid()
-                 ? result.nextEligibleAt.toLocalTime().toString(Qt::ISODate)
-                 : QStringLiteral("-"));
+             wakeDueLogText(result.nextEligibleAt));
     if (informative) qInfo().noquote() << line;
     else qDebug().noquote() << line;
 }
@@ -95,6 +104,10 @@ CognitiveCoordinator::CognitiveCoordinator(MemoryManager &memory, LLMService &mo
             ++failed;
             qWarning()<<"[Concern] update_failed by="<<turn<<"ref="<<ref;
         }
+        // R12-2c-3：事实更正/关注了结是"行动语境"的真实变化：相关在途联系/分享的旧提案
+        // 应因 fence epoch 前进而失效（历史事实/关注行保留）。无关群聊/索引不 bump。
+        if (committed > 0)
+            store.bumpActionContextEpoch(QStringLiteral("fact_corrected"));
         store.recordCognitiveAudit("concern_update",runId,0,
             QJsonObject{{"event_id",meta.eventId},{"turn",turn},{"requested",updates.size()},
                         {"committed",committed},{"failed",failed},{"updates",updates}});
@@ -128,6 +141,12 @@ CognitiveCoordinator::CognitiveCoordinator(MemoryManager &memory, LLMService &mo
         qInfo().noquote()
             << QStringLiteral("[Proposal] startup_drain=")
                    + QString::fromUtf8(QJsonDocument(startupDrain).toJson(QJsonDocument::Compact));
+    // R12-2c-3：崩溃窗口恢复——ActivityReview 已原子保存 share_intent 但未发出核验请求，
+    // 或 verifier 执行中进程退出。只恢复"有效未处理意图"，重新走 verifier→verified→commit；
+    // 同一成果版本幂等，不会重复自动分享。启动时 force=true 立即重试。
+    const int recoveredShareIntents = review.recoverPendingShareIntents(true, 4);
+    if (recoveredShareIntents > 0)
+        qInfo() << "[Activity] startup_share_intents_recovered=" << recoveredShareIntents;
     store.setAttentionState(QStringLiteral("last_start_at"),
                             QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
 }
@@ -157,6 +176,8 @@ void CognitiveCoordinator::reviewIfDue()
                    .arg(proposalDrain.value(QStringLiteral("withheld")).toInt())
                    .arg(proposalDrain.value(QStringLiteral("failed")).toInt());
     }
+    // R12-2c-3：定时恢复未处理的分享意愿（非 force，按 recovery_at 节流，避免每 tick 重复核验）。
+    review.recoverPendingShareIntents(false, 2);
     // 每轮打一次 backlog，用于区分"没东西可回顾"和"回顾被事件挡住"。
     // R12-0 降噪：只有 pending 非空、或最老 pending 已等待>0 秒时才 INFO；
     // 仅剩 by_state.done 的历史终态属于正常，用 DEBUG（此前 by_state 非空导致每分钟 INFO）。

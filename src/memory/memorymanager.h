@@ -337,9 +337,12 @@ public:
     // 普通领取 bump 的 version 不参与重置判断，避免把正常重试误判成修订。
     QString classifyReviewError(const QString &error) const;
     QJsonObject reviewFailure(const QString &sourceKind,const QString &sourceRef) const;
+    // R12-2c-3：expectedVersion>0 时先比对源当前版本；不一致说明这是旧版本尝试的迟到失败，
+    // 不写失败行、不推进新版本来源的退避状态（只打 [Review] stale_failure_ignored 审计）。
     bool recordReviewFailure(const QString &sourceKind,const QString &sourceRef,
                              const QString &stage,const QString &reason,
-                             bool countsAsFailure,QString *error=nullptr);
+                             bool countsAsFailure,QString *error=nullptr,
+                             int expectedVersion=0);
     bool clearReviewFailure(const QString &sourceKind,const QString &sourceRef);
     bool resetReviewFailure(const QString &sourceKind,const QString &sourceRef);
     // R12-1a：关注保留期终止定时重试。扫描 state='consider' 且仍有定时检查
@@ -581,10 +584,37 @@ public:
     // settleOutboxAction 语义）。写 delivery_ledger 终态；handed_off/protocol_accepted 时
     // 回写 open_wake_state.last_outcome / internal_activity.result_json.share_outcome/share_version；
     // unknown/rejected/withheld 不写成功、不重发。重复回执不重复累加。
+    // R12-2c-3：以 action_proposal.history_projected 为"历史已投影"持久化标记，成功回执在同一
+    // 事务内写主动历史并置 1；不可投影（非本地/协议成功）置 2 审计；unknown/withheld 永不写成功历史。
+    // 校验：动作存在、kind 与 action_key 前缀一致、提案 committed、Outbox 路由与动作行一致；
+    // 不存在/不匹配只审计，不写 ledger/历史。活动分享历史绑定原成果 artifact_ref/version/hash。
     bool recordActionReceipt(const QString &actionKey,const QString &outcome,
                              const QString &detail = QString());
-    // 启动对账：把 outbox 已 settle 但领域行未回写的新来源动作幂等补一次回执，返回处理条数。
+    // 启动对账：扫描所有"已成功回执但 history_projected=0"的新来源动作（状态标记扫描，
+    // 不再固定最早 64 条；每轮有界多批，投影后标记 1/2 因而不会饿死后续行），幂等、可重入、
+    // 重启补齐；已投影（1/2）不回退，不存在/冲突只审计。返回本次处理条数。
     int reconcileActionReceipts();
+
+    // ===== R12-2c-3：internal activity share 的崩溃恢复 =====
+    // 扫描已完成活动的有效未处理分享意愿（只有 status='completed'、share_intent.state='saved'、
+    // 成果 ref/版本/哈希仍匹配、未撤回、无同成果版本提案、无成功/未知分享回执的意图）。
+    // 单事务内有界领取（limit<=8），并把 share_intent.recovery_state 置 'requested'+recovery_at；
+    // 非 force 时同一意图在 retryAfterSeconds 内不重复领取（避免每 tick 重复核验）。
+    // 成果已被修改/撤回等不再发送的旧意图只写 recovery_state='withheld'+原因（活动状态不变）。
+    // 返回行：{ref,activity_id,channel,session,activity_version,artifact_ref,artifact_version,
+    //          artifact_hash,draft,intent}。绝不把所有历史成果自动加入分享队列。
+    QJsonArray claimPendingActivityShareIntents(int limit,bool force=false,
+                                                int retryAfterSeconds=300);
+    // 恢复/构建失败时把意图标记 withheld（审计；不改活动完成状态、不删历史/成果）。
+    bool markActivityShareIntentWithheld(const QString &ref,int artifactVersion,
+                                         const QString &reason);
+    // 正常完成路径发出核验请求时标记 requested（设置 recovery_at 节流），避免恢复扫描
+    // 在 verifier 在途时重复发起同一成果版本的核验；提案落库后扫描按唯一键跳过。
+    bool markActivityShareIntentRequested(const QString &ref,int artifactVersion);
+    // R12-2c-3：每次真实回顾尝试独立 run_id。领取时 thought_review_log 先落行，runId 生成后
+    // 由调用方回填最近一条空 run_id 的领取日志；迟到失败据此可区分旧尝试。
+    bool attachReviewAttemptRunId(const QString &sourceKind,const QString &sourceRef,
+                                  const QString &runId);
 
     // R12-2b：服务端选择主动投递目标（按配置顺序、宠物优先、跳过盲区/不可读文本）。
     // 返回 {found,channel,session}；仅用于提案 origin 的 target，真实可达性由 dispatcher 决定。
@@ -788,6 +818,13 @@ private:
     // R12-1a：暂停到期后的恢复尝试：若该源存在 failure 行且 suspended_until<=now，
     // 把 consecutive_failures 置 0（保留 last_reason）。返回 SQL 是否执行成功。
     bool recoverSuspendedFailure(const QString &sourceKind, const QString &sourceRef);
+
+    // R12-2c-3：事务内写一条主动历史（chat_history + raw_events），不提交。
+    // 同 channel/session/kind/ref 幂等（已存在返回既有 id，created=false）；任何一步失败返回 0，
+    // 调用方必须回滚。返回新历史轮次 id，供提交后建检索索引。
+    qlonglong writeProactiveHistoryLocked(const QString &channel, const QString &session,
+                                          const QString &text, const QString &kind,
+                                          const QString &ref, bool *created);
 
     QSqlDatabase m_db;
     QString m_databasePath;

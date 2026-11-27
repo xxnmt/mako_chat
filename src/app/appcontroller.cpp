@@ -84,6 +84,10 @@ AppController::AppController(QObject *parent)
     m_ttsService = new TTSService;
     m_chatWidget = new ChatWidget;
     m_memoryManager = new MemoryManager(ConfigManager::instance().getMemoryPath());
+    // R12-2c-3：LLMService 必须在 CognitiveCoordinator 构造之前拿到 MemoryManager——
+    // 协调器启动恢复会立即发出 internalShareProposalReady，若此时 LLMService 还没有
+    // memory（核验链会把请求直接 withheld/source_unavailable），有效分享意图会被误判成拒绝。
+    m_llmService->setMemoryManager(m_memoryManager);
     m_coordinator = new CognitiveCoordinator(*m_memoryManager, *m_llmService, this);
     m_memoryManager->seedIdentity(ConfigManager::instance().getMasterQQAccounts());
     const auto retrievalConfig =
@@ -95,7 +99,6 @@ AppController::AppController(QObject *parent)
     m_settingsWidget->setMemoryManager(m_memoryManager);
 
     m_memoryManager->decayEpisodicMemory();        // 启动时执行一次情景记忆衰减
-    m_llmService->setMemoryManager(m_memoryManager);
     m_rawEventProcessor = new RawEventProcessor(m_memoryManager, m_llmService, this);
     m_rawEventProcessor->start();
 
@@ -249,11 +252,16 @@ AppController::AppController(QObject *parent)
         // R12-2b：新来源（wake:/activity:）的回执统一写回 delivery_ledger + 领域行。
         // recordActionReceipt 幂等：重复回执不重复历史/版本；unknown/rejected/withheld 不写成功；
         // legacy reflection:/reminder:/thought: 回执仍由既有 settleOutboxAction 领域回写处理。
-        if (m_memoryManager
-            && (actionKey.startsWith(QStringLiteral("wake:"))
-                || actionKey.startsWith(QStringLiteral("activity:")))) {
+        const bool newSource = actionKey.startsWith(QStringLiteral("wake:"))
+            || actionKey.startsWith(QStringLiteral("activity:"));
+        if (m_memoryManager && newSource) {
+            // R12-2c-3：新来源的领域行/成功历史投影全部以 DB 权威行（action/outbox/proposal/
+            // payload_json）为准，不再依赖 dispatcher 的 m_inflight/Qt payload：
+            // 成功回执同事务写主动历史并置 history_projected；unknown/withheld 永不写成功历史；
+            // 重复回执由持久化标记幂等；崩溃窗口由 reconcileActionReceipts 补齐。
             m_memoryManager->recordActionReceipt(actionKey, outcome,
                                                  payload.value(QStringLiteral("detail")).toString());
+            return;
         }
         // "她说过"只能回写至少已经交给渠道的结果：rejected/withheld 明确未发送，绝不写；
         // unknown 只是"可能已送达但无法确认"，也不能写成她说过（执行层仍冻结不重发）。
@@ -269,10 +277,6 @@ AppController::AppController(QObject *parent)
         if (actionKey.startsWith(QStringLiteral("reflection:"))) {
             recordProactive(channel, session, text, QStringLiteral("contact"),
                             actionKey.section(QLatin1Char(':'), 0, 2));
-        } else if (actionKey.startsWith(QStringLiteral("wake:"))) {
-            // R12-2b：OpenWake contact 的主动历史用 wake/<id>:<version> 作为回认引用。
-            recordProactive(channel, session, text, QStringLiteral("contact"),
-                            actionKey.section(QLatin1Char(':'), 0, 2));
         } else if (actionKey.startsWith(QStringLiteral("reminder:"))) {
             recordProactive(channel, session, text, QStringLiteral("reminder"),
                             actionKey.section(QLatin1Char(':'), 1, 1));
@@ -281,11 +285,6 @@ AppController::AppController(QObject *parent)
             if (parts.size() >= 3)
                 recordProactive(channel, session, text, QStringLiteral("share"),
                                 QStringLiteral("%1:%2").arg(parts[1]).arg(parts[2]));
-        } else if (actionKey.startsWith(QStringLiteral("activity:"))) {
-            // R12-2b：internal 活动分享的主动历史引用 activity/<id>:<artifact_version>；
-            // 只写"她说过"的历史行，不改变活动完成状态（result_json 由 recordActionReceipt 写）。
-            recordProactive(channel, session, text, QStringLiteral("share"),
-                            actionKey.section(QLatin1Char(':'), 0, 2));
         }
     });
     // 普通回复的有限补发：只补"已经决定要发、且被渠道明确拒绝"的话，

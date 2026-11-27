@@ -12,7 +12,8 @@
 | R12-1b 统一活动管理（internal_activity 完整生命周期） | **已完成（源码+测试已提交）** | 前台/OpenWake 新活动写 internal_activity；legacy thought 只读适配；legacy 分享保留，internal 分享仅落意愿 |
 | R12-2a 通用 ActionOrigin/Proposal、Evidence Purpose、统一核验 | **已完成（源码+测试已提交）** | v32 `action_proposal`；不发送、不接 Outbox；生产库仍 v31，待 R12-2b 受控迁移 |
 | R12-2b OpenWake 联系/内部活动分享提交、Outbox、回执 | **已完成（源码+测试已提交）** | v32；allow_contact 默认 false；只入 Outbox，受控测试用 mock；生产库已 v32、零新发送 |
-| R12-3 认知快照连续性优化 | 待实施 | 跨入口一致性、去重、来源追踪、进一步预算优化 |
+| R12-2c 行动一致性与认知连续性修正 | **已完成（源码+测试已提交）** | v33 仅代码/测试；生产库仍 v32，迁移待独立评审 |
+| R12-3a/b 统一认知上下文/状态连续性 | 待实施 | 按要求后置，不提前开始 |
 
 ## R12-1a 补充修正（已独立提交）
 
@@ -49,6 +50,13 @@
 - internal activity share：绑定真实 completed artifact_ref/version/hash 与 share_intent，action_key `activity:<id>:<artifact_version>:share`；只入 Outbox，不改变活动完成状态；legacy share 链不变。
 - 回执：`actionSettled` 支持 `wake:`/`activity:`，`recordActionReceipt` 幂等回写 open_wake last_outcome / activity share_outcome/version；成功才写主动历史；unknown 不写成功/不重发；启动 `drainVerifiedActionProposals` + 回执对账。
 - 验证：全量 `ctest 23/23`；`tst_memorymanager 146/1 skipped`、`tst_memoryagent 94`、`tst_actionoutbox 20`、`tst_actionpolicy 17`、`tst_cognitivesnapshot 15`。生产库 v31→v32 迁移后旧行数不变（chat 534/ledger 137/outbox 0），`allow_contact=false` 启动零新发送。**未做**：真实 QQ/pet 目标发送（需另行授权）、R12-3、后台 tool loop。
+
+## R12-2c 已落地（2026-11-27）
+
+- **c1 语义核验可信边界**：verifier 输入按完整证据项分配预算、不再字符串截断；核心证据放不下时 `evidence_budget_exceeded` 并 withheld；request_id/action_key/origin/runId/payload_digest 全链路关联；严格 coverage/result 枚举白名单；在途请求按 request/action 管理，迟到/被取代回调丢弃；自由重写 repair 默认 fail closed（每 action ≤1 verifier、0 repair）；semantic_status 服务端白名单。
+- **c2 事务/Fence/发送前复验**：v33 增加 verified 指纹/request_id/verified_at/history_projected/cancel_reason/action_context_epoch；提交事务内重读提案、复验 state/来源/版本/runId/scope/target/expires/成果 hash/已验证内容指纹；额度事务内统计；ledger 写入失败回滚；action_key 幂等校验身份；Action Context Epoch 持久化在 attention_state，主人私聊输入/事实更正/撤销 bump，群聊不 bump；claimOutbox 排除 withheld/unknown/failed 不可重试，领取与 sender 前、QQ 入队前逐层复验，永久失效取消、可恢复保留。
+- **c3 回执与历史闭环**：`recordActionReceipt` DB 权威校验 + 同事务历史投影 + `history_projected` 幂等；unknown/withheld 迟到成功不写历史；不存在/未提交/渠道不匹配拒绝；对账按未投影扫描，不再只扫最早 64；旧 wake 不覆盖新 last_outcome；活动分享回执绑定 artifact_ref/version/hash；分享意图崩溃恢复（有界游标/节流/版本撤回失效），不自动加入历史成果；调度日志 UTC/local/epoch；每次尝试 run_id 回填；迟到失败按版本隔离；120/300/900 + 第 4 次暂停语义保持。
+- 验证：全量 `ctest 23/23`；`tst_memorymanager 154/1 skipped`、`tst_memoryagent 100`、`tst_actionoutbox 38`、`tst_actionpolicy 18`、`tst_cognitivesnapshot 15`。**生产库仍 v32、未启动应用、未真实发送**；v33 迁移已在临时库测试，待独立评审后迁移。
 
 - 全量 `ctest 23/23`；`tst_memorymanager` 139 passed/1 skipped、`tst_memoryagent` 91、`tst_cognitivesnapshot` 15、`tst_actionoutbox` 15、`tst_actionpolicy` 9。
 - 生产库 v31 无 schema 变更；R12-1b 无新迁移。

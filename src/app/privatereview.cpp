@@ -53,6 +53,18 @@ QString reviewIsoFromEpoch(qint64 seconds)
         : QString{};
 }
 
+// R12-2c-3：调度日志同时记录 UTC / local / epoch，便于跨时区对账；不改变任何调度语义。
+QString nextDueLogText(qint64 epochSeconds)
+{
+    if (epochSeconds <= 0)
+        return QStringLiteral("next_due_utc=- next_due_local=- next_due_epoch=0");
+    const QDateTime utc = QDateTime::fromSecsSinceEpoch(epochSeconds, Qt::UTC);
+    return QStringLiteral("next_due_utc=%1 next_due_local=%2 next_due_epoch=%3")
+        .arg(utc.toString(Qt::ISODate),
+             utc.toLocalTime().toString(Qt::ISODate))
+        .arg(epochSeconds);
+}
+
 // R12-1b：ActivityReview 结构化诊断。只记录字段形状/类型/枚举值/长度/阶段，
 // 不记录模型输出或私聊正文，便于真实模型排查而不泄漏内容。
 QString activityJsonTypeName(const QJsonValue &value)
@@ -298,7 +310,10 @@ bool PrivateReview::errorCountsAsFailure(const QString &error)
     // 策略/权限拦截：不计入认知失败，但调用方仍按原语义 defer。
     if (text == QStringLiteral("filtered") || text == QStringLiteral("writing_disabled")
         || text == QStringLiteral("permission_denied")
-        || text == QStringLiteral("not_visible"))
+        || text == QStringLiteral("not_visible")
+        // R12-2c-3：外部行动被 withheld（动作层授权/核验拒绝）不是"她想错了"，
+        // 不计入认知失败，也不推进来源退避。
+        || text == QStringLiteral("withheld"))
         return false;
     // 来源已变/CAS 冲突不是"她想错了"，记录诊断但不累计连续失败。
     if (text == QStringLiteral("invalid_or_stale_proposal")
@@ -332,7 +347,8 @@ void PrivateReview::recordFailure(const Attempt &attempt, const QString &reason,
     const qint64 now = QDateTime::currentSecsSinceEpoch();
     QString recordError;
     const bool recorded = store.recordReviewFailure(kind, ref, stage, reason,
-                                                    countsAsFailure, &recordError);
+                                                    countsAsFailure, &recordError,
+                                                    attempt.origin.version);
     if (!recorded) {
         qWarning().noquote()
             << QStringLiteral("[Review] failure_not_recorded kind=%1 ref=%2 version=%3"
@@ -620,6 +636,10 @@ WakeResult PrivateReview::wakeNonOpen(int dailyLimit, int cooldownSeconds)
         result.reason = QStringLiteral("storage_error");
         return result;
     }
+    // R12-2c-3：每次真实回顾尝试独立 run_id。领取日志先于 runId 生成写入，这里回填最近一条
+    // 空 run_id 的日志行，便于迟到失败/审计精确关联到"哪一次尝试"。
+    if (!store.attachReviewAttemptRunId(kindName(kind), origin.ref, origin.runId))
+        qWarning() << "[Review] run_id_attach_failed" << kindName(kind) << origin.ref;
     context.insert(QStringLiteral("origin"), origin.toJson());
     active = Attempt{origin, options.enabled && !options.targets.isEmpty()};
     // B1：当前活动（仅活动回顾有"活动"语义；关注/新来源回顾/OpenWake 不写入 current_activity）。
@@ -948,6 +968,9 @@ void PrivateReview::receive(qlonglong id, int version, const QJsonObject &propos
             qInfo().noquote()
                 << QStringLiteral("[Activity] share_proposal_requested ref=%1 key=%2")
                        .arg(ref, shareKey);
+            // R12-2c-3：标记恢复节流（requested+recovery_at）；提案落库后恢复扫描按唯一键跳过。
+            store.markActivityShareIntentRequested(
+                ref, intent.value(QStringLiteral("artifact_version")).toInt());
             emit internalShareProposalReady(request);
         }
         return;
@@ -1074,6 +1097,64 @@ void PrivateReview::receiveShareProposalResult(const QJsonObject &result)
     qInfo().noquote()
         << QStringLiteral("[ShareProposal] committed key=%1 action=%2")
                .arg(actionKey, committed.value(QStringLiteral("action_key")).toString());
+}
+
+// R12-2c-3：分享恢复入口。ActivityReview 在 finishActivity 原子保存 share_intent 后、发出
+// internalShareProposalReady 前崩溃，或 verifier 执行中进程退出，都会留下"已完成 + saved 意图 +
+// 无提案"的窗口。这里只恢复这类有效意图，重新走现有 verifier→verified→commit 链；同一成果
+// 版本由 action_key/提案唯一约束幂等，不会重复自动分享。失败/拒绝不改活动完成状态。
+int PrivateReview::recoverPendingShareIntents(bool force, int limit)
+{
+    // 分享功能/长期记忆关闭时不发起恢复核验：保持意图 saved 原样，等授权恢复后再处理
+    // （避免启动时对历史意图产生无意义的 verifier 请求；也不改变活动完成状态）。
+    if (!ConfigManager::instance().getProactiveConfig().enabled
+        || !ConfigManager::instance().getMemoryPolicyConfig().longTermMemoryEnabled)
+        return 0;
+    const int capped = qBound(1, limit, 8);
+    const auto rows = store.claimPendingActivityShareIntents(capped, force);
+    int emitted = 0;
+    for (const auto &value : rows) {
+        const QJsonObject row = value.toObject();
+        const QString ref = row.value(QStringLiteral("ref")).toString();
+        const QJsonObject intent = row.value(QStringLiteral("intent")).toObject();
+        const QString draft = row.value(QStringLiteral("draft")).toString();
+        const int artifactVersion = row.value(QStringLiteral("artifact_version")).toInt();
+        if (ref.isEmpty() || intent.isEmpty() || draft.trimmed().isEmpty()) continue;
+        const QJsonObject request = buildInternalShareRequest(store, ref, intent, draft);
+        if (request.isEmpty()) {
+            // 构建失败（无可见目标/结构不合法）：标记为 withheld 审计，不反复重试、不发送。
+            store.markActivityShareIntentWithheld(ref, artifactVersion,
+                                                  QStringLiteral("recovery_invalid_request"));
+            qInfo().noquote()
+                << QStringLiteral("[Activity] share_recovery_skipped ref=%1"
+                                  " artifact_version=%2 reason=invalid_request")
+                       .arg(ref)
+                       .arg(artifactVersion);
+            continue;
+        }
+        const QString actionKey = request.value(QStringLiteral("action_key")).toString();
+        const QJsonObject existingProposal = store.actionProposal(actionKey);
+        if (!existingProposal.isEmpty()
+            && existingProposal.value(QStringLiteral("state")).toString()
+                   != QStringLiteral("proposed")) {
+            // 已有同成果版本提案（verified/committed/withheld/expired 等）：已处理，不重复自动分享。
+            qInfo().noquote()
+                << QStringLiteral("[Activity] share_recovery_exists ref=%1 key=%2 state=%3")
+                       .arg(ref, actionKey,
+                            existingProposal.value(QStringLiteral("state")).toString());
+            continue;
+        }
+        qInfo().noquote()
+            << QStringLiteral("[Activity] share_recovery_requested ref=%1 key=%2"
+                              " artifact_version=%3 force=%4")
+                   .arg(ref, actionKey)
+                   .arg(artifactVersion)
+                   .arg(force ? 1 : 0);
+        emit internalShareProposalReady(request);
+        ++emitted;
+    }
+    if (emitted > 0) qInfo() << "[Activity] share_recovered=" << emitted;
+    return emitted;
 }
 
 void PrivateReview::receiveOpenWake(const Attempt &attempt, const QJsonObject &proposal,
@@ -1401,9 +1482,9 @@ void PrivateReview::receiveOpenWake(const Attempt &attempt, const QJsonObject &p
             const qint64 nextDue = activityResult.value(QStringLiteral("next_due_at")).toInteger();
             qInfo().noquote()
                 << QStringLiteral("[OpenWake] committed decision=start_activity"
-                                  " activity=%1 next_due=%2")
+                                  " activity=%1 %2")
                        .arg(activityResult.value(QStringLiteral("ref")).toString(),
-                            reviewIsoFromEpoch(nextDue));
+                            nextDueLogText(nextDue));
             logResult(decision, QStringLiteral("commit"), QString());
             return;
         }
@@ -1419,8 +1500,8 @@ void PrivateReview::receiveOpenWake(const Attempt &attempt, const QJsonObject &p
         store.clearReviewFailure(QStringLiteral("open_wake"), ref);
         const qint64 nextDue = QDateTime::currentSecsSinceEpoch() + qint64(effectiveMinutes) * 60;
         qInfo().noquote()
-            << QStringLiteral("[OpenWake] committed decision=%1 next_due=%2 note_len=%3")
-                   .arg(decision, reviewIsoFromEpoch(nextDue))
+            << QStringLiteral("[OpenWake] committed decision=%1 %2 note_len=%3")
+                   .arg(decision, nextDueLogText(nextDue))
                    .arg(note.size());
         logResult(decision, QStringLiteral("commit"), QString());
         return;

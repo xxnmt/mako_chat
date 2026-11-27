@@ -301,3 +301,10 @@ R12（自主认知入口）开工基线为 `c28d23d`、schema v30；R12-0 是唯
 - Internal share：真实 completed artifact/version/hash 绑定；只入 Outbox；legacy 分享链保留。
 - 回执：actionSettled 支持 wake/activity，recordActionReceipt 幂等回写；unknown 不重发；启动 drain verified 与回执对账。
 - 验证：`ctest 23/23`；`tst_memorymanager 146/1 skipped`、`tst_memoryagent 94`、`tst_actionoutbox 20`、`tst_actionpolicy 17`、`tst_cognitivesnapshot 15`。生产库 v32 迁移完成，行数不变，默认零新发送。**未做**：真实目标发送（需授权）、R12-3、后台 tool loop。
+
+## 18. R12-2c 行动一致性与认知连续性（2026-11-27）
+
+- **c1 语义核验**：完整证据项预算、不截断 JSON、`evidence_budget_exceeded` fail closed；request_id/action_key/origin/runId/payload_digest 关联；严格枚举白名单；在途请求隔离迟到回调；自由重写 repair 默认关闭；semantic_status 服务端白名单。
+- **c2 事务/Fence/发送前**：v33 verified 指纹/request_id/verified_at/history_projected/cancel_reason/action_context_epoch；提交事务内重读复验、额度并发安全、ledger 写失败回滚、action_key 幂等身份；action context epoch 持久 attention_state，主人私聊/事实更正/撤回 bump，群聊不 bump；claimOutbox/sender/QQ 入队边界逐层复验，withheld/unknown/failed 不可重领，永久失效取消。
+- **c3 回执/历史/恢复/调度**：DB 权威回执 + 同事务历史投影 + history_projected 幂等；对账未投影扫描不饿死；旧 wake 不覆盖新；分享回执绑定成果版本/哈希；分享意图崩溃恢复有界/节流/版本失效；每次尝试 run_id；迟到失败版本隔离；next_due UTC/local/epoch；保留 120/300/900 + 第 4 次暂停。
+- 验证：`ctest 23/23`；`tst_memorymanager 154/1 skipped`、`tst_memoryagent 100`、`tst_actionoutbox 38`、`tst_actionpolicy 18`、`tst_cognitivesnapshot 15`。生产库仍 v32、应用未启动、无真实发送；v33 迁移临时库验证，待独立评审。

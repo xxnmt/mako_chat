@@ -8667,6 +8667,255 @@ private slots:
         QVERIFY(db.reviewFailure(QStringLiteral("activity"), ref).isEmpty());
     }
 
+    // ===== R12-2c-3：调度/预算/失败生命周期回归（A24-A27） =====
+
+    // A24：max_per_day 只约束 OpenWake 领取次数（不是 contact/提醒次数）；max_per_day=0 停
+    // OpenWake；daily_limit=0 停后台自主认知但独立提醒仍可提交；OpenWake 与普通任务共享预算。
+    void schedulingBudgetSemantics()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableContact());
+        const QString path = dir.filePath(QStringLiteral("a24-budget.db"));
+        {
+            MemoryManager db(path);
+            QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+            QVERIFY(makeOpenWakeDue(path, QStringLiteral("a24-due")));
+            // max_per_day=1：只能领一次 OpenWake（领取次数上限，不是 contact 次数上限）。
+            QString reason;
+            auto wake = db.claimOpenWake(12, 60, 1, 100, 4, &reason);
+            QVERIFY2(!wake.isEmpty(), qPrintable(reason));
+            QVERIFY(db.finishOpenWake(wake.value(QStringLiteral("id")).toInteger(),
+                                      wake.value(QStringLiteral("version")).toInt(),
+                                      QStringLiteral("rest"), QString(), QJsonObject{},
+                                      30, nullptr));
+            QVERIFY(makeOpenWakeDue(path, QStringLiteral("a24-due-2")));
+            QVERIFY(db.claimOpenWake(12, 60, 1, 100, 4, &reason).isEmpty());
+            QCOMPARE(reason, QStringLiteral("budget"));
+            // 独立提醒链不受 OpenWake 每日上限影响，也不占用回顾预算。
+            const qint64 reminder = insertPendingReminder(
+                path, QStringLiteral("a24-reminder"), Channel::kPet,
+                Channel::kDefaultSession, -10, QStringLiteral("该喝水了"));
+            QVERIFY(reminder > 0);
+            const auto reminderCommit = db.commitReminderDeliveryAction(reminder);
+            QVERIFY2(!reminderCommit.contains(QStringLiteral("error")),
+                     qPrintable(reminderCommit.value(QStringLiteral("error")).toString()));
+        }
+        {
+            // max_per_day=0：OpenWake 停止领取；daily_limit=0：所有后台回顾停止，
+            // 但独立提醒仍可提交（提醒链不经过回顾预算）。
+            const QString path2 = dir.filePath(QStringLiteral("a24-disabled.db"));
+            MemoryManager db(path2);
+            QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+            QVERIFY(makeOpenWakeDue(path2, QStringLiteral("a24-due-3")));
+            QString reason;
+            QVERIFY(db.claimOpenWake(12, 60, 0, 100, 4, &reason).isEmpty());
+            QCOMPARE(reason, QStringLiteral("budget"));
+            const qint64 reflectionTurn = seedReflectionSource(db, QStringLiteral("a24-reflect"));
+            QVERIFY(reflectionTurn > 0);
+            reason.clear();
+            QVERIFY(db.claimPrivateReflection(0, 60, &reason).isEmpty());
+            QCOMPARE(reason, QStringLiteral("daily_limit"));
+            const qint64 reminder = insertPendingReminder(
+                path2, QStringLiteral("a24-reminder-2"), Channel::kPet,
+                Channel::kDefaultSession, -10, QStringLiteral("早点休息"));
+            QVERIFY(reminder > 0);
+            const auto reminderCommit = db.commitReminderDeliveryAction(reminder);
+            QVERIFY2(!reminderCommit.contains(QStringLiteral("error")),
+                     qPrintable(reminderCommit.value(QStringLiteral("error")).toString()));
+        }
+        {
+            // OpenWake 与普通任务共享每日预算：先领普通回顾后，OpenWake 因共享额度被挡。
+            const QString path3 = dir.filePath(QStringLiteral("a24-shared.db"));
+            MemoryManager db(path3);
+            QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+            QVERIFY(makeOpenWakeDue(path3, QStringLiteral("a24-due-4")));
+            const qint64 turn = seedReflectionSource(db, QStringLiteral("a24-shared-reflect"));
+            QVERIFY(turn > 0);
+            QVERIFY(!db.claimPrivateReflection(1, 60).isEmpty());
+            QString reason;
+            QVERIFY(db.claimOpenWake(1, 60, 12, 100, 4, &reason).isEmpty());
+            // 共享每日预算已用尽（OpenWake 与普通任务共用 thought_review_log 预算；
+            // claimOpenWake 将 daily_limit 归并为对外稳定原因 budget）。
+            QCOMPARE(reason, QStringLiteral("budget"));
+        }
+    }
+
+    // A25：N 次普通任务后的 OpenWake 优先级不因失败/重启清零；到期 OpenWake 不被普通任务饿死。
+    void openWakeFairnessPersistsAcrossFailureAndRestart()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableContact());
+        const QString path = dir.filePath(QStringLiteral("a25-fairness.db"));
+        MemoryManager db(path);
+        QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+        QVERIFY(makeOpenWakeDue(path, QStringLiteral("a25-due")));
+        QVERIFY(seedReflectionSource(db, QStringLiteral("a25-r1")) > 0);
+        QVERIFY(!db.claimPrivateReflection(12, 60).isEmpty());
+        QCOMPARE(db.openWakeState().value(QStringLiteral("non_open_since_due")).toInt(), 1);
+        QVERIFY(seedReflectionSource(db, QStringLiteral("a25-r2")) > 0);
+        QVERIFY(rewindReviewCooldown(path, QStringLiteral("a25-clock")));
+        QVERIFY(!db.claimPrivateReflection(12, 60).isEmpty());
+        QCOMPARE(db.openWakeState().value(QStringLiteral("non_open_since_due")).toInt(), 2);
+        // 失败（预算拦截）不重置公平计数；只按实际成功领取递增。
+        QVERIFY(db.claimPrivateReflection(0, 60).isEmpty());
+        QCOMPARE(db.openWakeState().value(QStringLiteral("non_open_since_due")).toInt(), 2);
+        // 重启不重置。
+        MemoryManager reopened(path);
+        QCOMPARE(reopened.openWakeState().value(QStringLiteral("non_open_since_due")).toInt(), 2);
+        // 到期 OpenWake 仍可领取（不被普通任务饿死），领取成功清零公平计数。
+        QVERIFY(makeOpenWakeDue(path, QStringLiteral("a25-due-2")));
+        QVERIFY(rewindReviewCooldown(path, QStringLiteral("a25-clock-2")));
+        QString reason;
+        const auto wake = reopened.claimOpenWake(12, 60, 12, 100, 4, &reason);
+        QVERIFY2(!wake.isEmpty(), qPrintable(reason));
+        QCOMPARE(reopened.openWakeState().value(QStringLiteral("non_open_since_due")).toInt(), 0);
+    }
+
+    // A26：每次真实回顾尝试独立 run_id；旧版本的迟到失败不污染新版本来源失败状态；
+    // 用户插话 yield 不增加失败计数。
+    void reviewAttemptRunIdAndLateFailureIsolation()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableContact());
+        const QString path = dir.filePath(QStringLiteral("a26-runid.db"));
+        MemoryManager db(path);
+        const qlonglong turn = seedReflectionSource(db, QStringLiteral("a26-r"));
+        QVERIFY(turn > 0);
+        const QString ref = QStringLiteral("reflection/%1").arg(turn);
+        const auto first = db.claimPrivateReflection(12, 60);
+        QVERIFY(!first.isEmpty());
+        const int firstVersion = first.value(QStringLiteral("version")).toInt();
+        QVERIFY(firstVersion > 0);
+        QVERIFY(db.attachReviewAttemptRunId(QStringLiteral("reflection"), ref,
+                                            QStringLiteral("run-a")));
+        QString error;
+        QVERIFY(db.recordReviewFailure(QStringLiteral("reflection"), ref, QStringLiteral("verify"),
+                                       QStringLiteral("network_error"), true, &error,
+                                       firstVersion));
+        QVERIFY(deferredSeconds(path, turn, QStringLiteral("a26-defer")) > 0);
+        QVERIFY(rewindReflectionAttempt(path, turn, QStringLiteral("a26-rewind")));
+        const auto second = db.claimPrivateReflection(12, 60);
+        QVERIFY(!second.isEmpty());
+        const int secondVersion = second.value(QStringLiteral("version")).toInt();
+        QVERIFY(secondVersion > firstVersion);
+        QVERIFY(db.attachReviewAttemptRunId(QStringLiteral("reflection"), ref,
+                                            QStringLiteral("run-b")));
+        {
+            RawDb raw(path, QStringLiteral("a26-runids"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT count(DISTINCT run_id) FROM thought_review_log "
+                         "WHERE source_kind='reflection' AND source_ref='")
+                         + ref + QStringLiteral("'")).toInt(),
+                     2);
+        }
+        // 旧版本的迟到失败只审计：不改变当前失败行（此前 1 次真实失败不变）。
+        const int failuresBefore =
+            db.reviewFailure(QStringLiteral("reflection"), ref)
+                .value(QStringLiteral("consecutive_failures")).toInt();
+        QCOMPARE(failuresBefore, 1);
+        QVERIFY(db.recordReviewFailure(QStringLiteral("reflection"), ref, QStringLiteral("verify"),
+                                       QStringLiteral("network_error"), true, &error,
+                                       firstVersion));
+        QCOMPARE(db.reviewFailure(QStringLiteral("reflection"), ref)
+                     .value(QStringLiteral("consecutive_failures")).toInt(),
+                 failuresBefore);
+        // 当前版本的失败才累计。
+        QVERIFY(db.recordReviewFailure(QStringLiteral("reflection"), ref, QStringLiteral("verify"),
+                                       QStringLiteral("network_error"), true, &error,
+                                       secondVersion));
+        QCOMPARE(db.reviewFailure(QStringLiteral("reflection"), ref)
+                     .value(QStringLiteral("consecutive_failures")).toInt(),
+                 failuresBefore + 1);
+        // 用户插话主动让出：不增加失败计数、不退避。
+        QVERIFY(rewindReflectionAttempt(path, turn, QStringLiteral("a26-rewind-2")));
+        PrivateReview review(db);
+        const auto wake = review.wake(12, 60);
+        QVERIFY2(wake.started, qPrintable(wake.reason));
+        review.yieldAttention(QStringLiteral("incoming_message"));
+        QCOMPARE(db.reviewFailure(QStringLiteral("reflection"), ref)
+                     .value(QStringLiteral("consecutive_failures")).toInt(),
+                 failuresBefore + 1);
+    }
+
+    // A27：action_context_epoch 只在相关语境变化时 bump（主人私聊输入/成果撤回/放弃活动），
+    // 无关群聊不 bump；模型决定的长 next_wake 不被缩短。
+    void actionContextEpochScopedAndLongIntervalPreserved()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableContact());
+        const QString path = dir.filePath(QStringLiteral("a27-epoch.db"));
+        MemoryManager db(path);
+        QCOMPARE(db.actionContextEpoch(), qint64(0));
+        RequestMeta ownerMeta = concernTurnMeta(QStringLiteral("a27-owner"));
+        ownerMeta.channel = Channel::kPet;
+        ownerMeta.sessionId = Channel::kDefaultSession;
+        QVERIFY(db.recordInput(QStringLiteral("我回来了"), ownerMeta, false) > 0);
+        QCOMPARE(db.actionContextEpoch(), qint64(1));
+        // 无关群聊输入不 bump。
+        RequestMeta groupMeta = concernTurnMeta(QStringLiteral("a27-group"));
+        groupMeta.channel = Channel::kQQGroup;
+        groupMeta.sessionId = QStringLiteral("group-1");
+        groupMeta.actorId = QStringLiteral("member-1");
+        QVERIFY(db.recordInput(QStringLiteral("群里随便聊聊"), groupMeta, false) > 0);
+        QCOMPARE(db.actionContextEpoch(), qint64(1));
+        // 完成活动本身不 bump；分享撤回（成果失效）bump。
+        const auto created = db.createActivity(
+            QStringLiteral("owner"), Channel::kPet, Channel::kDefaultSession,
+            QStringLiteral("写雨声"), QStringLiteral("记下窗边雨声"),
+            QStringLiteral("foreground"), QString(), QStringLiteral("a27-run-1"));
+        QVERIFY(!created.isEmpty());
+        const QString ref = created.value(QStringLiteral("ref")).toString();
+        QString error;
+        const auto finished = db.finishActivity(
+            ref, created.value(QStringLiteral("version")).toInt(),
+            QJsonObject{{QStringLiteral("status"), QStringLiteral("completed")},
+                        {QStringLiteral("reflection"), QStringLiteral("写好了")},
+                        {QStringLiteral("draft"), QStringLiteral("雨在窗上停了一停。")},
+                        {QStringLiteral("share_with_owner"), true}},
+            &error);
+        QVERIFY2(!finished.isEmpty(), qPrintable(error));
+        QCOMPARE(db.actionContextEpoch(), qint64(1));
+        QVERIFY(db.setActivityShareIntent(
+            ref, finished.value(QStringLiteral("version")).toInt(),
+            QStringLiteral("withdraw"), QString(), -1, &error));
+        QCOMPARE(db.actionContextEpoch(), qint64(2));
+        // 放弃活动（成果撤回）也 bump。
+        const auto secondActivity = db.createActivity(
+            QStringLiteral("owner"), Channel::kPet, Channel::kDefaultSession,
+            QStringLiteral("整理桌面"), QStringLiteral("记一下"),
+            QStringLiteral("foreground"), QString(), QStringLiteral("a27-run-2"));
+        QVERIFY(!secondActivity.isEmpty());
+        const auto abandoned = db.applyActivityAction(
+            secondActivity.value(QStringLiteral("ref")).toString(),
+            secondActivity.value(QStringLiteral("version")).toInt(),
+            QStringLiteral("abandon"), 0, QStringLiteral("test"), &error);
+        QVERIFY2(!abandoned.isEmpty(), qPrintable(error));
+        QCOMPARE(db.actionContextEpoch(), qint64(3));
+        // 模型给出的长间隔（1440 分钟）不被缩短。
+        QVERIFY(db.ensureOpenWakeScheduled(QStringLiteral("owner"), 0));
+        QVERIFY(makeOpenWakeDue(path, QStringLiteral("a27-due")));
+        QString reason;
+        const auto wake = db.claimOpenWake(12, 60, 12, 100, 4, &reason);
+        QVERIFY2(!wake.isEmpty(), qPrintable(reason));
+        const qint64 before = QDateTime::currentSecsSinceEpoch();
+        QVERIFY(db.finishOpenWake(wake.value(QStringLiteral("id")).toInteger(),
+                                  wake.value(QStringLiteral("version")).toInt(),
+                                  QStringLiteral("rest"), QString(), QJsonObject{},
+                                  1440, &error));
+        const qint64 nextDue =
+            db.openWakeState().value(QStringLiteral("next_due_at")).toInteger();
+        QVERIFY2(nextDue - before >= 1430 * 60, qPrintable(QString::number(nextDue - before)));
+    }
+
 };
 
 QTEST_GUILESS_MAIN(TestMemoryManager)

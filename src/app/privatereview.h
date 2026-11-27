@@ -53,6 +53,10 @@ public:
     // 结果已经过 LLMService 的确定性+coverage+一次语义核验/至多一次修复；这里负责
     // persistActionProposal → proposed→verified(CAS) → ActionCommitter::commitInternalActivityShare。
     void receiveShareProposalResult(const QJsonObject &result);
+    // R12-2c-3：启动/定时恢复已完成活动的未处理分享意愿（崩溃窗口：finish 保存 share_intent 后
+    // 未发信号、verifier 执行中进程退出）。只处理 saved + 成果 ref/版本/哈希仍匹配 + 未撤回 +
+    // 无同成果版本提案的意图；同一 artifact_version 幂等，不重复自动分享。返回发起核验条数。
+    int recoverPendingShareIntents(bool force = false, int limit = 2);
 
 signals:
     void contactProposed(qlonglong turn, int version);
