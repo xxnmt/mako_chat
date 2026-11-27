@@ -224,7 +224,16 @@ AppController::AppController(QObject *parent)
     m_actionOutbox = new ActionOutboxDispatcher(m_memoryManager, this);
     // sender 是唯一的渠道出口：桌宠直接显示气泡；QQ 私聊只在已连接且是主人时发送。
     // 不确定/被拒的回执由 dispatcher 落库（at-most-once），这里只回答"提交是否进入渠道"。
+    // R12-2c-2：这里也是"真正入渠道队列"的最后一个可取消边界——dispatcher 已在 sender 前
+    // 复验过一次，但领取到这里的窗口里主人仍可能插话/关闭权限/撤回成果，因此入队前再复验。
     m_actionOutbox->setSender([this](const Utterance &u) {
+        const auto guard = m_memoryManager->validateOutboxActionBeforeSend(u.deliveryEcho);
+        if (!guard.value(QStringLiteral("ok")).toBool()) {
+            qInfo() << "[Outbox] channel_boundary_blocked" << u.deliveryEcho
+                    << guard.value(QStringLiteral("reason")).toString()
+                    << "permanent=" << guard.value(QStringLiteral("permanent")).toBool();
+            return false;
+        }
         if (u.channel == Channel::kPet && u.sessionId == Channel::kDefaultSession)
             return m_petChannel->sendUtterance(u);
         if (u.channel == Channel::kQQPrivate

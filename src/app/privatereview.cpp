@@ -242,6 +242,10 @@ QJsonObject buildInternalShareRequest(MemoryManager &store, const QString &activ
                      {QStringLiteral("session_id"), session}}},
         {QStringLiteral("payload"), payload},
         {QStringLiteral("claims"), QJsonArray{}},
+        // R12-2c-2：把发起核验时的 Action Context Fence epoch 随请求带走，核验结果回来时
+        // 再与当前 epoch 比较：期间主人私聊插话/成果撤回则丢弃这份晚到的核验结果，
+        // 不允许用旧语境的 verified 结果创建新提案（LLMService 会原样透传本字段）。
+        {QStringLiteral("action_context_epoch"), store.actionContextEpoch()},
         {QStringLiteral("expires_at"), QDateTime::currentSecsSinceEpoch() + 3600}};
 }
 
@@ -969,6 +973,20 @@ void PrivateReview::receiveShareProposalResult(const QJsonObject &result)
         qWarning() << "[ShareProposal] unexpected kind" << kind << actionKey;
         return;
     }
+    // R12-2c-2：核验结果是异步返回的。若发起核验后主人私聊插话或成果被撤回，当前
+    // Action Context Fence epoch 已推进，这份晚到的旧核验结果不得创建新提案（fail closed）。
+    const QJsonValue requestEpochValue = result.value(QStringLiteral("action_context_epoch"));
+    const qint64 currentEpoch = store.actionContextEpoch();
+    if (!requestEpochValue.isDouble() || requestEpochValue.toInteger() != currentEpoch) {
+        qInfo().noquote()
+            << QStringLiteral("[ShareProposal] stale_context_epoch key=%1 request=%2 current=%3")
+                   .arg(actionKey,
+                        requestEpochValue.isDouble()
+                            ? QString::number(requestEpochValue.toInteger())
+                            : QStringLiteral("missing"))
+                   .arg(currentEpoch);
+        return;
+    }
     ActionOrigin origin;
     QString originError;
     if (!ActionOrigin::fromJson(result.value(QStringLiteral("origin")).toObject(),
@@ -1025,18 +1043,18 @@ void PrivateReview::receiveShareProposalResult(const QJsonObject &result)
         return;
     }
     QString stateError;
-    const bool promoted = store.updateActionProposalState(
-        actionKey, QStringLiteral("proposed"), QStringLiteral("verified"),
-        semanticStatus, QString(),
+    // R12-2c-2：verified 必须经唯一入口写入内容指纹 + verifier request_id + fence 快照；
+    // 普通 updateActionProposalState 不再允许直接推进到 verified。
+    const bool promoted = store.markActionProposalVerified(
+        actionKey, semanticStatus, result.value(QStringLiteral("request_id")).toString(),
         &stateError);
     if (!promoted) {
-        // CAS 失败（可能已被 drain 并发推进）：只要最终状态不是 verified/committed 就放弃。
         const QJsonObject now = store.actionProposal(actionKey);
         const QString state = now.value(QStringLiteral("state")).toString();
-        if (state != QStringLiteral("verified") && state != QStringLiteral("committed")) {
-            qWarning() << "[ShareProposal] verify CAS failed" << actionKey << stateError << state;
-            return;
-        }
+        qInfo().noquote()
+            << QStringLiteral("[ShareProposal] verify_failed key=%1 error=%2 state=%3")
+                   .arg(actionKey, stateError, state);
+        return;
     }
     ActionCommitter committer(&store);
     const auto committed = committer.commitInternalActivityShare(actionKey);
@@ -1319,36 +1337,49 @@ void PrivateReview::receiveOpenWake(const Attempt &attempt, const QJsonObject &p
             } else {
                 const QString semantic = planSemantic;
                 QString stateError;
-                store.updateActionProposalState(
-                    actionKey, QStringLiteral("proposed"), QStringLiteral("verified"),
-                    semantic, QString(), &stateError);
-                ActionCommitter committer(&store);
-                const auto committed = committer.commitOpenWakeContact(actionKey);
-                if (committed.contains(QStringLiteral("error"))) {
-                    const QString commitErrorCode =
-                        committed.value(QStringLiteral("error")).toString();
+                // R12-2c-2：verified 的唯一入口（写内容指纹/request_id/fence 快照）。
+                // 失败说明提案已被语境 fence/有效期/CAS 拦下，不再提交，也不发送。
+                if (!store.markActionProposalVerified(
+                        actionKey, semantic,
+                        plan.value(QStringLiteral("request_id")).toString(), &stateError)) {
                     const QJsonObject now = store.actionProposal(actionKey);
-                    if (now.value(QStringLiteral("state")).toString()
-                        == QStringLiteral("withheld")) {
-                        qInfo().noquote()
-                            << QStringLiteral("[OpenWake] contact_rejected reason=%1 key=%2")
-                                   .arg(commitErrorCode, actionKey);
-                        decision = QStringLiteral("reflect");
+                    qInfo().noquote()
+                        << QStringLiteral("[OpenWake] contact_rejected reason=verify_failed"
+                                          " key=%1 error=%2 state=%3")
+                               .arg(actionKey, stateError,
+                                    now.value(QStringLiteral("state")).toString());
+                    decision = QStringLiteral("reflect");
+                } else {
+                    ActionCommitter committer(&store);
+                    const auto committed = committer.commitOpenWakeContact(actionKey);
+                    if (committed.contains(QStringLiteral("error"))) {
+                        const QString commitErrorCode =
+                            committed.value(QStringLiteral("error")).toString();
+                        const QJsonObject now = store.actionProposal(actionKey);
+                        if (now.value(QStringLiteral("state")).toString()
+                            == QStringLiteral("withheld")
+                            || now.value(QStringLiteral("state")).toString()
+                                   == QStringLiteral("expired")) {
+                            qInfo().noquote()
+                                << QStringLiteral("[OpenWake] contact_rejected reason=%1 key=%2")
+                                       .arg(commitErrorCode, actionKey);
+                            decision = QStringLiteral("reflect");
+                        } else {
+                            // 可恢复失败（安静/额度/目标/DB）：提案保持 verified 供 drain 恢复，
+                            // wake 本身仍按 contact 完成（不重复回顾、不无限重试）。
+                            contactVerified = true;
+                            qInfo().noquote()
+                                << QStringLiteral("[OpenWake] contact_commit_pending key=%1"
+                                                  " reason=%2")
+                                       .arg(actionKey, commitErrorCode);
+                        }
                     } else {
-                        // 可恢复失败（安静/额度/目标/DB）：提案保持 verified 供 drain 恢复，
-                        // wake 本身仍按 contact 完成（不重复回顾、不无限重试）。
                         contactVerified = true;
                         qInfo().noquote()
-                            << QStringLiteral("[OpenWake] contact_commit_pending key=%1"
-                                              " reason=%2")
-                                   .arg(actionKey, commitErrorCode);
+                            << QStringLiteral("[OpenWake] contact_committed key=%1 state=%2")
+                                   .arg(actionKey,
+                                        committed.value(QStringLiteral("state")).toString());
                     }
-                } else {
-                    contactVerified = true;
-                    qInfo().noquote()
-                        << QStringLiteral("[OpenWake] contact_committed key=%1 state=%2")
-                               .arg(actionKey,
-                                    committed.value(QStringLiteral("state")).toString());
                 }
             }
         }

@@ -82,15 +82,57 @@ void ActionOutboxDispatcher::pollOnce()
     settledPayload[QStringLiteral("text")]=utterance.text;
     settledPayload[QStringLiteral("channel")]=utterance.channel;
     settledPayload[QStringLiteral("session")]=utterance.sessionId;
+
+    // R12-2c-2：sender 之前的最后一道复验（领取时 claimOutbox 已复验一次；这里覆盖
+    // "领取后、真正交给渠道前"的窗口：主人插话推进 fence epoch、权限关闭、成果撤回、
+    // 提案过期/取消、payload/目标绑定被改写）。
+    const auto preSend=m_memory->validateOutboxActionBeforeSend(actionKey);
+    if (!preSend.value(QStringLiteral("ok")).toBool()) {
+        const QString reason=preSend.value(QStringLiteral("reason")).toString();
+        settledPayload[QStringLiteral("detail")]=reason;
+        if (preSend.value(QStringLiteral("permanent")).toBool()) {
+            // 已经交付/冻结的终态不回退、不重复发；只安静跳过（不能把已送达写成 withheld）。
+            if (reason == QStringLiteral("already_terminal")
+                || reason == QStringLiteral("outbox_terminal")) {
+                qInfo() << "[Outbox] skip_terminal" << actionKey << reason;
+                return;
+            }
+            // 永久失效：outbox failed/action withheld/提案 cancel_reason 审计，绝不发送。
+            m_memory->cancelOutboxAction(actionKey,reason);
+            qInfo()<<"[Outbox] cancelled_before_send"<<actionKey<<reason;
+            emit actionSettled(actionKey,QStringLiteral("withheld"),settledPayload);
+        } else {
+            // 可恢复阻塞：回 queued（attempts 回退，不算一次发送），等下一拍。
+            m_memory->deferOutboxAction(actionKey,reason);
+            qInfo()<<"[Outbox] deferred_before_send"<<actionKey<<reason;
+        }
+        return;
+    }
+
     if (utterance.text.trimmed().isEmpty()) {
-        m_memory->settleOutboxAction(actionKey,QStringLiteral("withheld"),
-                                     QStringLiteral("empty_payload"));
+        m_memory->cancelOutboxAction(actionKey,QStringLiteral("empty_payload"));
         emit actionSettled(actionKey,QStringLiteral("withheld"),settledPayload);
         return;
     }
 
     if (!m_sender(utterance)) {
-        // 确定没有进入渠道：落 rejected；attempts<2 时 outbox 回 queued，下一次 poll 受控重试一次。
+        // 确定没有进入渠道：先再判一次是否已因失效被取消（sender 内可能还做了最后复验）。
+        const auto afterSend=m_memory->validateOutboxActionBeforeSend(actionKey);
+        if (!afterSend.value(QStringLiteral("ok")).toBool()
+            && afterSend.value(QStringLiteral("permanent")).toBool()) {
+            const QString reason=afterSend.value(QStringLiteral("reason")).toString();
+            if (reason == QStringLiteral("already_terminal")
+                || reason == QStringLiteral("outbox_terminal")) {
+                qInfo() << "[Outbox] skip_terminal_at_boundary" << actionKey << reason;
+                return;
+            }
+            settledPayload[QStringLiteral("detail")]=reason;
+            m_memory->cancelOutboxAction(actionKey,reason);
+            qInfo()<<"[Outbox] cancelled_at_channel_boundary"<<actionKey<<reason;
+            emit actionSettled(actionKey,QStringLiteral("withheld"),settledPayload);
+            return;
+        }
+        // 落 rejected；attempts<2 时 outbox 回 queued，下一次 poll 受控重试一次。
         m_memory->settleOutboxAction(actionKey,QStringLiteral("rejected"),
                                      QStringLiteral("submit_failed"));
         qInfo()<<"[Outbox] submit_failed"<<actionKey;

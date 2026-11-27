@@ -221,6 +221,18 @@ public:
     // 非通过状态一律 withheld（由调用方在 withhold 路径显式写）。
     static QString verifiedSemanticStatus(bool hasFactualClaims);
 
+    // ===== R12-2c-2：verified 内容绑定摘要（服务端规范化，含确定性） =====
+    // 与 LLMService 语义核验请求里的 payload_digest 保持完全一致：固定字段
+    // {message,reason,[draft],claims} 的紧凑 JSON 做 SHA-256，取前 16 位 hex。
+    // 提案通过（proposed→verified）时把它持久化到 action_proposal.verified_payload_hash；
+    // 提交/领取/发送前必须用同一函数从权威 payload/claims 重算并逐字比较，
+    // 任一侧内容被改写就拒绝，不允许"核验的是 A、发送的是 B"。
+    static QString canonicalProposalPayloadDigest(const QJsonObject &payload,
+                                                  const QJsonArray &claims);
+    // 仅 claims 数组的规范化摘要（SHA-256 前 16 位），用于把"核验过的声明集合"
+    // 与后续提交/发送的 claims 绑定；与 payload 摘要独立，两处都要一致。
+    static QString canonicalProposalClaimsDigest(const QJsonArray &claims);
+
 private:
     // 来源时间（时序基准）：wake 用 open_wake.started_at/created_at，
     // reflection/concern 用 chat_history/cognitive_source 的 reported；找不到返回空串。

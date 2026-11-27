@@ -20,6 +20,7 @@
 
 #include <QCryptographicHash>
 #include <QDateTime>
+#include <QTime>
 #include <QUuid>
 
 // 独立于 MemoryManager 的原始连接：建测试库、直接验表结构、模拟租约过期/并发写入。
@@ -164,6 +165,29 @@ public:
             QStringLiteral("identity.json"),
             QJsonDocument(root).toJson(QJsonDocument::Compact), nullptr);
     }
+    // R12-2c-2：关闭主动联系（A12）：已入 Outbox 的行必须在 sender 前被拦截（零发送）。
+    // open_wake.allow_contact 仍保持可用，单独验证 proactive.enabled 的撤回效果。
+    bool disableProactive()
+    {
+        QJsonObject proactive{{"enabled", false},
+                              {"private_writing", false},
+                              {"targets", QJsonArray{}}};
+        const QJsonObject openWake{{"enabled", true},
+                                   {"allow_contact", true},
+                                   {"initial_delay_seconds", 60},
+                                   {"min_interval_seconds", 300},
+                                   {"default_interval_seconds", 300},
+                                   {"max_interval_seconds", 86400},
+                                   {"max_non_open_jobs_when_due", 0},
+                                   {"max_model_steps_per_wake", 3},
+                                   {"max_per_day", 12},
+                                   {"shared_budget_percent", 30}};
+        const QJsonObject root{{"proactive", proactive},
+                               {"cognition", QJsonObject{{"open_wake", openWake}}}};
+        return ConfigManager::instance().writeConfigDocument(
+            QStringLiteral("identity.json"),
+            QJsonDocument(root).toJson(QJsonDocument::Compact), nullptr);
+    }
 
 private:
     QString m_path;
@@ -276,7 +300,9 @@ static QJsonObject internalShareProposal(qlonglong activityId, int artifactVersi
         {QStringLiteral("expires_at"), 0}};
 }
 
-// persist(proposed) → CAS(verified)；返回 action_key，失败返回空串。
+// persist(proposed) → markVerified(写入内容指纹/request_id/fence 快照)；返回 action_key，失败返回空串。
+// R12-2c-2：verified 只能经 MemoryManager::markActionProposalVerified 推进（生产路径由
+// PrivateReview 传入 LLMService 的 verifier request_id；测试这里用固定前缀的假 id）。
 static QString persistVerifiedProposal(MemoryManager &db, const QJsonObject &proposal,
                                        const QString &semanticStatus = QStringLiteral("not_required"))
 {
@@ -287,10 +313,33 @@ static QString persistVerifiedProposal(MemoryManager &db, const QJsonObject &pro
         return {};
     }
     const QString key = stored.value(QStringLiteral("action_key")).toString();
-    if (!db.updateActionProposalState(key, QStringLiteral("proposed"),
-                                      QStringLiteral("verified"), semanticStatus, QString(),
-                                      &error)) {
-        qWarning() << "verified CAS failed" << key << error;
+    const QString requestId = QStringLiteral("test-request-")
+        + QUuid::createUuid().toString(QUuid::WithoutBraces);
+    if (!db.markActionProposalVerified(key, semanticStatus, requestId, &error)) {
+        qWarning() << "markActionProposalVerified failed" << key << error;
+        return {};
+    }
+    return key;
+}
+
+// R12-2c-2：造一条已 verified 并成功提交到 Outbox 的 open wake contact；返回 action_key。
+// 仅入 Outbox（发送由测试里的 dispatcher/mock sender 决定），供 A12/A13/A16 使用。
+static QString seedCommittedWakeContact(MemoryManager &db, const QString &dbPath,
+                                        const QString &tag, const QString &message,
+                                        qint64 expiresAt = 0)
+{
+    const QString runId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const qlonglong wakeId = seedOpenWakeRow(dbPath, tag, runId);
+    if (wakeId <= 0) return {};
+    QJsonObject proposal = wakeContactProposal(wakeId, 1, runId, message);
+    if (expiresAt != 0) proposal[QStringLiteral("expires_at")] = expiresAt;
+    const QString key = persistVerifiedProposal(db, proposal);
+    if (key.isEmpty()) return {};
+    ActionCommitter committer(&db);
+    const auto committed = committer.commitOpenWakeContact(key);
+    if (committed.contains(QStringLiteral("error"))) {
+        qWarning() << "seedCommittedWakeContact failed"
+                   << committed.value(QStringLiteral("error")).toString();
         return {};
     }
     return key;
@@ -1439,6 +1488,460 @@ private slots:
             RawDb raw(path, QStringLiteral("dr-idem"));
             QVERIFY(raw.open());
             QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_outbox")).toInt(), 2);
+        }
+    }
+
+    // ===== R12-2c-2：提案提交事务边界 / Action Context Fence / 发送前最终复验 =====
+
+    // A07：核验通过后权威 payload 被改写 → 提交按 verified 内容指纹拒绝，不写动作/Outbox。
+    void verifiedContentTamperIsRejected()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableOpenWakeContact(true));
+        const QString path = dir.filePath(QStringLiteral("a07-tamper.db"));
+        MemoryManager db(path);
+        ActionCommitter committer(&db);
+        const QString runId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        const qlonglong wakeId = seedOpenWakeRow(path, QStringLiteral("a07-wake"), runId);
+        QVERIFY(wakeId > 0);
+        const QString key = persistVerifiedProposal(
+            db, wakeContactProposal(wakeId, 1, runId, QStringLiteral("在忙吗？")));
+        QVERIFY(!key.isEmpty());
+        {
+            // 核验时是"在忙吗？"，落库后改成另一句话：内容指纹必须对不上。
+            RawDb raw(path, QStringLiteral("a07-tamper-raw"));
+            QVERIFY(raw.open());
+            QVERIFY(raw.execPrepared(
+                QStringLiteral("UPDATE action_proposal SET payload_json=? WHERE action_key=?"),
+                {QStringLiteral(R"({"message":"晚安呀","reason":"想问候"})"), key}));
+        }
+        const auto rejected = committer.commitOpenWakeContact(key);
+        QCOMPARE(rejected.value(QStringLiteral("error")).toString(),
+                 QStringLiteral("policy_rejected"));
+        QCOMPARE(rejected.value(QStringLiteral("detail")).toString(),
+                 QStringLiteral("verified_content_mismatch"));
+        {
+            RawDb raw(path, QStringLiteral("a07-post"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM cognitive_action")).toInt(), 0);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_outbox")).toInt(), 0);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM action_proposal WHERE action_key='")
+                                    + key + QStringLiteral("'")).toString(),
+                     QStringLiteral("withheld"));
+        }
+    }
+
+    // A08：核验后主人私聊新消息推进 fence epoch → 旧提案 expired，不提交、不发送。
+    void verifiedProposalExpiresAfterOwnerPrivateInput()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableOpenWakeContact(true));
+        const QString path = dir.filePath(QStringLiteral("a08-fence.db"));
+        MemoryManager db(path);
+        ActionCommitter committer(&db);
+        const QString runId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        const qlonglong wakeId = seedOpenWakeRow(path, QStringLiteral("a08-wake"), runId);
+        QVERIFY(wakeId > 0);
+        const QString key = persistVerifiedProposal(
+            db, wakeContactProposal(wakeId, 1, runId, QStringLiteral("在忙吗？")));
+        QVERIFY(!key.isEmpty());
+        const qint64 epochBefore = db.actionContextEpoch();
+        // 相关的主人私聊输入（pet/subject=user/reply）→ bump。
+        QVERIFY(db.recordInput(QStringLiteral("我在忙，晚点说"), actionMeta(QStringLiteral("a08-owner")),
+                               false) > 0);
+        QCOMPARE(db.actionContextEpoch(), epochBefore + 1);
+        const auto committed = committer.commitOpenWakeContact(key);
+        QCOMPARE(committed.value(QStringLiteral("error")).toString(),
+                 QStringLiteral("stale_origin"));
+        {
+            RawDb raw(path, QStringLiteral("a08-post"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_outbox")).toInt(), 0);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM action_proposal WHERE action_key='")
+                                    + key + QStringLiteral("'")).toString(),
+                     QStringLiteral("expired"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT cancel_reason FROM action_proposal "
+                                               "WHERE action_key='") + key
+                                    + QStringLiteral("'")).toString(),
+                     QStringLiteral("context_epoch_changed"));
+        }
+    }
+
+    // A09：无关群聊消息不推进 fence epoch，也不取消主人的合法行动。
+    void unrelatedGroupMessageDoesNotCancelOwnerAction()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableOpenWakeContact(true));
+        const QString path = dir.filePath(QStringLiteral("a09-group.db"));
+        MemoryManager db(path);
+        ActionCommitter committer(&db);
+        const QString runId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        const qlonglong wakeId = seedOpenWakeRow(path, QStringLiteral("a09-wake"), runId);
+        QVERIFY(wakeId > 0);
+        const QString key = persistVerifiedProposal(
+            db, wakeContactProposal(wakeId, 1, runId, QStringLiteral("早安")));
+        QVERIFY(!key.isEmpty());
+        const qint64 epochBefore = db.actionContextEpoch();
+        RequestMeta group = actionMeta(QStringLiteral("a09-group-msg"));
+        group.channel = Channel::kQQGroup;
+        group.sessionId = QStringLiteral("group:123");
+        group.speaker = QStringLiteral("群友");
+        QVERIFY(db.recordInput(QStringLiteral("群里随便聊聊"), group, false) > 0);
+        QCOMPARE(db.actionContextEpoch(), epochBefore); // 群聊不 bump
+        const auto committed = committer.commitOpenWakeContact(key);
+        QVERIFY2(!committed.contains(QStringLiteral("error")),
+                 qPrintable(committed.value(QStringLiteral("error")).toString()));
+        {
+            RawDb raw(path, QStringLiteral("a09-post"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_outbox")).toInt(), 1);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM action_proposal WHERE action_key='")
+                                    + key + QStringLiteral("'")).toString(),
+                     QStringLiteral("committed"));
+        }
+    }
+
+    // A10：两个独立连接先后提交同一 action_key → 唯一动作/Outbox（幂等复用或 CAS 拒绝）。
+    void duplicateCommitAcrossConnectionsCreatesOneOutbox()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableOpenWakeContact(true));
+        const QString path = dir.filePath(QStringLiteral("a10-duplicate.db"));
+        QString key;
+        {
+            MemoryManager setup(path);
+            const QString runId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+            const qlonglong wakeId = seedOpenWakeRow(path, QStringLiteral("a10-wake"), runId);
+            QVERIFY(wakeId > 0);
+            key = persistVerifiedProposal(
+                setup, wakeContactProposal(wakeId, 1, runId, QStringLiteral("在忙吗？")));
+            QVERIFY(!key.isEmpty());
+        }
+        {
+            MemoryManager first(path, nullptr, QStringLiteral("a10-conn-1"));
+            MemoryManager second(path, nullptr, QStringLiteral("a10-conn-2"));
+            const auto r1 = ActionCommitter(&first).commitOpenWakeContact(key);
+            QVERIFY2(!r1.contains(QStringLiteral("error")),
+                     qPrintable(r1.value(QStringLiteral("error")).toString()));
+            const auto r2 = ActionCommitter(&second).commitOpenWakeContact(key);
+            // 第二个独立写者要么幂等复用既有动作，要么看到提案已 committed 而拒绝；
+            // 两种情况都不允许出现第二条动作/Outbox。
+            if (!r2.contains(QStringLiteral("error")))
+                QCOMPARE(r2.value(QStringLiteral("idempotent")).toBool(), true);
+        }
+        {
+            RawDb raw(path, QStringLiteral("a10-post"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM cognitive_action")).toInt(), 1);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_outbox")).toInt(), 1);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_proposal "
+                                               "WHERE state='committed'")).toInt(), 1);
+        }
+    }
+
+    // A11：两个独立连接各自提交不同提案，共享 contact 每日额度仍然不超额。
+    void separateConnectionsHonorSharedContactQuota()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableOpenWakeContact(true, 1));
+        const QString path = dir.filePath(QStringLiteral("a11-quota.db"));
+        QString keyA, keyB;
+        {
+            MemoryManager setup(path);
+            const QString runA = QUuid::createUuid().toString(QUuid::WithoutBraces);
+            const QString runB = QUuid::createUuid().toString(QUuid::WithoutBraces);
+            const qlonglong wakeA = seedOpenWakeRow(path, QStringLiteral("a11-wake-a"), runA);
+            const qlonglong wakeB = seedOpenWakeRow(path, QStringLiteral("a11-wake-b"), runB);
+            QVERIFY(wakeA > 0 && wakeB > 0);
+            keyA = persistVerifiedProposal(
+                setup, wakeContactProposal(wakeA, 1, runA, QStringLiteral("早安")));
+            keyB = persistVerifiedProposal(
+                setup, wakeContactProposal(wakeB, 1, runB, QStringLiteral("午安")));
+            QVERIFY(!keyA.isEmpty() && !keyB.isEmpty());
+        }
+        {
+            MemoryManager first(path, nullptr, QStringLiteral("a11-conn-1"));
+            MemoryManager second(path, nullptr, QStringLiteral("a11-conn-2"));
+            const auto r1 = ActionCommitter(&first).commitOpenWakeContact(keyA);
+            QVERIFY2(!r1.contains(QStringLiteral("error")),
+                     qPrintable(r1.value(QStringLiteral("error")).toString()));
+            const auto r2 = ActionCommitter(&second).commitOpenWakeContact(keyB);
+            QCOMPARE(r2.value(QStringLiteral("error")).toString(), QStringLiteral("limit"));
+        }
+        {
+            RawDb raw(path, QStringLiteral("a11-post"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM cognitive_action")).toInt(), 1);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_outbox")).toInt(), 1);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM delivery_ledger "
+                                               "WHERE kind='contact' AND state<>'withheld'")).toInt(),
+                     1);
+            // 被额度挡住的提案保留 verified，等待下一次 drain（不丢、不发送）。
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM action_proposal WHERE action_key='")
+                                    + keyB + QStringLiteral("'")).toString(),
+                     QStringLiteral("verified"));
+        }
+    }
+
+    // A12：已入 Outbox 后关闭主动联系 → sender 前拦截，零发送、终态 withheld、不重领。
+    void disabledProactiveBlocksQueuedContactBeforeSend()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableOpenWakeContact(true));
+        const QString path = dir.filePath(QStringLiteral("a12-disabled.db"));
+        MemoryManager db(path);
+        const QString key = seedCommittedWakeContact(db, path, QStringLiteral("a12-wake"),
+                                                     QStringLiteral("在忙吗？"));
+        QVERIFY(!key.isEmpty());
+        // 已入 Outbox 之后关闭主动联系：send 前必须拦截。
+        QVERIFY(identity.disableProactive());
+        ActionOutboxDispatcher dispatcher(&db);
+        int sends = 0;
+        dispatcher.setSender([&sends](const Utterance &) {
+            ++sends;
+            return true;
+        });
+        dispatcher.pollOnce();
+        QCOMPARE(sends, 0);
+        {
+            RawDb raw(path, QStringLiteral("a12-post"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM action_outbox WHERE action_key='")
+                                    + key + QStringLiteral("'")).toString(),
+                     QStringLiteral("failed"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM cognitive_action WHERE action_key='")
+                                    + key + QStringLiteral("'")).toString(),
+                     QStringLiteral("withheld"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM delivery_ledger "
+                                               "WHERE kind='contact' AND ref='")
+                                    + key + QStringLiteral("'")).toString(),
+                     QStringLiteral("withheld"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT cancel_reason FROM action_proposal "
+                                               "WHERE action_key='") + key
+                                    + QStringLiteral("'")).toString(),
+                     QStringLiteral("proactive_disabled"));
+        }
+        // 终态行不可重领，也不会再次调用 sender。
+        dispatcher.pollOnce();
+        QCOMPARE(sends, 0);
+    }
+
+    // A13：已入 Outbox 后进入安静时段 → 保留 queued（不占发送次数、零发送）；解除后发一次。
+    void quietHoursDeferQueuedContactWithoutSending()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableOpenWakeContact(true));
+        const QString path = dir.filePath(QStringLiteral("a13-quiet.db"));
+        MemoryManager db(path);
+        const QString key = seedCommittedWakeContact(db, path, QStringLiteral("a13-wake"),
+                                                     QStringLiteral("早安"));
+        QVERIFY(!key.isEmpty());
+        const QTime now = QTime::currentTime();
+        QVERIFY(identity.enableOpenWakeContact(true, -1,
+                                               now.addSecs(-3600).toString(QStringLiteral("HH:mm")),
+                                               now.addSecs(3600).toString(QStringLiteral("HH:mm"))));
+        ActionOutboxDispatcher dispatcher(&db);
+        int sends = 0;
+        dispatcher.setSender([&sends](const Utterance &) {
+            ++sends;
+            return true;
+        });
+        dispatcher.pollOnce();
+        QCOMPARE(sends, 0);
+        {
+            RawDb raw(path, QStringLiteral("a13-post"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM action_outbox WHERE action_key='")
+                                    + key + QStringLiteral("'")).toString(),
+                     QStringLiteral("queued"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT attempts FROM action_outbox WHERE action_key='")
+                                    + key + QStringLiteral("'")).toInt(),
+                     0);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM action_proposal WHERE action_key='")
+                                    + key + QStringLiteral("'")).toString(),
+                     QStringLiteral("committed"));
+        }
+        // 安静时段解除：下一拍正常发送一次（pet=handed_off）。
+        QVERIFY(identity.enableOpenWakeContact(true));
+        dispatcher.pollOnce();
+        QCOMPARE(sends, 1);
+    }
+
+    // A14：withheld 结算会把 outbox 置 failed（attempts 可能 <2）；这类失败行不得重领。
+    void withheldFailedRowIsNeverReclaimed()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableProactive());
+        const QString path = dir.filePath(QStringLiteral("a14-withheld.db"));
+        MemoryManager db(path);
+        ActionCommitter committer(&db);
+        const qint64 reminder = insertReminder(path, QStringLiteral("a14-reminder"), -10,
+                                               QStringLiteral("该睡了"));
+        QVERIFY(reminder > 0);
+        const auto committed = committer.commitReminderDelivery(reminder);
+        QVERIFY2(!committed.contains(QStringLiteral("error")),
+                 qPrintable(committed.value(QStringLiteral("error")).toString()));
+        const QString key = committed.value(QStringLiteral("action_key")).toString();
+        QVERIFY(!db.claimOutbox(QStringLiteral("a14-first"), 60).isEmpty());
+        QVERIFY(db.settleOutboxAction(key, QStringLiteral("withheld"),
+                                      QStringLiteral("pre_send_invalid")));
+        {
+            RawDb raw(path, QStringLiteral("a14-pre"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM action_outbox WHERE action_key='")
+                                    + key + QStringLiteral("'")).toString(),
+                     QStringLiteral("failed"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT attempts FROM action_outbox WHERE action_key='")
+                                    + key + QStringLiteral("'")).toInt(),
+                     1);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM cognitive_action WHERE action_key='")
+                                    + key + QStringLiteral("'")).toString(),
+                     QStringLiteral("withheld"));
+        }
+        // 不能因为 attempts<2 把 failed 行重新领出来（key 的 action 已 withheld）。
+        QVERIFY(db.claimOutbox(QStringLiteral("a14-second"), 60).isEmpty());
+        QVERIFY(db.claimOutbox(QStringLiteral("a14-third"), 60).isEmpty());
+    }
+
+    // A15：verified 提案在停机期间过期；重启后 drain 只落 expired，绝不补发。
+    void expiredVerifiedProposalIsNotResentAfterRestart()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableOpenWakeContact(true));
+        const QString path = dir.filePath(QStringLiteral("a15-expired.db"));
+        QString key;
+        {
+            MemoryManager db(path);
+            const QString runId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+            const qlonglong wakeId = seedOpenWakeRow(path, QStringLiteral("a15-wake"), runId);
+            QVERIFY(wakeId > 0);
+            QJsonObject proposal = wakeContactProposal(wakeId, 1, runId,
+                                                       QStringLiteral("在忙吗？"));
+            proposal[QStringLiteral("expires_at")] = QDateTime::currentSecsSinceEpoch() + 60;
+            key = persistVerifiedProposal(db, proposal);
+            QVERIFY(!key.isEmpty());
+            RawDb raw(path, QStringLiteral("a15-expire"));
+            QVERIFY(raw.open());
+            QVERIFY(raw.exec(QStringLiteral(
+                "UPDATE action_proposal SET expires_at=unixepoch()-5 WHERE action_key='") + key
+                + QStringLiteral("'")));
+        }
+        {
+            // 重启：启动恢复（drain）只能把过期 verified 落 expired，不补建 Outbox。
+            MemoryManager reopened(path);
+            const auto drained = reopened.drainVerifiedActionProposals(8);
+            QCOMPARE(drained.value(QStringLiteral("committed")).toInt(), 0);
+            QCOMPARE(drained.value(QStringLiteral("scanned")).toInt(), 0);
+        }
+        {
+            RawDb raw(path, QStringLiteral("a15-post"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM action_proposal WHERE action_key='")
+                                    + key + QStringLiteral("'")).toString(),
+                     QStringLiteral("expired"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_outbox")).toInt(), 0);
+        }
+    }
+
+    // A16：动作已领取/在渠道队列排队后语境失效 → 最后一个可取消边界（queue sender 复验）
+    //       必须拦截；随后取消落终态，不会重领。
+    void channelQueueBoundaryBlocksInvalidatedAction()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableOpenWakeContact(true));
+        const QString path = dir.filePath(QStringLiteral("a16-boundary.db"));
+        MemoryManager db(path);
+        const QString key = seedCommittedWakeContact(db, path, QStringLiteral("a16-wake"),
+                                                     QStringLiteral("在忙吗？"));
+        QVERIFY(!key.isEmpty());
+        // 模拟 dispatcher 已领取、动作正在渠道队列里等待真正发送。
+        const auto job = db.claimOutbox(QStringLiteral("a16-dispatcher"), 300);
+        QCOMPARE(job.value(QStringLiteral("action_key")).toString(), key);
+        // 排队期间主人又说话了：fence epoch 推进，旧动作失效。
+        QVERIFY(db.recordInput(QStringLiteral("先别发了"),
+                               actionMeta(QStringLiteral("a16-owner")), false) > 0);
+        // mock queue sender 在真正入队前的最后复验：必须拦截。
+        bool sent = false;
+        const auto guard = db.validateOutboxActionBeforeSend(key);
+        QVERIFY(!guard.value(QStringLiteral("ok")).toBool());
+        QVERIFY(guard.value(QStringLiteral("permanent")).toBool());
+        QCOMPARE(guard.value(QStringLiteral("reason")).toString(),
+                 QStringLiteral("context_epoch_changed"));
+        if (guard.value(QStringLiteral("ok")).toBool()) sent = true;
+        QVERIFY(!sent);
+        QVERIFY(db.cancelOutboxAction(key, guard.value(QStringLiteral("reason")).toString()));
+        {
+            RawDb raw(path, QStringLiteral("a16-post"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM action_outbox WHERE action_key='")
+                                    + key + QStringLiteral("'")).toString(),
+                     QStringLiteral("failed"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM cognitive_action WHERE action_key='")
+                                    + key + QStringLiteral("'")).toString(),
+                     QStringLiteral("withheld"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM delivery_ledger "
+                                               "WHERE kind='contact' AND ref='")
+                                    + key + QStringLiteral("'")).toString(),
+                     QStringLiteral("withheld"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT cancel_reason FROM action_proposal "
+                                               "WHERE action_key='") + key
+                                    + QStringLiteral("'")).toString(),
+                     QStringLiteral("context_epoch_changed"));
+        }
+        QVERIFY(db.claimOutbox(QStringLiteral("a16-after"), 60).isEmpty());
+    }
+
+    // A16 补充：dispatcher 领取时就复验（不需要 sender 参与），语境失效零发送。
+    void dispatcherRevalidatesBeforeSender()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        ProactiveIdentityGuard identity;
+        QVERIFY(identity.enableOpenWakeContact(true));
+        const QString path = dir.filePath(QStringLiteral("a16b-dispatcher.db"));
+        MemoryManager db(path);
+        const QString key = seedCommittedWakeContact(db, path, QStringLiteral("a16b-wake"),
+                                                     QStringLiteral("早安"));
+        QVERIFY(!key.isEmpty());
+        QVERIFY(db.recordInput(QStringLiteral("先别发"),
+                               actionMeta(QStringLiteral("a16b-owner")), false) > 0);
+        ActionOutboxDispatcher dispatcher(&db);
+        int sends = 0;
+        dispatcher.setSender([&sends](const Utterance &) {
+            ++sends;
+            return true;
+        });
+        dispatcher.pollOnce();
+        QCOMPARE(sends, 0);
+        {
+            RawDb raw(path, QStringLiteral("a16b-post"));
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM action_outbox WHERE action_key='")
+                                    + key + QStringLiteral("'")).toString(),
+                     QStringLiteral("failed"));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT state FROM cognitive_action WHERE action_key='")
+                                    + key + QStringLiteral("'")).toString(),
+                     QStringLiteral("withheld"));
         }
     }
 

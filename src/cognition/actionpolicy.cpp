@@ -1706,3 +1706,28 @@ QString ActionPolicy::verifiedSemanticStatus(bool hasFactualClaims)
                             : QStringLiteral("entailed_coverage");
 }
 
+// R12-2c-2：verified 内容绑定摘要。算法必须与 LLMService 的 verifierPayloadDigest
+// 逐字一致（同样的字段集合、同样的 Qt JSON 紧凑序列化、同样取 SHA-256 前 16 位 hex），
+// 否则持久化的"核验内容指纹"无法和 verifier 输入对齐。这里只处理规范化后的内容，
+// 不记录/输出 message/reason/draft 原文。
+QString ActionPolicy::canonicalProposalPayloadDigest(const QJsonObject &payload,
+                                                     const QJsonArray &claims)
+{
+    QJsonObject normalized{
+        {QStringLiteral("message"), payload.value(QStringLiteral("message"))},
+        {QStringLiteral("reason"), payload.value(QStringLiteral("reason"))}};
+    if (payload.contains(QStringLiteral("draft")))
+        normalized.insert(QStringLiteral("draft"), payload.value(QStringLiteral("draft")));
+    normalized.insert(QStringLiteral("claims"), claims);
+    const QByteArray canonical = QJsonDocument(normalized).toJson(QJsonDocument::Compact);
+    return QString::fromLatin1(
+        QCryptographicHash::hash(canonical, QCryptographicHash::Sha256).toHex().left(16));
+}
+
+QString ActionPolicy::canonicalProposalClaimsDigest(const QJsonArray &claims)
+{
+    const QByteArray canonical = QJsonDocument(claims).toJson(QJsonDocument::Compact);
+    return QString::fromLatin1(
+        QCryptographicHash::hash(canonical, QCryptographicHash::Sha256).toHex().left(16));
+}
+

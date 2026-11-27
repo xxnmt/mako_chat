@@ -10,6 +10,7 @@
 #include <QFile>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QJsonArray>
 #include <QDir>
 #include <QScopeGuard>
 #include <QSet>
@@ -642,6 +643,64 @@ public:
     bool fail = false;
 };
 
+// R12-2c-2：构造 v32 形状的 action_proposal（不含 v33 七列）+ attention_state。
+// withReflectionTable=false 时故意缺少 private_reflection，让迁移事务最后一步
+// （concern_resolution 的 DELETE 触发器）失败，用于验证整个 v33 迁移事务回滚。
+static bool seedV32ProposalFixture(RawDb &raw, bool withReflectionTable)
+{
+    bool ok = raw.exec(QStringLiteral(
+        "CREATE TABLE action_proposal("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "action_key TEXT NOT NULL UNIQUE,"
+        "kind TEXT NOT NULL,"
+        "origin_kind TEXT NOT NULL,"
+        "origin_ref TEXT NOT NULL,"
+        "origin_version INTEGER NOT NULL,"
+        "run_id TEXT,"
+        "scope TEXT NOT NULL,"
+        "context_epoch INTEGER NOT NULL DEFAULT 0,"
+        "target_channel TEXT NOT NULL,"
+        "target_session TEXT NOT NULL,"
+        "payload_json TEXT NOT NULL,"
+        "claims_json TEXT NOT NULL DEFAULT '[]',"
+        "semantic_status TEXT,"
+        "state TEXT NOT NULL DEFAULT 'proposed',"
+        "expires_at INTEGER NOT NULL DEFAULT 0,"
+        "committed_action_key TEXT,"
+        "error_code TEXT,"
+        "created_at INTEGER NOT NULL,"
+        "updated_at INTEGER NOT NULL)"));
+    ok = ok && raw.exec(QStringLiteral(
+        "CREATE TABLE attention_state(key TEXT PRIMARY KEY,value TEXT,"
+        "updated_at INTEGER NOT NULL DEFAULT 0)"));
+    // v32 时代已有的动作/Outbox 行：v33 迁移绝不能改写它们。
+    ok = ok && raw.exec(QStringLiteral(
+        "CREATE TABLE cognitive_action(id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "action_key TEXT NOT NULL UNIQUE,kind TEXT NOT NULL,channel TEXT,session_id TEXT,"
+        "payload_json TEXT,state TEXT)"));
+    ok = ok && raw.exec(QStringLiteral(
+        "CREATE TABLE action_outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,action_id INTEGER,"
+        "action_key TEXT,channel TEXT,session_id TEXT,payload_json TEXT,state TEXT,"
+        "attempts INTEGER NOT NULL DEFAULT 0)"));
+    ok = ok && raw.exec(QStringLiteral(
+        "INSERT INTO cognitive_action(action_key,kind,channel,session_id,payload_json,state) "
+        "VALUES('v32-legacy-action','SpontaneousContact','pet','default','{}','queued')"));
+    ok = ok && raw.exec(QStringLiteral(
+        "INSERT INTO action_outbox(action_id,action_key,channel,session_id,payload_json,state) "
+        "VALUES(1,'v32-legacy-action','pet','default','{}','queued')"));
+    if (withReflectionTable)
+        ok = ok && raw.exec(QStringLiteral(
+            "CREATE TABLE private_reflection(turn_id INTEGER PRIMARY KEY)"));
+    ok = ok && raw.exec(QStringLiteral(
+        "INSERT INTO action_proposal(action_key,kind,origin_kind,origin_ref,origin_version,"
+        "scope,target_channel,target_session,payload_json,claims_json,state,expires_at,"
+        "created_at,updated_at) VALUES('concern:9:1:contact','contact','concern','concern/9',1,"
+        "'owner','pet','default','{\"message\":\"在吗\"}','[]','verified',0,"
+        "unixepoch(),unixepoch())"));
+    ok = ok && raw.exec(QStringLiteral("PRAGMA user_version=32"));
+    return ok;
+}
+
 class TestMemoryManager : public QObject
 {
     Q_OBJECT
@@ -666,7 +725,7 @@ private slots:
         QVERIFY(raw.exec("DROP TABLE matter_revision"));
         for (int reopen=0; reopen<2; ++reopen) {
             MemoryManager db(path);
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),32);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 33);
             QCOMPARE(raw.scalar("SELECT state_updates FROM chat_history").toString(),QString("[]"));
             QVERIFY(db.matterHeads("user").isEmpty());
         }
@@ -1027,7 +1086,7 @@ private slots:
         }
         RawDb raw(path,"v17-semantics");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),32);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 33);
         QCOMPARE(raw.scalar("SELECT count(*) FROM matter_revision").toInt(),1);
         QVERIFY(raw.scalar("SELECT semantics IS NULL FROM matter_revision").toBool());
     }
@@ -1101,7 +1160,7 @@ private slots:
         RawDb raw(path,"lifecycle");
         QVERIFY(raw.open());
         QCOMPARE(raw.scalar("SELECT count(*) FROM matter_revision").toInt(),2);
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(),32);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 33);
     }
 
     void currentUnderstandingRetainsLatestSelfReport()
@@ -2257,7 +2316,7 @@ private slots:
         }
         RawDb raw(path, "v15-verify");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 32);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 33);
     }
 
     void databaseBackupIsConsistent()
@@ -2277,7 +2336,7 @@ private slots:
         RawDb copy(backup, "backup-copy");
         QVERIFY(copy.open());
         QCOMPARE(copy.scalar("SELECT count(*) FROM chat_history").toInt(), 1);
-        QCOMPARE(copy.scalar("PRAGMA user_version").toInt(), 32);
+        QCOMPARE(copy.scalar("PRAGMA user_version").toInt(), 33);
         QVERIFY(copy.scalar("SELECT count(*) FROM memory_chunks").toInt() > 0);
     }
 
@@ -2552,7 +2611,7 @@ private slots:
             QVERIFY(raw.open());
 
             // 版本推进到 v3
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 32);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 33);
 
             // 列扩展（v2 渠道 + v3 轮次）
             const QStringList historyCols = raw.columns("chat_history");
@@ -2657,7 +2716,7 @@ private slots:
             MemoryManager second(dbPath);
             RawDb raw(dbPath, "verify2");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 32);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 33);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM chat_history").toInt(), 1);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM relationship_state").toInt(), 2);
             QCOMPARE(raw.scalar("SELECT COUNT(*) FROM long_term_summary").toInt(), 1);
@@ -2674,7 +2733,7 @@ private slots:
             MemoryManager mm(dbPath);
             RawDb raw(dbPath, "fresh");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 32);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 33);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('raw_events')").toInt() > 0);
             QVERIFY(raw.scalar("SELECT COUNT(*) FROM pragma_table_info('memory_cursor')").toInt() > 0);
 
@@ -2881,7 +2940,7 @@ private slots:
         Q_UNUSED(mm);
         RawDb raw(dbPath, "v2verify");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 32);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 33);
         QCOMPARE(raw.scalar("SELECT user_input FROM chat_history").toString(), QStringLiteral("旧输入"));
         QCOMPARE(raw.scalar("SELECT turn_kind FROM chat_history").toString(), QStringLiteral("reply"));
         QCOMPARE(raw.scalar("SELECT subject FROM chat_history").toString(), QStringLiteral("user"));
@@ -3818,7 +3877,7 @@ private slots:
         {
             RawDb raw(path, "ledger-schema");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 32);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 33);
             const QStringList contact = raw.columns("reflection_contact");
             for (const auto &column : {QStringLiteral("attempts"), QStringLiteral("last_outcome"),
                                        QStringLiteral("last_attempt_at"),
@@ -4867,7 +4926,7 @@ private slots:
         MemoryManager reopened(path);
         RawDb raw(path, "v27-legacy-verify");
         QVERIFY(raw.open());
-        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 32);
+        QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 33);
         QCOMPARE(raw.scalar(QStringLiteral("SELECT outcome FROM reflection_contact WHERE turn_id=99001"))
                      .toString(), QStringLiteral("withheld"));
         QCOMPARE(raw.scalar(QStringLiteral("SELECT last_outcome FROM reflection_contact WHERE turn_id=99001"))
@@ -5094,7 +5153,7 @@ private slots:
             MemoryManager db(path);
             RawDb schema(path, "attention-schema");
             QVERIFY(schema.open());
-            QCOMPARE(schema.scalar("PRAGMA user_version").toInt(), 32);
+            QCOMPARE(schema.scalar("PRAGMA user_version").toInt(), 33);
             const QStringList eventColumns = schema.columns("attention_event");
             for (const auto &column : {QStringLiteral("kind"), QStringLiteral("ref"),
                                        QStringLiteral("payload"), QStringLiteral("state"),
@@ -5585,7 +5644,7 @@ private slots:
         {
             RawDb raw(path, "v31-verify");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 32);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 33);
             for (const auto &table : {QStringLiteral("open_wake_state"), QStringLiteral("open_wake"),
                                       QStringLiteral("internal_activity"), QStringLiteral("review_failure")})
                 QCOMPARE(raw.scalar(QStringLiteral(
@@ -5611,14 +5670,14 @@ private slots:
         {
             RawDb raw(path, "v31-verify-replay");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 32);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 33);
             QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM thought_review_log")).toInt(), 1);
             QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM open_wake")).toInt(), 0);
             QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM chat_history")).toInt(), 2);
         }
     }
 
-    // ===== R12-2a：v32 迁移（幂等重放；旧数据/Outbox 完整）=====
+    // ===== R12-2a/R12-2c-2：v32→v33 迁移（幂等重放；旧数据/Outbox 完整）=====
     void v32MigrationReplaysIdempotently()
     {
         QTemporaryDir dir;
@@ -5645,7 +5704,7 @@ private slots:
         {
             RawDb raw(path, "v32-verify");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 32);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 33);
             QCOMPARE(raw.scalar(QStringLiteral(
                 "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='action_proposal'"))
                          .toInt(), 1);
@@ -5660,7 +5719,15 @@ private slots:
                                        QStringLiteral("expires_at"),
                                        QStringLiteral("committed_action_key"),
                                        QStringLiteral("error_code"), QStringLiteral("created_at"),
-                                       QStringLiteral("updated_at")})
+                                       QStringLiteral("updated_at"),
+                                       // v33（R12-2c-2）：verified 内容绑定/取消审计/fence 快照
+                                       QStringLiteral("verified_payload_hash"),
+                                       QStringLiteral("verified_claims_hash"),
+                                       QStringLiteral("verified_request_id"),
+                                       QStringLiteral("verified_at"),
+                                       QStringLiteral("history_projected"),
+                                       QStringLiteral("cancel_reason"),
+                                       QStringLiteral("action_context_epoch")})
                 QVERIFY2(columns.contains(column), qPrintable(column));
             // 旧数据/Outbox 完整：迁移只新增表，不改写任何既有行。
             QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM chat_history")).toInt(), 1);
@@ -5684,12 +5751,193 @@ private slots:
         {
             RawDb raw(path, "v32-verify-replay");
             QVERIFY(raw.open());
-            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 32);
+            QCOMPARE(raw.scalar("PRAGMA user_version").toInt(), 33);
             QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_proposal")).toInt(), 1);
             QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM chat_history")).toInt(), 1);
             QCOMPARE(raw.scalar(QStringLiteral(
                 "SELECT count(*) FROM action_outbox WHERE action_key='v32-legacy-action'")).toInt(), 1);
         }
+    }
+
+    // ===== R12-2c-2：正式 v32→v33 迁移（verified 绑定/取消审计/fence 列）=====
+    void v33MigratesFromV32WithVerifiedBindings()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath(QStringLiteral("v33-from-v32.db"));
+        {
+            RawDb raw(path, "v33-from-v32-create");
+            QVERIFY(raw.open());
+            QVERIFY(seedV32ProposalFixture(raw, true));
+        }
+        {
+            MemoryManager migrated(path);
+            // 迁移不重置既有 fence 值（此库没有 → 读回 0）。
+            QCOMPARE(migrated.actionContextEpoch(), qint64(0));
+        }
+        {
+            RawDb raw(path, "v33-from-v32-verify");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("PRAGMA user_version")).toInt(), 33);
+            const QStringList columns = raw.columns("action_proposal");
+            for (const auto &column : {QStringLiteral("verified_payload_hash"),
+                                       QStringLiteral("verified_claims_hash"),
+                                       QStringLiteral("verified_request_id"),
+                                       QStringLiteral("verified_at"),
+                                       QStringLiteral("history_projected"),
+                                       QStringLiteral("cancel_reason"),
+                                       QStringLiteral("action_context_epoch")})
+                QVERIFY2(columns.contains(column), qPrintable(column));
+            // 旧行完整保留；新列对旧行取 NULL/0（不追溯改写，也不伪造绑定）。
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT state FROM action_proposal WHERE action_key='concern:9:1:contact'"))
+                         .toString(),
+                     QStringLiteral("verified"));
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT json_extract(payload_json,'$.message') FROM action_proposal "
+                         "WHERE action_key='concern:9:1:contact'")).toString(),
+                     QStringLiteral("在吗"));
+            QVERIFY(raw.scalar(QStringLiteral(
+                        "SELECT verified_payload_hash FROM action_proposal "
+                        "WHERE action_key='concern:9:1:contact'")).isNull());
+            QVERIFY(raw.scalar(QStringLiteral(
+                        "SELECT verified_claims_hash FROM action_proposal "
+                        "WHERE action_key='concern:9:1:contact'")).isNull());
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT history_projected FROM action_proposal "
+                         "WHERE action_key='concern:9:1:contact'")).toInt(),
+                     0);
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT action_context_epoch FROM action_proposal "
+                         "WHERE action_key='concern:9:1:contact'")).toInt(),
+                     0);
+            QVERIFY(raw.scalar(QStringLiteral(
+                        "SELECT cancel_reason FROM action_proposal "
+                        "WHERE action_key='concern:9:1:contact'")).isNull());
+            // 旧动作/Outbox 完整：迁移只加列，不改写既有提交行。
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT state FROM cognitive_action WHERE action_key='v32-legacy-action'"))
+                         .toString(),
+                     QStringLiteral("queued"));
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT count(*) FROM action_outbox WHERE action_key='v32-legacy-action'"))
+                         .toInt(),
+                     1);
+        }
+        // 重复打开：v33 幂等重放，不重复加列、不改旧行。
+        for (int reopen = 0; reopen < 2; ++reopen) { MemoryManager again(path); }
+        {
+            RawDb raw(path, "v33-from-v32-reopen");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("PRAGMA user_version")).toInt(), 33);
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_proposal")).toInt(), 1);
+        }
+    }
+
+    // v33 迁移失败必须整体回滚：PRAGMA user_version 保持 32，新列一个都不能留下，
+    // 旧提案行原样保留。失败注入：库缺少 private_reflection，迁移事务末尾的
+    // concern_resolution 触发器创建失败。
+    void v33MigrationFailureRollsBackAllDdl()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath(QStringLiteral("v33-fail.db"));
+        {
+            RawDb raw(path, "v33-fail-create");
+            QVERIFY(raw.open());
+            QVERIFY(seedV32ProposalFixture(raw, false));
+        }
+        { MemoryManager failed(path); } // 构造器内部 rollback；进程不受影响
+        {
+            RawDb raw(path, "v33-fail-verify");
+            QVERIFY(raw.open());
+            QCOMPARE(raw.scalar(QStringLiteral("PRAGMA user_version")).toInt(), 32);
+            const QStringList columns = raw.columns("action_proposal");
+            for (const auto &column : {QStringLiteral("verified_payload_hash"),
+                                       QStringLiteral("verified_claims_hash"),
+                                       QStringLiteral("verified_request_id"),
+                                       QStringLiteral("verified_at"),
+                                       QStringLiteral("history_projected"),
+                                       QStringLiteral("cancel_reason"),
+                                       QStringLiteral("action_context_epoch")})
+                QVERIFY2(!columns.contains(column), qPrintable(column));
+            QCOMPARE(raw.scalar(QStringLiteral("SELECT count(*) FROM action_proposal")).toInt(), 1);
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT state FROM action_proposal WHERE action_key='concern:9:1:contact'"))
+                         .toString(),
+                     QStringLiteral("verified"));
+            // 失败回滚不能丢/改旧动作与 Outbox 行。
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT count(*) FROM cognitive_action "
+                         "WHERE action_key='v32-legacy-action'")).toInt(),
+                     1);
+            QCOMPARE(raw.scalar(QStringLiteral(
+                         "SELECT count(*) FROM action_outbox "
+                         "WHERE action_key='v32-legacy-action'")).toInt(),
+                     1);
+        }
+    }
+
+    // R12-2c-2：Action Context Fence 的 attention_state 持久化/单调递增/重启恢复。
+    void actionContextEpochPersistsAndBumps()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath(QStringLiteral("action-fence.db"));
+        {
+            MemoryManager db(path);
+            QCOMPARE(db.actionContextEpoch(), qint64(0));
+            QCOMPARE(db.bumpActionContextEpoch(QStringLiteral("owner_private_input")), qint64(1));
+            QCOMPARE(db.bumpActionContextEpoch(QStringLiteral("share_withdrawn")), qint64(2));
+            QCOMPARE(db.actionContextEpoch(), qint64(2));
+            // 只做审计：最新原因/更新时间可读。
+            QCOMPARE(db.attentionState(QStringLiteral("action_context_reason")),
+                     QStringLiteral("share_withdrawn"));
+            QVERIFY(!db.attentionState(QStringLiteral("action_context_updated_at")).isEmpty());
+            // 普通 setAttentionState 不参与 fence（不会覆盖 epoch）。
+            db.setAttentionState(QStringLiteral("current_activity"), QStringLiteral("activity/1"));
+            QCOMPARE(db.actionContextEpoch(), qint64(2));
+        }
+        {
+            // 重启后从 attention_state 原值读回，绝不清零。
+            MemoryManager reopened(path);
+            QCOMPARE(reopened.actionContextEpoch(), qint64(2));
+            QCOMPARE(reopened.bumpActionContextEpoch(QStringLiteral("owner_private_input")),
+                     qint64(3));
+        }
+    }
+
+    // R12-2c-2：取消审计——未终态提案回 expired + cancel_reason；重复取消幂等。
+    void cancelActionProposalAuditsAndExpires()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath(QStringLiteral("cancel-proposal.db"));
+        MemoryManager db(path);
+        const auto origin = ActionOrigin::forConcern(11, 1, QStringLiteral("owner"),
+                                                     Channel::kPet, Channel::kDefaultSession);
+        const QString key = origin.actionKey(QStringLiteral("contact"));
+        const QJsonObject proposal{
+            {QStringLiteral("origin"), origin.toJson()},
+            {QStringLiteral("kind"), QStringLiteral("contact")},
+            {QStringLiteral("payload"),
+             QJsonObject{{QStringLiteral("message"), QStringLiteral("在吗")},
+                         {QStringLiteral("reason"), QStringLiteral("自己想到")}}},
+            {QStringLiteral("claims"), QJsonArray{}},
+            {QStringLiteral("expires_at"), 0}};
+        QString error;
+        QVERIFY(!db.persistActionProposal(proposal, &error).contains(QStringLiteral("error")));
+        QVERIFY(db.markActionProposalVerified(key, QStringLiteral("entailed"),
+                                              QStringLiteral("req-cancel"), &error));
+        QVERIFY(db.cancelActionProposal(key, QStringLiteral("context_epoch_changed")));
+        auto row = db.actionProposal(key);
+        QCOMPARE(row.value(QStringLiteral("state")).toString(), QStringLiteral("expired"));
+        QCOMPARE(row.value(QStringLiteral("cancel_reason")).toString(),
+                 QStringLiteral("context_epoch_changed"));
+        // 幂等：重复取消不改变终态、不报错。
+        QVERIFY(db.cancelActionProposal(key, QStringLiteral("context_epoch_changed")));
+        row = db.actionProposal(key);
+        QCOMPARE(row.value(QStringLiteral("state")).toString(), QStringLiteral("expired"));
     }
 
     // R12-2a：ActionProposal 持久化 —— 幂等/冲突/CAS/过期/重启可读。
@@ -5788,20 +6036,36 @@ private slots:
             db.persistActionProposal(forgedSemantic, &forgedSemanticError);
             QCOMPARE(forgedSemanticError, QStringLiteral("semantic_status_forbidden"));
 
-            // CAS：前态不匹配 → 失败；正确前态 → 推进并写入服务端 semantic_status。
+            // CAS：R12-2c-2 起旧入口不再允许直接推进 verified（必须先写内容绑定）。
             QString casError;
-            QVERIFY(!db.updateActionProposalState(key, QStringLiteral("verified"),
-                                                  QStringLiteral("withheld"),
-                                                  QStringLiteral("insufficient"), {}, &casError));
-            QCOMPARE(casError, QStringLiteral("cas_conflict"));
-            QVERIFY(db.updateActionProposalState(key, QStringLiteral("proposed"),
-                                                 QStringLiteral("verified"),
-                                                 QStringLiteral("entailed"), {}, &casError));
-            QCOMPARE(db.actionProposal(key).value(QStringLiteral("semantic_status")).toString(),
-                     QStringLiteral("entailed"));
             QVERIFY(!db.updateActionProposalState(key, QStringLiteral("proposed"),
                                                   QStringLiteral("verified"),
                                                   QStringLiteral("entailed"), {}, &casError));
+            QCOMPARE(casError, QStringLiteral("verified_binding_required"));
+            // 唯一入口：markActionProposalVerified 写入 payload/claims 指纹、request_id、
+            // verified_at 与提案生成时的 fence epoch 快照。
+            QVERIFY(db.markActionProposalVerified(key, QStringLiteral("entailed"),
+                                                  QStringLiteral("req-memory-manager"),
+                                                  &casError));
+            const auto verifiedRow = db.actionProposal(key);
+            QCOMPARE(verifiedRow.value(QStringLiteral("semantic_status")).toString(),
+                     QStringLiteral("entailed"));
+            QCOMPARE(verifiedRow.value(QStringLiteral("state")).toString(),
+                     QStringLiteral("verified"));
+            QCOMPARE(verifiedRow.value(QStringLiteral("verified_request_id")).toString(),
+                     QStringLiteral("req-memory-manager"));
+            QCOMPARE(verifiedRow.value(QStringLiteral("verified_payload_hash")).toString().size(), 16);
+            QCOMPARE(verifiedRow.value(QStringLiteral("verified_claims_hash")).toString().size(), 16);
+            QVERIFY(verifiedRow.value(QStringLiteral("verified_at")).toInteger() > 0);
+            QVERIFY(verifiedRow.value(QStringLiteral("action_context_epoch")).toInteger() >= 0);
+            // 重复标记核验通过是幂等的（不覆盖首次绑定）。
+            QVERIFY(db.markActionProposalVerified(key, QStringLiteral("entailed"),
+                                                  QStringLiteral("req-memory-manager"),
+                                                  &casError));
+            // 前态不匹配（已经从 verified 推进过）仍然拒绝。
+            QVERIFY(!db.updateActionProposalState(key, QStringLiteral("proposed"),
+                                                  QStringLiteral("withheld"),
+                                                  QStringLiteral("insufficient"), {}, &casError));
             QCOMPARE(casError, QStringLiteral("cas_conflict"));
             // committed 只能由 markProposalCommitted 写；commit key 必须非空。
             QString commitError;

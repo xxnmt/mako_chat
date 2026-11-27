@@ -255,6 +255,20 @@ public:
     // 当前活动/切换原因等"当下状态"的键值存档（attention_state）。
     void setAttentionState(const QString &key, const QString &value);
     QString attentionState(const QString &key) const;
+    // ===== R12-2c-2：Action Context Fence（行动相关语境版本）=====
+    // 三维区分：origin_version=来源/成果版本（ActionOrigin.version）；
+    //           evidence_revision=真实证据修订（artifact_version/hash 或来源修订）；
+    //           action_context_epoch=当前行动相关语境的单调版本（本接口）。
+    // epoch 以十进制整数持久化在既有 attention_state（键 action_context_epoch），
+    // 不新增表、不清零：重启后从 SQLite 原值读回。提案落库时快照到
+    // action_proposal.action_context_epoch；提交/claimOutbox/实际发送前都要比较，
+    // 不一致则提案 expired/cancelled 审计、动作不发送（历史事实/成果永不删除）。
+    qint64 actionContextEpoch() const;
+    // 递增并返回新 epoch；失败返回 -1（不改变已存值）。reason 只做审计（最长 80 字），
+    // 同时刷新 action_context_updated_at/reason 两个 attention_state 键。
+    // 触发点只应是"与主人当前行动相关"的变化（主人私聊输入、成果撤回等），
+    // 无关群聊/索引/摘要不得调用。
+    qint64 bumpActionContextEpoch(const QString &reason = QString());
     // 扫描进程中断遗留的 received 轮次，幂等入队 recovery 事件；返回新入队条数。
     int enqueueRecoveryEvents(int olderThanSeconds = 120);
     // 启动恢复：把租约已过期仍停在 pending 的关注回顾放回可重领状态。
@@ -275,7 +289,29 @@ public:
     QJsonObject commitActivityShareAction(qlonglong activityId,int version,const QString &draft);
     // outbox 领取：state='queued'（或失败的受控重试）→ dispatching，写租约并 attempts+1；
     // 同一行不会被第二个领取者拿到。返回 {action_key,kind,channel,session,payload,payload_json,...}。
+    // R12-2c-2：领取时先做发送前最终复验（见 validateOutboxActionBeforeSend）。
+    //   * 永久失效（提案未 committed/已取消/已过期/epoch 变化/verified 内容指纹不符/
+    //     成果撤回/权限关闭/action 已终态等）→ 行落 outbox failed + action withheld、
+    //     账本 withheld、提案 cancel_reason 审计，然后继续找下一条，绝不发送/重领；
+    //   * 可恢复阻塞（安静时段/每日额度/目标暂时不可达）→ 保留 queued（不占 attempts），
+    //     本次返回空，等后续轮询；
+    //   * withheld/unknown/handed_off 对应行（含 outbox=failed 的 withheld 遗留）不可重领。
     QJsonObject claimOutbox(const QString &owner,int leaseSeconds = 60);
+    // R12-2c-2：发送前最终复验（只读分类，不发送）。dispatcher 在 sender 前调用；
+    // AppController 的渠道 sender 在"真正入队"这个最后可取消边界再调用一次。
+    // 返回 {ok:bool,permanent:bool,reason:QString,action_state,outbox_state,channel,session}。
+    // 新来源（wake:/activity:）额外复验：提案 state=committed、cancel_reason、expires_at、
+    // action_context_epoch 与当前 attention_state epoch、verified_payload_hash/
+    // verified_claims_hash 与权威 payload/claims、target/开关/权限/安静时段/共享额度、
+    // 来源版本/runId/scope/target、成果 artifact_ref/version/hash/share_intent。
+    // legacy（reminder/reflection/thought）保留既有领域有效期语义，只做状态一致性复验。
+    QJsonObject validateOutboxActionBeforeSend(const QString &actionKey);
+    // 可恢复阻塞：把刚领取的 dispatching 行放回 queued（attempts 回退，不算一次发送），
+    // action 回 queued；用于安静时段/额度/目标暂不可达。仅用于新来源动作。
+    bool deferOutboxAction(const QString &actionKey,const QString &reason);
+    // 永久失效取消：一个事务内 outbox=failed、action=withheld、领域账本=withheld，
+    // 并把未提交的提案置 expired/已提交提案写 cancel_reason 审计；幂等。绝不发送。
+    bool cancelOutboxAction(const QString &actionKey,const QString &reason);
     // 回执/结果落库：一个事务内同时更新 action/outbox 与对应领域行（contact/reminder/share）。
     // outcome ∈ protocol_accepted|handed_off|rejected|unknown|withheld。
     // rejected 且 outbox attempts<2 → 回 queued（受控一次重试）；unknown → 冻结，永不重发。
@@ -486,9 +522,25 @@ public:
     // 允许的迁移：proposed→verified|withheld|expired|unknown；
     //             verified→committed（仅 markProposalCommitted）|withheld|expired|unknown；
     //             committed/withheld/expired/unknown 为终态。
+    // R12-2c-2：toState='verified' 一律拒绝（verified_binding_required）——verified 必须经
+    // markActionProposalVerified 在同一事务写入内容指纹/request_id/verified_at/fence epoch。
     bool updateActionProposalState(const QString &actionKey, const QString &fromState,
                                    const QString &toState, const QString &semanticStatus,
                                    const QString &errorCode = QString(), QString *error = nullptr);
+    // R12-2c-2：proposed→verified 的唯一入口（单事务）。重新读取权威提案行后：
+    //   * state 必须是 proposed（verified/committed 幂等返回 true；其它终态失败）；
+    //   * semantic_status 必须是服务端封闭枚举且非 withheld；
+    //   * verified_request_id 必须非空（verifier 请求的服务端关联 id）；
+    //   * 从库内 payload/claims 重新计算 verified_payload_hash/verified_claims_hash
+    //     （与 verifier 输入同一规范化算法）并持久化，同时写 verified_at；
+    //   * action_context_epoch 必须仍等于当前 fence epoch（主人私聊插话/成果撤回后旧在途
+    //     核验失效），不一致 → 置 expired + cancel_reason=context_epoch_changed，返回 false。
+    // 任一步失败整体回滚；成功后提交/发送前还会再次复核这些绑定。
+    bool markActionProposalVerified(const QString &actionKey,const QString &semanticStatus,
+                                    const QString &verifiedRequestId,QString *error = nullptr);
+    // 取消审计（幂等、单事务）：未终态（proposed/verified）→ expired；committed 保持 committed
+    // （回执闭环需要），只写 cancel_reason 供审计；绝不删除历史事实/成果。
+    bool cancelActionProposal(const QString &actionKey,const QString &reason);
     // 扫描 proposed/verified 且 expires_at>0 且已过期的提案 → expired；返回更新行数（幂等）。
     // now=0 表示使用数据库当前时间（unixepoch）。
     int expireActionProposals(qint64 now = 0);
@@ -497,7 +549,9 @@ public:
     bool markProposalCommitted(const QString &actionKey, const QString &committedActionKey,
                                QString *error = nullptr);
 
-    // ===== R12-2b：verified 提案的原子提交 / 回执 / 恢复（v32 表足够，无新 schema）=====
+    // ===== R12-2b：verified 提案的原子提交 / 回执 / 恢复 =====
+    // R12-2c-2 起依赖 v33 的 verified_payload_hash/verified_claims_hash/verified_request_id/
+    // verified_at/cancel_reason/action_context_epoch 列（历史投影字段预留）。
     // 从 action_proposal 读 state='verified' 的提案，再次用 ActionPolicy::validateActionProposal
     // 复核来源/版本/runId/scope/epoch/target/成果新鲜度/功能开关/权限/coverage，再复核安静时段、
     // 可达目标与共享 contact 额度；通过后在**单事务**内写 cognitive_action + action_outbox +
@@ -511,6 +565,11 @@ public:
     // 不可恢复的失败（来源失效/成果不符/allow_contact 关闭/重复）把提案落 withheld；
     // 可恢复的失败（quiet/limit/target_unreachable/db_error）保留 verified，交由
     // drainVerifiedActionProposals 在之后的启动/定时点重试，不丢提案。
+    // R12-2c-2：进入事务后重新读取权威提案行并复验 state='verified'、来源/版本/runId/scope/
+    // context_epoch/target/expires、成果 artifact_ref/version/hash、verified_request_id 绑定、
+    // verified_payload_hash/verified_claims_hash 与即将提交的 payload/claims 完全一致，
+    // 以及 action_context_epoch 未变；任一不一致 → conflict/stale/expired，不写任何动作行。
+    // 语义网络请求只在本函数之外（LLMService 核验链），事务内绝不等待网络。
     QJsonObject commitVerifiedActionProposal(const QString &actionKey,QString *error = nullptr);
     // 便捷入口：先确认 kind/origin 再提交（wake→contact、activity→share）。
     QJsonObject commitVerifiedOpenWakeContact(const QString &actionKey,QString *error = nullptr);

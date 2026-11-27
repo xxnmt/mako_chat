@@ -304,6 +304,15 @@ bool MemoryManager::recordCognitiveAudit(const QString &kind, const QString &run
 
 qint64 MemoryManager::recordInput(const QString &input, const RequestMeta &meta, bool observe)
 {
+    // R12-2c-2：Action Context Fence 的触发点：相关的**主人私聊输入**（pet/qq_private，
+    // subject=user，reply 轮）推进行动语境版本，使旧在途提案/已入 Outbox 未发送的主动动作
+    // 失效。无关群聊/第三方/感知轮次不 bump（不能因群消息全局取消主人行动）。
+    const bool ownerPrivateInput =
+        !input.isEmpty()
+        && (meta.channel == Channel::kPet || meta.channel == Channel::kQQPrivate)
+        && meta.subject == QStringLiteral("user")
+        && meta.turnKind == QStringLiteral("reply");
+    if (ownerPrivateInput) bumpActionContextEpoch(QStringLiteral("owner_private_input"));
     if (!meta.persistTurn || meta.eventId.isEmpty() || input.isEmpty()) return 0;
     if (!m_db.transaction()) {
         qWarning() << "[Conversation] receipt transaction failed" << m_db.lastError();
@@ -961,6 +970,77 @@ QString MemoryManager::attentionState(const QString &key) const
     if (!q.exec() || !q.next())
         return {};
     return q.value(0).toString();
+}
+
+// R12-2c-2：Action Context Fence 的持久化版本。沿用 attention_state 的键值存档，
+// 不新增表：action_context_epoch=整数（缺失视为 0），action_context_updated_at=unix 秒，
+// action_context_reason=最近一次 bump 的原因（只做审计，最长 80 字）。
+// 该值跨重启可验证、绝不清零；提案落库时快照到 action_proposal.action_context_epoch。
+qint64 MemoryManager::actionContextEpoch() const
+{
+    const QString value = attentionState(QStringLiteral("action_context_epoch")).trimmed();
+    if (value.isEmpty()) return 0;
+    bool ok = false;
+    const qint64 epoch = value.toLongLong(&ok);
+    return (ok && epoch >= 0) ? epoch : 0;
+}
+
+qint64 MemoryManager::bumpActionContextEpoch(const QString &reason)
+{
+    if (!m_db.isOpen()) return -1;
+    if (!m_db.transaction()) return -1;
+    auto rollback = qScopeGuard([this] { m_db.rollback(); });
+    const auto upsertState = [this](const QString &key, const QString &value) -> bool {
+        QSqlQuery q(m_db);
+        q.prepare("INSERT INTO attention_state(key,value,updated_at) VALUES(?,?,unixepoch()) "
+                  "ON CONFLICT(key) DO UPDATE SET value=excluded.value,"
+                  "updated_at=excluded.updated_at");
+        q.addBindValue(key);
+        q.addBindValue(value);
+        return q.exec();
+    };
+    // 单条 UPSERT 原子自增：并发/重启都不会读到中间值，也不会覆盖成 0。
+    QSqlQuery increase(m_db);
+    if (!increase.exec(QStringLiteral(
+            "INSERT INTO attention_state(key,value,updated_at) "
+            "VALUES('action_context_epoch','1',unixepoch()) "
+            "ON CONFLICT(key) DO UPDATE SET "
+            "value=CAST(coalesce(CAST(attention_state.value AS INTEGER),0)+1 AS TEXT),"
+            "updated_at=excluded.updated_at"))) {
+        qWarning() << "[Fence] bump failed" << increase.lastError();
+        m_db.rollback();
+        rollback.dismiss();
+        return -1;
+    }
+    bool ok = false;
+    qint64 epoch = -1;
+    {
+        QSqlQuery read(m_db);
+        read.prepare("SELECT value FROM attention_state WHERE key='action_context_epoch'");
+        if (read.exec() && read.next())
+            epoch = read.value(0).toString().toLongLong(&ok);
+    }
+    if (!ok || epoch < 0) {
+        m_db.rollback();
+        rollback.dismiss();
+        return -1;
+    }
+    const QString auditReason = reason.trimmed().left(80);
+    const QString nowText = QString::number(QDateTime::currentSecsSinceEpoch());
+    if (!upsertState(QStringLiteral("action_context_updated_at"), nowText)
+        || !upsertState(QStringLiteral("action_context_reason"), auditReason)) {
+        m_db.rollback();
+        rollback.dismiss();
+        return -1;
+    }
+    if (!m_db.commit()) {
+        m_db.rollback();
+        return -1;
+    }
+    rollback.dismiss();
+    qInfo() << "[Fence] action_context_epoch=" << epoch
+            << "reason=" << (auditReason.isEmpty() ? QStringLiteral("-") : auditReason);
+    return epoch;
 }
 
 int MemoryManager::enqueueRecoveryEvents(int olderThanSeconds)
@@ -5632,6 +5712,47 @@ void MemoryManager::initDatabase(const QString &dbFilePath, const QString &conne
             qDebug()<<"[MemoryManager]数据库结构升级完成,版本:"<<currentVersion;
         }
 
+        if (currentVersion<33) {
+            // v33（R12-2c-2）：ActionProposal 的 verified 内容绑定 / 历史投影与取消审计 /
+            // Action Context Fence 快照。原因：
+            //   * v32 只记录"核验通过"这一状态，没有持久化"到底核验了哪份内容"。模型核验
+            //     与真正提交之间如果 payload/claims 被改写（内存/DB 篡改或串线），提交层无法
+            //     证明"核验的是 A、发送的是 B"；因此新增 verified_payload_hash（与 verifier
+            //     输入的 payload_digest 同一规范化算法）、verified_claims_hash、
+            //     verified_request_id、verified_at，核验通过时在 proposed→verified 的同一事务写入；
+            //   * 提案在提交后仍需在 claimOutbox/真正发送前被取消（主人插话使语境变化、
+            //     通道关闭、成果撤回、过期等）。已提交提案不能回退 state（回执闭环依赖
+            //     committed），因此用 cancel_reason 记录取消审计；history_projected 预留给
+            //     c3 回执历史投影幂等标记（本片只建列并保持 0，不实现 c3 闭环）；
+            //   * action_context_epoch 记录"提案生成时的行动语境版本"快照，来源方案未包含，
+            //     但 fence 必须持久化在提案上才能跨重启比较，故一并加入（不是来源身份里的
+            //     context_epoch）。
+            // 幂等：全部 ensureColumn + IF NOT EXISTS；旧测试把 user_version 压回更小值重放
+            // 迁移也安全。旧行新列保持 NULL/0，不改写任何既有提案/动作/Outbox。
+            if (!ensureColumn(query, "action_proposal", "verified_payload_hash",
+                              "ALTER TABLE action_proposal ADD COLUMN verified_payload_hash TEXT")
+                || !ensureColumn(query, "action_proposal", "verified_claims_hash",
+                                 "ALTER TABLE action_proposal ADD COLUMN verified_claims_hash TEXT")
+                || !ensureColumn(query, "action_proposal", "verified_request_id",
+                                 "ALTER TABLE action_proposal ADD COLUMN verified_request_id TEXT")
+                || !ensureColumn(query, "action_proposal", "verified_at",
+                                 "ALTER TABLE action_proposal ADD COLUMN verified_at INTEGER")
+                || !ensureColumn(query, "action_proposal", "history_projected",
+                                 "ALTER TABLE action_proposal ADD COLUMN history_projected "
+                                 "INTEGER NOT NULL DEFAULT 0")
+                || !ensureColumn(query, "action_proposal", "cancel_reason",
+                                 "ALTER TABLE action_proposal ADD COLUMN cancel_reason TEXT")
+                || !ensureColumn(query, "action_proposal", "action_context_epoch",
+                                 "ALTER TABLE action_proposal ADD COLUMN action_context_epoch "
+                                 "INTEGER NOT NULL DEFAULT 0"))
+                throw query.lastError();
+            if (!query.exec("CREATE INDEX IF NOT EXISTS action_proposal_verified_at "
+                            "ON action_proposal(verified_at)")
+                || !query.exec("PRAGMA user_version=33")) throw query.lastError();
+            currentVersion=33;
+            qDebug()<<"[MemoryManager]数据库结构升级完成,版本:"<<currentVersion;
+        }
+
         // 关注了结的独立流水（v22 的补充表）。与 reflection_change（回顾链修订）分开：
         // 前者由正常对话写回，后者由私下回顾写，共用 turn 主键会互相覆盖。
         // 用 IF NOT EXISTS 幂等补表，不改变结构版本号，旧库升级与新库初始化走同一句。
@@ -8610,6 +8731,10 @@ bool MemoryManager::setActivityShareIntent(const QString &ref, int expectedVersi
                .arg(trimmedAction, parsed.ref())
                .arg(newShareVersion)
                .arg(storedArtifactVersion);
+    // R12-2c-2：成果撤回是 Action Context Fence 的触发点——相关分享语境已变，
+    // 已在途/已入 Outbox 未发送的旧分享提案按 epoch 不一致失效（历史成果保留不删除）。
+    if (trimmedAction == QStringLiteral("withdraw"))
+        bumpActionContextEpoch(QStringLiteral("share_withdrawn"));
     return true;
 }
 
@@ -9219,6 +9344,12 @@ QString MemoryManager::snapshotSubjectId(const RequestMeta &meta) const
 //            settle rejected 且 attempts<2 → 回 queued（受控一次重试）。
 namespace {
 
+// R12-2c-2：以下三个函数定义在后面的 R12-2b 提交片区（同一匿名命名空间），
+// 发送前复验需要复用同一套错误码映射/硬拒绝分类/安静时段口径，先前置声明避免分叉。
+bool actionProposalHardReject(const QString &code);
+QString actionProposalErrorCode(const QString &reason);
+bool actionQuietNow(const ProactiveConfig &options);
+
 // R12-2b：新来源动作在 cognitive_action.kind 上的稳定名称。
 // 与 legacy 的 SpontaneousContact / ActivityShare 分开，settle/恢复分支据此把回执写回
 // open_wake_state / internal_activity，而不会误走 reflection_contact / thought_result 旧路径。
@@ -9292,6 +9423,36 @@ void actionNoteDelivery(const QSqlDatabase &db,const QString &kind,const QString
     q.addBindValue(state);
     q.addBindValue(attemptsDelta);
     if (!q.exec()) qWarning()<<"[Outbox] ledger 写入失败"<<kind<<ref<<state<<q.lastError();
+}
+
+// R12-2c-2：提交事务里的账本写入必须可判定。SQLite 的 UPSERT 影响 1 行；
+// 影响行数不是 1 时提交方必须整体回滚，绝不能出现"动作/Outbox 写了、额度账本没写"。
+bool actionNoteDeliveryChecked(const QSqlDatabase &db,const QString &kind,const QString &ref,
+                               const QString &channel,const QString &session,const QString &text,
+                               const QString &state,int attemptsDelta)
+{
+    if (kind.isEmpty() || ref.isEmpty() || state.isEmpty()) return false;
+    QSqlQuery q(db);
+    q.prepare("INSERT INTO delivery_ledger(kind,ref,channel,session,text,state,attempts,updated_at) "
+              "VALUES(?,?,?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(kind,ref) DO UPDATE SET "
+              "state=excluded.state,"
+              "channel=coalesce(excluded.channel,delivery_ledger.channel),"
+              "session=coalesce(excluded.session,delivery_ledger.session),"
+              "text=coalesce(excluded.text,delivery_ledger.text),"
+              "attempts=delivery_ledger.attempts+excluded.attempts,"
+              "updated_at=CURRENT_TIMESTAMP");
+    q.addBindValue(kind);
+    q.addBindValue(ref);
+    q.addBindValue(channel.isEmpty() ? QVariant() : QVariant(channel));
+    q.addBindValue(session.isEmpty() ? QVariant() : QVariant(session));
+    q.addBindValue(text.isEmpty() ? QVariant() : QVariant(text));
+    q.addBindValue(state);
+    q.addBindValue(attemptsDelta);
+    if (!q.exec() || q.numRowsAffected() != 1) {
+        qWarning() << "[Outbox] ledger 提交写入失败" << kind << ref << state << q.lastError();
+        return false;
+    }
+    return true;
 }
 
 // 幂等查询：动作已存在时返回其当前状态，调用方据此不重复建 outbox。
@@ -9502,6 +9663,277 @@ bool settleOutboxDomain(const QSqlDatabase &db,const QString &actionKey,const QS
         }
     }
     return true;
+}
+
+// R12-2c-2：事务内取消一条 outbox 动作（永久失效，绝不发送）。幂等：
+// outbox=failed、action=withheld、领域账本/领域行=withheld，提案写 cancel_reason
+// （未提交的置 expired；已 committed 保持 state 供 c3 回执闭环），不删除任何历史事实/成果。
+// 返回 false 表示任一写步骤失败，调用方必须整体回滚（不能留下半取消状态）。
+bool cancelOutboxLocked(const QSqlDatabase &db,const QString &actionKey,const QString &kind,
+                        const QString &channel,const QString &session,const QString &reason)
+{
+    // 已交付/已冻结（handed_off/unknown/withheld）的动作绝不回退：只写提案取消审计，
+    // 不改动作/Outbox/账本（"已实际交付动作不回退"）。
+    QString currentActionState;
+    {
+        QSqlQuery current(db);
+        current.prepare("SELECT state FROM cognitive_action WHERE action_key=?");
+        current.addBindValue(actionKey);
+        if (current.exec() && current.next()) currentActionState = current.value(0).toString();
+    }
+    if (currentActionState == QStringLiteral("handed_off")
+        || currentActionState == QStringLiteral("unknown")
+        || currentActionState == QStringLiteral("withheld")) {
+        QSqlQuery proposalAudit(db);
+        proposalAudit.prepare("UPDATE action_proposal SET "
+                              "state=CASE WHEN state IN ('proposed','verified') "
+                              "THEN 'expired' ELSE state END,"
+                              "cancel_reason=?,updated_at=unixepoch() WHERE action_key=?");
+        proposalAudit.addBindValue(reason.left(120));
+        proposalAudit.addBindValue(actionKey);
+        if (!proposalAudit.exec()) {
+            qWarning()<<"[Outbox] cancel proposal 失败"<<actionKey<<proposalAudit.lastError();
+            return false;
+        }
+        return true;
+    }
+    bool ok = true;
+    QSqlQuery action(db);
+    action.prepare("UPDATE cognitive_action SET state='withheld',last_outcome='withheld',"
+                   "updated_at=unixepoch() WHERE action_key=? "
+                   "AND state NOT IN ('handed_off','unknown','withheld')");
+    action.addBindValue(actionKey);
+    if (!action.exec()) {
+        qWarning()<<"[Outbox] cancel action 失败"<<actionKey<<action.lastError();
+        ok = false;
+    }
+    QSqlQuery outbox(db);
+    outbox.prepare("UPDATE action_outbox SET state='failed',last_error=?,lease_owner=NULL,"
+                   "lease_until=NULL,completed_at=coalesce(completed_at,unixepoch()) "
+                   "WHERE action_key=? AND state NOT IN ('dispatched','unknown')");
+    outbox.addBindValue(reason.left(120));
+    outbox.addBindValue(actionKey);
+    if (!outbox.exec()) {
+        qWarning()<<"[Outbox] cancel outbox 失败"<<actionKey<<outbox.lastError();
+        ok = false;
+    }
+    // 领域行/账本统一落 withheld（contact/reminder/share），不会出现"没发却记为已发"。
+    if (!settleOutboxDomain(db,actionKey,kind,channel,session,QStringLiteral("withheld"))) {
+        qWarning()<<"[Outbox] cancel domain 失败"<<actionKey<<kind;
+        ok = false;
+    }
+    QSqlQuery proposal(db);
+    proposal.prepare("UPDATE action_proposal SET "
+                     "state=CASE WHEN state IN ('proposed','verified') THEN 'expired' ELSE state END,"
+                     "cancel_reason=?,updated_at=unixepoch() WHERE action_key=?");
+    proposal.addBindValue(reason.left(120));
+    proposal.addBindValue(actionKey);
+    if (!proposal.exec()) {
+        qWarning()<<"[Outbox] cancel proposal 失败"<<actionKey<<proposal.lastError();
+        ok = false;
+    }
+    return ok;
+}
+
+// R12-2c-2：发送前最终复验的返回结构。
+// permanent=true 表示授权/内容/语境已不可恢复（取消终态、不重领）；
+// permanent=false 只用于安静时段/每日额度/目标暂时不可达这类可恢复阻塞（保留 queued）。
+struct OutboxSendBlock
+{
+    bool blocked = false;
+    bool permanent = false;
+    QString reason;
+};
+
+// R12-2c-2：发送前最终复验（只读，不发网络、不写库）。
+// claimOutbox（领取时）与 ActionOutboxDispatcher/AppController sender（最后一个可取消边界）
+// 共用同一判定，避免"只在某个入口检查一次"。新来源（wake:/activity:）做完整复验：
+//   action/outbox 状态一致；提案 committed/未取消/未过期；Action Context Fence epoch 未变；
+//   verified 内容指纹与权威 payload/claims 一致；target 与动作/Outbox 完全绑定且仍是主人
+//   私聊渠道；来源版本/runId/scope/target、成果 artifact_ref/version/hash/share_intent、
+//   开关/权限/覆盖范围（ActionPolicy 确定性复核）；安静时段与共享额度。
+// legacy（reminder/reflection/thought）保留既有领域有效期语义，只做状态一致性复验。
+OutboxSendBlock outboxSendGuard(MemoryManager &memory,const QSqlDatabase &db,
+                                const QString &actionKey)
+{
+    OutboxSendBlock block;
+    const auto stop = [&block](bool permanent,const QString &reason) {
+        block.blocked = true;
+        block.permanent = permanent;
+        block.reason = reason;
+        return block;
+    };
+    // 1) action/outbox 状态一致：终态行绝不重领/重发（"withheld 对应 failed" 也在此排除）。
+    QString kind, channel, session, actionState, outboxState;
+    QString actionPayloadJson, outboxPayloadJson;
+    int outboxAttempts = 0;
+    {
+        QSqlQuery row(db);
+        row.prepare(QStringLiteral(
+            "SELECT a.kind,a.state,a.channel,a.session_id,a.payload_json,"
+            "o.state,o.channel,o.session_id,o.payload_json,o.attempts "
+            "FROM cognitive_action a JOIN action_outbox o ON o.action_id=a.id "
+            "WHERE a.action_key=?"));
+        row.addBindValue(actionKey);
+        if (!row.exec() || !row.next()) return stop(true, QStringLiteral("action_missing"));
+        kind = row.value(0).toString();
+        actionState = row.value(1).toString();
+        channel = row.value(2).toString();
+        session = row.value(3).toString();
+        actionPayloadJson = row.value(4).toString();
+        outboxState = row.value(5).toString();
+        const QString outboxChannel = row.value(6).toString();
+        const QString outboxSession = row.value(7).toString();
+        outboxPayloadJson = row.value(8).toString();
+        outboxAttempts = row.value(9).toInt();
+        if (outboxChannel != channel || outboxSession != session
+            || outboxChannel.trimmed().isEmpty() || outboxSession.trimmed().isEmpty())
+            return stop(true, QStringLiteral("target_mismatch"));
+    }
+    if (actionState == QStringLiteral("handed_off") || actionState == QStringLiteral("unknown")
+        || actionState == QStringLiteral("withheld"))
+        return stop(true, QStringLiteral("already_terminal"));
+    if (outboxState == QStringLiteral("unknown") || outboxState == QStringLiteral("dispatched"))
+        return stop(true, QStringLiteral("outbox_terminal"));
+    if (outboxState == QStringLiteral("failed") && outboxAttempts >= 2)
+        return stop(true, QStringLiteral("outbox_terminal"));
+    if (outboxState != QStringLiteral("queued") && outboxState != QStringLiteral("dispatching")
+        && outboxState != QStringLiteral("failed"))
+        return stop(true, QStringLiteral("outbox_invalid_state"));
+    // 新来源才做完整 fence/绑定/策略复核；legacy 的领域有效期在各自 commit/settle 校验，
+    // 这里只保证 failed 行不会被当作可发送行重领。
+    const bool newSource = actionKey.startsWith(QStringLiteral("wake:"))
+        || actionKey.startsWith(QStringLiteral("activity:"));
+    if (!newSource) {
+        if (outboxState == QStringLiteral("failed")
+            && (actionState != QStringLiteral("rejected") || outboxAttempts >= 2))
+            return stop(true, QStringLiteral("outbox_terminal"));
+        // legacy（reminder/reflection/thought）保留既有领域有效期/取消语义：
+        // 用户提醒有自己独立的 due/expires（在 commit 与领域状态机里校验），
+        // 不因主人插话统一取消；这里只排除终态/不可重试行，不改变旧行为。
+        return block;
+    }
+    // 2) 提案状态 / 取消审计 / 有效期。
+    const QJsonObject proposal = memory.actionProposal(actionKey);
+    if (proposal.isEmpty()) return stop(true, QStringLiteral("proposal_missing"));
+    const QString proposalState = proposal.value(QStringLiteral("state")).toString();
+    if (proposalState != QStringLiteral("committed"))
+        return stop(true, proposalState == QStringLiteral("expired")
+                              ? QStringLiteral("expired")
+                              : QStringLiteral("proposal_not_committed"));
+    if (!proposal.value(QStringLiteral("cancel_reason")).toString().trimmed().isEmpty())
+        return stop(true, QStringLiteral("proposal_cancelled"));
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    const qint64 expiresAt = proposal.value(QStringLiteral("expires_at")).toInteger();
+    if (expiresAt > 0 && expiresAt <= now) return stop(true, QStringLiteral("expired"));
+    // 3) Action Context Fence：提交后、发送前语境必须仍是提案生成时那一版。
+    const qint64 snapshotEpoch = proposal.value(QStringLiteral("action_context_epoch")).toInteger();
+    if (snapshotEpoch != memory.actionContextEpoch())
+        return stop(true, QStringLiteral("context_epoch_changed"));
+    // 4) verified 内容指纹必须与权威 payload/claims 完全一致（防"核验 A、发送 B"）。
+    const QJsonObject payload = proposal.value(QStringLiteral("payload")).toObject();
+    const QJsonArray claims = proposal.value(QStringLiteral("claims")).toArray();
+    const QString verifiedPayloadHash =
+        proposal.value(QStringLiteral("verified_payload_hash")).toString();
+    const QString verifiedClaimsHash =
+        proposal.value(QStringLiteral("verified_claims_hash")).toString();
+    if (verifiedPayloadHash.isEmpty() || verifiedClaimsHash.isEmpty()
+        || proposal.value(QStringLiteral("verified_request_id")).toString().trimmed().isEmpty())
+        return stop(true, QStringLiteral("verified_binding_missing"));
+    if (ActionPolicy::canonicalProposalPayloadDigest(payload, claims) != verifiedPayloadHash
+        || ActionPolicy::canonicalProposalClaimsDigest(claims) != verifiedClaimsHash)
+        return stop(true, QStringLiteral("verified_content_mismatch"));
+    // 5) target 三方绑定：提案 target = 动作行 = Outbox，且仍是允许的主人私聊渠道。
+    const QString targetChannel = proposal.value(QStringLiteral("target_channel")).toString();
+    const QString targetSession = proposal.value(QStringLiteral("target_session")).toString();
+    const QString proposalKind = proposal.value(QStringLiteral("kind")).toString();
+    if (targetChannel != channel || targetSession != session)
+        return stop(true, QStringLiteral("target_mismatch"));
+    auto &cfg = ConfigManager::instance();
+    const ProactiveConfig opts = cfg.getProactiveConfig();
+    const bool petTarget =
+        targetChannel == Channel::kPet && targetSession == Channel::kDefaultSession;
+    const bool qqTarget = targetChannel == Channel::kQQPrivate && cfg.isMasterQQ(targetSession);
+    if (!petTarget && !qqTarget) return stop(true, QStringLiteral("target_not_owner_private"));
+    // 权限/开关先于"目标暂时不可达"判定：主动联系/长期记忆被关闭是授权撤回（永久失效），
+    // 不能因为 targets 同时被清空就降级成可恢复阻塞。
+    if (!opts.enabled || !cfg.getMemoryPolicyConfig().longTermMemoryEnabled)
+        return stop(true, QStringLiteral("proactive_disabled"));
+    if (!opts.targets.contains(qMakePair(targetChannel, targetSession)))
+        return stop(false, QStringLiteral("target_unreachable"));
+    // 动作/Outbox payload 与提案内容绑定（防篡改/串线）。
+    const QJsonObject actionPayload = QJsonDocument::fromJson(actionPayloadJson.toUtf8()).object();
+    const QJsonObject outboxPayload = QJsonDocument::fromJson(outboxPayloadJson.toUtf8()).object();
+    const QString expectedActionKind = proposalKind == QStringLiteral("contact")
+        ? kActionKindOpenWakeContact : kActionKindInternalShare;
+    if (kind != expectedActionKind
+        || actionPayload.value(QStringLiteral("origin_ref")).toString()
+               != proposal.value(QStringLiteral("origin_ref")).toString()
+        || actionPayload.value(QStringLiteral("origin_version")).toInt()
+               != proposal.value(QStringLiteral("origin_version")).toInt())
+        return stop(true, QStringLiteral("payload_mismatch"));
+    const QString expectedText = proposalKind == QStringLiteral("contact")
+        ? payload.value(QStringLiteral("message")).toString().trimmed()
+        : payload.value(QStringLiteral("draft")).toString().trimmed();
+    const auto payloadText = [](const QJsonObject &value) {
+        const QString message = value.value(QStringLiteral("message")).toString().trimmed();
+        return message.isEmpty() ? value.value(QStringLiteral("draft")).toString().trimmed()
+                                 : message;
+    };
+    const QString actionText = payloadText(actionPayload);
+    const QString outboxText = payloadText(outboxPayload);
+    if (expectedText.isEmpty() || actionText != expectedText || outboxText != expectedText)
+        return stop(true, QStringLiteral("payload_mismatch"));
+    // 6) allow_contact：OpenWake contact 的独立授权撤回（enabled/长期记忆已在上面判过）。
+    if (proposalKind == QStringLiteral("contact")
+        && proposal.value(QStringLiteral("origin_kind")).toString() == QStringLiteral("wake")
+        && !cfg.openWakeAllowContact())
+        return stop(true, QStringLiteral("allow_contact_disabled"));
+    // 7) 来源真实身份/版本/runId/scope/epoch/target/成果/coverage 统一复核（确定性、无网络）。
+    ActionOrigin origin;
+    QString originError;
+    if (!ActionOrigin::fromJson(proposal.value(QStringLiteral("origin")).toObject(),
+                                &origin, &originError)
+        || !origin.isValid())
+        return stop(true, QStringLiteral("invalid_origin"));
+    ActionPolicy policy(&memory);
+    const QJsonObject validationInput{
+        {QStringLiteral("origin"), proposal.value(QStringLiteral("origin"))},
+        {QStringLiteral("kind"), proposalKind},
+        {QStringLiteral("action_key"), actionKey},
+        {QStringLiteral("target"),
+         QJsonObject{{QStringLiteral("channel"), targetChannel},
+                     {QStringLiteral("session_id"), targetSession}}},
+        {QStringLiteral("payload"), payload},
+        {QStringLiteral("claims"), claims},
+        {QStringLiteral("expires_at"), expiresAt}};
+    QString policyError;
+    const QJsonObject validation = policy.validateActionProposal(validationInput, &policyError);
+    if (!validation.value(QStringLiteral("allowed")).toBool()) {
+        const QString reason = validation.value(QStringLiteral("reason")).toString(policyError);
+        const QString code = actionProposalErrorCode(reason);
+        // 目标类失败可恢复（等通道/配置恢复）；来源失效/成果不符/开关关闭永久失效。
+        if (code == QStringLiteral("target_unreachable"))
+            return stop(false, code);
+        return stop(true, code);
+    }
+    // 8) 安静时段/共享额度：可恢复阻塞，保留 queued 等下一拍（不占发送 attempts）。
+    if (proposalKind == QStringLiteral("contact")) {
+        if (actionQuietNow(opts)) return stop(false, QStringLiteral("quiet"));
+        if (opts.contactDailyLimit > 0) {
+            QSqlQuery used(db);
+            // 排除本动作自己的账本行，否则"自己占的额度"会把已提交动作永久挡死。
+            used.prepare(QStringLiteral(
+                "SELECT count(*) FROM delivery_ledger WHERE kind='contact' "
+                "AND date(created_at,'localtime')=date('now','localtime') "
+                "AND state<>'withheld' AND ref<>?"));
+            used.addBindValue(actionKey);
+            if (used.exec() && used.next()
+                && used.value(0).toInt() >= opts.contactDailyLimit)
+                return stop(false, QStringLiteral("limit"));
+        }
+    }
+    return block;
 }
 
 // 恢复（进程崩溃遗留）时的领域回写：at-most-once，只标"不确定"，不增加失败尝试计数。
@@ -9970,56 +10402,209 @@ QJsonObject MemoryManager::claimOutbox(const QString &owner,int leaseSeconds)
     if (leaseSeconds<=0) leaseSeconds=60;
     if (!m_db.transaction()) return {};
     auto rollback=qScopeGuard([this]{m_db.rollback();});
-    QSqlQuery pick(m_db);
     // 只领取 queued，或"被渠道明确拒绝且还有一次重试预算"的失败行；
     // dispatching（可能已交给网络）永远不在这里重领——它只能由 recoverStaleOutbox 冻结为 unknown。
-    pick.prepare("SELECT o.id,o.action_id,o.action_key,o.channel,o.session_id,o.payload_json,o.attempts,"
-                 "a.kind,a.state FROM action_outbox o JOIN cognitive_action a ON a.id=o.action_id "
-                 "WHERE o.state='queued' OR (o.state='failed' AND o.attempts<2) "
-                 "ORDER BY o.id LIMIT 1");
-    if (!pick.exec() || !pick.next()) { m_db.rollback(); return {}; }
-    const auto outboxId=pick.value(0).toLongLong();
-    const auto actionId=pick.value(1).toLongLong();
-    const auto actionKey=pick.value(2).toString();
-    const auto channel=pick.value(3).toString();
-    const auto session=pick.value(4).toString();
-    const auto payloadJson=pick.value(5).toString();
-    const auto attempts=pick.value(6).toInt();
-    const auto kind=pick.value(7).toString();
-    pick.finish();
-
-    QSqlQuery claim(m_db);
-    claim.prepare("UPDATE action_outbox SET state='dispatching',lease_owner=?,"
-                  "lease_until=unixepoch()+?,dispatched_at=coalesce(dispatched_at,unixepoch()),"
-                  "attempts=attempts+1 WHERE id=? AND (state='queued' "
-                  "OR (state='failed' AND attempts<2))");
-    claim.addBindValue(owner);
-    claim.addBindValue(leaseSeconds);
-    claim.addBindValue(outboxId);
-    if (!claim.exec() || claim.numRowsAffected()!=1) { m_db.rollback(); return {}; }
-
-    QSqlQuery touch(m_db);
-    touch.prepare("UPDATE cognitive_action SET state='dispatching',updated_at=unixepoch() "
-                  "WHERE id=? AND state NOT IN ('unknown','withheld')");
-    touch.addBindValue(actionId);
-    if (!touch.exec()) { m_db.rollback(); return {}; }
-
-    if (!markOutboxDomainDispatching(m_db,actionKey,kind,channel,session)) {
+    // R12-2c-2：显式排除 action 终态（handed_off/unknown/withheld）。withheld 分支会把
+    // outbox 置 failed 且 attempts 可能仍 <2，以前会被这条 attempts<2 重新领取并再发一次；
+    // 现在由 a.state 判断排除（重点：withheld 对应 failed 不得重领，不能只看 attempts）。
+    QSqlQuery pick(m_db);
+    pick.prepare(QStringLiteral(
+        "SELECT o.id,o.action_id,o.action_key,o.channel,o.session_id,o.payload_json,"
+        "o.attempts,a.kind FROM action_outbox o JOIN cognitive_action a ON a.id=o.action_id "
+        "WHERE (o.state='queued' OR (o.state='failed' AND o.attempts<2 AND a.state='rejected')) "
+        "AND a.state IN ('queued','rejected') ORDER BY o.id LIMIT 8"));
+    if (!pick.exec()) {
         m_db.rollback();
         return {};
     }
+    struct Candidate {
+        qlonglong outboxId = 0;
+        qlonglong actionId = 0;
+        QString actionKey;
+        QString channel;
+        QString session;
+        QString payloadJson;
+        int attempts = 0;
+        QString kind;
+    };
+    QList<Candidate> candidates;
+    while (pick.next()) {
+        candidates.append(Candidate{pick.value(0).toLongLong(), pick.value(1).toLongLong(),
+                                    pick.value(2).toString(), pick.value(3).toString(),
+                                    pick.value(4).toString(), pick.value(5).toString(),
+                                    pick.value(6).toInt(), pick.value(7).toString()});
+    }
+    pick.finish();
+    if (candidates.isEmpty()) {
+        m_db.rollback();
+        return {};
+    }
+    // 领取时复验：永久失效当场取消（不发送、不重领）；可恢复阻塞保留 queued 等下一拍。
+    bool cancelledAny = false;
+    for (const auto &candidate : candidates) {
+        const OutboxSendBlock guard = outboxSendGuard(*this, m_db, candidate.actionKey);
+        if (guard.blocked) {
+            if (guard.permanent) {
+                // 终态（可能被另一个连接/回执并发推进）只跳过，不回退动作/账本。
+                if (guard.reason == QStringLiteral("already_terminal")
+                    || guard.reason == QStringLiteral("outbox_terminal"))
+                    continue;
+                if (!cancelOutboxLocked(m_db, candidate.actionKey, candidate.kind,
+                                        candidate.channel, candidate.session, guard.reason)) {
+                    m_db.rollback();
+                    return {};
+                }
+                cancelledAny = true;
+                qInfo() << "[Outbox] cancelled_at_claim key=" << candidate.actionKey
+                        << "reason=" << guard.reason;
+            }
+            continue; // 可恢复：本次不领，行仍 queued；不消耗 attempts
+        }
+        QSqlQuery claim(m_db);
+        claim.prepare("UPDATE action_outbox SET state='dispatching',lease_owner=?,"
+                      "lease_until=unixepoch()+?,dispatched_at=coalesce(dispatched_at,unixepoch()),"
+                      "attempts=attempts+1 WHERE id=? AND (state='queued' "
+                      "OR (state='failed' AND attempts<2))");
+        claim.addBindValue(owner);
+        claim.addBindValue(leaseSeconds);
+        claim.addBindValue(candidate.outboxId);
+        if (!claim.exec() || claim.numRowsAffected()!=1) {
+            m_db.rollback();
+            return {};
+        }
+        QSqlQuery touch(m_db);
+        touch.prepare("UPDATE cognitive_action SET state='dispatching',updated_at=unixepoch() "
+                      "WHERE id=? AND state NOT IN ('unknown','withheld')");
+        touch.addBindValue(candidate.actionId);
+        if (!touch.exec()) {
+            m_db.rollback();
+            return {};
+        }
+        if (!markOutboxDomainDispatching(m_db,candidate.actionKey,candidate.kind,
+                                         candidate.channel,candidate.session)) {
+            m_db.rollback();
+            return {};
+        }
+        if (!m_db.commit()) return {};
+        rollback.dismiss();
+        qInfo()<<"[Outbox] claimed key="<<candidate.actionKey<<"kind="<<candidate.kind
+               <<"attempt="<<(candidate.attempts+1);
+        return QJsonObject{{QStringLiteral("outbox_id"),candidate.outboxId},
+                           {QStringLiteral("action_id"),candidate.actionId},
+                           {QStringLiteral("action_key"),candidate.actionKey},
+                           {QStringLiteral("kind"),candidate.kind},
+                           {QStringLiteral("channel"),candidate.channel},
+                           {QStringLiteral("session"),candidate.session},
+                           {QStringLiteral("payload_json"),candidate.payloadJson},
+                           {QStringLiteral("payload"),
+                            QJsonDocument::fromJson(candidate.payloadJson.toUtf8()).object()},
+                           {QStringLiteral("attempts"),candidate.attempts+1}};
+    }
+    // 只做了取消（或全部可恢复阻塞）：提交取消结果后返回空，下一拍再试。
     if (!m_db.commit()) return {};
     rollback.dismiss();
-    qInfo()<<"[Outbox] claimed key="<<actionKey<<"kind="<<kind<<"attempt="<<(attempts+1);
-    return QJsonObject{{QStringLiteral("outbox_id"),outboxId},
-                       {QStringLiteral("action_id"),actionId},
-                       {QStringLiteral("action_key"),actionKey},
-                       {QStringLiteral("kind"),kind},
-                       {QStringLiteral("channel"),channel},
-                       {QStringLiteral("session"),session},
-                       {QStringLiteral("payload_json"),payloadJson},
-                       {QStringLiteral("payload"),QJsonDocument::fromJson(payloadJson.toUtf8()).object()},
-                       {QStringLiteral("attempts"),attempts+1}};
+    if (cancelledAny) qInfo() << "[Outbox] claim skipped: invalid rows cancelled";
+    return {};
+}
+
+QJsonObject MemoryManager::validateOutboxActionBeforeSend(const QString &actionKey)
+{
+    const QString key = actionKey.trimmed();
+    QJsonObject result{{QStringLiteral("ok"),false},
+                       {QStringLiteral("permanent"),false},
+                       {QStringLiteral("reason"),QStringLiteral("db_error")}};
+    if (!m_db.isOpen() || key.isEmpty()) return result;
+    const OutboxSendBlock block = outboxSendGuard(*this, m_db, key);
+    result[QStringLiteral("ok")] = !block.blocked;
+    result[QStringLiteral("permanent")] = block.permanent;
+    result[QStringLiteral("reason")] = block.reason;
+    // 附带只读审计字段（供 dispatcher/日志分类；不作为发送依据）。
+    QSqlQuery row(m_db);
+    row.prepare(QStringLiteral(
+        "SELECT a.state,o.state,a.channel,a.session_id FROM cognitive_action a "
+        "JOIN action_outbox o ON o.action_id=a.id WHERE a.action_key=?"));
+    row.addBindValue(key);
+    if (row.exec() && row.next()) {
+        result[QStringLiteral("action_state")] = row.value(0).toString();
+        result[QStringLiteral("outbox_state")] = row.value(1).toString();
+        result[QStringLiteral("channel")] = row.value(2).toString();
+        result[QStringLiteral("session")] = row.value(3).toString();
+    }
+    return result;
+}
+
+bool MemoryManager::deferOutboxAction(const QString &actionKey,const QString &reason)
+{
+    const QString key = actionKey.trimmed();
+    if (!m_db.isOpen() || key.isEmpty()) return false;
+    if (!key.startsWith(QStringLiteral("wake:")) && !key.startsWith(QStringLiteral("activity:")))
+        return false; // 仅新来源动作使用可恢复回队；legacy 保留既有 rejected 重试语义
+    if (!m_db.transaction()) return false;
+    auto rollback=qScopeGuard([this]{m_db.rollback();});
+    QSqlQuery outbox(m_db);
+    // 不算一次发送：attempts 回退，租约清空，状态回 queued。
+    outbox.prepare("UPDATE action_outbox SET state='queued',lease_owner=NULL,lease_until=NULL,"
+                   "last_error=?,attempts=CASE WHEN attempts>0 THEN attempts-1 ELSE 0 END "
+                   "WHERE action_key=? AND state='dispatching'");
+    outbox.addBindValue(reason.left(120));
+    outbox.addBindValue(key);
+    if (!outbox.exec() || outbox.numRowsAffected()!=1) {
+        m_db.rollback();
+        rollback.dismiss();
+        return false;
+    }
+    QSqlQuery action(m_db);
+    action.prepare("UPDATE cognitive_action SET state='queued',updated_at=unixepoch() "
+                   "WHERE action_key=? AND state='dispatching'");
+    action.addBindValue(key);
+    if (!action.exec()) {
+        m_db.rollback();
+        rollback.dismiss();
+        return false;
+    }
+    if (!m_db.commit()) {
+        m_db.rollback();
+        return false;
+    }
+    rollback.dismiss();
+    qInfo() << "[Outbox] deferred key=" << key << "reason=" << reason;
+    return true;
+}
+
+bool MemoryManager::cancelOutboxAction(const QString &actionKey,const QString &reason)
+{
+    const QString key = actionKey.trimmed();
+    const QString why = reason.trimmed().left(120);
+    if (!m_db.isOpen() || key.isEmpty() || why.isEmpty()) return false;
+    if (!m_db.transaction()) return false;
+    auto rollback=qScopeGuard([this]{m_db.rollback();});
+    QString kind, channel, session;
+    {
+        QSqlQuery row(m_db);
+        row.prepare("SELECT a.kind,a.channel,a.session_id FROM cognitive_action a "
+                    "JOIN action_outbox o ON o.action_id=a.id WHERE a.action_key=?");
+        row.addBindValue(key);
+        if (!row.exec() || !row.next()) {
+            m_db.rollback();
+            rollback.dismiss();
+            return false;
+        }
+        kind = row.value(0).toString();
+        channel = row.value(1).toString();
+        session = row.value(2).toString();
+    }
+    if (!cancelOutboxLocked(m_db, key, kind, channel, session, why)) {
+        m_db.rollback();
+        rollback.dismiss();
+        return false;
+    }
+    if (!m_db.commit()) {
+        m_db.rollback();
+        return false;
+    }
+    rollback.dismiss();
+    qInfo() << "[Outbox] cancelled key=" << key << "reason=" << why;
+    return true;
 }
 
 bool MemoryManager::settleOutboxAction(const QString &actionKey,const QString &outcome,
@@ -10202,7 +10787,9 @@ bool proposalSemanticStatusValid(const QString &status)
 const QString kProposalColumns = QStringLiteral(
     "id,action_key,kind,origin_kind,origin_ref,origin_version,run_id,scope,context_epoch,"
     "target_channel,target_session,payload_json,claims_json,semantic_status,state,expires_at,"
-    "committed_action_key,error_code,created_at,updated_at");
+    "committed_action_key,error_code,verified_payload_hash,verified_claims_hash,"
+    "verified_request_id,verified_at,history_projected,cancel_reason,action_context_epoch,"
+    "created_at,updated_at");
 
 // 行 → JSON：JSON 列解析回对象/数组；origin 同时给出结构化的 origin 对象与扁平字段。
 QJsonObject proposalRowJson(const QSqlQuery &query)
@@ -10261,6 +10848,22 @@ QJsonObject proposalRowJson(const QSqlQuery &query)
         {QStringLiteral("committed_action_key"),
          query.value(QStringLiteral("committed_action_key")).toString()},
         {QStringLiteral("error_code"), query.value(QStringLiteral("error_code")).toString()},
+        // R12-2c-2：verified 内容绑定 / 取消审计 / fence 快照（旧行缺省为 NULL/0）。
+        {QStringLiteral("verified_payload_hash"),
+         query.value(QStringLiteral("verified_payload_hash")).toString()},
+        {QStringLiteral("verified_claims_hash"),
+         query.value(QStringLiteral("verified_claims_hash")).toString()},
+        {QStringLiteral("verified_request_id"),
+         query.value(QStringLiteral("verified_request_id")).toString()},
+        {QStringLiteral("verified_at"),
+         query.value(QStringLiteral("verified_at")).toLongLong()},
+        // 预留给 c3 回执历史投影的幂等标记；本片只建列并保持 0。
+        {QStringLiteral("history_projected"),
+         query.value(QStringLiteral("history_projected")).toInt()},
+        {QStringLiteral("cancel_reason"),
+         query.value(QStringLiteral("cancel_reason")).toString()},
+        {QStringLiteral("action_context_epoch"),
+         query.value(QStringLiteral("action_context_epoch")).toLongLong()},
         {QStringLiteral("created_at"),
          query.value(QStringLiteral("created_at")).toLongLong()},
         {QStringLiteral("updated_at"),
@@ -10363,14 +10966,17 @@ QJsonObject MemoryManager::persistActionProposal(const QJsonObject &proposal, QS
         return idempotent;
     }
     // 7) 单事务写入；唯一约束兜底并发下的重复 key。
+    // R12-2c-2：落库时快照当前 Action Context Fence epoch。后续 verified 绑定、提交、
+    // claimOutbox 与实际发送前都和这个快照比较；同 key 幂等重放不覆盖首次快照。
+    const qint64 fenceEpoch = actionContextEpoch();
     if (!m_db.transaction()) return fail(QStringLiteral("db_error"));
     auto rollback = qScopeGuard([this] { m_db.rollback(); });
     QSqlQuery insert(m_db);
     insert.prepare(QStringLiteral(
         "INSERT INTO action_proposal(action_key,kind,origin_kind,origin_ref,origin_version,"
         "run_id,scope,context_epoch,target_channel,target_session,payload_json,claims_json,"
-        "semantic_status,state,expires_at,created_at,updated_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL,'proposed',?,unixepoch(),unixepoch())"));
+        "semantic_status,state,expires_at,action_context_epoch,created_at,updated_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL,'proposed',?,?,unixepoch(),unixepoch())"));
     insert.addBindValue(actionKey);
     insert.addBindValue(kind);
     insert.addBindValue(origin.kindName());
@@ -10384,6 +10990,7 @@ QJsonObject MemoryManager::persistActionProposal(const QJsonObject &proposal, QS
     insert.addBindValue(payloadJson);
     insert.addBindValue(claimsJson);
     insert.addBindValue(expiresAt);
+    insert.addBindValue(fenceEpoch);
     if (!insert.exec()) {
         m_db.rollback();
         rollback.dismiss();
@@ -10445,6 +11052,8 @@ bool MemoryManager::updateActionProposalState(const QString &actionKey, const QS
         return fail(QStringLiteral("invalid_state"));
     // committed 必须走 markProposalCommitted（需要 committed_action_key）。
     if (to == QStringLiteral("committed")) return fail(QStringLiteral("invalid_state"));
+    // R12-2c-2：verified 必须走 markActionProposalVerified（需要内容指纹/request_id/fence）。
+    if (to == QStringLiteral("verified")) return fail(QStringLiteral("verified_binding_required"));
     if (!proposalTransitionAllowed(from, to)) return fail(QStringLiteral("invalid_transition"));
     if (!proposalSemanticStatusValid(semantic))
         return fail(QStringLiteral("invalid_semantic_status"));
@@ -10483,6 +11092,164 @@ bool MemoryManager::updateActionProposalState(const QString &actionKey, const QS
     return true;
 }
 
+// R12-2c-2：proposed→verified 的唯一入口。核验（语义网络请求）已经在调用方/LLMService
+// 完成；这里只做服务端权威的"内容绑定落库"，不发网络请求、不发送消息。
+// 关键不变式：verified 行必须携带"到底核验了哪份内容"的指纹 + verifier request_id +
+// verified_at + 生成时的 fence epoch；之后提交/领取/发送都以此为准重算并逐字比较。
+bool MemoryManager::markActionProposalVerified(const QString &actionKey,
+                                               const QString &semanticStatus,
+                                               const QString &verifiedRequestId, QString *error)
+{
+    if (error) error->clear();
+    const auto fail = [error](const QString &reason) {
+        if (error) *error = reason;
+        return false;
+    };
+    const QString key = actionKey.trimmed();
+    const QString semantic = semanticStatus.trimmed();
+    const QString requestId = verifiedRequestId.trimmed();
+    if (key.isEmpty()) return fail(QStringLiteral("invalid_action_key"));
+    if (!m_db.isOpen()) return fail(QStringLiteral("db_error"));
+    // 只有服务端封闭枚举才能进入 verified；空串/withheld 都不允许。
+    if (semantic.isEmpty() || semantic == QStringLiteral("withheld")
+        || !proposalSemanticStatusValid(semantic))
+        return fail(QStringLiteral("invalid_semantic_status"));
+    if (requestId.isEmpty()) return fail(QStringLiteral("missing_verified_request_id"));
+    if (requestId.size() > 120) return fail(QStringLiteral("invalid_verified_request_id"));
+    if (!m_db.transaction()) return fail(QStringLiteral("db_error"));
+    auto rollback = qScopeGuard([this] { m_db.rollback(); });
+    QJsonObject row;
+    {
+        QSqlQuery query(m_db);
+        query.prepare(QStringLiteral("SELECT ") + kProposalColumns
+                      + QStringLiteral(" FROM action_proposal WHERE action_key=?"));
+        query.addBindValue(key);
+        if (!query.exec() || !query.next()) {
+            m_db.rollback();
+            rollback.dismiss();
+            return fail(QStringLiteral("not_found"));
+        }
+        row = proposalRowJson(query);
+    }
+    const QString state = row.value(QStringLiteral("state")).toString();
+    if (state == QStringLiteral("committed") || state == QStringLiteral("verified")) {
+        // 幂等：已经 verified/committed 的提案不重复改写绑定；提交/发送前还会复核绑定。
+        m_db.rollback();
+        rollback.dismiss();
+        return true;
+    }
+    if (state != QStringLiteral("proposed")) {
+        m_db.rollback();
+        rollback.dismiss();
+        return fail(QStringLiteral("invalid_state"));
+    }
+    // Action Context Fence：提案落库时快照的 epoch 必须仍等于当前语境版本。
+    // 主人私聊插话/成果撤回等已推进 epoch → 这份"旧在途核验"不能再变成 verified。
+    const qint64 currentEpoch = actionContextEpoch();
+    const qint64 snapshotEpoch = row.value(QStringLiteral("action_context_epoch")).toInteger();
+    if (currentEpoch != snapshotEpoch) {
+        QSqlQuery expire(m_db);
+        expire.prepare(QStringLiteral(
+            "UPDATE action_proposal SET state='expired',cancel_reason=?,updated_at=unixepoch() "
+            "WHERE action_key=? AND state='proposed'"));
+        expire.addBindValue(QStringLiteral("context_epoch_changed"));
+        expire.addBindValue(key);
+        if (!expire.exec()) return fail(QStringLiteral("db_error"));
+        if (!m_db.commit()) {
+            m_db.rollback();
+            return fail(QStringLiteral("db_error"));
+        }
+        rollback.dismiss();
+        qInfo() << "[Proposal] expired key=" << key
+                << "reason=context_epoch_changed snapshot=" << snapshotEpoch
+                << "current=" << currentEpoch;
+        return fail(QStringLiteral("context_epoch_changed"));
+    }
+    const QString kind = row.value(QStringLiteral("kind")).toString();
+    const QJsonObject payload = row.value(QStringLiteral("payload")).toObject();
+    const QJsonArray claims = row.value(QStringLiteral("claims")).toArray();
+    if (kind == QStringLiteral("contact")
+        && payload.value(QStringLiteral("message")).toString().trimmed().isEmpty()) {
+        m_db.rollback();
+        rollback.dismiss();
+        return fail(QStringLiteral("missing_message"));
+    }
+    if (kind == QStringLiteral("activity_share")
+        && payload.value(QStringLiteral("draft")).toString().trimmed().isEmpty()) {
+        m_db.rollback();
+        rollback.dismiss();
+        return fail(QStringLiteral("missing_artifact_draft"));
+    }
+    const QString payloadHash = ActionPolicy::canonicalProposalPayloadDigest(payload, claims);
+    const QString claimsHash = ActionPolicy::canonicalProposalClaimsDigest(claims);
+    if (payloadHash.isEmpty() || claimsHash.isEmpty()) {
+        m_db.rollback();
+        rollback.dismiss();
+        return fail(QStringLiteral("binding_failed"));
+    }
+    QSqlQuery update(m_db);
+    update.prepare(QStringLiteral(
+        "UPDATE action_proposal SET state='verified',semantic_status=?,"
+        "verified_payload_hash=?,verified_claims_hash=?,verified_request_id=?,"
+        "verified_at=?,error_code=NULL,updated_at=unixepoch() "
+        "WHERE action_key=? AND state='proposed'"));
+    update.addBindValue(semantic);
+    update.addBindValue(payloadHash);
+    update.addBindValue(claimsHash);
+    update.addBindValue(requestId);
+    update.addBindValue(QDateTime::currentSecsSinceEpoch());
+    update.addBindValue(key);
+    if (!update.exec()) return fail(QStringLiteral("db_error"));
+    if (update.numRowsAffected() != 1) {
+        m_db.rollback();
+        rollback.dismiss();
+        return fail(QStringLiteral("cas_conflict"));
+    }
+    if (!m_db.commit()) {
+        m_db.rollback();
+        return fail(QStringLiteral("db_error"));
+    }
+    rollback.dismiss();
+    qInfo() << "[Proposal] verified key=" << key << "semantic=" << semantic
+            << "request=" << requestId.left(8);
+    return true;
+}
+
+// R12-2c-2：取消审计（幂等）。未提交提案回 expired；已 committed 的保持状态（回执闭环依赖
+// committed），只写 cancel_reason，供 claimOutbox/发送前复验识别"已取消、不得发送"。
+bool MemoryManager::cancelActionProposal(const QString &actionKey, const QString &reason)
+{
+    const QString key = actionKey.trimmed();
+    const QString why = reason.trimmed().left(120);
+    if (!m_db.isOpen() || key.isEmpty() || why.isEmpty()) return false;
+    if (!m_db.transaction()) return false;
+    auto rollback = qScopeGuard([this] { m_db.rollback(); });
+    QSqlQuery update(m_db);
+    update.prepare(QStringLiteral(
+        "UPDATE action_proposal SET "
+        "state=CASE WHEN state IN ('proposed','verified') THEN 'expired' ELSE state END,"
+        "cancel_reason=?,updated_at=unixepoch() WHERE action_key=?"));
+    update.addBindValue(why);
+    update.addBindValue(key);
+    if (!update.exec()) {
+        m_db.rollback();
+        rollback.dismiss();
+        return false;
+    }
+    if (update.numRowsAffected() != 1) {
+        m_db.rollback();
+        rollback.dismiss();
+        return false;
+    }
+    if (!m_db.commit()) {
+        m_db.rollback();
+        return false;
+    }
+    rollback.dismiss();
+    qInfo() << "[Proposal] cancelled key=" << key << "reason=" << why;
+    return true;
+}
+
 int MemoryManager::expireActionProposals(qint64 now)
 {
     if (!m_db.isOpen()) return 0;
@@ -10491,8 +11258,10 @@ int MemoryManager::expireActionProposals(qint64 now)
     auto rollback = qScopeGuard([this] { m_db.rollback(); });
     QSqlQuery update(m_db);
     // 只处理明确设置了过期时间且已到期的提案；expires_at=0 表示"不过期"。
+    // 审计：cancel_reason 记录 expired（若还没有其它取消原因），便于 claim/发送前诊断。
     update.prepare(QStringLiteral(
-        "UPDATE action_proposal SET state='expired',updated_at=unixepoch() "
+        "UPDATE action_proposal SET state='expired',"
+        "cancel_reason=coalesce(cancel_reason,'expired'),updated_at=unixepoch() "
         "WHERE state IN ('proposed','verified') AND expires_at>0 AND expires_at<=?"));
     update.addBindValue(when);
     if (!update.exec()) {
@@ -10635,7 +11404,8 @@ QJsonObject MemoryManager::commitVerifiedActionProposal(const QString &actionKey
         return fail(QStringLiteral("invalid_kind"));
     }
     // 幂等：已经有动作行时不重复建 outbox；若提案停在 verified，补一次 committed 回写。
-    // 同 key 不同 kind/来源版本视为 conflict/duplicate（不能静默复用另一条主动动作）。
+    // 同 key 不同 kind/来源版本/目标/正文/claims 视为 conflict/duplicate（不能静默复用
+    // 另一条主动动作；R12-2c-2 起逐项核对，不再只比 origin_ref/version）。
     const QString expectedActionKind = kind == QStringLiteral("contact")
         ? kActionKindOpenWakeContact : kActionKindInternalShare;
     const QJsonObject existing = existingAction(m_db, key);
@@ -10655,11 +11425,30 @@ QJsonObject MemoryManager::commitVerifiedActionProposal(const QString &actionKey
                     row.value(1).toString().toUtf8()).object();
             }
         }
-        if (!existingPayload.isEmpty()
-            && (existingPayload.value(QStringLiteral("origin_ref")).toString()
-                    != proposal.value(QStringLiteral("origin_ref")).toString()
-                || existingPayload.value(QStringLiteral("origin_version")).toInt()
-                    != proposal.value(QStringLiteral("origin_version")).toInt())) {
+        bool sameAction = !existingPayload.isEmpty()
+            && existingPayload.value(QStringLiteral("origin_ref")).toString()
+                   == proposal.value(QStringLiteral("origin_ref")).toString()
+            && existingPayload.value(QStringLiteral("origin_version")).toInt()
+                   == proposal.value(QStringLiteral("origin_version")).toInt()
+            && existing.value(QStringLiteral("channel")).toString()
+                   == proposal.value(QStringLiteral("target_channel")).toString()
+            && existing.value(QStringLiteral("session")).toString()
+                   == proposal.value(QStringLiteral("target_session")).toString();
+        if (sameAction) {
+            const QJsonObject proposalPayload = proposal.value(QStringLiteral("payload")).toObject();
+            const QJsonArray proposalClaims = proposal.value(QStringLiteral("claims")).toArray();
+            const QString proposalText = kind == QStringLiteral("contact")
+                ? proposalPayload.value(QStringLiteral("message")).toString().trimmed()
+                : proposalPayload.value(QStringLiteral("draft")).toString().trimmed();
+            const QString actionText =
+                !existingPayload.value(QStringLiteral("message")).toString().trimmed().isEmpty()
+                ? existingPayload.value(QStringLiteral("message")).toString().trimmed()
+                : existingPayload.value(QStringLiteral("draft")).toString().trimmed();
+            sameAction = !proposalText.isEmpty() && actionText == proposalText
+                && canonicalJson(existingPayload.value(QStringLiteral("claims")).toArray())
+                       == canonicalJson(proposalClaims);
+        }
+        if (!sameAction) {
             if (error) *error = QStringLiteral("duplicate");
             return QJsonObject{{QStringLiteral("error"), QStringLiteral("duplicate")}};
         }
@@ -10676,10 +11465,29 @@ QJsonObject MemoryManager::commitVerifiedActionProposal(const QString &actionKey
                         ? QStringLiteral("invalid_state")
                         : QStringLiteral("not_verified"));
     }
+    // R12-2c-2：Action Context Fence。提案落库后主人私聊插话/成果撤回已经推进 epoch，
+    // 这份旧核验不能再提交（历史事实/成果保留，只是不发送旧动作）。
+    if (proposal.value(QStringLiteral("action_context_epoch")).toInteger() != actionContextEpoch()) {
+        cancelActionProposal(key, QStringLiteral("context_epoch_changed"));
+        return fail(QStringLiteral("stale_origin"), QStringLiteral("context_epoch_changed"));
+    }
+    // R12-2c-2：verified 行必须带内容绑定；v32 迁移遗留的旧 verified 行没有指纹，
+    // 一律 fail closed（withheld，不发送），等重新核验后产生新的 verified 行。
+    const QString verifiedPayloadHash =
+        proposal.value(QStringLiteral("verified_payload_hash")).toString();
+    const QString verifiedClaimsHash =
+        proposal.value(QStringLiteral("verified_claims_hash")).toString();
+    if (verifiedPayloadHash.isEmpty() || verifiedClaimsHash.isEmpty()
+        || proposal.value(QStringLiteral("verified_request_id")).toString().trimmed().isEmpty()) {
+        updateActionProposalState(key, QStringLiteral("verified"), QStringLiteral("withheld"),
+                                  QStringLiteral("withheld"),
+                                  QStringLiteral("verified_binding_missing"));
+        return fail(QStringLiteral("policy_rejected"),
+                    QStringLiteral("verified_binding_missing"));
+    }
     const qint64 expiresAt = proposal.value(QStringLiteral("expires_at")).toInteger();
     if (expiresAt > 0 && expiresAt <= QDateTime::currentSecsSinceEpoch()) {
-        updateActionProposalState(key, QStringLiteral("verified"), QStringLiteral("expired"),
-                                  QString(), QStringLiteral("expired"));
+        cancelActionProposal(key, QStringLiteral("expired"));
         return fail(QStringLiteral("stale_origin"), QStringLiteral("expired"));
     }
     auto &cfg = ConfigManager::instance();
@@ -10893,9 +11701,27 @@ QJsonObject MemoryManager::commitVerifiedActionProposal(const QString &actionKey
             {QStringLiteral("draft"), draft}};
     }
 
+    // R12-2c-2：即将提交的 payload/claims 必须与"核验时的内容指纹"完全一致。
+    // 这里按提交内容重算；进入事务后再用权威提案行复核一次（双重复验）。
+    const QString commitClaimsDigest = ActionPolicy::canonicalProposalClaimsDigest(claims);
+    if (ActionPolicy::canonicalProposalPayloadDigest(payload, claims) != verifiedPayloadHash
+        || commitClaimsDigest != verifiedClaimsHash) {
+        updateActionProposalState(key, QStringLiteral("verified"), QStringLiteral("withheld"),
+                                  QStringLiteral("withheld"),
+                                  QStringLiteral("verified_content_mismatch"));
+        return fail(QStringLiteral("policy_rejected"),
+                    QStringLiteral("verified_content_mismatch"));
+    }
+
     // 单事务：动作 + Outbox + 账本 + 提案 CAS 一起落库（失败整体回滚）。
     if (!m_db.transaction()) return fail(QStringLiteral("db_error"));
     auto rollback = qScopeGuard([this] { m_db.rollback(); });
+    const auto rollbackThenFail = [this, &rollback, &fail](const QString &code,
+                                                           const QString &detail) {
+        m_db.rollback();
+        rollback.dismiss();
+        return fail(code, detail);
+    };
     // 并发兜底：进入事务后再查一次动作行（唯一约束仍是最后防线）。
     const QJsonObject raced = existingAction(m_db, key);
     if (!raced.isEmpty()) {
@@ -10906,6 +11732,109 @@ QJsonObject MemoryManager::commitVerifiedActionProposal(const QString &actionKey
         QJsonObject result = raced;
         result[QStringLiteral("proposal_state")] = QStringLiteral("committed");
         return result;
+    }
+    // R12-2c-2：事务内重新读取权威提案行并逐项复验来源/版本/runId/scope/epoch/target/expires/
+    // verified 绑定与即将提交的内容；任何不一致都不提交（窗口内被改写 → conflict/stale）。
+    const QJsonObject fresh = actionProposal(key);
+    if (fresh.isEmpty()) return rollbackThenFail(QStringLiteral("db_error"),
+                                                 QStringLiteral("proposal_disappeared"));
+    const auto sameField = [&fresh, &proposal](const char *field) {
+        const QString name = QString::fromLatin1(field);
+        return canonicalJson(QJsonObject{{QStringLiteral("v"), fresh.value(name)}})
+            == canonicalJson(QJsonObject{{QStringLiteral("v"), proposal.value(name)}});
+    };
+    if (fresh.value(QStringLiteral("state")).toString() != QStringLiteral("verified")
+        || fresh.value(QStringLiteral("kind")).toString() != kind
+        || fresh.value(QStringLiteral("origin_kind")).toString() != originKind
+        || !sameField("origin_ref") || !sameField("origin_version") || !sameField("run_id")
+        || !sameField("scope") || !sameField("context_epoch")
+        || fresh.value(QStringLiteral("target_channel")).toString() != targetChannel
+        || fresh.value(QStringLiteral("target_session")).toString() != targetSession
+        || fresh.value(QStringLiteral("expires_at")).toInteger() != expiresAt
+        || fresh.value(QStringLiteral("verified_payload_hash")).toString() != verifiedPayloadHash
+        || fresh.value(QStringLiteral("verified_claims_hash")).toString() != verifiedClaimsHash
+        || fresh.value(QStringLiteral("verified_request_id")).toString()
+               != proposal.value(QStringLiteral("verified_request_id")).toString()
+        || canonicalJson(fresh.value(QStringLiteral("payload")).toObject())
+               != canonicalJson(payloadIn)
+        || canonicalJson(fresh.value(QStringLiteral("claims")).toArray())
+               != canonicalJson(claims))
+        return rollbackThenFail(QStringLiteral("cas_conflict"),
+                                QStringLiteral("proposal_changed"));
+    // fence/expires 在事务内再判一次（并发插话/过期不发送）。
+    if (fresh.value(QStringLiteral("action_context_epoch")).toInteger() != actionContextEpoch()) {
+        m_db.rollback();
+        rollback.dismiss();
+        cancelActionProposal(key, QStringLiteral("context_epoch_changed"));
+        return fail(QStringLiteral("stale_origin"), QStringLiteral("context_epoch_changed"));
+    }
+    if (fresh.value(QStringLiteral("expires_at")).toInteger() > 0
+        && fresh.value(QStringLiteral("expires_at")).toInteger()
+               <= QDateTime::currentSecsSinceEpoch()) {
+        m_db.rollback();
+        rollback.dismiss();
+        cancelActionProposal(key, QStringLiteral("expired"));
+        return fail(QStringLiteral("stale_origin"), QStringLiteral("expired"));
+    }
+    if (ActionPolicy::canonicalProposalPayloadDigest(
+            fresh.value(QStringLiteral("payload")).toObject(),
+            fresh.value(QStringLiteral("claims")).toArray()) != verifiedPayloadHash
+        || ActionPolicy::canonicalProposalClaimsDigest(
+               fresh.value(QStringLiteral("claims")).toArray()) != verifiedClaimsHash) {
+        m_db.rollback();
+        rollback.dismiss();
+        updateActionProposalState(key, QStringLiteral("verified"), QStringLiteral("withheld"),
+                                  QStringLiteral("withheld"),
+                                  QStringLiteral("verified_content_mismatch"));
+        return fail(QStringLiteral("policy_rejected"),
+                    QStringLiteral("verified_content_mismatch"));
+    }
+    // 事务内再做一次统一策略复核（来源版本/runId/scope/epoch/target/成果/权限/coverage），
+    // 覆盖 phase1 读取之后、事务开始之前的窗口；确定性、无网络。
+    {
+        ActionPolicy txPolicy(this);
+        const QString txTargetChannel =
+            fresh.value(QStringLiteral("target_channel")).toString();
+        const QString txTargetSession =
+            fresh.value(QStringLiteral("target_session")).toString();
+        const QJsonObject txInput{
+            {QStringLiteral("origin"), fresh.value(QStringLiteral("origin"))},
+            {QStringLiteral("kind"), fresh.value(QStringLiteral("kind"))},
+            {QStringLiteral("action_key"), key},
+            {QStringLiteral("target"),
+             QJsonObject{{QStringLiteral("channel"), txTargetChannel},
+                         {QStringLiteral("session_id"), txTargetSession}}},
+            {QStringLiteral("payload"), fresh.value(QStringLiteral("payload"))},
+            {QStringLiteral("claims"), fresh.value(QStringLiteral("claims"))},
+            {QStringLiteral("expires_at"), fresh.value(QStringLiteral("expires_at"))}};
+        QString txError;
+        const QJsonObject txValidation = txPolicy.validateActionProposal(txInput, &txError);
+        if (!txValidation.value(QStringLiteral("allowed")).toBool()) {
+            const QString reason = txValidation.value(QStringLiteral("reason")).toString(txError);
+            const QString code = actionProposalErrorCode(reason);
+            m_db.rollback();
+            rollback.dismiss();
+            if (actionProposalHardReject(code)) {
+                updateActionProposalState(key, QStringLiteral("verified"),
+                                          QStringLiteral("withheld"),
+                                          QStringLiteral("withheld"), code);
+            }
+            return fail(code, reason);
+        }
+    }
+    // 共享 contact 每日额度：事务内统计（额度占用与 action/outbox 同一写事务），
+    // 任何一步失败整体回滚；并发两个提交不会因"先读后写"而双占额度（SQLite 单写者）。
+    if (kind == QStringLiteral("contact") && opts.contactDailyLimit > 0) {
+        QSqlQuery usedNow(m_db);
+        usedNow.prepare(QStringLiteral(
+            "SELECT count(*) FROM delivery_ledger WHERE kind='contact' "
+            "AND date(created_at,'localtime')=date('now','localtime') "
+            "AND state<>'withheld'"));
+        if (!usedNow.exec() || !usedNow.next())
+            return rollbackThenFail(QStringLiteral("db_error"), QStringLiteral("quota_check"));
+        if (usedNow.value(0).toInt() >= opts.contactDailyLimit)
+            return rollbackThenFail(QStringLiteral("limit"),
+                                    QStringLiteral("contact_daily_limit"));
     }
     const QString payloadJson = canonicalJson(payload);
     const QString outboxPayloadJson = canonicalJson(outboxPayload);
@@ -10929,8 +11858,10 @@ QJsonObject MemoryManager::commitVerifiedActionProposal(const QString &actionKey
         if (!touch.exec()) return fail(QStringLiteral("db_error"), QStringLiteral("action_touch"));
     }
     // 账本：kind=contact/share，ref=action_key（与 settle/回执/共享额度同一口径）。
-    actionNoteDelivery(m_db, ledgerKind, key, targetChannel, targetSession, text,
-                       QStringLiteral("claimed"), 0);
+    // R12-2c-2：必须检查影响行数为 1，失败整体回滚（不能出现"动作入 Outbox、额度没占"）。
+    if (!actionNoteDeliveryChecked(m_db, ledgerKind, key, targetChannel, targetSession, text,
+                                   QStringLiteral("claimed"), 0))
+        return fail(QStringLiteral("db_error"), QStringLiteral("ledger_failed"));
     {
         QSqlQuery proposalUpdate(m_db);
         proposalUpdate.prepare(QStringLiteral(

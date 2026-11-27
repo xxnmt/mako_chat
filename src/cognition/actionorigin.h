@@ -26,6 +26,16 @@
 //   * contextEpoch  OpenWake 的 current_context_epoch（其它来源为 0）；
 //   * targetChannel/targetSession  本次动作的目标渠道/会话（服务端生成，不允许调用方替换）。
 //
+// R12-2c-2：Action Context Fence 三维语义（本片只补充说明，字段沿用既有约定）：
+//   * origin_version    来源/成果版本（上面的 version；文档、成果版本是"证据修订"）；
+//   * evidence_revision 真实证据修订（artifact_version/hash 或来源修订，在上面的 version 中体现）；
+//   * action_context_epoch 当前行动相关语境版本：**不是** origin 里的 contextEpoch。
+//     它由服务端在 attention_state 中单独持久化（MemoryManager::actionContextEpoch /
+//     bumpActionContextEpoch），提案落库时快照到 action_proposal.action_context_epoch；
+//    主人私聊输入/成果撤回等使旧提案失效，提交与 Outbox 发送前都要逐字比较。
+//    这里的 contextEpoch 只是 OpenWake 的来源 epoch（open_wake.current_context_epoch），
+//     不能替代行动语境 fence。
+//
 // action_key 约定（与既有 ActionCommitter 完全一致）：
 //   contact：       wake:<id>:<version>:contact
 //                   reflection:<turn>:<version>:contact

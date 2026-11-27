@@ -3118,6 +3118,21 @@ private slots:
         QCOMPARE(scalarMemorySql(QStringLiteral("SELECT count(*) FROM action_outbox")), qint64(1));
         QCOMPARE(scalarMemorySql(QStringLiteral(
                      "SELECT count(*) FROM delivery_ledger WHERE kind='contact'")), qint64(1));
+        // R12-2c-2：提案落库的 verified 内容指纹 / verifier request_id 必须与本次核验输入
+        // 完全一致（ActionPolicy::canonicalProposalPayloadDigest 与 LLMService 的
+        // verifierPayloadDigest 同一规范化算法）；提交/发送前都以此复核。
+        QCOMPARE(textMemorySql(QStringLiteral(
+                     "SELECT verified_payload_hash FROM action_proposal WHERE action_key='")
+                     + actionKey + QStringLiteral("'")),
+                 actionVerifierInput.value(QStringLiteral("payload_digest")).toString());
+        QCOMPARE(textMemorySql(QStringLiteral(
+                     "SELECT verified_request_id FROM action_proposal WHERE action_key='")
+                     + actionKey + QStringLiteral("'")),
+                 actionVerifierInput.value(QStringLiteral("request_id")).toString());
+        QCOMPARE(textMemorySql(QStringLiteral(
+                     "SELECT history_projected FROM action_proposal WHERE action_key='")
+                     + actionKey + QStringLiteral("'")),
+                 QStringLiteral("0"));
         QCOMPARE(textMemorySql(QStringLiteral("SELECT decision FROM open_wake WHERE id=")
                                    + QString::number(wakeId)),
                  QStringLiteral("contact"));
