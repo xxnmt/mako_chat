@@ -15,7 +15,8 @@
 | R12-2c 行动一致性与认知连续性修正 | **已完成（源码+测试已提交）** | v33 仅代码/测试；生产库仍 v32 迁移待独立评审，2026-11-27 生产库备份副本已升 v33 验证 |
 | R12-3a 第一切片（shadow） | **已完成（源码+测试已提交）** | 不替换生产 prompt、不新增 schema、不删除旧模块；见 [设计](R12_3A_CONTEXT_DESIGN.md)/[盘点](R12_3A_SOURCE_INVENTORY.md) |
 | R12-3a 第二切片（实际模型输入投影） | **已完成（默认关闭、可回退；源码+测试已提交）** | 仅接管前台/回顾的快照块与跨渠道证据块；CURRENT_UNDERSTANDING/MEMORY_DATA/历史/工具/行动链未改；见设计文档 §9 |
-| R12-3b 逐模块替换/状态连续性 | 未开始 | 按用户要求后置，不提前开始 |
+| R12-3b 跨入口认知连续性与资源分配（第一轮） | **已完成（默认关闭、可回退；源码+测试已提交）** | 领域结构化投影、A/B/C/D 可见性、按用途预算、跨入口连续性、真实执行回执只读接入；CURRENT_UNDERSTANDING/MEMORY_DATA/工具/consult 正文仍未迁移；见设计文档 §10 |
+| R12-3b 后续（正文位置迁移/其它入口） | 未开始 | 完成后停止评审再评估；不提前进入 B5 自然运行 |
 
 ## R12-1a 补充修正（已独立提交）
 
@@ -177,4 +178,32 @@
 - **风险**：短上下文下 saved_bytes 可能为负（统一时间说明/JSON 引用开销）；actual+tool
   模式、actual 开启下的真实行动链未单独覆盖；生产默认仍关闭，需运行观察后再切默认。
   旧机制退役条件见设计文档 §9.7，本轮不删除旧模块。
+
+## R12-3b 跨入口认知连续性与资源分配（2026-11-28）
+
+在第一/第二切片之上补齐“统一身份≠统一形状”、模型可见性、按用途预算与跨入口连续性；
+actual 仍默认关闭，生产配置/库未改。
+
+- **结构化投影**：`CognitiveEvidence` 增加 `purposes`（多用途不丢域归属）和
+  `structuredByPurpose`（旧领域模型可见行）。快照各域按旧协议字段输出；去重只去重复正文，
+  委托状态/到期、活动版本/状态/目标/成果元数据、回执 outcome 等必要状态仍保留。
+- **模型可见引用 A/B/C/D**：A 服务端可解析、B 正文确实在最终输入（按 canonical 文本回搜）、
+  C 必要结构化状态在最终输入、D 当前入口授权。只有 A+B(+C) 成立才允许正文替换为引用；
+  修正了“关注 thread 没有来源正文却被当成已序列化”的假阳性。OpenWake/Activity 数值 id
+  不再映射 chat/reflection；同数值 id 反向测试覆盖。
+- **按用途预算**：前台/Reflection·Concern/OpenWake/ActivityReview 各自领域优先级；
+  先降级为引用再整条省略，`trimmed_domains/overflow_domains` 显式报告；快照预算仍 4096。
+- **跨入口连续性**：OpenWake→前台、Activity→前台→ActivityReview、活动完成→分享→回执、
+  跨渠道更正、时间连续性均有隔离库测试（actual=1 通过）。
+- **继续统一入口**：新增 `MemoryManager::recentActionReceipts()` 只读回执目录（不新增账本），
+  前台 actual 注入真实执行回执；行动核验仍从权威数据源读完整证据。
+- **真实模型（actual=1、隔离库、mock sender）**：tool 模式实调 memory_recall（requests=3）；
+  OpenWake contact/quiet、Activity share 经 verifier→Outbox→mock sender→回执；真实 verifier
+  拒绝无依据 claim；真实 prompt_tokens 前台 3427/回顾 1975。
+- **验证**：全量 `ctest 24/24`（171s）；`tst_cognitivecontext 24 passed`；
+  `tst_memoryagent 124 passed/6 skipped`（设凭据时真实模型用例通过）；
+  `tst_memorymanager 157 passed/1 skipped`。未启动生产应用、未发真实渠道消息。
+- **风险**：真实模型/网络非确定（A-contact 偶发重试）；短上下文 saved_bytes 可能为负；
+  CURRENT_UNDERSTANDING/MEMORY_DATA/工具/consult 正文位置未迁移；actual 未默认开启。
+  细节与可退役机制见 [设计文档 §10](R12_3A_CONTEXT_DESIGN.md)。
 

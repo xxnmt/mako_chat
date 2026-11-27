@@ -609,6 +609,11 @@ public:
     // 不再固定最早 64 条；每轮有界多批，投影后标记 1/2 因而不会饿死后续行），幂等、可重入、
     // 重启补齐；已投影（1/2）不回退，不存在/冲突只审计。返回本次处理条数。
     int reconcileActionReceipts();
+    // R12-3b：只读执行回执目录（不新增账本、不写库）。只读取既有
+    // cognitive_action + delivery_ledger，返回最近的有界行：
+    // {ref(action_key),kind,state,outcome,updated_at,channel,session,last_error}。
+    // outcome 优先 last_outcome，其次 ledger state；不把“队列中”伪装成已送达。
+    QJsonArray recentActionReceipts(int limit = 6) const;
 
     // ===== R12-2c-3：internal activity share 的崩溃恢复 =====
     // 扫描已完成活动的有效未处理分享意愿（只有 status='completed'、share_intent.state='saved'、

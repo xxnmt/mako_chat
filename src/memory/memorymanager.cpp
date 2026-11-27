@@ -12232,6 +12232,45 @@ QString receiptHistoryRef(const QString &actionKey)
 
 } // namespace
 
+QJsonArray MemoryManager::recentActionReceipts(int limit) const
+{
+    QJsonArray rows;
+    if (!m_db.isOpen() || limit <= 0) return rows;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral(
+        "SELECT ca.action_key,ca.kind,ca.state,ca.last_outcome,ca.updated_at,"
+        "ca.channel,ca.session_id,dl.state,dl.updated_at,dl.last_error "
+        "FROM cognitive_action ca LEFT JOIN delivery_ledger dl ON dl.ref=ca.action_key "
+        "ORDER BY ca.updated_at DESC,ca.id DESC LIMIT ?"));
+    q.addBindValue(limit);
+    if (!q.exec()) return rows;
+    const auto iso = [](const qint64 seconds) {
+        return seconds > 0
+            ? QDateTime::fromSecsSinceEpoch(seconds, Qt::UTC).toString(Qt::ISODateWithMs)
+            : QString();
+    };
+    while (q.next()) {
+        const QString actionOutcome = q.value(3).toString().trimmed();
+        const QString ledgerState = q.value(7).toString().trimmed();
+        const qint64 actionUpdated = q.value(4).toLongLong();
+        const qint64 ledgerUpdated = q.value(8).toLongLong();
+        const QString outcome = !actionOutcome.isEmpty() ? actionOutcome
+            : (!ledgerState.isEmpty() ? ledgerState : q.value(2).toString());
+        rows.append(QJsonObject{
+            {QStringLiteral("ref"), q.value(0).toString()},
+            {QStringLiteral("action_key"), q.value(0).toString()},
+            {QStringLiteral("kind"), q.value(1).toString()},
+            {QStringLiteral("state"), q.value(2).toString()},
+            {QStringLiteral("outcome"), outcome},
+            {QStringLiteral("channel"), q.value(5).toString()},
+            {QStringLiteral("session"), q.value(6).toString()},
+            {QStringLiteral("updated_at"), iso(qMax(actionUpdated, ledgerUpdated))},
+            {QStringLiteral("ledger_state"), ledgerState},
+            {QStringLiteral("last_error"), q.value(9).toString()}});
+    }
+    return rows;
+}
+
 bool MemoryManager::recordActionReceipt(const QString &actionKey, const QString &outcome,
                                         const QString &detail)
 {

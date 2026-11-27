@@ -15,6 +15,11 @@
 
 namespace {
 
+// 前置声明：ingest 阶段用到投影辅助函数（定义在本文件后半部分的匿名命名空间）。
+QString projectionIso(const QDateTime &value);
+void tagPurpose(CognitiveEvidence &evidence, const QString &purpose,
+                const QJsonObject &structured);
+
 QString compactJson(const QJsonObject &object)
 {
     return QString::fromUtf8(QJsonDocument(object).toJson(QJsonDocument::Compact));
@@ -329,6 +334,16 @@ QJsonObject CognitiveEvidence::toJson() const
         json.insert(QStringLiteral("derived_from"), QJsonArray::fromStringList(derivedFrom));
     if (!modelHandles.isEmpty())
         json.insert(QStringLiteral("model_handles"), QJsonArray::fromStringList(modelHandles));
+    if (!purposes.isEmpty())
+        json.insert(QStringLiteral("purposes"), QJsonArray::fromStringList(purposes));
+    if (!structuredByPurpose.isEmpty()) {
+        QStringList structuredKeys;
+        for (auto it = structuredByPurpose.constBegin(); it != structuredByPurpose.constEnd(); ++it) {
+            if (!it.value().isEmpty()) structuredKeys.append(it.key());
+        }
+        if (!structuredKeys.isEmpty())
+            json.insert(QStringLiteral("structured_purposes"), QJsonArray::fromStringList(structuredKeys));
+    }
     return json;
 }
 
@@ -395,6 +410,7 @@ QJsonObject CognitiveContextScene::toJson() const
         {QStringLiteral("blind_zone"), blindZone},
         {QStringLiteral("long_term_memory_enabled"), longTermMemoryEnabled},
         {QStringLiteral("owner_private"), ownerPrivate},
+        {QStringLiteral("viewer_is_owner"), viewerIsOwner},
         {QStringLiteral("capability_scope"), capabilityScope}};
 }
 
@@ -573,8 +589,10 @@ bool CognitiveContextBuilder::isOwnerPrivateScene(const RequestMeta &meta, bool 
 {
     if (blindZone) return false;
     const bool owner = meta.subject.isEmpty() || meta.subject == QStringLiteral("user");
+    // 回顾上下文可能只知道“这是主人私聊来源”（没有显式渠道）；按既有快照约定
+    // 视为主人私聊域，绝不因此扩到群聊/第三方。
     const bool privateChannel = meta.channel == Channel::kPet
-        || meta.channel == Channel::kQQPrivate;
+        || meta.channel == Channel::kQQPrivate || meta.channel.isEmpty();
     return owner && privateChannel;
 }
 
@@ -582,6 +600,8 @@ void CognitiveContextBuilder::addEvidence(CognitiveContext &context, CognitiveEv
                                           ShadowComparison *comparisonIn) const
 {
     if (!evidence.identity.isValid()) return;
+    if (evidence.purpose.isEmpty() && !evidence.purposes.isEmpty())
+        evidence.purpose = evidence.purposes.first();
     ShadowComparison *comparison = comparisonIn ? comparisonIn : m_comparison;
     context.budget.totalMaterialBytes += evidence.text.toUtf8().size();
     if (evidence.time.eventTimeUnknown && hasRelativeTimeExpression(evidence.text))
@@ -591,7 +611,19 @@ void CognitiveContextBuilder::addEvidence(CognitiveContext &context, CognitiveEv
 
     for (auto &existing : context.evidence) {
         if (existing.identity.stableKey() != evidence.identity.stableKey()) continue;
-        // 同一身份重复出现：只保留一份完整文本，记录所有入口/句柄，不重复序列化。
+        // 同一身份重复出现：只保留一份完整文本，记录所有入口/句柄/语义用途，不重复序列化。
+        if (existing.purposes.isEmpty() && !existing.purpose.isEmpty())
+            existing.purposes.append(existing.purpose);
+        QStringList incomingPurposes = evidence.purposes;
+        if (incomingPurposes.isEmpty() && !evidence.purpose.isEmpty())
+            incomingPurposes.append(evidence.purpose);
+        for (const QString &purpose : incomingPurposes)
+            if (!existing.purposes.contains(purpose)) existing.purposes.append(purpose);
+        for (auto it = evidence.structuredByPurpose.constBegin();
+             it != evidence.structuredByPurpose.constEnd(); ++it) {
+            if (!existing.structuredByPurpose.contains(it.key()))
+                existing.structuredByPurpose.insert(it.key(), it.value());
+        }
         for (const QString &usage : evidence.usages)
             if (!existing.usages.contains(usage)) existing.usages.append(usage);
         for (const QString &handle : evidence.modelHandles)
@@ -696,7 +728,11 @@ void CognitiveContextBuilder::ingestSnapshot(CognitiveContext &context,
         evidence.sessionId = fact.sessionId;
         evidence.privacy = privacyOverride.isEmpty() ? fact.privacy : privacyOverride;
         evidence.sensitive = fact.sensitive;
-        evidence.purpose = QStringLiteral("snapshot:%1").arg(domainName);
+        const QString purpose = QStringLiteral("snapshot:%1").arg(domainName);
+        tagPurpose(evidence, purpose,
+                   QJsonObject{{QStringLiteral("ref"), evidence.identity.displayRef()},
+                               {QStringLiteral("authority"), evidenceAuthorityName(fact.authority)},
+                               {QStringLiteral("at"), projectionIso(fact.occurredAtUtc)}});
         evidence.usages.append(QStringLiteral("snapshot:%1").arg(domainName));
         evidence.text = truncateText(fact.text, 512);
         evidence.time.eventAtUtc = fact.occurredAtUtc.toUTC();
@@ -729,7 +765,11 @@ void CognitiveContextBuilder::ingestSnapshot(CognitiveContext &context,
                                                    motivation.version, QStringLiteral("motivation"));
         evidence.kind = EvidenceKind::InternalAutonomousRecord;
         evidence.authority = EvidenceAuthority::InternalState;
-        evidence.purpose = QStringLiteral("snapshot:motivations");
+        tagPurpose(evidence, QStringLiteral("snapshot:motivations"),
+                   QJsonObject{{QStringLiteral("ref"), motivation.ref},
+                               {QStringLiteral("kind"), motivation.kind},
+                               {QStringLiteral("summary"), motivation.summary},
+                               {QStringLiteral("version"), motivation.version}});
         evidence.usages.append(QStringLiteral("snapshot:motivations"));
         evidence.privacy = QStringLiteral("private");
         evidence.text = truncateText(motivation.summary, 240);
@@ -748,7 +788,13 @@ void CognitiveContextBuilder::ingestSnapshot(CognitiveContext &context,
                                                    0);
         evidence.kind = EvidenceKind::UserDelegation;
         evidence.authority = EvidenceAuthority::UserStatement;
-        evidence.purpose = QStringLiteral("snapshot:commitments");
+        tagPurpose(evidence, QStringLiteral("snapshot:commitments"),
+                   QJsonObject{{QStringLiteral("ref"), commitment.ref},
+                               {QStringLiteral("kind"), commitment.kind},
+                               {QStringLiteral("state"), commitment.state},
+                               {QStringLiteral("due_at"), projectionIso(commitment.dueAtUtc)},
+                               {QStringLiteral("expires_at"), projectionIso(commitment.expiresAtUtc)},
+                               {QStringLiteral("message"), commitment.text}});
         evidence.usages.append(QStringLiteral("snapshot:commitments"));
         evidence.privacy = QStringLiteral("private");
         evidence.text = truncateText(commitment.text, 240);
@@ -772,7 +818,7 @@ void CognitiveContextBuilder::ingestSnapshot(CognitiveContext &context,
                                                    QStringLiteral("activity"));
         evidence.kind = EvidenceKind::ActivityArtifact;
         evidence.authority = EvidenceAuthority::InternalState;
-        evidence.purpose = QStringLiteral("snapshot:activities");
+        tagPurpose(evidence, QStringLiteral("snapshot:activities"), row);
         evidence.usages.append(QStringLiteral("snapshot:activities"));
         evidence.privacy = QStringLiteral("private");
         evidence.text = truncateText(row.value(QStringLiteral("summary")).toString(
@@ -796,7 +842,7 @@ void CognitiveContextBuilder::ingestSnapshot(CognitiveContext &context,
                                                    QStringLiteral("artifact"));
         evidence.kind = EvidenceKind::ActivityArtifact;
         evidence.authority = EvidenceAuthority::ExecutionResult;
-        evidence.purpose = QStringLiteral("snapshot:recent_activity_results");
+        tagPurpose(evidence, QStringLiteral("snapshot:recent_activity_results"), row);
         evidence.usages.append(QStringLiteral("snapshot:recent_activity_results"));
         evidence.privacy = QStringLiteral("private");
         evidence.text = truncateText(row.value(QStringLiteral("summary")).toString(
@@ -821,7 +867,7 @@ void CognitiveContextBuilder::ingestSnapshot(CognitiveContext &context,
                                                    row.value(QStringLiteral("version")).toInt());
         evidence.kind = EvidenceKind::InternalAutonomousRecord;
         evidence.authority = EvidenceAuthority::InternalState;
-        evidence.purpose = QStringLiteral("snapshot:internal_wakes");
+        tagPurpose(evidence, QStringLiteral("snapshot:internal_wakes"), row);
         evidence.usages.append(QStringLiteral("snapshot:internal_wakes"));
         evidence.privacy = QStringLiteral("private");
         evidence.text = truncateText(row.value(QStringLiteral("summary")).toString(
@@ -1426,7 +1472,7 @@ void CognitiveContextBuilder::ingestPrivateEvidence(CognitiveContext &context,
         }
         evidence.subjectId = request.meta.subject;
         evidence.privacy = QStringLiteral("private");
-        evidence.purpose = QStringLiteral("private_evidence");
+        tagPurpose(evidence, QStringLiteral("private_evidence:cross_channel"), item);
         evidence.usages.append(QStringLiteral("private_evidence:cross_channel"));
         evidence.text = truncateText(item.value(QStringLiteral("text")).toString(
             item.value(QStringLiteral("quote")).toString()), 400);
@@ -1730,7 +1776,7 @@ void CognitiveContextBuilder::ingestReceipts(CognitiveContext &context,
         evidence.kind = EvidenceKind::ExecutionResult;
         evidence.authority = EvidenceAuthority::ExecutionResult;
         evidence.privacy = QStringLiteral("private");
-        evidence.purpose = QStringLiteral("execution_receipt");
+        tagPurpose(evidence, QStringLiteral("execution_receipt"), row);
         evidence.usages.append(QStringLiteral("receipt:outcome"));
         evidence.text = truncateText(row.value(QStringLiteral("outcome")).toString(), 120);
         evidence.time.reportedAtUtc =
@@ -1759,6 +1805,20 @@ void CognitiveContextBuilder::applyProjection(CognitiveContext &context,
         QStringLiteral("execution_receipt"), QStringLiteral("private_evidence"),
         QStringLiteral("review_thread")};
     const bool ownerPrivate = context.scene.ownerPrivate;
+    // 群内主人：既要保持“私聊/内部状态不外扩”，又允许既有检索/工具已授权给主人的
+    // 跨渠道证据（例如群内本人问近况时带出的 revision 归属）。第三方群成员不享受此放宽。
+    const bool groupOwner = !ownerPrivate && context.scene.viewerIsOwner
+        && context.scene.channel == Channel::kQQGroup;
+    const auto upstreamAuthorizedPrivate = [](const CognitiveEvidence &evidence) {
+        for (const QString &usage : evidence.usages) {
+            const QString module = usage.section(QLatin1Char(':'), 0, 0);
+            if (module == QStringLiteral("retrieval") || module == QStringLiteral("private_evidence")
+                || module == QStringLiteral("tool")) {
+                return true;
+            }
+        }
+        return false;
+    };
     QList<CognitiveEvidence> kept;
     kept.reserve(context.evidence.size());
     int filtered = 0;
@@ -1770,8 +1830,9 @@ void CognitiveContextBuilder::applyProjection(CognitiveContext &context,
             deny = true;
             reason = QStringLiteral("sensitive");
         }
-        if (!ownerPrivate && (evidence.privacy == QStringLiteral("private")
-                              || evidence.privacy == QStringLiteral("sensitive"))) {
+        if (!ownerPrivate && !groupOwner
+            && (evidence.privacy == QStringLiteral("private")
+                || evidence.privacy == QStringLiteral("sensitive"))) {
             deny = true;
             reason = QStringLiteral("private_in_non_owner_projection");
         }
@@ -1779,8 +1840,20 @@ void CognitiveContextBuilder::applyProjection(CognitiveContext &context,
             for (const QString &usage : evidence.usages) {
                 const QString domain = usage.section(QLatin1Char(':'), -1);
                 const QString module = usage.section(QLatin1Char(':'), 0, 0);
-                if (ownerPrivateDomains.contains(domain)
-                    || (module == QStringLiteral("activity") && !ownerPrivate)
+                if (ownerPrivateDomains.contains(domain)) {
+                    // 群内主人可保留上游已授权的跨渠道证据（检索/工具/私密证据），
+                    // 但自己的内部状态域（动机/活动/唤醒等）不进群聊投影。
+                    const bool allowForOwnerGroup = groupOwner
+                        && (module == QStringLiteral("retrieval")
+                            || module == QStringLiteral("private_evidence")
+                            || module == QStringLiteral("tool"));
+                    if (!allowForOwnerGroup) {
+                        deny = true;
+                        reason = QStringLiteral("owner_private_domain:%1").arg(domain);
+                        break;
+                    }
+                }
+                if ((module == QStringLiteral("activity") && !ownerPrivate)
                     || (module == QStringLiteral("reminder") && !ownerPrivate
                         && evidence.channel != context.scene.channel)) {
                     deny = true;
@@ -1789,10 +1862,11 @@ void CognitiveContextBuilder::applyProjection(CognitiveContext &context,
                 }
             }
         }
-        // 群聊入口不携带其它私聊会话的原始内容（即使材料已过滤，这里再守一层）。
+        // 群聊入口不携带其它私聊会话的原始内容（上游已授权的跨渠道证据除外）。
         if (context.scene.channel == Channel::kQQGroup && !evidence.channel.isEmpty()
             && evidence.channel != context.scene.channel
-            && evidence.channel != Channel::kQQGroup) {
+            && evidence.channel != Channel::kQQGroup
+            && !(groupOwner && upstreamAuthorizedPrivate(evidence))) {
             deny = true;
             reason = QStringLiteral("cross_channel_in_group");
         }
@@ -1800,13 +1874,12 @@ void CognitiveContextBuilder::applyProjection(CognitiveContext &context,
             ++filtered;
             if (!reason.isEmpty() && !context.deniedDomains.contains(reason))
                 context.deniedDomains.append(reason);
-            if (evidence.privacy == QStringLiteral("private") && !ownerPrivate) {
-                // 被正确过滤，不是 leak。
-            }
             continue;
         }
-        // 防御性 leak 检查：非 owner 私有投影中不应残留 private 证据。
-        if (!ownerPrivate && evidence.privacy == QStringLiteral("private")) ++leaks;
+        // 防御性 leak 检查：第三方/非授权入口不应残留 private 证据。
+        if (!ownerPrivate && !(groupOwner && upstreamAuthorizedPrivate(evidence))) {
+            if (evidence.privacy == QStringLiteral("private")) ++leaks;
+        }
         kept.append(evidence);
     }
     context.evidence = kept;
@@ -1876,6 +1949,8 @@ CognitiveContext CognitiveContextBuilder::buildShadow(const CognitiveContextRequ
         request.meta.channel, request.meta.sessionId);
     context.scene.blindZone = blindZone;
     context.scene.ownerPrivate = isOwnerPrivateScene(request.meta, blindZone);
+    context.scene.viewerIsOwner = request.meta.subject.isEmpty()
+        || request.meta.subject == QStringLiteral("user");
     if (context.scene.ownerPrivate) context.scene.audienceKind = QStringLiteral("owner_private");
     else if (request.meta.channel == Channel::kQQGroup)
         context.scene.audienceKind = QStringLiteral("public_group");
@@ -2067,16 +2142,23 @@ QJsonObject CognitiveProjectionStats::toJson() const
         {QStringLiteral("prompt_tokens"), promptTokens},
         {QStringLiteral("duplicate_evidence_count"), duplicateEvidenceCount},
         {QStringLiteral("duplicate_entries_omitted"), duplicateEntriesOmitted},
+        {QStringLiteral("duplicate_refs_replaced"), duplicateRefsReplaced},
+        {QStringLiteral("duplicate_text_chars_removed"), duplicateTextCharsRemoved},
         {QStringLiteral("effective_evidence_count"), effectiveEvidenceCount},
         {QStringLiteral("refs_emitted"), refsEmitted},
         {QStringLiteral("refs_resolved"), refsResolved},
         {QStringLiteral("refs_unresolved"), refsUnresolved},
+        {QStringLiteral("refs_body_visible"), refsBodyVisible},
+        {QStringLiteral("refs_structured_visible"), refsStructuredVisible},
+        {QStringLiteral("refs_authorized"), refsAuthorized},
         {QStringLiteral("privacy_filtered"), privacyFiltered},
         {QStringLiteral("privacy_leaks"), privacyLeaks},
         {QStringLiteral("build_ms"), double(buildMs)},
         {QStringLiteral("model_requests"), modelRequests},
         {QStringLiteral("snapshot_budget_bytes"), snapshotBudgetBytes},
         {QStringLiteral("snapshot_budget_trimmed"), snapshotBudgetTrimmed},
+        {QStringLiteral("trimmed_domains"), QJsonArray::fromStringList(trimmedDomains)},
+        {QStringLiteral("overflow_domains"), QJsonArray::fromStringList(overflowDomains)},
         {QStringLiteral("domain_kept"), kept}};
 }
 
@@ -2084,6 +2166,7 @@ QJsonObject CognitiveProjection::toJson() const
 {
     return QJsonObject{{QStringLiteral("snapshot"), snapshotJson},
                        {QStringLiteral("private_evidence_items"), privateEvidenceItems},
+                       {QStringLiteral("receipts"), receipts},
                        {QStringLiteral("unified_time_block"), unifiedTimeBlock},
                        {QStringLiteral("stats"), stats.toJson()}};
 }
@@ -2103,40 +2186,140 @@ QString projectionTime(const CognitiveEvidence &evidence)
     return QString();
 }
 
-QJsonObject projectionFullRow(const CognitiveEvidence &evidence, int textCap)
+// R12-3b：领域结构化投影。统一身份不等于统一形状：每个域按旧协议字段输出，
+// 去重只作用于“重复正文”，状态/版本/时间/成果等业务字段仍保留。
+QJsonObject projectionDomainBase(const CognitiveEvidence &evidence, const QString &domain)
 {
-    QJsonObject row{
-        {QStringLiteral("ref"), evidence.identity.displayRef()},
-        {QStringLiteral("kind"), evidenceKindName(evidence.kind)},
-        {QStringLiteral("authority"), evidenceAuthorityName(evidence.authority)}};
-    if (evidence.identity.version > 0) row.insert(QStringLiteral("version"), evidence.identity.version);
-    const QString at = projectionTime(evidence);
-    if (!at.isEmpty()) row.insert(QStringLiteral("at"), at);
-    const QString text = textCap > 0 ? truncateText(evidence.text, textCap) : evidence.text;
-    row.insert(QStringLiteral("text"), text);
+    const QString purpose = QStringLiteral("snapshot:") + domain;
+    QJsonObject row = evidence.structuredFor(purpose);
+    if (row.isEmpty()) row = evidence.structuredFor(evidence.purpose);
+    if (row.isEmpty()) row = evidence.structuredFor(QStringLiteral("private_evidence"));
+    if (row.isEmpty()) row = evidence.structuredFor(QStringLiteral("retrieval"));
+    if (row.isEmpty()) {
+        row.insert(QStringLiteral("ref"), evidence.identity.displayRef());
+        row.insert(QStringLiteral("authority"), evidenceAuthorityName(evidence.authority));
+        const QString at = projectionTime(evidence);
+        if (!at.isEmpty()) row.insert(QStringLiteral("at"), at);
+        if (!evidence.text.isEmpty()) row.insert(QStringLiteral("text"), evidence.text);
+    }
+    const QString ref = evidence.identity.displayRef();
+    if (!row.contains(QStringLiteral("ref"))) row.insert(QStringLiteral("ref"), ref);
+    if (evidence.identity.version > 0 && !row.contains(QStringLiteral("version")))
+        row.insert(QStringLiteral("version"), evidence.identity.version);
     return row;
 }
 
-QJsonObject projectionRefOnlyRow(const CognitiveEvidence &evidence, const QString &note)
+QJsonObject projectionFullRow(const CognitiveEvidence &evidence, const QString &domain, int textCap)
 {
-    QJsonObject row{
-        {QStringLiteral("ref"), evidence.identity.displayRef()},
-        {QStringLiteral("kind"), evidenceKindName(evidence.kind)},
-        {QStringLiteral("authority"), evidenceAuthorityName(evidence.authority)},
-        {QStringLiteral("dedup"), true},
-        {QStringLiteral("duplicate_note"),
-         note.isEmpty() ? QStringLiteral("同一证据已在更原始的资料中完整给出，这里只引用，不重复正文")
-                        : note}};
-    if (evidence.identity.version > 0) row.insert(QStringLiteral("version"), evidence.identity.version);
-    const QString at = projectionTime(evidence);
-    if (!at.isEmpty()) row.insert(QStringLiteral("at"), at);
+    QJsonObject row = projectionDomainBase(evidence, domain);
+    if (domain == QStringLiteral("observations") || domain == QStringLiteral("self_expressions")
+        || domain == QStringLiteral("inferences")) {
+        const QString text = textCap > 0 ? truncateText(evidence.text, textCap) : evidence.text;
+        row.insert(QStringLiteral("text"), text);
+        row.insert(QStringLiteral("authority"), evidenceAuthorityName(evidence.authority));
+        const QString at = projectionTime(evidence);
+        if (!at.isEmpty()) row.insert(QStringLiteral("at"), at);
+    } else if (domain == QStringLiteral("motivations")) {
+        if (evidence.identity.version > 0) row.insert(QStringLiteral("version"), evidence.identity.version);
+        if (!row.contains(QStringLiteral("summary")))
+            row.insert(QStringLiteral("summary"), truncateText(evidence.text, textCap));
+        if (!row.contains(QStringLiteral("kind")))
+            row.insert(QStringLiteral("kind"), evidenceKindName(evidence.kind));
+    } else if (domain == QStringLiteral("commitments")) {
+        if (!row.contains(QStringLiteral("message")))
+            row.insert(QStringLiteral("message"), truncateText(evidence.text, textCap));
+        if (!row.contains(QStringLiteral("state")))
+            row.insert(QStringLiteral("state"), evidence.sourceState);
+    } else {
+        // activities / recent_activity_results / internal_wakes：保留旧领域行字段；
+        // 只对超长自由文本做上限，避免单条吃掉预算（旧快照由预算整条裁剪）。
+        const QStringList longKeys{QStringLiteral("text"), QStringLiteral("summary"),
+                                   QStringLiteral("draft"), QStringLiteral("progress"),
+                                   QStringLiteral("next_step"), QStringLiteral("reflection"),
+                                   QStringLiteral("note")};
+        for (const QString &key : longKeys) {
+            if (row.value(key).isString() && textCap > 0
+                && row.value(key).toString().size() > textCap) {
+                row.insert(key, truncateText(row.value(key).toString(), textCap));
+            }
+        }
+        if (!row.contains(QStringLiteral("text")) && !evidence.text.isEmpty()
+            && domain == QStringLiteral("internal_wakes")) {
+            row.insert(QStringLiteral("summary"), truncateText(evidence.text, textCap));
+        }
+    }
+    return row;
+}
+
+QJsonObject projectionRefOnlyRow(const CognitiveEvidence &evidence, const QString &domain,
+                                 const QString &note, bool *structuredKept)
+{
+    QJsonObject row = projectionDomainBase(evidence, domain);
+    bool kept = false;
+    if (domain == QStringLiteral("observations") || domain == QStringLiteral("self_expressions")
+        || domain == QStringLiteral("inferences")) {
+        // 观察/表达/认识去重后仍保留来源、主体、时间与权威性，只去掉重复正文。
+        row.remove(QStringLiteral("text"));
+        if (!row.contains(QStringLiteral("authority")))
+            row.insert(QStringLiteral("authority"), evidenceAuthorityName(evidence.authority));
+        const QString at = projectionTime(evidence);
+        if (!at.isEmpty()) row.insert(QStringLiteral("at"), at);
+        kept = row.contains(QStringLiteral("authority")) && row.contains(QStringLiteral("at"));
+    } else if (domain == QStringLiteral("motivations")) {
+        row.remove(QStringLiteral("summary"));
+        kept = row.contains(QStringLiteral("kind")) && row.contains(QStringLiteral("version"));
+    } else if (domain == QStringLiteral("commitments")) {
+        // 委托：状态/到期/有效期是行动依据，必须保留；只去掉重复正文。
+        row.remove(QStringLiteral("message"));
+        kept = row.contains(QStringLiteral("state")) && row.contains(QStringLiteral("due_at"));
+    } else if (domain == QStringLiteral("activities")) {
+        // 活动：正文（draft/progress/next_step）由活动消息/thread 携带；状态、目标、成果版本保留。
+        for (const auto &key : {QStringLiteral("draft"), QStringLiteral("progress"),
+                                QStringLiteral("next_step"), QStringLiteral("reflection"),
+                                QStringLiteral("paused_reason"), QStringLiteral("deferred_reason"),
+                                QStringLiteral("text"), QStringLiteral("summary")}) {
+            row.remove(key);
+        }
+        kept = row.contains(QStringLiteral("version"))
+            && (row.contains(QStringLiteral("status")) || row.contains(QStringLiteral("goal")));
+    } else if (domain == QStringLiteral("recent_activity_results")) {
+        for (const auto &key : {QStringLiteral("title"), QStringLiteral("summary"),
+                                QStringLiteral("text")}) {
+            row.remove(key);
+        }
+        kept = row.contains(QStringLiteral("artifact_ref"))
+            || row.contains(QStringLiteral("version"));
+    } else if (domain == QStringLiteral("internal_wakes")) {
+        for (const auto &key : {QStringLiteral("note"), QStringLiteral("summary"),
+                                QStringLiteral("text")}) {
+            row.remove(key);
+        }
+        kept = row.contains(QStringLiteral("ref"));
+    }
+    row.insert(QStringLiteral("dedup"), true);
+    row.insert(QStringLiteral("duplicate_note"),
+               note.isEmpty()
+                   ? QStringLiteral("同一证据已在更原始的资料中完整给出；正文不重复，业务状态保留")
+                   : note);
+    if (structuredKept) *structuredKept = kept;
     return row;
 }
 
 int projectionDomainCap(const QString &domain)
 {
     if (domain == QStringLiteral("commitments")) return 120;
+    if (domain == QStringLiteral("activities")) return 400;
+    if (domain == QStringLiteral("recent_activity_results")) return 240;
     return 160;
+}
+
+// 供 ingest 侧登记“同一条证据的多个认知用途/对应领域行”。
+void tagPurpose(CognitiveEvidence &evidence, const QString &purpose,
+                const QJsonObject &structured = {}){
+    if (evidence.purpose.isEmpty()) evidence.purpose = purpose;
+    if (!evidence.purposes.contains(purpose)) evidence.purposes.append(purpose);
+    if (!structured.isEmpty())
+        evidence.structuredByPurpose.insert(purpose, structured);
 }
 
 } // namespace
@@ -2164,104 +2347,190 @@ CognitiveProjection projectModelInput(const CognitiveContext &context,
 
     // 1) 跨渠道私密证据先投影：它通常携带检索到的完整原文（比快照 160 字更完整），
     //    因此作为“第二权威”在快照之前占用完整文本；历史/最近群消息已在 alreadySerialized 中。
-    for (const auto &evidence : context.evidence) {
-        bool relevant = false;
-        for (const QString &usage : evidence.usages) {
-            if (usage.startsWith(QStringLiteral("private_evidence:"))
-                || usage.startsWith(QStringLiteral("retrieval:"))) {
-                relevant = true;
-                break;
+    //    只有该入口确实会注入“跨渠道记忆资料”块时，才允许把这些证据当成已可见。
+    if (options.privateEvidenceInjected) {
+        for (const auto &evidence : context.evidence) {
+            bool relevant = false;
+            for (const QString &purpose : evidence.purposes) {
+                if (purpose.startsWith(QStringLiteral("private_evidence:"))
+                    || purpose.startsWith(QStringLiteral("retrieval:"))) {
+                    relevant = true;
+                    break;
+                }
             }
-        }
-        if (!relevant) continue;
-        const QString handle = evidence.modelHandles.isEmpty()
-            ? evidence.identity.displayRef() : evidence.modelHandles.first();
-        QJsonObject item;
-        if (renderedStable.contains(evidence.identity.stableKey())) {
-            item = projectionRefOnlyRow(evidence,
-                QStringLiteral("同一证据已在短期历史/当前输入中完整给出，这里只引用"));
-            ++projection.stats.duplicateEntriesOmitted;
-        } else {
-            item = projectionFullRow(evidence, 400);
+            for (const QString &usage : evidence.usages) {
+                if (usage.startsWith(QStringLiteral("private_evidence:"))
+                    || usage.startsWith(QStringLiteral("retrieval:"))) {
+                    relevant = true;
+                    break;
+                }
+            }
+            if (!relevant) continue;
+            const QString handle = evidence.modelHandles.isEmpty()
+                ? evidence.identity.displayRef() : evidence.modelHandles.first();
+            QJsonObject item = evidence.structuredFor(QStringLiteral("private_evidence"));
+            if (item.isEmpty()) item = evidence.structuredFor(QStringLiteral("retrieval"));
+            if (item.isEmpty()) {
+                item = QJsonObject{{QStringLiteral("source_type"), evidence.identity.sourceKind},
+                                   {QStringLiteral("authority"), evidenceAuthorityName(evidence.authority)}};
+                if (!evidence.channel.isEmpty()) item.insert(QStringLiteral("channel"), evidence.channel);
+                if (!evidence.sessionId.isEmpty()) item.insert(QStringLiteral("session"), evidence.sessionId);
+                const QString at = projectionTime(evidence);
+                if (!at.isEmpty()) item.insert(QStringLiteral("time"), at);
+            }
             item.insert(QStringLiteral("id"), handle);
             item.insert(QStringLiteral("ref"), evidence.identity.displayRef());
-            renderedStable.insert(evidence.identity.stableKey());
-            ++projection.stats.effectiveEvidenceCount;
+            item.insert(QStringLiteral("source_kind"), evidence.identity.sourceKind);
+            if (renderedStable.contains(evidence.identity.stableKey())) {
+                // 去重：只去重复正文，保留来源/时间/说话人/可见性等必要字段。
+                for (const auto &key : {QStringLiteral("text"), QStringLiteral("content"),
+                                        QStringLiteral("message")}) {
+                    item.remove(key);
+                }
+                item.insert(QStringLiteral("dedup"), true);
+                item.insert(QStringLiteral("duplicate_note"),
+                            QStringLiteral("同一证据已在短期历史/当前输入中完整给出，这里只引用"));
+                projection.refOnlyKeys.append(evidence.identity.stableKey());
+                if (item.contains(QStringLiteral("source_ref"))
+                    || item.contains(QStringLiteral("id"))) {
+                    projection.structuredRefOnlyKeys.append(evidence.identity.stableKey());
+                    ++projection.stats.refsStructuredVisible;
+                }
+                ++projection.stats.duplicateEntriesOmitted;
+                ++projection.stats.duplicateRefsReplaced;
+                projection.stats.duplicateTextCharsRemoved += evidence.text.size();
+            } else {
+                item.insert(QStringLiteral("text"), truncateText(evidence.text, 400));
+                renderedStable.insert(evidence.identity.stableKey());
+                projection.fullKeys.append(evidence.identity.stableKey());
+                ++projection.stats.effectiveEvidenceCount;
+            }
+            if (!evidence.identity.stable) item.insert(QStringLiteral("run_scoped"), true);
+            projection.privateEvidenceItems.append(item);
         }
-        if (!evidence.identity.stable) item.insert(QStringLiteral("run_scoped"), true);
-        item.insert(QStringLiteral("source_kind"), evidence.identity.sourceKind);
-        projection.privateEvidenceItems.append(item);
     }
 
-    // 2) 快照投影：同域形状，完整文本/引用二选一；预算仍为 snapshot_budget_bytes。
-    const QStringList domainOrder{
-        QStringLiteral("observations"), QStringLiteral("self_expressions"),
-        QStringLiteral("inferences"), QStringLiteral("motivations"),
-        QStringLiteral("commitments"), QStringLiteral("activities"),
-        QStringLiteral("recent_activity_results"), QStringLiteral("internal_wakes")};
+    // 2) 快照投影：按领域旧形状输出；完整文本/仅引用二选一；预算仍为 snapshot_budget_bytes。
+    const QStringList domainOrder = projectionDomainPriority(options.entry, options.reviewKind);
     QHash<QString, QJsonArray> domains;
     for (const QString &domain : domainOrder) domains.insert(domain, QJsonArray{});
-    auto snapshotDomainOf = [](const QString &purpose, QString *domain) {
-        if (!purpose.startsWith(QStringLiteral("snapshot:"))) return false;
-        *domain = purpose.mid(int(QStringLiteral("snapshot:").size()));
-        return true;
-    };
     for (const auto &evidence : context.evidence) {
-        QString domain;
-        if (!snapshotDomainOf(evidence.purpose, &domain)) continue;
-        if (!domains.contains(domain)) continue;
-        QJsonArray rows = domains.value(domain);
-        if (rows.size() >= 8) continue;
-        if (renderedStable.contains(evidence.identity.stableKey())) {
-            rows.append(projectionRefOnlyRow(evidence, QString()));
-            ++projection.stats.duplicateEntriesOmitted;
-        } else {
-            rows.append(projectionFullRow(evidence, projectionDomainCap(domain)));
-            renderedStable.insert(evidence.identity.stableKey());
-            ++projection.stats.effectiveEvidenceCount;
-            projection.stats.domainKept[domain] += 1;
+        for (const QString &purpose : evidence.purposes) {
+            if (!purpose.startsWith(QStringLiteral("snapshot:"))) continue;
+            const QString domain = purpose.mid(int(QStringLiteral("snapshot:").size()));
+            if (!domains.contains(domain)) continue;
+            QJsonArray rows = domains.value(domain);
+            if (rows.size() >= 8) break;
+            if (renderedStable.contains(evidence.identity.stableKey())) {
+                bool structuredKept = false;
+                rows.append(projectionRefOnlyRow(evidence, domain, QString(), &structuredKept));
+                projection.refOnlyKeys.append(evidence.identity.stableKey());
+                if (structuredKept) {
+                    projection.structuredRefOnlyKeys.append(evidence.identity.stableKey());
+                    ++projection.stats.refsStructuredVisible;
+                }
+                ++projection.stats.duplicateEntriesOmitted;
+                ++projection.stats.duplicateRefsReplaced;
+                projection.stats.duplicateTextCharsRemoved += evidence.text.size();
+            } else {
+                const QJsonObject row = projectionFullRow(evidence, domain,
+                                                          projectionDomainCap(domain));
+                rows.append(row);
+                renderedStable.insert(evidence.identity.stableKey());
+                projection.fullKeys.append(evidence.identity.stableKey());
+                ++projection.stats.effectiveEvidenceCount;
+                projection.stats.domainKept[domain] += 1;
+            }
+            domains.insert(domain, rows);
         }
-        domains.insert(domain, rows);
+    }
+
+    // 3) 真实执行回执：只读、有界；没有该消息块时不伪装成已注入。
+    if (options.receiptsInjected) {
+        for (const auto &evidence : context.evidence) {
+            if (!evidence.purposes.contains(QStringLiteral("execution_receipt"))
+                && evidence.purpose != QStringLiteral("execution_receipt")) {
+                continue;
+            }
+            QJsonObject row = evidence.structuredFor(QStringLiteral("execution_receipt"));
+            if (row.isEmpty()) {
+                row = QJsonObject{{QStringLiteral("ref"), evidence.identity.displayRef()},
+                                  {QStringLiteral("outcome"), evidence.text}};
+            }
+            if (projection.receipts.size() < 6) projection.receipts.append(row);
+        }
     }
 
     QJsonObject snapshot;
     for (const QString &domain : domainOrder) snapshot.insert(domain, domains.value(domain));
     snapshot.insert(QStringLiteral("policy_view"),
                     QJsonObject{{QStringLiteral("entry"), options.entry},
+                                {QStringLiteral("review_kind"), options.reviewKind},
                                 {QStringLiteral("owner_private"), options.ownerPrivate},
                                 {QStringLiteral("blind_zone"), context.scene.blindZone},
                                 {QStringLiteral("channel"), context.scene.channel},
                                 {QStringLiteral("session"), context.scene.sessionId},
                                 {QStringLiteral("rule"),
-                                 QStringLiteral("只读资料；去重项只给 ref，正文在更原始资料中")}});
-    // 预算裁剪顺序与旧快照一致：先低优先域，再最小集；预算不足时显式标记。
-    const QStringList trimPriority{
-        QStringLiteral("inferences"), QStringLiteral("recent_activity_results"),
-        QStringLiteral("activities"), QStringLiteral("motivations"),
-        QStringLiteral("self_expressions"), QStringLiteral("internal_wakes"),
-        QStringLiteral("commitments"), QStringLiteral("observations")};
+                                 QStringLiteral("只读资料；去重项只给 ref，正文在更原始资料中；"
+                                                "各领域保留必要状态字段")}});
+    // R12-3b：按认知用途决定裁剪顺序，而不是固定让 observations 吃掉预算。
+    // 先低优先域降级为引用（保留结构化状态），仍超预算才整条省略并显式报告。
+    QStringList lowToHigh = domainOrder;
+    std::reverse(lowToHigh.begin(), lowToHigh.end());
     auto snapshotBytes = [&snapshot]() {
         return QJsonDocument(snapshot).toJson(QJsonDocument::Compact).size();
     };
+    const auto findByDisplayRef = [&context](const QString &ref) -> const CognitiveEvidence * {
+        for (const auto &evidence : context.evidence) {
+            if (evidence.identity.displayRef() == ref) return &evidence;
+        }
+        return nullptr;
+    };
     while (snapshotBytes() > options.snapshotBudgetBytes) {
         bool changed = false;
-        for (const QString &domain : trimPriority) {
+        // 先降级完整行（保留 ref/状态）
+        for (const QString &domain : lowToHigh) {
             QJsonArray rows = snapshot.value(domain).toArray();
-            if (rows.size() <= 1) continue;
+            for (int i = int(rows.size()) - 1; i >= 0; --i) {
+                const QJsonObject row = rows.at(i).toObject();
+                if (row.value(QStringLiteral("dedup")).toBool()) continue;
+                const auto *evidence = findByDisplayRef(row.value(QStringLiteral("ref")).toString());
+                if (!evidence) continue;
+                bool structuredKept = false;
+                const QJsonObject demoted =
+                    projectionRefOnlyRow(*evidence, domain, QString(), &structuredKept);
+                rows.removeAt(i);
+                rows.insert(i, demoted);
+                snapshot.insert(domain, rows);
+                projection.refOnlyKeys.append(evidence->identity.stableKey());
+                if (structuredKept)
+                    projection.structuredRefOnlyKeys.append(evidence->identity.stableKey());
+                ++projection.stats.duplicateRefsReplaced;
+                projection.stats.duplicateTextCharsRemoved += evidence->text.size();
+                if (!projection.stats.trimmedDomains.contains(domain))
+                    projection.stats.trimmedDomains.append(domain);
+                projection.stats.snapshotBudgetTrimmed = true;
+                changed = true;
+                break;
+            }
+            if (changed) break;
+        }
+        if (changed) continue;
+        // 已全部降级仍超预算：整条省略最低优先域，显式登记 overflow。
+        for (const QString &domain : lowToHigh) {
+            QJsonArray rows = snapshot.value(domain).toArray();
+            if (rows.isEmpty()) continue;
             rows.removeLast();
             snapshot.insert(domain, rows);
+            if (rows.isEmpty() && !projection.stats.overflowDomains.contains(domain))
+                projection.stats.overflowDomains.append(domain);
+            if (!projection.stats.trimmedDomains.contains(domain))
+                projection.stats.trimmedDomains.append(domain);
             projection.stats.snapshotBudgetTrimmed = true;
             changed = true;
             break;
         }
         if (!changed) break;
-    }
-    for (const QString &domain : trimPriority) {
-        if (snapshotBytes() <= options.snapshotBudgetBytes) break;
-        const QJsonArray rows = snapshot.value(domain).toArray();
-        if (rows.isEmpty()) continue;
-        snapshot.insert(domain, QJsonArray{});
-        projection.stats.snapshotBudgetTrimmed = true;
     }
     projection.snapshotJson = snapshot;
 
@@ -2279,6 +2548,18 @@ CognitiveProjection projectModelInput(const CognitiveContext &context,
                  context.scene.blindZone ? QStringLiteral("true") : QStringLiteral("false"));
     projection.stats.buildMs = timer.elapsed();
     return projection;
+}
+
+bool evidenceRefMatches(const CognitiveEvidence &evidence, const QString &ref)
+{
+    if (ref.trimmed().isEmpty()) return false;
+    if (evidence.modelHandles.contains(ref)) return true;
+    if (evidence.identity.displayRef() == ref) return true;
+    const EvidenceIdentity wanted = evidenceIdentityForRef(ref);
+    if (!wanted.isValid()) return false;
+    if (wanted.sourceKind != evidence.identity.sourceKind) return false;
+    // ref 是稳定行标识；模型可见 ref 经常省略 version（如 activity/1），按 ref 匹配即可。
+    return wanted.ref == evidence.identity.ref;
 }
 
 QStringList projectionRefs(const CognitiveProjection &projection)
@@ -2307,5 +2588,197 @@ QStringList projectionRefs(const CognitiveProjection &projection)
     };
     collect(projection.snapshotJson);
     collect(projection.privateEvidenceItems);
+    collect(projection.receipts);
     return refs;
+}
+
+QStringList projectionDomainPriority(const QString &entry, const QString &reviewKind)
+{
+    if (entry == QStringLiteral("private_review")) {
+        if (reviewKind == QStringLiteral("open_wake")) {
+            // OpenWake：自己的认识/念头/动机、活动与成果、安排与约束优先；不强制关注用户。
+            return {QStringLiteral("motivations"), QStringLiteral("inferences"),
+                    QStringLiteral("activities"), QStringLiteral("recent_activity_results"),
+                    QStringLiteral("observations"), QStringLiteral("self_expressions"),
+                    QStringLiteral("commitments"), QStringLiteral("internal_wakes")};
+        }
+        if (reviewKind == QStringLiteral("activity")) {
+            // ActivityReview：当前活动目标/草稿/进度/完成条件优先，不因近期消息被挤出。
+            return {QStringLiteral("activities"), QStringLiteral("recent_activity_results"),
+                    QStringLiteral("inferences"), QStringLiteral("observations"),
+                    QStringLiteral("self_expressions"), QStringLiteral("motivations"),
+                    QStringLiteral("commitments"), QStringLiteral("internal_wakes")};
+        }
+        // Reflection/Concern：关注对象、原始证据、更正、已有认识与处理结果优先。
+        return {QStringLiteral("observations"), QStringLiteral("self_expressions"),
+                QStringLiteral("inferences"), QStringLiteral("motivations"),
+                QStringLiteral("commitments"), QStringLiteral("activities"),
+                QStringLiteral("recent_activity_results"), QStringLiteral("internal_wakes")};
+    }
+    // 前台交流：当前输入/场景不在快照预算内；快照内优先用户委托、观察、自表达、活动状态。
+    return {QStringLiteral("commitments"), QStringLiteral("observations"),
+            QStringLiteral("self_expressions"), QStringLiteral("activities"),
+            QStringLiteral("inferences"), QStringLiteral("motivations"),
+            QStringLiteral("recent_activity_results"), QStringLiteral("internal_wakes")};
+}
+
+CognitiveProjectionOptions foregroundProjectionOptions(
+    bool ownerPrivate, int snapshotBudgetBytes, const QList<HistoryTurn> &history,
+    const RecentContextBundle &recent, const QString &currentInput,
+    const QJsonArray &concerns, const QJsonArray &activities, const QJsonArray &reminders)
+{
+    CognitiveProjectionOptions options;
+    options.entry = QStringLiteral("foreground_reply");
+    options.ownerPrivate = ownerPrivate;
+    options.snapshotBudgetBytes = snapshotBudgetBytes;
+    for (const HistoryTurn &turn : history) {
+        if (turn.id <= 0) continue;
+        options.markSerialized(
+            evidenceIdentityForRef(QStringLiteral("chat/%1").arg(turn.id), QString(), 0,
+                                   QStringLiteral("user_statement")).stableKey(),
+            QStringLiteral("history:user"));
+        if (!turn.rawReply.trimmed().isEmpty()) {
+            options.markSerialized(
+                evidenceIdentityForRef(QStringLiteral("reply/%1").arg(turn.id)).stableKey(),
+                QStringLiteral("history:assistant"));
+        }
+    }
+    for (const RecentContextItem &item : recent.items) {
+        if (item.rawEventId > 0) {
+            options.markSerialized(
+                evidenceIdentityForRef(QStringLiteral("raw/%1").arg(item.rawEventId)).stableKey(),
+                QStringLiteral("recent_group_context"));
+        }
+    }
+    if (!currentInput.isEmpty()) {
+        options.markSerialized(
+            evidenceIdentityForRef(QStringLiteral("current_input")).stableKey(),
+            QStringLiteral("current_input"));
+    }
+    for (const auto &value : concerns) {
+        const auto row = value.toObject();
+        const QString rootRef = row.value(QStringLiteral("root_ref")).toString();
+        const QString stableRef = rootRef.isEmpty()
+            ? row.value(QStringLiteral("ref")).toString() : rootRef;
+        if (!stableRef.isEmpty()) {
+            options.markSerialized(
+                evidenceIdentityForRef(stableRef, QString(),
+                                       row.value(QStringLiteral("version")).toInt()).stableKey(),
+                QStringLiteral("concern_message"));
+        }
+    }
+    for (const auto &value : activities) {
+        const auto row = value.toObject();
+        const QString ref = row.value(QStringLiteral("ref")).toString();
+        if (!ref.isEmpty()) {
+            options.markSerialized(
+                evidenceIdentityForRef(ref, QString(),
+                                       row.value(QStringLiteral("version")).toInt()).stableKey(),
+                QStringLiteral("activity_message"));
+        }
+    }
+    for (const auto &value : reminders) {
+        const qlonglong id = value.toObject().value(QStringLiteral("id")).toInteger();
+        if (id > 0) {
+            options.markSerialized(
+                evidenceIdentityForRef(QStringLiteral("reminder/%1").arg(id)).stableKey(),
+                QStringLiteral("reminder_message"));
+        }
+    }
+    return options;
+}
+
+CognitiveProjectionOptions reviewProjectionOptions(
+    const QJsonObject &thread, const QString &kind, qlonglong id, int version,
+    bool ownerPrivate, int snapshotBudgetBytes)
+{
+    CognitiveProjectionOptions options;
+    options.entry = QStringLiteral("private_review");
+    options.reviewKind = kind;
+    options.ownerPrivate = ownerPrivate;
+    options.snapshotBudgetBytes = snapshotBudgetBytes;
+    // 私密跨渠道证据块/回执块在回顾入口不注入；不能把它们当成已序列化。
+    options.privateEvidenceInjected = false;
+    options.receiptsInjected = false;
+    const auto markIdentity = [&options](const QString &ref, int ver,
+                                         const QString &facet, const QString &source) {
+        if (ref.trimmed().isEmpty()) return;
+        options.markSerialized(evidenceIdentityForRef(ref, QString(), ver, facet).stableKey(),
+                               source);
+    };
+    // 按真实 CognitiveOrigin 区分：OpenWake/Activity 的数值 id 不是 chat/reflection id。
+    if (kind == QStringLiteral("reflection")) {
+        // reflection thread 的 owner_statement 是来源发言原文；没有该字段时不得假设
+        // “来源已序列化”，否则去重后正文会从模型输入消失。
+        if (!thread.value(QStringLiteral("owner_statement")).toString().trimmed().isEmpty()) {
+            markIdentity(QStringLiteral("chat/%1").arg(id), 0, QStringLiteral("user_statement"),
+                         QStringLiteral("review_thread:source_turn"));
+            markIdentity(QStringLiteral("reflection/%1").arg(id), 0, QString(),
+                         QStringLiteral("review_thread:source_reflection"));
+        }
+    } else if (kind == QStringLiteral("concern")) {
+        // 关注 thread 不携带来源发言原文（只有自己的 note/后续 since）；不能把 chat/<head>
+        // 当成已序列化。只登记 thread 里确实有正文的 note/concern/since 身份。
+        const QJsonObject concernRecord = thread.value(QStringLiteral("concern")).toObject();
+        const QString concernRef = concernRecord.value(QStringLiteral("ref")).toString();
+        if (!concernRef.isEmpty()) {
+            markIdentity(concernRef, 0, QString(), QStringLiteral("review_thread:concern"));
+        }
+        const QString head = concernRecord.value(QStringLiteral("head")).toString();
+        if (!head.isEmpty()) {
+            markIdentity(head, 0, QStringLiteral("note"), QStringLiteral("review_thread:concern_head_note"));
+        }
+    } else if (kind == QStringLiteral("open_wake")) {
+        const QJsonObject origin = thread.value(QStringLiteral("origin")).toObject();
+        QString ref = origin.value(QStringLiteral("ref")).toString();
+        if (ref.isEmpty()) ref = QStringLiteral("wake/%1").arg(id);
+        const int originVersion = origin.value(QStringLiteral("version")).toInt(version);
+        markIdentity(ref, originVersion, QString(), QStringLiteral("review_thread:open_wake_origin"));
+    } else if (kind == QStringLiteral("activity")) {
+        QString ref = thread.value(QStringLiteral("activity_ref")).toString();
+        if (ref.isEmpty()) ref = thread.value(QStringLiteral("ref")).toString();
+        const int activityVersion = thread.value(QStringLiteral("version")).toInt(version);
+        markIdentity(ref, activityVersion, QString(), QStringLiteral("review_thread:activity"));
+    }
+    // thread 里实际携带的历史/consult/prior/concern/basis 来源。
+    for (const auto &value : thread.value(QStringLiteral("history")).toArray()) {
+        const qlonglong turn = value.toObject().value(QStringLiteral("turn")).toInteger();
+        if (turn > 0)
+            markIdentity(QStringLiteral("chat/%1").arg(turn), 0, QStringLiteral("user_statement"),
+                         QStringLiteral("review_thread:history"));
+    }
+    // 关注回顾的 `since` 是来源之后主人说过的话，thread 里有完整正文。
+    for (const auto &value : thread.value(QStringLiteral("since")).toArray()) {
+        const qlonglong turn = value.toObject().value(QStringLiteral("turn")).toInteger();
+        if (turn > 0)
+            markIdentity(QStringLiteral("chat/%1").arg(turn), 0, QStringLiteral("user_statement"),
+                         QStringLiteral("review_thread:since"));
+    }
+    for (const auto &value : thread.value(QStringLiteral("consulted")).toArray()) {
+        const qlonglong turn = value.toObject().value(QStringLiteral("turn")).toInteger();
+        if (turn > 0)
+            markIdentity(QStringLiteral("chat/%1").arg(turn), 0, QStringLiteral("user_statement"),
+                         QStringLiteral("review_thread:consulted"));
+    }
+    const QJsonObject prior = thread.value(QStringLiteral("prior")).toObject();
+    const int priorVersion = prior.value(QStringLiteral("version")).toInt();
+    if (!prior.value(QStringLiteral("ref")).toString().isEmpty()) {
+        markIdentity(prior.value(QStringLiteral("ref")).toString(), priorVersion,
+                     QStringLiteral("note"), QStringLiteral("review_thread:prior_note"));
+    }
+    if (!prior.value(QStringLiteral("root_ref")).toString().isEmpty()) {
+        markIdentity(prior.value(QStringLiteral("root_ref")).toString(), priorVersion, QString(),
+                     QStringLiteral("review_thread:prior_concern"));
+    }
+    const QJsonObject concern = thread.value(QStringLiteral("concern")).toObject();
+    markIdentity(concern.value(QStringLiteral("ref")).toString(), 0, QString(),
+                 QStringLiteral("review_thread:concern"));
+    for (const auto &value : thread.value(QStringLiteral("basis")).toObject()
+                                  .value(QStringLiteral("reminders")).toArray()) {
+        const qlonglong reminderId = value.toObject().value(QStringLiteral("id")).toInteger();
+        if (reminderId > 0)
+            markIdentity(QStringLiteral("reminder/%1").arg(reminderId), 0, QString(),
+                         QStringLiteral("review_thread:basis_reminder"));
+    }
+    return options;
 }

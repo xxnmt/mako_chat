@@ -1426,6 +1426,8 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
         shadow.retrieved = m_lastRetrievalResult.evidence;
         shadow.recent = recentBundle;
         shadow.privateEvidence = privateEvidence;
+        // R12-3b：只读执行回执（来自既有行动/投递权威数据，不新增账本）。
+        if (m_memoryManager) shadow.receipts = m_memoryManager->recentActionReceipts(6);
         shadow.legacyEvidence = m_run.evidence;
         int promptChars = 0;
         int promptBytes = 0;
@@ -1484,68 +1486,20 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
             //   3) 新增统一时间/权限最小说明。
             // 不接管：CURRENT_UNDERSTANDING/MEMORY_DATA/短期历史/RECENT_GROUP_CONTEXT/
             // 关注/活动/提醒/能力清单/工具协议——它们保留原组装逻辑与 ref 契约。
-            CognitiveProjectionOptions options;
-            options.entry = QStringLiteral("foreground_reply");
-            options.ownerPrivate = shadowContext.scene.ownerPrivate;
-            options.snapshotBudgetBytes = shadowContext.budget.snapshotBudgetBytes;
-            for (const HistoryTurn &turn : historyQA) {
-                if (turn.id <= 0) continue;
-                options.alreadySerialized.insert(
-                    evidenceIdentityForRef(QStringLiteral("chat/%1").arg(turn.id), QString(), 0,
-                                           QStringLiteral("user_statement")).stableKey());
-                if (!turn.rawReply.trimmed().isEmpty()) {
-                    options.alreadySerialized.insert(
-                        evidenceIdentityForRef(QStringLiteral("reply/%1").arg(turn.id)).stableKey());
-                }
-            }
-            for (const RecentContextItem &item : recentBundle.items) {
-                if (item.rawEventId > 0) {
-                    options.alreadySerialized.insert(
-                        evidenceIdentityForRef(QStringLiteral("raw/%1").arg(item.rawEventId)).stableKey());
-                }
-            }
-            if (!userInput.isEmpty()) {
-                options.alreadySerialized.insert(
-                    evidenceIdentityForRef(QStringLiteral("current_input")).stableKey());
-            }
-            for (const auto &value : shadowConcerns) {
-                const auto row = value.toObject();
-                const QString rootRef = row.value(QStringLiteral("root_ref")).toString();
-                const QString stableRef = rootRef.isEmpty()
-                    ? row.value(QStringLiteral("ref")).toString() : rootRef;
-                if (!stableRef.isEmpty()) {
-                    options.alreadySerialized.insert(
-                        evidenceIdentityForRef(stableRef, QString(),
-                                               row.value(QStringLiteral("version")).toInt()).stableKey());
-                }
-            }
-            for (const auto &value : shadowActivities) {
-                const auto row = value.toObject();
-                if (!row.value(QStringLiteral("ref")).toString().isEmpty()) {
-                    options.alreadySerialized.insert(
-                        evidenceIdentityForRef(row.value(QStringLiteral("ref")).toString(), QString(),
-                                               row.value(QStringLiteral("version")).toInt()).stableKey());
-                }
-            }
-            for (const auto &value : shadowReminders) {
-                const qlonglong id = value.toObject().value(QStringLiteral("id")).toInteger();
-                if (id > 0)
-                    options.alreadySerialized.insert(
-                        evidenceIdentityForRef(QStringLiteral("reminder/%1").arg(id)).stableKey());
-            }
+            CognitiveProjectionOptions options = foregroundProjectionOptions(
+                shadowContext.scene.ownerPrivate, shadowContext.budget.snapshotBudgetBytes,
+                historyQA, recentBundle, userInput, shadowConcerns, shadowActivities,
+                shadowReminders);
+            // 只有实际会注入的证据块才允许算“已序列化”。
+            options.privateEvidenceInjected = shadowPrivateEvidenceMsgIndex >= 0;
+            options.receiptsInjected = !shadow.receipts.isEmpty();
             const CognitiveProjection projection = projectModelInput(shadowContext, options);
             QStringList refs = projectionRefs(projection);
             const auto resolves = [&](const QString &ref) {
                 if (ref == QStringLiteral("current_input")) return true;
                 if (m_run.evidence.contains(ref)) return true;
-                const EvidenceIdentity identity = evidenceIdentityForRef(ref);
-                if (!identity.isValid()) return false;
                 for (const auto &evidence : shadowContext.evidence) {
-                    if (evidence.identity.eventKey() == identity.eventKey()
-                        || evidence.identity.stableKey() == identity.stableKey()
-                        || evidence.modelHandles.contains(ref)) {
-                        return true;
-                    }
+                    if (evidenceRefMatches(evidence, ref)) return true;
                 }
                 return false;
             };
@@ -1571,12 +1525,43 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
             messagesArray.insert(qMax(0, int(messagesArray.size()) - 1),
                                  QJsonObject{{QStringLiteral("role"), QStringLiteral("system")},
                                              {QStringLiteral("content"), projection.unifiedTimeBlock}});
+            if (!projection.receipts.isEmpty()) {
+                messagesArray.insert(
+                    qMax(0, int(messagesArray.size()) - 1),
+                    QJsonObject{{QStringLiteral("role"), QStringLiteral("system")},
+                                {QStringLiteral("content"),
+                                 QStringLiteral("【真实执行回执｜只读｜来自行动/投递权威数据】\n"
+                                                "outcome 表示实际执行结果；queued/verified 不等于已送达；"
+                                                "unknown 表示可能已送达、不得重发。\n")
+                                     + QString::fromUtf8(QJsonDocument(projection.receipts)
+                                                             .toJson(QJsonDocument::Compact))}});
+            }
             int inputChars = 0;
             int inputBytes = 0;
+            QStringList finalContents;
             for (const auto &value : messagesArray) {
                 const QString content = value.toObject().value(QStringLiteral("content")).toString();
                 inputChars += content.size();
                 inputBytes += content.toUtf8().size();
+                finalContents.append(content);
+            }
+            const auto evidenceByKey = [&shadowContext](const QString &key) -> const CognitiveEvidence * {
+                for (const auto &evidence : shadowContext.evidence) {
+                    if (evidence.identity.stableKey() == key) return &evidence;
+                }
+                return nullptr;
+            };
+            const auto bodyContainsText = [&finalContents](const QString &text) {
+                const QString needle = text.trimmed().left(48);
+                if (needle.size() < 4) return false;
+                for (const QString &content : finalContents)
+                    if (content.contains(needle)) return true;
+                return false;
+            };
+            int refsBodyVisible = int(projection.fullKeys.size());
+            for (const QString &key : projection.refOnlyKeys) {
+                const auto *evidence = evidenceByKey(key);
+                if (evidence && bodyContainsText(evidence->text)) ++refsBodyVisible;
             }
             CognitiveProjectionStats stats = projection.stats;
             stats.baselineChars = promptChars;
@@ -1588,6 +1573,9 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
             stats.refsEmitted = int(refs.size());
             stats.refsResolved = resolved;
             stats.refsUnresolved = int(refs.size()) - resolved;
+            stats.refsBodyVisible = refsBodyVisible;
+            stats.refsStructuredVisible += int(projection.fullKeys.size());
+            stats.refsAuthorized = int(refs.size());
             stats.privacyFiltered = comparison.privacyFiltered;
             stats.privacyLeaks = comparison.privacyLeaks;
             stats.modelRequests = m_modelRequestCount;
@@ -1599,18 +1587,21 @@ void LLMService::prepareReply(const QString &userInput, const QList<HistoryTurn>
             qInfo().noquote()
                 << QStringLiteral("[Cognitive][Actual] entry=foreground_reply input_chars=%1"
                                   " baseline_chars=%2 saved_chars=%3 input_bytes=%4"
-                                  " dup_evidence=%5 dup_omitted=%6 effective=%7"
-                                  " refs=%8/%9 privacy_filtered=%10 privacy_leaks=%11"
-                                  " snapshot_budget=%12 trimmed=%13 build_ms=%14")
+                                  " dup_evidence=%5 dup_replaced=%6 effective=%7"
+                                  " refs=%8/%9 body_visible=%10 structured_visible=%11"
+                                  " privacy_filtered=%12 privacy_leaks=%13"
+                                  " snapshot_budget=%14 trimmed=%15 build_ms=%16")
                        .arg(stats.inputChars)
                        .arg(stats.baselineChars)
                        .arg(stats.savedChars)
                        .arg(stats.inputBytes)
                        .arg(stats.duplicateEvidenceCount)
-                       .arg(stats.duplicateEntriesOmitted)
+                       .arg(stats.duplicateRefsReplaced)
                        .arg(stats.effectiveEvidenceCount)
                        .arg(stats.refsResolved)
                        .arg(stats.refsEmitted)
+                       .arg(stats.refsBodyVisible)
+                       .arg(stats.refsStructuredVisible)
                        .arg(stats.privacyFiltered)
                        .arg(stats.privacyLeaks)
                        .arg(stats.snapshotBudgetBytes)
@@ -2310,72 +2301,28 @@ void LLMService::generatePrivateReview(qlonglong id, int version, const QJsonObj
             // ===== R12-3a 第二切片：回顾入口实际投影 =====
             // 回顾 thread 已完整携带来源/历史/prior/concern/consulted；快照数据块中同一身份
             // 只给 ref，避免来源发言在快照与 thread 里各序列化一遍。
-            CognitiveProjectionOptions options;
-            options.entry = QStringLiteral("private_review");
-            options.ownerPrivate = shadowContext.scene.ownerPrivate;
-            options.snapshotBudgetBytes = shadowContext.budget.snapshotBudgetBytes;
-            if (id > 0) {
-                options.alreadySerialized.insert(
-                    evidenceIdentityForRef(QStringLiteral("chat/%1").arg(id), QString(), 0,
-                                           QStringLiteral("user_statement")).stableKey());
-                options.alreadySerialized.insert(
-                    evidenceIdentityForRef(QStringLiteral("reflection/%1").arg(id)).stableKey());
-            }
-            for (const auto &value : thread.value(QStringLiteral("history")).toArray()) {
-                const qlonglong turn = value.toObject().value(QStringLiteral("turn")).toInteger();
-                if (turn > 0)
-                    options.alreadySerialized.insert(
-                        evidenceIdentityForRef(QStringLiteral("chat/%1").arg(turn), QString(), 0,
-                                               QStringLiteral("user_statement")).stableKey());
-            }
-            for (const auto &value : thread.value(QStringLiteral("consulted")).toArray()) {
-                const qlonglong turn = value.toObject().value(QStringLiteral("turn")).toInteger();
-                if (turn > 0)
-                    options.alreadySerialized.insert(
-                        evidenceIdentityForRef(QStringLiteral("chat/%1").arg(turn), QString(), 0,
-                                               QStringLiteral("user_statement")).stableKey());
-            }
-            const auto actualPrior = thread.value(QStringLiteral("prior")).toObject();
-            const int priorVersion = actualPrior.value(QStringLiteral("version")).toInt();
-            if (!actualPrior.value(QStringLiteral("ref")).toString().isEmpty()) {
-                options.alreadySerialized.insert(
-                    evidenceIdentityForRef(actualPrior.value(QStringLiteral("ref")).toString(),
-                                           QString(), priorVersion, QStringLiteral("note")).stableKey());
-            }
-            if (!actualPrior.value(QStringLiteral("root_ref")).toString().isEmpty()) {
-                options.alreadySerialized.insert(
-                    evidenceIdentityForRef(actualPrior.value(QStringLiteral("root_ref")).toString(),
-                                           QString(), priorVersion).stableKey());
-            }
-            const auto actualConcern = thread.value(QStringLiteral("concern")).toObject();
-            if (!actualConcern.value(QStringLiteral("ref")).toString().isEmpty()) {
-                options.alreadySerialized.insert(
-                    evidenceIdentityForRef(actualConcern.value(QStringLiteral("ref")).toString()).stableKey());
-            }
-            for (const auto &value : thread.value(QStringLiteral("basis")).toObject()
-                                          .value(QStringLiteral("reminders")).toArray()) {
-                const qlonglong reminderId = value.toObject().value(QStringLiteral("id")).toInteger();
-                if (reminderId > 0)
-                    options.alreadySerialized.insert(
-                        evidenceIdentityForRef(QStringLiteral("reminder/%1").arg(reminderId)).stableKey());
-            }
+            CognitiveProjectionOptions options = reviewProjectionOptions(
+                thread, kind, id, version, shadowContext.scene.ownerPrivate,
+                shadowContext.budget.snapshotBudgetBytes);
             const CognitiveProjection projection = projectModelInput(shadowContext, options);
             QStringList refs = projectionRefs(projection);
             const auto resolves = [&](const QString &ref) {
                 if (legacy.contains(ref) || ref == QStringLiteral("current_input")) return true;
-                const EvidenceIdentity identity = evidenceIdentityForRef(ref);
-                if (!identity.isValid()) return false;
                 for (const auto &evidence : shadowContext.evidence) {
-                    if (evidence.identity.eventKey() == identity.eventKey()
-                        || evidence.identity.stableKey() == identity.stableKey()
-                        || evidence.modelHandles.contains(ref)) {
-                        return true;
-                    }
+                    if (evidenceRefMatches(evidence, ref)) return true;
                 }
                 return false;
             };
             int resolved = 0;
-            for (const QString &ref : refs) if (resolves(ref)) ++resolved;
+            QStringList unresolvedRefs;
+            for (const QString &ref : refs) {
+                if (resolves(ref)) ++resolved;
+                else if (unresolvedRefs.size() < 8) unresolvedRefs.append(ref);
+            }
+            if (!unresolvedRefs.isEmpty()) {
+                qWarning().noquote() << "[Cognitive][Actual] unresolved refs:"
+                                     << unresolvedRefs.join(QLatin1Char(','));
+            }
             for (int i = 0; i < messages.size(); ++i) {
                 const auto message = messages.at(i).toObject();
                 if (message.value(QStringLiteral("role")).toString() != QStringLiteral("system")) continue;
@@ -2401,10 +2348,30 @@ void LLMService::generatePrivateReview(qlonglong id, int version, const QJsonObj
             }
             int inputChars = 0;
             int inputBytes = 0;
+            QStringList finalContents;
             for (const auto &value : messages) {
                 const QString content = value.toObject().value(QStringLiteral("content")).toString();
                 inputChars += content.size();
                 inputBytes += content.toUtf8().size();
+                finalContents.append(content);
+            }
+            const auto evidenceByKey = [&shadowContext](const QString &key) -> const CognitiveEvidence * {
+                for (const auto &evidence : shadowContext.evidence) {
+                    if (evidence.identity.stableKey() == key) return &evidence;
+                }
+                return nullptr;
+            };
+            const auto bodyContainsText = [&finalContents](const QString &text) {
+                const QString needle = text.trimmed().left(48);
+                if (needle.size() < 4) return false;
+                for (const QString &content : finalContents)
+                    if (content.contains(needle)) return true;
+                return false;
+            };
+            int refsBodyVisible = int(projection.fullKeys.size());
+            for (const QString &key : projection.refOnlyKeys) {
+                const auto *evidence = evidenceByKey(key);
+                if (evidence && bodyContainsText(evidence->text)) ++refsBodyVisible;
             }
             CognitiveProjectionStats stats = projection.stats;
             stats.baselineChars = promptChars;
@@ -2416,6 +2383,9 @@ void LLMService::generatePrivateReview(qlonglong id, int version, const QJsonObj
             stats.refsEmitted = int(refs.size());
             stats.refsResolved = resolved;
             stats.refsUnresolved = int(refs.size()) - resolved;
+            stats.refsBodyVisible = refsBodyVisible;
+            stats.refsStructuredVisible += int(projection.fullKeys.size());
+            stats.refsAuthorized = int(refs.size());
             stats.privacyFiltered = comparison.privacyFiltered;
             stats.privacyLeaks = comparison.privacyLeaks;
             stats.modelRequests = m_modelRequestCount;
@@ -2425,16 +2395,19 @@ void LLMService::generatePrivateReview(qlonglong id, int version, const QJsonObj
             qInfo().noquote()
                 << QStringLiteral("[Cognitive][Actual] entry=private_review kind=%1"
                                   " input_chars=%2 baseline_chars=%3 saved_chars=%4"
-                                  " dup_evidence=%5 dup_omitted=%6 refs=%7/%8"
-                                  " privacy_filtered=%9 privacy_leaks=%10 build_ms=%11")
+                                  " dup_evidence=%5 dup_replaced=%6 refs=%7/%8"
+                                  " body_visible=%9 structured_visible=%10"
+                                  " privacy_filtered=%11 privacy_leaks=%12 build_ms=%13")
                        .arg(kind)
                        .arg(stats.inputChars)
                        .arg(stats.baselineChars)
                        .arg(stats.savedChars)
                        .arg(stats.duplicateEvidenceCount)
-                       .arg(stats.duplicateEntriesOmitted)
+                       .arg(stats.duplicateRefsReplaced)
                        .arg(stats.refsResolved)
                        .arg(stats.refsEmitted)
+                       .arg(stats.refsBodyVisible)
+                       .arg(stats.refsStructuredVisible)
                        .arg(stats.privacyFiltered)
                        .arg(stats.privacyLeaks)
                        .arg(stats.buildMs);

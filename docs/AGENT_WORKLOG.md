@@ -569,3 +569,33 @@ B5 节奏按报告修正：固定提交基线 → 2–4h 受控冒烟（self_des
   基线一致）；未启动应用、未发真实渠道消息；actual 默认关闭，可回退。
 - **未做/风险**：actual+tool 模式、actual 开启下真实行动链未单独覆盖；生产默认切换留待运行观察；
   旧机制（旧快照 JSON/原样证据块/shadow 对照/`m_run.evidence`）按设计 §9.7 条件退役，本轮不删。
+
+---
+
+## 2026-11-28 · R12-3b 跨入口认知连续性与资源分配（第一轮）
+
+在 R12-3a 第二切片（`2722d2b`）之上补齐语义完整性、模型可见性、按用途预算与连续性。
+
+- **结构化投影**：`CognitiveEvidence` 增加 `purposes`/`structuredByPurpose`；快照/私密证据/
+  回执按旧领域字段渲染；去重只去重复正文，委托状态/到期、活动版本/状态/目标/成果元数据、
+  回执 outcome 等保留。修正“关注 thread 没有来源正文却被当成已序列化”的假阳性。
+- **A/B/C/D 可见性**：A 服务端可解析、B 正文实际在最终输入、C 必要结构化状态、D 入口授权；
+  只有 A+B(+C) 成立才允许正文换引用；`refs_body_visible/refs_structured_visible/refs_authorized`
+  进入 projection 报告；OpenWake/Activity 数值 id 不映射 chat/reflection（反向测试覆盖）。
+- **按用途预算**：前台/Reflection·Concern/OpenWake/ActivityReview 各自领域优先级；先降级引用
+  再整条省略，`trimmed_domains/overflow_domains` 显式报告；快照预算仍 4096。
+- **跨入口连续性测试（actual=1）**：OpenWake→前台、Activity→前台→ActivityReview、活动完成/
+  分享回执、跨渠道更正、群内主人跨渠道 revision 全部通过；第三方群成员隐私过滤。
+- **继续统一入口**：新增 `MemoryManager::recentActionReceipts()` 只读回执目录（不新增账本），
+  前台 actual 注入真实执行回执；行动核验仍读权威完整证据。
+- **真实模型验收（隔离库、mock sender、无真实渠道消息）**：tool 模式实调 memory_recall
+  （requests=3）；OpenWake contact/quiet、Activity share 走 verifier→Outbox→mock sender→回执；
+  真实 verifier 拒绝无依据 claim；真实 prompt_tokens 前台 3427/回顾 1975。
+  A-contact 多次真实验收中偶发 network_error/模型未联系，重试后通过（记录为风险）。
+- **验证**：全量 `ctest 24/24`（171s）；`tst_cognitivecontext 24 passed`；
+  `tst_memoryagent 124 passed/6 skipped`；`tst_memorymanager 157 passed/1 skipped`。
+  生产库/配置未改（v33、contact_daily_limit=0、snapshot_budget_bytes=4096），未启动应用、
+  未发真实消息；actual 默认关闭。
+- **未做/风险**：CURRENT_UNDERSTANDING/MEMORY_DATA/tool/consult 正文位置未迁移；短上下文
+  saved_bytes 可能为负；真实模型非确定；actual+tool/memory_read 未单独强制真实模型。
+  旧机制退役条件见设计文档 §10.10，本轮不删；不进入 B5 自然运行/R13/Vision/tool loop/Attention 重构。

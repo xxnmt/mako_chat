@@ -393,3 +393,173 @@ matched/missing/extra、跨模块重复身份数、同事件多 facet 数、同 
 
 **新增模块职责边界**：`cognitivecontext.*` 只负责“证据身份/语义/时间/覆盖/投影/对照”；
 不持有数据库、不发请求、不写库、不做调度；LLMService 仍负责消息组装与模型调用。
+
+---
+
+## 10. R12-3b：跨入口认知连续性与资源分配（2026-11-28 提交）
+
+基线：远端/本地 `2722d2b`。本轮不新增独立 Planner、不额外调用模型决定预算、
+不新增固定话题/行为配额，不把 actual 设为生产默认。
+
+### 10.1 结构化状态完整性（统一身份 ≠ 统一形状）
+
+`CognitiveEvidence` 新增：
+- `purposes`（全部语义用途；同一证据可被多个域/入口使用，不再只保留 first-seen）；
+- `structuredByPurpose`（各用途对应的旧领域模型可见行，来自既有读取投影，不新造状态）。
+
+`projectModelInput` 改为按领域渲染，**去重只作用于重复正文**：
+| 域 | 完整行保留 | 去重后（只引用）仍保留 |
+|---|---|---|
+| observations / self_expressions / inferences | ref/authority/at/text | ref/authority/at（来源与权威性） |
+| motivations | ref/kind/summary/version | ref/kind/version |
+| commitments | ref/kind/state/due_at/expires_at/message | state/due_at/expires_at |
+| activities | 活动旧行：ref/version/status/goal/draft/progress/next_step/artifact_ref/artifact_version/share_intent 等 | ref/version/status/goal/artifact 元数据；正文（draft/progress/next_step）由活动消息/thread 携带 |
+| recent_activity_results | ref/version/artifact_ref/artifact_version/status/completed_at/title/summary | artifact_ref/artifact_version/completed_at（去掉 title/summary） |
+| internal_wakes | ref/version/kind/own_next_review_at/note | ref/version/kind/own_next_review_at |
+| private evidence | 原检索证据行（id/source_ref/source_type/time/speaker/authority/text） | source_ref/source_type/time/speaker/authority（去 text） |
+| execution_receipt | 只读回执行：ref/kind/state/outcome/updated_at/channel/session/last_error | —（有界单独注入） |
+
+跨域去重测试验证：同一 chat 轮次同时来自快照与私密证据时 `purposes` ≥2；
+matter revision/活动成果/委托的版本、状态、到期时间、artifact 元数据在“只引用”行中仍存在。
+
+### 10.2 模型可见引用完整性 A/B/C/D
+
+新增区分与实测字段（`projection`）：
+- **A `refs_resolved/unresolved`**：服务端可解析；
+- **B `refs_body_visible`**：被替换为引用的正文确实出现在最终 messages（按 canonical text 回搜）；
+- **C `refs_structured_visible`**：去重行保留必要结构化状态（域级要求见 10.1）；
+- **D `refs_authorized`**：该引用在当前入口授权范围内（`privacy_leaks=0` 兜底）。
+
+关键修正：
+1. `alreadySerialized` 只登记“最终实际序列化内容”的来源（history/recent/current；
+   review 的来源按真实 `CognitiveOrigin` kind 登记）。
+2. 只有确实注入的消息块才允许算已序列化：`privateEvidenceInjected` / `receiptsInjected`。
+3. **关注 thread 没有来源发言原文**：不再把 `chat/<concern head>` 当作已序列化，
+   避免去重后正文从模型输入消失（本轮 concern 实测 B 从 0→2）。
+4. OpenWake/Activity 数值 id 不映射成 chat/reflection；同一数值 id 反向测试覆盖
+   chat/reflection/wake/activity 四种身份。
+5. group owner 与 third-party 分开：群内主人保留上游已授权的跨渠道证据，
+   第三方群成员全部过滤；内部状态域（动机/活动/唤醒）对群聊始终不投影。
+
+### 10.3 按用途分配认知资源（仍保持 4096 字节快照预算）
+
+`projectionDomainPriority(entry, reviewKind)`（确定性表，无新 Planner/模型调用）：
+- 前台：commitments → observations → self_expressions → activities → inferences →
+  motivations → recent_activity_results → internal_wakes；
+- Reflection/Concern：observations → self_expressions → inferences → motivations →
+  commitments → activities → recent_activity_results → internal_wakes；
+- OpenWake：motivations → inferences → activities → recent_activity_results →
+  observations → self_expressions → commitments → internal_wakes；
+- ActivityReview：activities → recent_activity_results → inferences → observations →
+  self_expressions → motivations → commitments → internal_wakes。
+
+裁剪策略：先低优先域“完整行→只引用（保留状态）”，仍超预算才整条省略；
+`trimmed_domains` / `overflow_domains` 显式报告，不静默。快照预算未增加。
+
+### 10.4 跨入口连续性验证（隔离库、真实持久化状态）
+
+| 场景 | 测试 | 验证点 |
+|---|---|---|
+| OpenWake → 前台 | `actualOpenWakeToForegroundContinuity` | 内部记录以 `internal_state`/`wake/<id>` 出现，不伪造 chat/用户事实；活动安排可读 |
+| Activity → 前台 → ActivityReview | `actualActivityContinuityForegroundAndReview` | 前台读到同一 ref/version/草稿/active；回顾继续同一 ref/version 与草稿，不重置 |
+| Activity 完成 → 分享 → 回执 | `actualExecutionReceiptVisible`（提醒链同构）+ `realActionAcceptance(D-share)` | 只读回执来自权威 `cognitive_action`/`delivery_ledger`，outcome=handed_off 可见；账本仍 1 份 |
+| 跨渠道更正 | `actualCrossChannelCorrectionContinuity` | 最新理解进入有权限入口；历史 revision 身份区分（cross_version_groups≥1） |
+| 时间连续性 | `timeSemanticsAreServerOwned` + 前台 actual 时间块断言 | 服务端 now local/UTC/timezone；旧“今天/明天”不当当前时间；跨午夜由服务端计算 |
+
+### 10.5 继续统一资料入口（本轮范围）
+
+- 已统一身份/权限/引用/覆盖：CURRENT_UNDERSTANDING、MEMORY_DATA、自动检索、短期历史、
+  Concern/Reflection/OpenWake/Activity、Reminder、工具结果、matter consult、真实执行回执
+  在 `CognitiveContext` 目录里都有身份与用途；`projectionRefs` 可回查。
+- 实际“正文唯一序列化位置”本轮只接管快照块与跨渠道证据块；**CURRENT_UNDERSTANDING /
+  MEMORY_DATA / 工具轮 / consult 的 prompt 正文仍走旧路径**（工具协议、`ref:N` 编号、
+  `evidence_decision` 契约保持不变）。
+- **真实执行回执**：新增 `MemoryManager::recentActionReceipts()`（只读，不新增账本），
+  前台 actual 模式注入“真实执行回执”只读消息；queued/verified 不等于已送达，unknown 不重发。
+- 行动核验仍从权威数据源读取完整证据；prompt 裁剪后的文本不用于 `VerificationBinding`。
+
+### 10.6 真实模型验收（actual=1、隔离库、mock sender、无真实渠道消息）
+
+| # | 验收项 | 结果/证据 |
+|---|---|---|
+| 1 | 前台 tool 模式实际调用 memory_recall 并完成回答 | `realModelActualToolRecall`：PASS，日志 `real tool round observed: true requests=3` |
+| 2 | memory_read / Matter consult 后续引用解析 | 工具轮/consult 相关确定性测试在 actual=1 下通过（`toolPathRequiresFrameAndAuditsResolution` 等）；真实模型未强制单独触发 memory_read（风险） |
+| 3 | OpenWake 合法主动联系 → verifier → 提交 → mock sender → 回执 | `realActionAcceptance(A-contact)` PASS（含真实 verifier、Outbox、receipt；日志 `r12-3b-realActionAcceptance-attempt*.log`；注意真实模型/网络偶发重试，详见 10.9） |
+| 4 | OpenWake 安静/拒绝后正常完成 | `realActionAcceptance(B-quiet)` PASS（不发送、正常收尾） |
+| 5 | ActivityReview 真实成果并分享 | `realActionAcceptance(D-share)` PASS（真实模型→确定性+verifier→Outbox→mock sender→回执） |
+| 6 | 后续前台区分“完成/已分享” | 回执/活动结果只读证据 + `actualExecutionReceiptVisible`；成果完成与投递 outcome 分开 |
+| 7 | 已有提醒读取/修改/取消 | 全量 reminder 链回归（`tst_memorymanager`/`tst_actionoutbox`/`tst_memoryagent`）；actual=1 下 `actualExecutionReceiptVisible` 覆盖读取与回执；修改/取消由既有用例覆盖 |
+| 8 | 主人跨渠道更正传播 | `actualCrossChannelCorrectionContinuity` PASS（actual=1） |
+| 9 | 检索失败不被解释为空历史 | `retrievalFailureIsNotEmptyHistory`（builder 四态）+ `tst_memorymanager::retrievalDistinguishesFailedIndexFromEmptyIndex` |
+| 10 | 群聊/第三方不泄露私人资料 | `groupExpressionReceivesAttributedRevisions`（actual=1 通过，群内主人仅收到上游授权 revision）；第三方投影单测 privacy_leaks=0 |
+
+真实模型集成日志：`build/stage-b/r12-3b-realModelUnifiedContextIntegration.log`、
+`r12-3b-realModelActualToolRecall.log`、`r12-3b-realActionAcceptance-attempt*.log`、
+`r12-3b-realVerifierRejectsUnsupportedClaim.log`。
+每个行动仍最多 1 次 verifier、0 次 repair；不以成功联系次数作为指标。
+
+### 10.7 对比数据（自动测试/隔离库，非生产）
+
+**(a) mock 前台 fixture**（`unifiedContextActualForeground`）：
+baseline 8145 chars → 7730（saved 415）；duplicate evidence 6、改写引用 10；
+refs 4/4 resolved、B=6、C=10、authorized=4、privacy 0/0；模型主请求各 1。
+
+**(b) 回顾四来源**（`unifiedContextActualReviewKinds`）：
+reflection saved_chars 6 / B1 C1；concern saved_chars −7 / B2 C3（来源正文保留，不做假去重）；
+open_wake saved_chars 64 / B1 C1；activity saved_chars 55 / B1 C1；均 refs 全解析、privacy 0。
+
+**(c) 真实 provider（DeepSeek）**：
+
+| 指标 | 前台 | 回顾 |
+|---|---:|---:|
+| input chars / baseline | 6630 / 6763（saved 133） | 4441 / 4403（saved −38） |
+| input bytes / baseline | 12494 / 12163（saved −331） | 7521 / 7329（saved −192） |
+| duplicate replaced / text chars removed | 4 / 26 | 2 / 15 |
+| refs emitted / resolved / body / structured | 2/2/2/4 | 2/2/3/3 |
+| privacy filtered / leaks | 0 / 0 | 0 / 0 |
+| prompt_tokens | 3427 | 1975 |
+| 模型请求 | 1（工具轮场景 3 次：主→工具→最终） | 1（另一次回顾入口 1） |
+
+短上下文 saved_bytes 为负的说明同 §9.3：统一时间说明与结构化引用项的固定开销；
+验收口径是“重复正文只序列化一次 + B/C 可见性成立”，不删必要资料。
+
+### 10.8 构建与回归
+
+- 全量构建通过（`build/stage-b/r12-3b-build.log`）；
+- **全量 ctest 24/24 通过**（`build/stage-b/r12-3b-ctest.log`，171.06s）；
+- `tst_cognitivecontext 24 passed`（新增结构化/来源/优先级/回执可见性 4 组，共 22 个测试函数）；
+- `tst_memoryagent 124 passed / 6 skipped`（6 个 opt-in 真实模型/真实库用例，环境变量未设时跳过；
+  设真实凭据时上述真实模型用例通过）；
+- `tst_memorymanager 157 passed / 1 skipped`；
+- 生产库/配置未改（v33、contact_daily_limit=0、snapshot_budget_bytes=4096，哈希/mtime 与基线一致）；
+  未启动生产应用、未发真实渠道消息。
+
+### 10.9 剩余风险
+
+1. **真实模型/网络非确定**：A-contact 在多次 actual=1 真实验收中出现过
+   `network_error`/模型未选择 contact 的失败；重试后通过。报告按“观察到偶发失败、最终证据通过”记录，
+   不以成功次数为指标。
+2. **短上下文总字节可能上升**：时间说明/结构化引用固定开销；长上下文收益待生产观察。
+3. **CURRENT_UNDERSTANDING/MEMORY_DATA/tool/consult 正文位置未迁移**：身份/权限/引用已统一，
+   但正文仍走旧路径；R12-3b 之后仍需逐步切换。
+4. **真实模型未单独强制 memory_read**：工具轮真实调用 memory_recall 已实证；memory_read 的
+   引用解析由确定性工具测试覆盖。
+5. **concern 来源正文保留**导致比理想更多的字符（正确性优先，B 可见性证明不成立时不做去重）。
+6. **actual 仍未默认开启**：生产 `MAKO_COGNITIVE_CONTEXT_ACTUAL` 未设置；切换默认需单独授权/运行观察。
+7. **群内主人的跨渠道证据**依赖上游检索/工具授权；本轮只做“不在群内扩到内部状态域”，
+   没有改变上游权限链。
+
+### 10.10 可退役机制（本轮不删）
+
+原 §9.7 清单继续有效，新增/更新：
+| 旧机制 | 退役条件 |
+|---|---|
+| 关注回顾里“来源 chat 假定已序列化”的旧简化 | 已在本轮删除（改为按 thread 实际正文登记） |
+| 通用证据行投影（§9 的 `projectionFullRow` 旧通用形状） | 已由领域结构化投影替换 |
+| `m_run.evidence` 临时引用表 | 统一目录提供稳定引用解析 + 工具/action 全链路迁移后 |
+| 旧快照 JSON/原样证据块序列化 | actual 生产观察无质量回退且 R12-3b 完成剩余正文迁移后 |
+| shadow 对照分支 | actual 覆盖指标稳定后保留只读统计即可 |
+
+边界：不新增独立架构层；`cognitivecontext.*` 仍只做证据/时间/覆盖/投影，不持库、不发请求；
+行动核验仍从权威数据源读完整证据；不进入 B5 正式自然运行、不设 actual 生产默认、
+不进入 R13/Vision/后台通用 tool loop/完整 Attention 重构。

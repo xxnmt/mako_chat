@@ -116,11 +116,19 @@ struct CognitiveEvidence
     bool sensitive = false;
     EvidenceTime time;
     QString purpose;       // 首个用途（current_understanding / snapshot / history / retrieval / tool / review / action_source ...）
+    QStringList purposes;  // 该证据的全部语义用途（同一证据可被多个域/入口使用）
     QStringList usages;    // 该身份被哪些模块/入口使用（去重）
     QStringList derivedFrom;   // 派生摘要/认识/推断的原始证据 refs
     QStringList modelHandles;  // 模型侧可见编号（ref:N、chunk/<id>、source/<id> 等），只报告不合并
     QString text;
     QString sourceState = QStringLiteral("complete");
+    // 各用途对应的“旧领域模型可见结构化字段”。键为 purpose（如 snapshot:commitments），
+    // 值为该领域原本会注入模型的行（来自既有读取投影，不新造状态）。
+    QHash<QString, QJsonObject> structuredByPurpose;
+    QJsonObject structuredFor(const QString &purpose) const
+    {
+        return structuredByPurpose.value(purpose);
+    }
 
     int textChars() const { return text.size(); }
     QJsonObject toJson() const;
@@ -172,6 +180,7 @@ struct CognitiveContextScene
     bool blindZone = false;
     bool longTermMemoryEnabled = false;
     bool ownerPrivate = false;
+    bool viewerIsOwner = false;   // 当前对话对象是否主人（群内主人 ≠ 第三方）
     QString capabilityScope;
     QJsonObject toJson() const;
 };
@@ -297,12 +306,20 @@ struct CognitiveProjectionStats
     int refsEmitted = 0;
     int refsResolved = 0;
     int refsUnresolved = 0;
+    // R12-3b：模型实际可见性检查（A 服务端可解析 / B 正文在最终输入 / C 结构化状态在最终输入 / D 授权）
+    int refsBodyVisible = 0;
+    int refsStructuredVisible = 0;
+    int refsAuthorized = 0;
+    int duplicateRefsReplaced = 0;
+    int duplicateTextCharsRemoved = 0;
     int privacyFiltered = 0;
     int privacyLeaks = 0;
     qint64 buildMs = 0;
     int modelRequests = 0;       // 由调用方填；用于断言“不额外增加请求”
     int snapshotBudgetBytes = 4096;
     bool snapshotBudgetTrimmed = false;
+    QStringList trimmedDomains;
+    QStringList overflowDomains;
     QHash<QString, int> domainKept; // 每域完整条目数
     QJsonObject toJson() const;
 };
@@ -310,17 +327,35 @@ struct CognitiveProjectionStats
 struct CognitiveProjectionOptions
 {
     QString entry;
+    QString reviewKind;          // private_review 时：reflection/concern/open_wake/activity
     bool ownerPrivate = true;
     // 已经由更权威/更原始消息完整序列化的身份（stableKey）。投影遇到这些身份时只给 ref。
     QSet<QString> alreadySerialized;
+    // 该身份在最终实际输入里的来源（history:user / review_thread / current_input ...），
+    // 用于 B/C 可见性检查与报告，避免“服务端认为已序列化但实际没有注入”。
+    QHash<QString, QString> serializedSources;
     int snapshotBudgetBytes = 4096;
+    // 该入口是否真的会注入“跨渠道记忆资料/执行回执”消息块；没有注入时不得把其中的
+    // 证据当成“已序列化”，否则会出现服务端认为可见但模型实际看不到的假阳性。
+    bool privateEvidenceInjected = true;
+    bool receiptsInjected = true;
+    void markSerialized(const QString &stableKey, const QString &source)
+    {
+        if (stableKey.isEmpty()) return;
+        alreadySerialized.insert(stableKey);
+        if (!source.isEmpty()) serializedSources.insert(stableKey, source);
+    }
 };
 
 struct CognitiveProjection
 {
     QJsonObject snapshotJson;        // 快照数据块（与 CognitiveSnapshotBuilder::toPromptJson 同域形状）
     QJsonArray privateEvidenceItems; // 跨渠道私密证据 items（可含 duplicate_ref_only 项）
+    QJsonArray receipts;             // 真实执行回执（只读；有空表就单独注入）
     QString unifiedTimeBlock;        // 统一时间/权限最小 system 说明
+    QStringList refOnlyKeys;         // 被改写为“仅引用”的身份（服务端 stableKey）
+    QStringList structuredRefOnlyKeys; // 其中保留了必要结构化状态的身份
+    QStringList fullKeys;            // 本次给出完整正文的身份
     CognitiveProjectionStats stats;
     QJsonObject toJson() const;
 };
@@ -331,6 +366,23 @@ CognitiveProjection projectModelInput(const CognitiveContext &context,
 
 // 从投影里收集模型可见的 ref 字符串（用于引用解析率统计/测试）。
 QStringList projectionRefs(const CognitiveProjection &projection);
+
+// 判断模型可见 ref 是否对应统一目录里的某条证据（按 sourceKind+ref 匹配，版本可缺省）。
+bool evidenceRefMatches(const CognitiveEvidence &evidence, const QString &ref);
+
+// R12-3b：两入口的“已序列化来源”构造。按真实 CognitiveOrigin kind 区分来源身份，
+// 禁止把 OpenWake/Activity 的数值 id 无条件映射成 chat/reflection id。
+// 这些函数只做身份与来源登记，不查库、不写状态。
+CognitiveProjectionOptions foregroundProjectionOptions(
+    bool ownerPrivate, int snapshotBudgetBytes, const QList<HistoryTurn> &history,
+    const RecentContextBundle &recent, const QString &currentInput,
+    const QJsonArray &concerns, const QJsonArray &activities, const QJsonArray &reminders);
+CognitiveProjectionOptions reviewProjectionOptions(
+    const QJsonObject &thread, const QString &kind, qlonglong id, int version,
+    bool ownerPrivate, int snapshotBudgetBytes);
+
+// 按入口/用途返回快照域优先级（从高到低）；预算裁剪从低优先级开始。
+QStringList projectionDomainPriority(const QString &entry, const QString &reviewKind);
 
 // shadow 输入。所有材料都来自调用方已经读取的视图；builder 不额外查库、不发请求。
 struct CognitiveContextRequest

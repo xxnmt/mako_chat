@@ -114,6 +114,10 @@ private slots:
     void projectionKeepsFullForUnserialized();
     void projectionBudgetTrimsExplicitly();
     void projectionGroupHasNoPrivateDomains();
+    void projectionStructuredFieldsPreserved();
+    void projectionOriginKindDoesNotCrossMap();
+    void projectionPurposePriority();
+    void projectionReceiptsVisibilityGate();
 };
 
 void CognitiveContextTest::identityNormalization()
@@ -460,6 +464,8 @@ void CognitiveContextTest::privacyProjectionBlocksPrivateInGroup()
         request.meta.channel = Channel::kQQGroup;
         request.meta.sessionId = QStringLiteral("30001");
         request.meta.actorId = QStringLiteral("10001");
+        // 第三方群成员入口：私人资料必须全部过滤。
+        request.meta.subject = QStringLiteral("qq:10001");
         fill(request);
         CognitiveContextBuilder builder(nullptr);
         ShadowComparison comparison;
@@ -887,6 +893,7 @@ void CognitiveContextTest::projectionGroupHasNoPrivateDomains()
     request.meta.channel = Channel::kQQGroup;
     request.meta.sessionId = QStringLiteral("30001");
     request.meta.actorId = QStringLiteral("10001");
+    request.meta.subject = QStringLiteral("qq:10001");
     request.meta.receivedAtUtc = at;
     request.hasSnapshot = true;
     request.snapshot.builtAtUtc = at;
@@ -916,6 +923,315 @@ void CognitiveContextTest::projectionGroupHasNoPrivateDomains()
         QVERIFY(!value.toObject().value(QStringLiteral("text")).toString().contains(
             QStringLiteral("私聊内容")));
     QVERIFY(projection.unifiedTimeBlock.contains(QStringLiteral("owner_private=false")));
+}
+
+void CognitiveContextTest::projectionStructuredFieldsPreserved()
+{
+    const QDateTime at = nowUtc();
+    CognitiveContextRequest request = baseRequest();
+    request.currentInput = QStringLiteral("在吗");
+    request.meta.receivedAtUtc = at;
+    request.hasSnapshot = true;
+    request.snapshot.builtAtUtc = at;
+    request.snapshot.observations.append(fact(QStringLiteral("chat/1"),
+                                              EvidenceAuthority::UserStatement,
+                                              QStringLiteral("重复的观察正文"),
+                                              QStringLiteral("pet"), QStringLiteral("default"), at));
+    request.snapshot.motivations.append(SelfMotivation{
+        QStringLiteral("concern/5"), QStringLiteral("concern"),
+        QStringLiteral("重复的动机正文"), 3});
+    request.snapshot.commitments.append(DelegatedCommitment{
+        QStringLiteral("reminder/5"), QStringLiteral("reminder"),
+        QStringLiteral("pending"), at.addSecs(3600), at.addSecs(7200),
+        QStringLiteral("重复的委托正文")});
+    request.snapshot.activities.append(QJsonObject{
+        {QStringLiteral("ref"), QStringLiteral("activity/5")},
+        {QStringLiteral("version"), 4},
+        {QStringLiteral("status"), QStringLiteral("active")},
+        {QStringLiteral("goal"), QStringLiteral("完成草稿")},
+        {QStringLiteral("draft"), QStringLiteral("重复的活动正文")},
+        {QStringLiteral("progress"), QStringLiteral("写了两段")}});
+    request.snapshot.recentActivityResults.append(QJsonObject{
+        {QStringLiteral("ref"), QStringLiteral("activity/5")},
+        {QStringLiteral("version"), 4},
+        {QStringLiteral("artifact_ref"), QStringLiteral("activity/5")},
+        {QStringLiteral("artifact_version"), 4},
+        {QStringLiteral("status"), QStringLiteral("completed")},
+        {QStringLiteral("completed_at"), iso(at)},
+        {QStringLiteral("summary"), QStringLiteral("重复的成果正文")}});
+    request.snapshot.internalWakes.append(QJsonObject{
+        {QStringLiteral("ref"), QStringLiteral("wake/5")},
+        {QStringLiteral("version"), 2},
+        {QStringLiteral("kind"), QStringLiteral("open_wake")},
+        {QStringLiteral("own_next_review_at"), iso(at.addSecs(1800))},
+        {QStringLiteral("note"), QStringLiteral("重复的内部记录正文")}});
+    // 同一 chat/1 同时从跨渠道证据进入统一目录：用于验证“多用途不丢域归属”。
+    request.privateEvidence.append(QJsonObject{
+        {QStringLiteral("evidence_ref"), QStringLiteral("chat/1")},
+        {QStringLiteral("own"), true},
+        {QStringLiteral("speaker_role"), QStringLiteral("user")},
+        {QStringLiteral("reported_at"), iso(at)},
+        {QStringLiteral("text"), QStringLiteral("重复的观察正文")}});
+    CognitiveContextBuilder builder(nullptr);
+    const CognitiveContext context = builder.buildShadow(request);
+    QVERIFY(context.scene.ownerPrivate);
+
+    CognitiveProjectionOptions options;
+    options.entry = QStringLiteral("foreground_reply");
+    options.ownerPrivate = true;
+    // 全部标记为已在其他消息完整序列化，验证“去重但结构化状态保留”。
+    options.markSerialized(
+        evidenceIdentityForRef(QStringLiteral("chat/1"), QString(), 0,
+                               QStringLiteral("user_statement")).stableKey(),
+        QStringLiteral("history:user"));
+    options.markSerialized(
+        evidenceIdentityForRef(QStringLiteral("concern/5"), QString(), 3,
+                               QStringLiteral("motivation")).stableKey(),
+        QStringLiteral("concern_message"));
+    options.markSerialized(
+        evidenceIdentityForRef(QStringLiteral("reminder/5")).stableKey(),
+        QStringLiteral("reminder_message"));
+    options.markSerialized(
+        evidenceIdentityForRef(QStringLiteral("activity/5"), QString(), 4,
+                               QStringLiteral("activity")).stableKey(),
+        QStringLiteral("activity_message"));
+    options.markSerialized(
+        evidenceIdentityForRef(QStringLiteral("activity/5"), QString(), 4,
+                               QStringLiteral("artifact")).stableKey(),
+        QStringLiteral("activity_result_message"));
+    options.markSerialized(
+        evidenceIdentityForRef(QStringLiteral("wake/5"), QString(), 2).stableKey(),
+        QStringLiteral("wake_message"));
+    const CognitiveProjection projection = projectModelInput(context, options);
+    const QJsonObject snapshot = projection.snapshotJson;
+
+    bool sawObservationDedup = false;
+    for (const auto &value : snapshot.value(QStringLiteral("observations")).toArray()) {
+        const auto row = value.toObject();
+        if (row.value(QStringLiteral("ref")).toString() != QStringLiteral("chat/1")) continue;
+        sawObservationDedup = true;
+        QVERIFY(row.value(QStringLiteral("dedup")).toBool());
+        QVERIFY(!row.contains(QStringLiteral("text")));
+        // 观察：来源/权威性/时间必须保留。
+        QVERIFY(row.contains(QStringLiteral("authority")));
+        QVERIFY(row.contains(QStringLiteral("at")));
+    }
+    QVERIFY(sawObservationDedup);
+
+    bool sawCommitmentState = false;
+    for (const auto &value : snapshot.value(QStringLiteral("commitments")).toArray()) {
+        const auto row = value.toObject();
+        if (row.value(QStringLiteral("ref")).toString() != QStringLiteral("reminder/5")) continue;
+        sawCommitmentState = true;
+        QVERIFY(row.value(QStringLiteral("dedup")).toBool());
+        QVERIFY(!row.contains(QStringLiteral("message")));
+        // 委托：状态/到期/有效期保留。
+        QCOMPARE(row.value(QStringLiteral("state")).toString(), QStringLiteral("pending"));
+        QVERIFY(!row.value(QStringLiteral("due_at")).toString().isEmpty());
+        QVERIFY(!row.value(QStringLiteral("expires_at")).toString().isEmpty());
+    }
+    QVERIFY(sawCommitmentState);
+
+    bool sawActivityState = false;
+    for (const auto &value : snapshot.value(QStringLiteral("activities")).toArray()) {
+        const auto row = value.toObject();
+        if (row.value(QStringLiteral("ref")).toString() != QStringLiteral("activity/5")) continue;
+        sawActivityState = true;
+        QVERIFY(row.value(QStringLiteral("dedup")).toBool());
+        QVERIFY(!row.contains(QStringLiteral("draft")));
+        // 活动：版本/状态/目标/成果元数据保留。
+        QCOMPARE(row.value(QStringLiteral("version")).toInt(), 4);
+        QCOMPARE(row.value(QStringLiteral("status")).toString(), QStringLiteral("active"));
+        QVERIFY(row.contains(QStringLiteral("goal")));
+    }
+    QVERIFY(sawActivityState);
+
+    bool sawArtifact = false;
+    for (const auto &value : snapshot.value(QStringLiteral("recent_activity_results")).toArray()) {
+        const auto row = value.toObject();
+        if (row.value(QStringLiteral("ref")).toString() != QStringLiteral("activity/5")) continue;
+        sawArtifact = true;
+        QVERIFY(row.value(QStringLiteral("dedup")).toBool());
+        QVERIFY(!row.contains(QStringLiteral("summary")));
+        QCOMPARE(row.value(QStringLiteral("artifact_version")).toInt(), 4);
+        QVERIFY(!row.value(QStringLiteral("completed_at")).toString().isEmpty());
+    }
+    QVERIFY(sawArtifact);
+
+    bool sawWake = false;
+    for (const auto &value : snapshot.value(QStringLiteral("internal_wakes")).toArray()) {
+        const auto row = value.toObject();
+        if (row.value(QStringLiteral("ref")).toString() != QStringLiteral("wake/5")) continue;
+        sawWake = true;
+        QVERIFY(row.value(QStringLiteral("dedup")).toBool());
+        QVERIFY(!row.contains(QStringLiteral("note")));
+        QVERIFY(!row.value(QStringLiteral("own_next_review_at")).toString().isEmpty());
+    }
+    QVERIFY(sawWake);
+
+    // 同一证据多个用途：chat/1 同时来自 snapshot observations 与历史。
+    bool sawMultiPurpose = false;
+    for (const auto &evidence : context.evidence) {
+        if (evidence.purposes.size() >= 2) sawMultiPurpose = true;
+    }
+    QVERIFY(sawMultiPurpose);
+}
+
+void CognitiveContextTest::projectionOriginKindDoesNotCrossMap()
+{
+    const qlonglong sharedId = 5;
+    const QString chatKey = QStringLiteral("chat|chat/%1#user_statement").arg(sharedId);
+    const QString reflectionKey = QStringLiteral("reflection|reflection/%1").arg(sharedId);
+    const QString wakeKey = QStringLiteral("wake|wake/%1@1").arg(sharedId);
+    const QString activityKey = QStringLiteral("activity|activity/%1@1").arg(sharedId);
+
+    {
+        const auto options = reviewProjectionOptions(
+            QJsonObject{{QStringLiteral("kind"), QStringLiteral("reflection")},
+                        {QStringLiteral("owner_statement"), QStringLiteral("来源发言正文")}},
+            QStringLiteral("reflection"), sharedId, 1, true, 4096);
+        QVERIFY(options.alreadySerialized.contains(chatKey));
+        QVERIFY(options.alreadySerialized.contains(reflectionKey));
+        QVERIFY(!options.alreadySerialized.contains(wakeKey));
+        QCOMPARE(options.serializedSources.value(chatKey),
+                 QStringLiteral("review_thread:source_turn"));
+    }
+    {
+        // 关注 thread 没有来源发言原文：不得把 chat/<head> 当成已序列化（B 可见性要求）。
+        const auto options = reviewProjectionOptions(
+            QJsonObject{{QStringLiteral("kind"), QStringLiteral("concern")},
+                        {QStringLiteral("concern"),
+                         QJsonObject{{QStringLiteral("ref"), QStringLiteral("concern/5")},
+                                     {QStringLiteral("head"), QStringLiteral("reflection/2")}}},
+                        {QStringLiteral("since"), QJsonArray{QJsonObject{
+                             {QStringLiteral("turn"), 7},
+                             {QStringLiteral("text"), QStringLiteral("后续更正")}}}}},
+            QStringLiteral("concern"), sharedId, 2, true, 4096);
+        QVERIFY(!options.alreadySerialized.contains(chatKey));
+        QVERIFY(!options.alreadySerialized.contains(reflectionKey));
+        QVERIFY(options.alreadySerialized.contains(QStringLiteral("concern|concern/5")));
+        QVERIFY(options.alreadySerialized.contains(QStringLiteral("reflection|reflection/2#note")));
+        QVERIFY(options.alreadySerialized.contains(
+            QStringLiteral("chat|chat/7#user_statement")));
+        QVERIFY(!options.alreadySerialized.contains(wakeKey));
+    }
+    {
+        const QJsonObject thread{
+            {QStringLiteral("kind"), QStringLiteral("open_wake")},
+            {QStringLiteral("origin"), QJsonObject{
+                 {QStringLiteral("kind"), QStringLiteral("open_wake")},
+                 {QStringLiteral("ref"), QStringLiteral("wake/5")},
+                 {QStringLiteral("id"), sharedId},
+                 {QStringLiteral("version"), 1}}}};
+        const auto options = reviewProjectionOptions(
+            thread, QStringLiteral("open_wake"), sharedId, 1, true, 4096);
+        QVERIFY(options.alreadySerialized.contains(wakeKey));
+        // OpenWake 数值 id 不得映射成 chat/reflection 身份。
+        QVERIFY(!options.alreadySerialized.contains(chatKey));
+        QVERIFY(!options.alreadySerialized.contains(reflectionKey));
+        QCOMPARE(options.serializedSources.value(wakeKey),
+                 QStringLiteral("review_thread:open_wake_origin"));
+    }
+    {
+        const QJsonObject thread{
+            {QStringLiteral("kind"), QStringLiteral("activity")},
+            {QStringLiteral("activity_ref"), QStringLiteral("activity/5")},
+            {QStringLiteral("version"), 1},
+            {QStringLiteral("activity"), QJsonObject{}}};
+        const auto options = reviewProjectionOptions(
+            thread, QStringLiteral("activity"), sharedId, 1, true, 4096);
+        QVERIFY(options.alreadySerialized.contains(activityKey));
+        QVERIFY(!options.alreadySerialized.contains(chatKey));
+        QVERIFY(!options.alreadySerialized.contains(reflectionKey));
+        QCOMPARE(options.serializedSources.value(activityKey),
+                 QStringLiteral("review_thread:activity"));
+    }
+    // 反向：同一数值 id 在统一目录里是不同身份。
+    const auto chat = evidenceIdentityForRef(QStringLiteral("chat/5"));
+    const auto reflection = evidenceIdentityForRef(QStringLiteral("reflection/5"));
+    const auto wake = evidenceIdentityForRef(QStringLiteral("wake/5"));
+    const auto activity = evidenceIdentityForRef(QStringLiteral("activity/5"));
+    QSet<QString> keys{chat.eventKey(), reflection.eventKey(), wake.eventKey(), activity.eventKey()};
+    QCOMPARE(keys.size(), 4);
+}
+
+void CognitiveContextTest::projectionPurposePriority()
+{
+    const QDateTime at = nowUtc();
+    CognitiveContextBuilder builder(nullptr);
+    auto build = [&]() {
+        CognitiveContextRequest request = baseRequest();
+        request.currentInput = QStringLiteral("在吗");
+        request.meta.receivedAtUtc = at;
+        request.hasSnapshot = true;
+        request.snapshot.builtAtUtc = at;
+        for (int i = 0; i < 6; ++i) {
+            request.snapshot.observations.append(fact(
+                QStringLiteral("chat/%1").arg(300 + i), EvidenceAuthority::UserStatement,
+                QString(300, QLatin1Char('o')), QStringLiteral("pet"),
+                QStringLiteral("default"), at));
+            request.snapshot.motivations.append(SelfMotivation{
+                QStringLiteral("concern/%1").arg(400 + i), QStringLiteral("concern"),
+                QString(300, QLatin1Char('m')), 1});
+            request.snapshot.activities.append(QJsonObject{
+                {QStringLiteral("ref"), QStringLiteral("activity/%1").arg(500 + i)},
+                {QStringLiteral("version"), 1},
+                {QStringLiteral("status"), QStringLiteral("active")},
+                {QStringLiteral("goal"), QStringLiteral("目标%1").arg(i)},
+                {QStringLiteral("draft"), QString(300, QLatin1Char('d'))}});
+        }
+        return builder.buildShadow(request);
+    };
+    const CognitiveContext context = build();
+    auto priorityFor = [&](const QString &entry, const QString &kind) {
+        CognitiveProjectionOptions options;
+        options.entry = entry;
+        options.reviewKind = kind;
+        options.ownerPrivate = true;
+        options.snapshotBudgetBytes = 4096;
+        return projectModelInput(context, options).stats;
+    };
+    // 前台：观察优先于动机/活动；活动优先级高于动机。
+    auto foreground = priorityFor(QStringLiteral("foreground_reply"), {});
+    QVERIFY(foreground.trimmedDomains.contains(QStringLiteral("motivations")));
+    QVERIFY(foreground.domainKept.value(QStringLiteral("observations")) > 0);
+    // OpenWake：动机/活动优先于观察。
+    auto openWake = priorityFor(QStringLiteral("private_review"), QStringLiteral("open_wake"));
+    QVERIFY(openWake.trimmedDomains.contains(QStringLiteral("observations")));
+    QVERIFY(openWake.domainKept.value(QStringLiteral("motivations")) > 0);
+    // ActivityReview：活动优先于动机/观察。
+    auto activity = priorityFor(QStringLiteral("private_review"), QStringLiteral("activity"));
+    QVERIFY(activity.trimmedDomains.contains(QStringLiteral("motivations"))
+            || activity.trimmedDomains.contains(QStringLiteral("observations")));
+    QVERIFY(activity.domainKept.value(QStringLiteral("activities")) > 0);
+}
+
+void CognitiveContextTest::projectionReceiptsVisibilityGate()
+{
+    CognitiveContextRequest request = baseRequest();
+    request.currentInput = QStringLiteral("在吗");
+    request.meta.receivedAtUtc = nowUtc();
+    request.receipts.append(QJsonObject{
+        {QStringLiteral("ref"), QStringLiteral("wake:1:1:contact")},
+        {QStringLiteral("kind"), QStringLiteral("contact")},
+        {QStringLiteral("state"), QStringLiteral("handed_off")},
+        {QStringLiteral("outcome"), QStringLiteral("handed_off")},
+        {QStringLiteral("updated_at"), iso(nowUtc())},
+        {QStringLiteral("channel"), QStringLiteral("pet")},
+        {QStringLiteral("session"), QStringLiteral("default")}});
+    CognitiveContextBuilder builder(nullptr);
+    const CognitiveContext context = builder.buildShadow(request);
+    CognitiveProjectionOptions options;
+    options.entry = QStringLiteral("foreground_reply");
+    options.ownerPrivate = true;
+    options.receiptsInjected = true;
+    auto withReceipts = projectModelInput(context, options);
+    QCOMPARE(withReceipts.receipts.size(), 1);
+    QCOMPARE(withReceipts.receipts.first().toObject().value(QStringLiteral("outcome")).toString(),
+             QStringLiteral("handed_off"));
+    options.receiptsInjected = false;
+    auto withoutReceipts = projectModelInput(context, options);
+    QVERIFY(withoutReceipts.receipts.isEmpty());
 }
 
 QTEST_MAIN(CognitiveContextTest)
