@@ -690,5 +690,9 @@ R12 最后一次集中功能收尾。修复预算裁剪与 dedup 的语义冲突
 - **候选**：`build/stage-b/Windows_AI.exe`，113,178,793 B，SHA-256
   `6E2C52729522FC38E62A9B265B3145E769A1CB3B3005905A0B011085644A2998`。
 - **生产**：库/配置哈希未变，未启动应用、未发真实消息；actual 默认关闭。
+- **修正**：`settingsapplyplan.h` 中 `memory.owner_cross_channel_private` 的差异读取路径
+  从 identity 改为 setting.json；新增开启/关闭两方向测试，确保单独修改跨渠道权限会触发
+  权限差异/撤回。重建后全量 ctest 24/24（102.14s），候选哈希更新为
+  `B1DB78235D2C9C8B9F04337A5A7F1CD8C08036DF8BEC1D52369AB672CD0D4AEB`。
 - **未做/边界**：不新增 schema、不重建检索系统、不做 QFileSystemWatcher 自动监听、
   不新增独立权限规则；本轮后停止扩展设置系统，进入 B5 部署与使用。

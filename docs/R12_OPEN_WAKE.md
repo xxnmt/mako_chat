@@ -273,4 +273,7 @@ R12 最后一次集中功能收尾；不新增认知能力、不改生产配置/
   `tst_memoryagent 127 passed/6 skipped`。生产库/配置未改，未启动应用。
 - 候选：`build/stage-b/Windows_AI.exe` SHA-256
   `6E2C52729522FC38E62A9B265B3145E769A1CB3B3005905A0B011085644A2998`。
+  修正 `memory.owner_cross_channel_private` 差异路径（setting.json）后重建为
+  `B1DB78235D2C9C8B9F04337A5A7F1CD8C08036DF8BEC1D52369AB672CD0D4AEB`；
+  全量 ctest 24/24（102.14s）。
 

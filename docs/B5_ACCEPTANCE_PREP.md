@@ -10,8 +10,8 @@
 | 项 | 值 |
 |---|---|
 | 候选路径 | `build/stage-b/Windows_AI.exe` |
-| 大小 / 时间 | 113,178,793 B / 2026-11-28 08:01:20（最终构建后） |
-| SHA-256 | `6E2C52729522FC38E62A9B265B3145E769A1CB3B3005905A0B011085644A2998` |
+| 大小 / 时间 | 113,178,793 B / 2026-11-28 08:29:34（修正跨渠道权限差异路径后重建） |
+| SHA-256 | `B1DB78235D2C9C8B9F04337A5A7F1CD8C08036DF8BEC1D52369AB672CD0D4AEB` |
 | 构建 | Ninja Debug，Qt 6.11.1 / MinGW 13.1；全量构建通过 |
 | 说明 | 候选二进制未复制到生产运行目录 `build/Desktop_Qt_6_11_1_MinGW_64_bit_Debug`；生产 run 目录二进制/配置/库保持原样 |
 
@@ -152,7 +152,7 @@ duplicate 投递、隐私过滤/泄漏、行动回执状态。**不以主动联�
 
 ## 11. 候选版本验证记录
 
-- 全量构建通过；**ctest 24/24 通过**（`build/stage-b/b5-settings-final-ctest.log`，102.23s）。
+- 全量构建通过；**ctest 24/24 通过**（`build/stage-b/b5-settings-final-ctest.log`，102.14s）。
 - `tst_settingspages 11 passed`（导航合并/三个上限单入口/高级诊断搬迁/非法区间拒绝/
   有效值归一显示/无修改不写入/未展示字段保留/actual 状态/环境变量）；
   `tst_memoryagent 127 passed / 6 skipped`（含 actual 配置热读取与环境变量优先级）；

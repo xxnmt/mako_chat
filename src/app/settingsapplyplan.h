@@ -87,7 +87,7 @@ inline ApplyPlan plan(const QJsonObject &before, const QJsonObject &after)
     result.timeSettings = setting(QStringLiteral("time"));
     result.permissions = result.masterAccounts
         || identity(QStringLiteral("memory.blind_zones"))
-        || identity(QStringLiteral("memory.owner_cross_channel_private"))
+        || setting(QStringLiteral("memory.owner_cross_channel_private"))
         || identity(QStringLiteral("proactive.enabled"))
         || identity(QStringLiteral("proactive.private_writing"))
         || identity(QStringLiteral("proactive.targets"))

@@ -296,9 +296,11 @@ private slots:
                  {QStringLiteral("qq"), QJsonObject{{QStringLiteral("enabled"), true},
                                                     {QStringLiteral("ws_url"), QStringLiteral("ws://a")},
                                                     {QStringLiteral("reply"), QJsonObject{{QStringLiteral("private"), QStringLiteral("master")}}}}},
-                 {QStringLiteral("memory"), QJsonObject{{QStringLiteral("retrieval"),
-                     QJsonObject{{QStringLiteral("candidate_limit"), 40},
-                                 {QStringLiteral("embedding_model"), QString()}}}}}}},
+                 {QStringLiteral("memory"), QJsonObject{
+                     {QStringLiteral("retrieval"),
+                      QJsonObject{{QStringLiteral("candidate_limit"), 40},
+                                  {QStringLiteral("embedding_model"), QString()}}},
+                     {QStringLiteral("owner_cross_channel_private"), false}}}}},
             {QStringLiteral("identity"), QJsonObject{
                  {QStringLiteral("proactive"), QJsonObject{{QStringLiteral("daily_limit"), 288}}},
                  {QStringLiteral("appearance"), QJsonObject{{QStringLiteral("follow_external_mood"), true}}},
@@ -384,6 +386,20 @@ private slots:
             {QStringLiteral("cognition"), QJsonObject{{QStringLiteral("snapshot_budget_bytes"), 4096}}}};
         plan = MakoSettings::plan(base, changed);
         QVERIFY(!plan.permissions); // 未涉及权限字段
+        // 跨渠道权限位于 setting.json：单独修改必须触发权限撤回/差异更新。
+        auto withCrossChannel = [&base](bool enabled) {
+            QJsonObject snapshot = base;
+            auto setting = snapshot.value(QStringLiteral("setting")).toObject();
+            auto memory = setting.value(QStringLiteral("memory")).toObject();
+            memory.insert(QStringLiteral("owner_cross_channel_private"), enabled);
+            setting.insert(QStringLiteral("memory"), memory);
+            snapshot.insert(QStringLiteral("setting"), setting);
+            return snapshot;
+        };
+        plan = MakoSettings::plan(withCrossChannel(false), withCrossChannel(true));
+        QVERIFY2(plan.permissions, "开启跨渠道权限要走权限差异");
+        plan = MakoSettings::plan(withCrossChannel(true), withCrossChannel(false));
+        QVERIFY2(plan.permissions, "关闭跨渠道权限必须走权限撤回");
     }
 
     void legacyPlannerFieldsShowModeValidity()
