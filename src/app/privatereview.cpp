@@ -908,7 +908,10 @@ void PrivateReview::receive(qlonglong id, int version, const QJsonObject &propos
         const auto contact = proposal["contact"].toObject();
         const auto action = proposal["concern_action"].toString();
         const auto decision = action.isEmpty() ? QStringLiteral("none") : action;
-        if (error.isEmpty() && store.finishConcernReview(id,version,proposal)) {
+        const auto commit = error.isEmpty()
+            ? store.finishConcernReview(id,version,proposal)
+            : MemoryManager::ReflectionCommitResult{error,{}};
+        if (commit) {
             qInfo() << "[Concern] committed" << id << version << action << contact["timing"].toString();
             // 投递权限与安静时段由 AppController 的 canContactNow 再核验；这里只把"现在联系"的
             // 决定交给投递层，keep/revise/resolve/drop 只在记忆层落库，不产生外部消息。
@@ -921,10 +924,12 @@ void PrivateReview::receive(qlonglong id, int version, const QJsonObject &propos
                       contact["withhold_reason"].toString());
             return;
         }
-        // 领取时已经扣过预算/冷却，失败把关注放回队列（持久失败行决定退避）。
-        const QString reason = error.isEmpty() ? QStringLiteral("invalid_or_stale_proposal") : error;
-        recordFailure(attempt, reason, reviewStage(proposal,error,false),
-                      errorCountsAsFailure(reason));
+        const QString reason = commit.failure;
+        if (reason != QStringLiteral("version_conflict") && reason != QStringLiteral("cas_conflict")) {
+            const bool retry = reason != QStringLiteral("writing_disabled")
+                && reason != QStringLiteral("permission_denied");
+            recordFailure(attempt, reason, reviewStage(proposal,error,false), retry);
+        }
         logResult(decision, reviewStage(proposal,error,false), reason);
         return;
     }

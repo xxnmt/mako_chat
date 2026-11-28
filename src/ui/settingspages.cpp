@@ -52,11 +52,11 @@ QString settingHelp(const Field &field)
         {"memory.retrieval.auto_backfill", "启用后，在启动或应用配置时从已有记录回填空的索引。"},
         {"memory.retrieval.candidate_limit", "进入后续排序的候选数量上限，调高可能增加检索耗时。"},
         {"memory.retrieval.rerank_enabled", "开启：将候选正文和查询交给配置的重排服务重新排序。关闭：保留本地检索排序，跳过重排服务。"},
-        {"memory.retrieval.rerank_limit", "限制送入重排环节的候选数量。值越高，服务能比较的候选越多，调用耗时和输入量也可能增加。关闭重排时该项不生效。"},
+        {"memory.retrieval.rerank_limit", "限制融合排序后保留的结果数量。开重排时也是请求返回上限，关闭重排仍裁剪结果。候选数量上限另设。"},
         {"memory.retrieval.embedding_enabled", "使用向量查找语义相近的文本，启用后后台会补齐缺失向量。"},
         {"memory.retrieval.embedding_provider", "未指定：尚未选定向量服务。阿里云百炼：调用已配置端点和凭据计算语义向量。本地测试：用哈希向量验证索引流程，无法替代真实语义检索。"},
         {"memory.retrieval.embedding_model", "留空时，百炼使用 text-embedding-v4。"},
-        {"memory.retrieval.embedding_dimension", "向量长度须与服务模型及索引一致。0 使用提供方默认值。"},
+        {"memory.retrieval.embedding_dimension", "须与已建索引的向量长度一致。0 表示按提供方自动使用 DashScope 1024 维或本地测试 64 维。切换后旧向量不会自动重建。"},
         {"memory.retrieval.rerank_model", "重排服务接受的模型名称。百炼默认使用 qwen3-rerank，使用自定义服务时填写该服务支持的模型名称。"},
         {"memory.retrieval.embedding_api_key_env", "未配置百炼密钥时，用此名称读取环境变量。填写的是变量名。"},
         {"memory.retrieval.embedding_endpoint", "可填写完整向量接口地址。留空时从百炼服务地址推导。"},
@@ -66,17 +66,17 @@ QString settingHelp(const Field &field)
         {"memory.agent_trigger", "回忆类问题：独立规划模式按回忆意图决定是否启动。每轮：独立规划模式在每轮都尝试规划。模型工具模式由模型按需发起。"},
         {"memory.agent_plan_v2", "开启后，独立规划使用按查找目标组织的新版计划。关闭后使用旧版检索规划协议。"},
         {"memory.agent_max_rounds", "单轮对话允许的记忆补查轮数上限。前台仍受共享补查预算和重复调用限制。"},
-        {"memory.agent_timeout_ms", "独立规划模式的等待预算，单位是毫秒。到时返回已取得的资料。"},
+        {"memory.agent_timeout_ms", "独立 Planner 使用此值作为整轮期限，共享检索执行器也使用此值。模型工具的定向检索受此预算约束，概览走独立查询。它不是主模型请求或 HTTP 超时。"},
         {"memory.agent_max_results", "记忆补查返回的结果数量限制。详细内容可按工具支持的方式进一步核对。"},
         {"memory.owner_cross_channel_private", "允许在主人私密会话中使用其他私密渠道的个人记忆。"},
-        {"memory.privacy_rules", "添加规则名称、匹配方式、匹配内容及处理方式。匹配支持关键字、原文和正则。处理支持脱敏或拦截。"},
+        {"memory.privacy_rules", "管理员配置的内容规则。exact 使用字面子字符串匹配，pattern 使用正则。规则作用于可见资料及相应读写阶段。"},
         {"memory.blind_zones", "逐行填写渠道和会话标识。桌宠会话使用 default，QQ 使用目标账号或群号。"},
         {"qq.reply.master_any_group", "允许主人在回复群列表之外触发回应。实际触发仍按渠道回复策略判断。"},
         {"qq.reply.group", "关闭：不回群消息。仅被 @ 时：消息必须包含指向茉子的 QQ @ 消息段。全部：无需 @，仍检查群及发送者权限。"},
         {"qq.reply.private", "关闭：不回私聊。仅主人：只回复已绑定主人账号。允许列表：回复主人及表中勾选允许回复的账号。全部：可回复所有账号，是否记录按记录权限判断。"},
         {"qq.reply.restrict_empty_group_list", "开启：群回复表没有勾选项时，按空白名单处理。关闭：空名单沿用原有兼容行为，所有群可进入后续回复策略。主人例外、群触发方式和发送者权限仍分别检查。"},
-        {"qq.group_permissions", "允许记录：该群可参与长期群聊记忆，仍需启用群聊记忆，并遵守下方的群记忆模式。允许回复：该群进入回复名单，仍受 @ 方式和发送者权限约束。短期回复历史由短期记忆开关单独控制。"},
-        {"qq.private_permissions", "允许记录：该账号可进入记忆，仍受长短期记忆开关控制。允许回复：在私聊回应范围为允许列表时纳入回复名单。主人和全部模式有各自的全局规则。"},
+        {"qq.group_permissions", "分别配置允许记录和允许回复的群。记录还受总开关、群模式和发送者策略限制。回复受回复模式和触发条件限制。检索另检查访问权限。"},
+        {"qq.private_permissions", "分别配置私聊记录与回复账号。主人身份、私聊回复模式和已有记忆的检索权限各自检查。"},
         {"qq.group_memory_mode", "严格白名单 strict_whitelist：只记录主人和该群发送者白名单。群授权 group_authorized：开启群聊记忆且群允许记录时，可记录普通成员；回复仍检查发送者权限。"},
         {"qq.group_sender_allowlist", "按群填写允许记录的发送者账号。多个账号用空格或逗号分隔。"},
         {"qq.membership_max_age_minutes", "判断已缓存群成员信息是否过期的时间。"},
@@ -90,10 +90,10 @@ QString settingHelp(const Field &field)
         {"proactive.private_writing", "允许空闲时回顾最近的主人私下交流，留下自己的想法或休息，也可以继续到期的文字活动。两者共用每日上限和回顾间隔。主动联系另行设置。"},
         {"proactive.targets", "填写可主动联系的渠道及会话标识，桌宠会话填 default。"},
         {"proactive.idle_seconds", "从最近一次会话活动开始计时。达到该秒数后才允许进行后台创作回顾或尝试主动联系。0 表示没有额外空闲等待。"},
-        {"proactive.daily_limit", "每天最多领取多少次后台创作回顾任务。0 停止领取。这是每日回顾上限，不等同于自主唤醒上限或每日主动联系上限。"},
-        {"proactive.contact_daily_limit", "每日最多主动开口次数，0 不限制。这是主动联系上限，不等同于每日回顾上限或自主唤醒上限。"},
+        {"proactive.daily_limit", "每日共享回顾额度，包含普通回顾、活动、关注与 OpenWake。0 停止后台回顾领取。用户委托提醒独立。"},
+        {"proactive.contact_daily_limit", "主动联系投递共享上限。0 表示不限。保持安静时段、授权和语义核验。"},
         {"proactive.concern_default_check_minutes", "关注默认再检查间隔，0 表示只在新证据时。"},
-        {"proactive.concern_retention_days", "超过该天数的关注不再按时间到期。"},
+        {"proactive.concern_retention_days", "限制已留存关注的定时复查与失败重试。到期后，仍可由新证据命中或读到已有历史。"},
         {"proactive.cooldown_seconds", "两次后台创作回顾之间的间隔，单位为秒。运行时至少等待 60 秒。"},
         {"proactive.schedule", "可填写 HH:mm 及 fixed（固定）或 random（随机）。当前只保存，定时调度尚未接入。"},
         {"logging.directory", "默认保存到程序目录的 app_data/logs。更换位置后，新日志从保存设置时起写到新目录。"},
@@ -104,11 +104,11 @@ QString settingHelp(const Field &field)
         {"memory.debug_full_logs", "开启后记录对话正文和模型请求，用于诊断。"},
         {"cognition.open_wake.enabled", "允许系统按计划创建内部唤醒（OpenWake）。关闭后不再创建新的唤醒；已有的提醒、回顾和主动联系仍按各自开关执行。"},
         {"cognition.open_wake.allow_contact", "允许内部唤醒在符合条件时主动联系主人。与启用唤醒独立：只开启唤醒、不开启此项时，唤醒只做内部回顾。"},
-        {"cognition.open_wake.max_per_day", "每天最多创建多少次内部唤醒。这是自主唤醒独立上限，不等同于每日回顾上限或每日主动联系上限。"},
+        {"cognition.open_wake.max_per_day", "0 停止 OpenWake 领取。正值同时受每日共享额度与共享预算占比限制。"},
         {"cognition.open_wake.shared_budget_percent", "内部唤醒与普通回顾共享每日预算时，允许占用的百分比。调低会让唤醒更少占用回顾额度。"},
-        {"cognition.snapshot_budget_bytes", "每轮认知快照的提示词字节预算，范围 2048 至 8192。预算不足时先缩短低优先正文，再显式省略；不会增加模型请求。"},
-        {"cognition.context_actual_enabled", "实验功能：使用统一认知上下文替换旧的上下文组装路径。默认关闭；保存后需重启应用生效。进程环境变量 MAKO_COGNITIVE_CONTEXT_ACTUAL 可临时覆盖本配置（显式设为 0 表示关闭）。"},
-        {"cognition.open_wake.initial_delay_seconds", "应用启动后默认等待多少秒再安排第一次内部唤醒。"},
+        {"cognition.snapshot_budget_bytes", "仅限制认知状态快照的 JSON 字节数。角色提示、工具协议、当前输入和其他上下文使用各自预算。"},
+        {"cognition.context_actual_enabled", "B5 实验功能。保存后下一次独立认知运行读取。显式测试 setter 优先，其次是环境变量 MAKO_COGNITIVE_CONTEXT_ACTUAL（含 0），最后是此配置。"},
+        {"cognition.open_wake.initial_delay_seconds", "仅在尚无有效唤醒计划时用于首次调度。已保存的下一次唤醒不会因保存此值重排。后续时间由模型提议与允许的间隔共同确定。"},
         {"cognition.open_wake.default_interval_seconds", "模型没有给出下次唤醒时间时使用的默认间隔。"},
         {"cognition.open_wake.min_interval_seconds", "允许模型提议的最小唤醒间隔；小于此值会在提交边界被夹紧。"},
         {"cognition.open_wake.max_interval_seconds", "允许模型提议的最大唤醒间隔。"},
@@ -282,14 +282,6 @@ QJsonValue effectiveIdentityValue(const QString &path)
                                            {QStringLiteral("session_id"), target.second}});
             }
             return targets;
-        }
-        if (path == QStringLiteral("proactive.schedule")) {
-            QJsonArray schedule;
-            for (const auto &item : proactive.schedule) {
-                schedule.append(QJsonObject{{QStringLiteral("at"), item.at},
-                                            {QStringLiteral("type"), item.type}});
-            }
-            return schedule;
         }
         return {};
     }
@@ -573,6 +565,9 @@ Binding buildField(const Field &field, const QJsonValue &value, QWidget *parent)
             const auto pair = entry.split('=');
             choice->addItem(pair.last(), pair.first());
         }
+        if (field.path.join('.') == QStringLiteral("memory.retrieval.embedding_provider")
+            && value.toString() == QStringLiteral("local_hash_test"))
+            choice->addItem(QStringLiteral("本地测试（已配置）"), QStringLiteral("local_hash_test"));
         int index = choice->findData(value.toString());
         if (index < 0) {
             choice->addItem(value.toString(), value.toString());
@@ -681,6 +676,22 @@ Field field(const QString &path, const QString &label, QJsonValue fallback, cons
 }
 
 
+QString openWakeCapStatus()
+{
+    auto &config = ConfigManager::instance();
+    const auto wake = config.getOpenWakeConfig();
+    const auto memory = config.getMemoryPolicyConfig();
+    const int cap = wake.enabled && memory.longTermMemoryEnabled
+        ? OpenWakeConfig::effectiveDailyCap(config.getProactiveConfig().dailyLimit,
+                                           wake.maxPerDay, wake.sharedBudgetPercent) : 0;
+    return QStringLiteral("已保存配置的有效日上限：%1 次。实际领取还受剩余额度和调度条件限制。").arg(cap);
+}
+
+QString integerRange(int minimum, int maximum)
+{
+    return QStringLiteral("num:%1:%2").arg(minimum).arg(maximum);
+}
+
 QList<Page> pages()
 {
     return {
@@ -708,8 +719,6 @@ QList<Page> pages()
             {"模型文件", {
                 field("tts.gpt_weights_path", "GPT 权重", "", "file"),
                 field("tts.sovits_weights_path", "SoVITS 权重", "", "file"),
-                field("tts.gpt_model_dir", "GPT 模型目录", "", "directory"),
-                field("tts.sovits_model_dir", "SoVITS 模型目录", "", "directory"),
             }},
         }},
         {"记忆与检索", "管理对话上下文、检索与索引。", "setting.json", {
@@ -725,13 +734,13 @@ QList<Page> pages()
                 field("memory.retrieval.auto_backfill", "自动回填空索引", false, "bool"),
                 field("memory.retrieval.candidate_limit", "候选数量上限", 40, "num:10:200"),
                 field("memory.retrieval.rerank_enabled", "启用重排", true, "bool"),
-                field("memory.retrieval.rerank_limit", "重排数量上限", 10, "num:1:40"),
+                field("memory.retrieval.rerank_limit", "检索结果上限", 10, "num:1:40"),
             }},
             {"主动回忆工具", {
                 field("memory.agent_enabled", "启用补查工具", true, "bool"),
                 field("memory.agent_mode", "回忆方式", "tool", "choice:tool=模型工具|legacy=独立规划"),
                 field("memory.agent_protocol", "工具协议", "native", "choice:native=原生调用|json_envelope=JSON 信封"),
-                field("memory.agent_timeout_ms", "工具超时（毫秒）", 6000, "num:1000:15000"),
+                field("memory.agent_timeout_ms", "规划与定向检索预算（毫秒）", 6000, "num:1000:15000"),
                 field("memory.agent_max_rounds", "最多工具轮数", 2, "num:1:4"),
                 field("memory.agent_max_results", "最多返回条数", 8, "num:1:20"),
             }},
@@ -752,7 +761,6 @@ QList<Page> pages()
             }},
             {"群聊记忆", {
                 field("qq.group_memory_enabled", "启用群聊记忆", false, "bool"),
-                field("qq.group_retention_days", "保留天数（清理暂未接入）", 30, "num:1:3650"),
                 field("qq.membership_refresh_minutes", "成员刷新间隔（分钟）", 30, "num:0:1440"),
                 field("qq.membership_max_age_minutes", "成员缓存有效期（分钟）", 1440, "num:1:10080"),
                 field("qq.group_memory_mode", "各群记忆模式", QJsonObject{}, "modes"),
@@ -781,7 +789,6 @@ QList<Page> pages()
         {"隐私规则", "设置跨渠道记忆、内容过滤与策略版本。", "setting.json", {
             {"记忆权限", {
                 field("memory.owner_cross_channel_private", "允许主人跨私聊渠道使用个人记忆", false, "bool"),
-                field("memory.privacy_policy_version", "策略版本标识", "r3", "text"),
                 field("memory.privacy_rules", "内容过滤规则", QJsonArray{}, "rules"),
             }},
         }},
@@ -800,16 +807,16 @@ QList<Page> pages()
                 field("proactive.enabled", "允许主动联系", false, "bool"),
                 field("proactive.private_writing", "允许私下回顾与创作", false, "bool"),
                 field("proactive.concern_default_check_minutes", "关注再检查间隔（分钟）", 720, "num:0:10080"),
-                field("proactive.concern_retention_days", "关注保留天数（到期清理暂未接入，仅保存）", 14, "num:1:365"),
+                field("proactive.concern_retention_days", "关注定时复查保留期（天）", 14, "num:1:365"),
                 field("proactive.cooldown_seconds", "回顾间隔（秒）", 900, "num:60:604800"),
                 field("proactive.idle_seconds", "空闲等待（秒）", 1800, "num:0:604800"),
                 field("proactive.quiet_hours.start", "安静开始", "23:00", "time"),
                 field("proactive.quiet_hours.end", "安静结束", "08:00", "time"),
                 field("proactive.targets", "允许联系的会话", QJsonArray{}, "targets"),
             }},
-            {"每日上限（三个上限相互独立）", {
+            {"每日回顾额度与主动联系上限", {
                 field("proactive.daily_limit", "每日回顾上限", 3, "num:0:999"),
-                field("cognition.open_wake.max_per_day", "每日自主唤醒上限", 12, "num:0:96"),
+                field("cognition.open_wake.max_per_day", "每日自主唤醒上限", OpenWakeConfig{}.maxPerDay, integerRange(0, OpenWakeConfig::maxDailyLimit)),
                 field("proactive.contact_daily_limit", "每日主动联系上限（0 表示不限）", 3, "num:0:99"),
             }},
             {"内部唤醒与快照", {
@@ -820,11 +827,14 @@ QList<Page> pages()
                 field("cognition.context_actual_enabled", "启用统一认知上下文（B5 实验功能）", false, "bool"),
             }},
             {"高级设置：调度与失败退避", {
-                field("cognition.open_wake.initial_delay_seconds", "首次唤醒延迟（秒）", 900, "num:60:86400"),
-                field("cognition.open_wake.default_interval_seconds", "默认唤醒间隔（秒）", 1800, "num:300:86400"),
-                field("cognition.open_wake.min_interval_seconds", "最小唤醒间隔（秒）", 300, "num:300:86400"),
-                field("cognition.open_wake.max_interval_seconds", "最大唤醒间隔（秒）", 86400, "num:300:86400"),
-                field("cognition.open_wake.max_model_steps_per_wake", "单次唤醒最多模型步数", 3, "num:1:8"),
+                field("cognition.open_wake.initial_delay_seconds", "首次唤醒延迟（秒）", OpenWakeConfig{}.initialDelaySeconds,
+                      integerRange(OpenWakeConfig::minDelaySeconds, OpenWakeConfig::maxDelaySeconds)),
+                field("cognition.open_wake.default_interval_seconds", "默认唤醒间隔（秒）", OpenWakeConfig{}.defaultIntervalSeconds,
+                      integerRange(OpenWakeConfig::minFollowupSeconds, OpenWakeConfig::maxDelaySeconds)),
+                field("cognition.open_wake.min_interval_seconds", "最小唤醒间隔（秒）", OpenWakeConfig{}.minIntervalSeconds,
+                      integerRange(OpenWakeConfig::minFollowupSeconds, OpenWakeConfig::maxDelaySeconds)),
+                field("cognition.open_wake.max_interval_seconds", "最大唤醒间隔（秒）", OpenWakeConfig{}.maxIntervalSeconds,
+                      integerRange(OpenWakeConfig::minFollowupSeconds, OpenWakeConfig::maxDelaySeconds)),
                 field("cognition.open_wake.max_non_open_jobs_when_due", "到期后先让出的普通回顾次数", 3, "num:0:20"),
                 field("cognition.review_backoff_seconds", "回顾失败退避（秒，逗号分隔）", QJsonArray{120, 300, 900}, "ints"),
                 field("cognition.max_review_failures", "连续失败暂停阈值", 4, "num:1:10"),
@@ -833,7 +843,7 @@ QList<Page> pages()
         {"高级与诊断", "检索服务、Legacy 兼容参数与诊断日志；普通使用无需修改。", "setting.json", {
             {"检索服务（高级诊断）", {
                 field("memory.retrieval.embedding_enabled", "启用向量召回", false, "bool"),
-                field("memory.retrieval.embedding_provider", "向量服务（local_hash_test 仅用于诊断）", "", "choice:=未指定|dashscope=阿里云百炼|local_hash_test=本地测试"),
+                field("memory.retrieval.embedding_provider", "向量服务", "", "choice:=未指定|dashscope=阿里云百炼"),
                 field("memory.retrieval.embedding_endpoint", "向量端点", "", "text"),
                 field("memory.retrieval.embedding_api_key_env", "向量密钥环境变量", "DASHSCOPE_API_KEY", "text"),
                 field("memory.retrieval.embedding_model", "向量模型", "", "text"),
@@ -933,6 +943,9 @@ PageView buildPage(const Page &page, const std::function<void()> &applied, QWidg
     }
 
     for (const auto &group : page.groups) {
+        const auto agent = ConfigManager::instance().getMemoryPolicyConfig().agent;
+        if (group.title == QStringLiteral("兼容性：Legacy Planner")
+            && (!agent.enabled || agent.mode != QStringLiteral("legacy"))) continue;
         auto *card = new QGroupBox(group.title, contents);
         card->setStyleSheet(QStringLiteral(
             "QGroupBox { border: 1px solid palette(mid); border-radius: 8px; margin-top: 10px; }"
@@ -1028,6 +1041,13 @@ PageView buildPage(const Page &page, const std::function<void()> &applied, QWidg
                 runtimeStatus->setWordWrap(true);
                 runtimeStatus->setObjectName(key + QStringLiteral(".status"));
                 form->addRow(new QLabel(QStringLiteral("当前运行状态"), card), runtimeStatus);
+            }
+            if (key == "cognition.open_wake.max_per_day") {
+                auto *status = new QLabel(card);
+                status->setWordWrap(true);
+                status->setObjectName(QStringLiteral("openWakeEffectiveDailyCap"));
+                status->setText(openWakeCapStatus());
+                form->addRow(new QLabel(QStringLiteral("有效上限"), card), status);
             }
             if (key == "memory.agent_mode") {
                 const bool legacy = configured.toString() == QStringLiteral("legacy");
@@ -1174,6 +1194,8 @@ PageView buildPage(const Page &page, const std::function<void()> &applied, QWidg
                     }
                 }
             }
+            if (auto *status = panel->findChild<QLabel *>(QStringLiteral("openWakeEffectiveDailyCap")))
+                status->setText(openWakeCapStatus());
             applied();
             QStringList changedKeys;
             for (const auto &[index, value] : edits) {

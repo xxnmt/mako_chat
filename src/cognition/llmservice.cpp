@@ -2748,7 +2748,7 @@ const QString kVerifierModel = QStringLiteral("deepseek-v4-flash");
 
 QJsonObject verifierRequestBody(const QString &inputText)
 {
-    // R12-2c-final-1：单次输出预算提高到 1024（真实 provider 默认 thinking 下 reasoning
+    // R12-2c-final-1：单次输出预算为 2048（真实 provider 默认 thinking 下 reasoning
     // 也计入 max_tokens；256 时生产日志 9 次核验 8 次 finish_reason=length）。不发送
     // thinking:{type:disabled}（该参数会导致连接重置，真实 provider 不支持）。
     return QJsonObject{

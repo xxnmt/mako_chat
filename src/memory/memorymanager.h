@@ -203,7 +203,7 @@ public:
     QJsonObject claimDueConcern(int dailyLimit, int cooldownSeconds,
                                 QString *reason = nullptr, QDateTime *nextEligibleAt = nullptr);
     QJsonObject concernReviewContext(qint64 turn, int version) const;
-    bool finishConcernReview(qlonglong turn, int version, const QJsonObject &proposal);
+    ReflectionCommitResult finishConcernReview(qlonglong turn, int version, const QJsonObject &proposal);
     // 只有 contact.timing=="now" 需要可核验的行动依据；返回空串=通过，否则返回拒绝原因
     // （missing_basis / invalid_basis_type / invalid_basis_ref / stale_owner_evidence /
     //   artifact_already_shared / time_delegation_owned_by_reminder）。

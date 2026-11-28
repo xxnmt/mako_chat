@@ -167,9 +167,12 @@ private slots:
         QCOMPARE(cfg.targets.at(0).first, Channel::kPet);
         QCOMPARE(cfg.targets.at(0).second, Channel::kDefaultSession);
         QCOMPARE(cfg.targets.at(1).first, Channel::kQQGroup);
-        QCOMPARE(cfg.schedule.size(), 1);
-        QCOMPARE(cfg.schedule.at(0).at, QStringLiteral("07:30"));
-        QCOMPARE(cfg.schedule.at(0).type, QStringLiteral("fixed"));
+        const auto path = ConfigManager::instance().getConfigDirPath() + "/identity.json";
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        QCOMPARE(QJsonDocument::fromJson(file.readAll()).object().value("proactive").toObject()
+                     .value("schedule").toArray().first().toObject().value("at").toString(),
+                 QStringLiteral("07:30"));
     }
 
     void shortMemoryLengthHasDefault()

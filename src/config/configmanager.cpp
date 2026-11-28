@@ -590,7 +590,6 @@ bool ConfigManager::writeConfigDocument(const QString &name, const QByteArray &c
                    || !checkType("identity", "master", QJsonValue::Object)
                    || !checkType("memory", "blind_zones", QJsonValue::Array)
                    || !checkType("proactive", "targets", QJsonValue::Array)
-                   || !checkType("proactive", "schedule", QJsonValue::Array)
                    || !checkType("cognition", "semantic_verifier", QJsonValue::Object)) {
             return fail(QStringLiteral("请检查身份、盲区和主动活动字段的对象或数组类型"));
         }
@@ -952,17 +951,17 @@ void ConfigManager::ensureIdentityLoaded() const
             openWake.enabled = openWakeObj.value("enabled").toBool(false);
             openWake.allowContact = openWakeObj.value("allow_contact").toBool(false);
             openWake.initialDelaySeconds =
-                qBound(60, openWakeObj.value("initial_delay_seconds").toInt(900), 86400);
+                qBound(OpenWakeConfig::minDelaySeconds, openWakeObj.value("initial_delay_seconds").toInt(openWake.initialDelaySeconds), OpenWakeConfig::maxDelaySeconds);
             // 默认最小间隔 300 秒：模型仍可在协议 5..1440 分钟内提议，提交边界再按
             // [min,max] 夹紧（夹紧不是失败）；缺省时也用同一套 effective 规则。
             int minInterval =
-                qBound(300, openWakeObj.value("min_interval_seconds").toInt(300), 86400);
+                qBound(OpenWakeConfig::minFollowupSeconds, openWakeObj.value("min_interval_seconds").toInt(openWake.minIntervalSeconds), OpenWakeConfig::maxDelaySeconds);
             int maxInterval =
-                qBound(300, openWakeObj.value("max_interval_seconds").toInt(86400), 86400);
+                qBound(OpenWakeConfig::minFollowupSeconds, openWakeObj.value("max_interval_seconds").toInt(openWake.maxIntervalSeconds), OpenWakeConfig::maxDelaySeconds);
             if (maxInterval < minInterval) maxInterval = minInterval;
             const int defaultInterval = qBound(
                 minInterval,
-                openWakeObj.value("default_interval_seconds").toInt(1800),
+                openWakeObj.value("default_interval_seconds").toInt(openWake.defaultIntervalSeconds),
                 maxInterval);
             openWake.minIntervalSeconds = minInterval;
             openWake.maxIntervalSeconds = maxInterval;
@@ -971,7 +970,7 @@ void ConfigManager::ensureIdentityLoaded() const
                 qBound(0, openWakeObj.value("max_non_open_jobs_when_due").toInt(3), 20);
             openWake.maxModelStepsPerWake =
                 qBound(1, openWakeObj.value("max_model_steps_per_wake").toInt(3), 8);
-            openWake.maxPerDay = qBound(0, openWakeObj.value("max_per_day").toInt(12), 96);
+            openWake.maxPerDay = qBound(0, openWakeObj.value("max_per_day").toInt(openWake.maxPerDay), OpenWakeConfig::maxDailyLimit);
             openWake.sharedBudgetPercent =
                 qBound(1, openWakeObj.value("shared_budget_percent").toInt(30), 100);
             m_openWake = openWake;
@@ -991,16 +990,6 @@ void ConfigManager::ensureIdentityLoaded() const
         m_proactive.targets.append(qMakePair(t.value("channel").toString(Channel::kPet),
                                              t.value("session_id").toString(Channel::kDefaultSession)));
     }
-    for (const QJsonValue &v : proObj.value("schedule").toArray()) {
-        QJsonObject s = v.toObject();
-        ScheduleItem item;
-        item.at = s.value("at").toString();
-        item.type = s.value("type").toString("fixed");
-        if (!item.at.isEmpty()) {
-            m_proactive.schedule.append(item);
-        }
-    }
-
     qDebug() << "[ConfigManager]identity.json 加载完成: self" << m_selfQQ.size()
              << "个 / master" << m_masterQQ.size() << "个 / 盲区" << m_blindZones.size() << "个";
 }

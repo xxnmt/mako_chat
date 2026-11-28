@@ -225,7 +225,7 @@ private slots:
         QVERIFY(!stack->currentWidget()->findChild<QWidget *>("memory.retrieval.embedding_provider"));
         search->setText(QStringLiteral("高级与诊断"));
         QVERIFY(stack->currentWidget()->findChild<QWidget *>("memory.retrieval.embedding_provider"));
-        QVERIFY(stack->currentWidget()->findChild<QWidget *>("memory.agent_plan_v2"));
+        QVERIFY(!stack->currentWidget()->findChild<QWidget *>("memory.agent_plan_v2"));
         search->setText(QStringLiteral("日志")); // 日志已移入高级与诊断
         QVERIFY(stack->currentWidget()->findChild<QWidget *>("logging.directory"));
     }
@@ -428,6 +428,7 @@ private slots:
         root2->findChild<QLineEdit *>("settingsSearch")->setText(QStringLiteral("memory.agent_mode"));
         auto *status2 = root2->findChild<QLabel *>("memory.agent_mode.status");
         QVERIFY(status2 && status2->text().contains(QStringLiteral("独立规划")));
+        QVERIFY(root2->findChild<QWidget *>("memory.agent_plan_v2"));
     }
 
     void noChangeSaveDoesNotApplyOrRewrite()
@@ -522,8 +523,7 @@ private slots:
             "cognition.open_wake.initial_delay_seconds"))->setValue(600);
         static_cast<QSpinBox *>(root->findChild<QWidget *>(
             "cognition.open_wake.default_interval_seconds"))->setValue(1200);
-        static_cast<QSpinBox *>(root->findChild<QWidget *>(
-            "cognition.open_wake.max_model_steps_per_wake"))->setValue(4);
+        QVERIFY(!root->findChild<QWidget *>("cognition.open_wake.max_model_steps_per_wake"));
         static_cast<QSpinBox *>(root->findChild<QWidget *>(
             "cognition.open_wake.max_non_open_jobs_when_due"))->setValue(2);
         backoff->setText(QStringLiteral("60, 180, 600"));
@@ -544,7 +544,9 @@ private slots:
         QCOMPARE(savedOpenWake.value("default_interval_seconds").toInt(), 1200);
         QCOMPARE(savedOpenWake.value("max_per_day").toInt(), 5);
         QCOMPARE(savedOpenWake.value("shared_budget_percent").toInt(), 40);
-        QCOMPARE(savedOpenWake.value("max_model_steps_per_wake").toInt(), 4);
+        QCOMPARE(savedOpenWake.value("max_model_steps_per_wake").toInt(), 3);
+        auto *cap = root->findChild<QLabel *>("openWakeEffectiveDailyCap");
+        QVERIFY(cap && cap->text().contains(QStringLiteral("5 次")));
         QCOMPARE(savedOpenWake.value("max_non_open_jobs_when_due").toInt(), 2);
         const auto savedCognition = saved.value("cognition").toObject();
         QCOMPARE(savedCognition.value("snapshot_budget_bytes").toInt(), 8192);

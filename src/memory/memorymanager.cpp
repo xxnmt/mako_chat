@@ -6679,11 +6679,7 @@ QJsonObject MemoryManager::claimOpenWake(int dailyLimit, int cooldownSeconds,
                                                        : scopeKey.trimmed();
     // 独立每日预算：min(openWakeDailyLimit, dailyLimit*sharedBudgetPercent/100)。
     // 取整至少 1（正预算不能因整除被永久饿死），但绝不突破共享 dailyLimit。
-    int cap = 0;
-    if (dailyLimit > 0 && openWakeDailyLimit > 0) {
-        const int share = qMax(1, dailyLimit * qMax(0, sharedBudgetPercent) / 100);
-        cap = qMin(openWakeDailyLimit, qMin(dailyLimit, share));
-    }
+    const int cap = OpenWakeConfig::effectiveDailyCap(dailyLimit, openWakeDailyLimit, sharedBudgetPercent);
     if (cap <= 0) return fail(QStringLiteral("budget"));
     if (!m_db.transaction()) return fail(QStringLiteral("db_error"));
     auto rollback = qScopeGuard([this] { m_db.rollback(); });

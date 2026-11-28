@@ -991,38 +991,44 @@ QString MemoryManager::validateContactBasis(const QString &channel,const QString
     return {};
 }
 
-bool MemoryManager::finishConcernReview(qlonglong turn,int version,const QJsonObject &proposal)
+MemoryManager::ReflectionCommitResult MemoryManager::finishConcernReview(qlonglong turn,int version,const QJsonObject &proposal)
 {
+    const auto fail = [](const char *code) {
+        return ReflectionCommitResult{QString::fromLatin1(code), {}};
+    };
+    QString contactRejection;
     static const QSet<QString> actions{QStringLiteral("keep"),QStringLiteral("revise"),
                                        QStringLiteral("resolve"),QStringLiteral("drop"),
                                        QStringLiteral("contact")};
     const auto action=proposal["concern_action"].toString();
-    if (!actions.contains(action)) return false;
+    if (!actions.contains(action)) return fail("invalid_internal_structure");
     const auto note=proposal["note"].toString().trimmed();
-    if (note.size()>240) return false;
+    if (note.size()>240) return fail("invalid_internal_structure");
     // 模型没给 next_check_after_minutes 时用配置的默认间隔；显式 0 仍表示"只在新证据时"。
     const int concernDefaultMinutes =
         ConfigManager::instance().getProactiveConfig().concernDefaultCheckMinutes;
     const int minutes=qBound(0,proposal["forget"].toObject()["next_check_after_minutes"]
                                     .toInt(concernDefaultMinutes),10080);
-    if (!m_db.transaction()) return false;
+    if (!m_db.transaction()) return fail("db_error");
     auto rollback=qScopeGuard([this]{m_db.rollback();});
     QSqlQuery q(m_db);
     // 与领取时一致的来源校验：只有仍处于 pending 且 version 匹配的领取才能落库。
-    q.prepare("SELECT h.channel,h.session_id,s.input,r.note,r.topic,r.watch" + sourceRows +
+    q.prepare("SELECT h.channel,h.session_id,s.input,r.note,r.topic,r.watch,r.version,r.state" + sourceRows +
               "JOIN private_reflection r ON r.turn_id=h.id WHERE " + eligible +
-              " AND h.id=? AND r.version=? AND r.state='pending'");
+              " AND h.id=?");
     q.addBindValue(turn);
-    q.addBindValue(version);
-    if (!q.exec() || !q.next()) return false;
+    if (!q.exec()) return fail("db_error");
+    if (!q.next()) return fail("source_unavailable");
+    if (q.value(6).toInt()!=version || q.value(7).toString()!="pending")
+        return fail("version_conflict");
     const auto channel=q.value(0).toString();
     const auto session=q.value(1).toString();
     const auto beforeNote=q.value(3).toString();
     const auto beforeTopic=q.value(4).toString();
     const auto beforeWatch=q.value(5).toString();
     const MemoryReadPolicy policy;
-    if (!policy.allows(channel,session,q.value(2).toString())) return false;
-    if (!note.isEmpty() && !policy.allows(channel,session,note)) return false;
+    if (!policy.allows(channel,session,q.value(2).toString())) return fail("permission_denied");
+    if (!note.isEmpty() && !policy.allows(channel,session,note)) return fail("internal_note_filtered");
     q.finish();
     QString sql;
     QList<QVariant> bindings;
@@ -1043,7 +1049,7 @@ bool MemoryManager::finishConcernReview(qlonglong turn,int version,const QJsonOb
         const auto topic=proposal["topic"].toString().trimmed().left(60);
         const auto watch=proposal["watch"].toString().trimmed().left(200);
         if ((!topic.isEmpty() && !policy.allows(channel,session,topic))
-            || (!watch.isEmpty() && !policy.allows(channel,session,watch))) return false;
+            || (!watch.isEmpty() && !policy.allows(channel,session,watch))) return fail("internal_concern_filtered");
         const qint64 delay=nextCheckAfter(minutes);
         sql=QStringLiteral("UPDATE private_reflection SET state='consider',claimed_by=NULL,"
                            "next_check_at=CASE WHEN ?>0 THEN unixepoch()+? ELSE 0 END,"
@@ -1078,6 +1084,7 @@ bool MemoryManager::finishConcernReview(qlonglong turn,int version,const QJsonOb
             && (contactTiming!="now" || (!contactMessage.isEmpty() && contactMessage.size()<=300
                                         && policy.allows(channel,session,contactMessage)));
         if (!contactValid) {
+            contactRejection=QStringLiteral("invalid_contact");
             qInfo()<<"[Concern] invalid_contact turn="<<turn<<"version="<<version;
             sql=QStringLiteral("UPDATE private_reflection SET state='consider',claimed_by=NULL,"
                                "next_check_at=0,updated_at=unixepoch() "
@@ -1090,15 +1097,8 @@ bool MemoryManager::finishConcernReview(qlonglong turn,int version,const QJsonOb
             // 确定性复核（动机合法性 + claims refs/authority/时序 + quiet/冷却/目标）。
             // 语义核验已由 LLMService 完成并写进 contact.semantic_status；这里不再调用模型。
             newCheck=checkNewContractContact(this,channel,session,turn,contact,contactTiming);
-            if (!newCheck.withheld) {
-                if (contactTiming==QStringLiteral("now")
-                    && (contactMessage.isEmpty() || contactMessage.size()>300
-                        || !policy.allows(channel,session,contactMessage))) return false;
-            } else if (!contactMessage.isEmpty()
-                       && (contactMessage.size()>300 || !policy.allows(channel,session,contactMessage))) {
-                return false;
-            }
             if (newCheck.withheld) {
+                contactRejection=newCheck.reason;
                 // 新契约被拒：不投递，但按 keep 语义把关注放回队列；联系意图与
                 // semantic_status=withheld 一起落库，保证"为什么没开口"可审计。
                 qInfo()<<"[Concern] new_contract_withheld turn="<<turn<<"version="<<version
@@ -1118,6 +1118,7 @@ bool MemoryManager::finishConcernReview(qlonglong turn,int version,const QJsonOb
         } else if (contactTiming==QStringLiteral("now")) {
             const auto rejection=validateContactBasis(channel,session,turn,contact);
             if (!rejection.isEmpty()) {
+                contactRejection=rejection;
                 // 依据核验不过：不要投递，但也不能让关注卡在 pending 里无限 defer。
                 // 保留关注，等待新的依据，并留一条可审计的修订。
                 const auto declaredType=contact["basis"].toObject()["type"].toString();
@@ -1148,7 +1149,8 @@ bool MemoryManager::finishConcernReview(qlonglong turn,int version,const QJsonOb
     }
     q.prepare(sql);
     for (const auto &value : bindings) q.addBindValue(value);
-    if (!q.exec() || q.numRowsAffected()!=1) return false;
+    if (!q.exec()) return fail("db_error");
+    if (q.numRowsAffected()!=1) return fail("cas_conflict");
     if (action=="contact" && (contactNewContract || !contactBasisRejected)) {
         // 联系意图与关注状态同一事务落库；投递层之后按 outcome='proposed' 取走。
         // basis_type/basis_refs 记录这次"现在联系"凭什么发生，非 now 的联系留 NULL。
@@ -1190,7 +1192,7 @@ bool MemoryManager::finishConcernReview(qlonglong turn,int version,const QJsonOb
                            ? QVariant(newCheck.claimsJson) : QVariant());
         q.addBindValue(contactNewContract && !newCheck.semanticStatus.isEmpty()
                            ? QVariant(newCheck.semanticStatus) : QVariant());
-        if (!q.exec()) return false;
+        if (!q.exec()) return fail("db_error");
     }
     {
         // 到期回顾是原地更新同一行，旧想法会被覆盖；这里把"决策前/后"快照留成流水，
@@ -1206,19 +1208,20 @@ bool MemoryManager::finishConcernReview(qlonglong turn,int version,const QJsonOb
         rev.addBindValue(beforeNote);
         rev.addBindValue((rejectedContact || contactTiming.isEmpty()) ? QVariant() : QVariant(contactTiming));
         rev.addBindValue(turn);
-        if (!rev.exec()) return false;
+        if (!rev.exec()) return fail("db_error");
     }
-    if (!m_db.commit()) return false;
+    if (!m_db.commit()) return fail("db_error");
     rollback.dismiss();
     qInfo()<<"[Concern] review committed turn="<<turn<<"version="<<version<<"action="<<revisionAction;
-    return true;
+    return {{}, contactRejection};
 }
 
 bool MemoryManager::deferConcernReview(qlonglong turn,int version,const QString &reason)
 {
     QSqlQuery q(m_db);
-    q.prepare("UPDATE private_reflection SET state='deferred',eligible_at=unixepoch(),updated_at=unixepoch() "
-              "WHERE turn_id=? AND version=? AND state='pending'");
+    q.prepare("UPDATE private_reflection SET state='consider',claimed_by=NULL,next_check_at=unixepoch(),"
+              "eligible_at=unixepoch(),updated_at=unixepoch() "
+              "WHERE turn_id=? AND version=? AND state='pending' AND claimed_by='due'");
     q.addBindValue(turn);
     q.addBindValue(version);
     const bool saved=q.exec() && q.numRowsAffected()==1;

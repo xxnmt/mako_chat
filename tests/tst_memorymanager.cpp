@@ -763,6 +763,63 @@ class TestMemoryManager : public QObject
     Q_OBJECT
 
 private slots:
+    void malformedReviewCommit_defersUntilEligible_data()
+    {
+        QTest::addColumn<bool>("concern");
+        QTest::newRow("reflection") << false;
+        QTest::newRow("concern") << true;
+    }
+
+    void malformedReviewCommit_defersUntilEligible()
+    {
+        QFETCH(bool, concern);
+        ProactiveIdentityGuard config;
+        QVERIFY(config.writeIdentity(R"({"proactive":{"enabled":true,"private_writing":true}})"));
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const auto path = dir.filePath("commit-backoff.db");
+        MemoryManager db(path);
+        const auto turn = concern
+            ? seedOpenConcern(db, concernTurnMeta("commit-concern"), QStringLiteral("窗台有雨声"), QStringLiteral("Concern note"))
+            : seedReflectionSource(db, QStringLiteral("commit-reflection"));
+        QVERIFY(turn > 0);
+        if (concern) {
+            RawDb clock(path,"first-due");
+            QVERIFY(clock.open());
+            QVERIFY(clock.exec("UPDATE private_reflection SET next_check_at=unixepoch()-1"));
+            QVERIFY(rewindReviewCooldown(path,"first-cooldown"));
+        }
+        PrivateReview review(db);
+        QSignalSpy requests(&review, &PrivateReview::requested);
+        const QString kind = concern ? QStringLiteral("concern") : QStringLiteral("reflection");
+        QCOMPARE(review.wake(12,0).kind, kind);
+        QCOMPARE(requests.size(), 1);
+        const auto first = requests.first();
+        auto malformed = originProposal(first.at(2).toJsonObject());
+        malformed[concern ? "concern_action" : "choice"] = QStringLiteral("invalid");
+        const auto id = first.at(0).toLongLong();
+        const auto version = first.at(1).toInt();
+        review.receive(id,version,malformed,{});
+        QVERIFY(deferredSeconds(path,turn,"commit-delayed") > 0);
+        const auto ref = QStringLiteral("%1/%2").arg(kind).arg(turn);
+        const auto failure = db.reviewFailure(kind,ref);
+        QCOMPARE(failure.value("last_reason").toString(), QStringLiteral("invalid_internal_structure"));
+        QCOMPARE(failure.value("consecutive_failures").toInt(), 1);
+        QVERIFY(!review.wake(12,0).started);
+        QVERIFY(advanceReviewClock(path,"commit-elapsed",180));
+        QCOMPARE(review.wake(12,0).kind, kind);
+        QCOMPARE(requests.size(), 2);
+        review.receive(id,version,malformed,{});
+        QCOMPARE(db.reviewFailure(kind,ref).value("consecutive_failures").toInt(), 1);
+        const auto next = requests.last();
+        auto valid = originProposal(next.at(2).toJsonObject());
+        valid[concern ? "concern_action" : "choice"] = concern ? "contact" : "rest";
+        if (concern) valid["contact"] = QJsonObject{{"timing","invalid"}};
+        review.receive(next.at(0).toLongLong(),next.at(1).toInt(),valid,{});
+        QVERIFY(db.reviewFailure(kind,ref).isEmpty());
+        QVERIFY(!db.hasProposedContact(turn,next.at(1).toInt()));
+    }
+
     void reflectionCommitReportsFailureAndIsolatesContact()
     {
         ProactiveIdentityGuard config;

@@ -25,12 +25,6 @@ struct BlindZone {
     QString sessionId;
 };
 
-// 主动对话调度项（Phase 2 使用）
-struct ScheduleItem {
-    QString at;      // "07:30" 固定时刻
-    QString type;    // "fixed" | "random"（random=在窗口内随机）
-};
-
 // 主动对话/私下写作配置：enabled 控制主动联系/分享，privateWriting 控制后台写作/回顾。
 struct ProactiveConfig {
     bool enabled = false;
@@ -42,7 +36,6 @@ struct ProactiveConfig {
     QString quietStart = "23:00";            // 免打扰时段
     QString quietEnd = "08:00";
     int idleSeconds = 1800;                  // 闲聊冷却（自上次对话起）
-    QList<ScheduleItem> schedule;            // 定时主动
     // 执行端约束：主动联系额度与关注（concern）的到期策略。
     int contactDailyLimit = 3;               // 每日"现在联系"投递上限；0=不限制
     int concernDefaultCheckMinutes = 720;    // 关注默认多久后再考虑；0=只在新证据时
@@ -69,6 +62,11 @@ struct SemanticVerifierConfig {
 // enabled=false 时不创建唤醒，daily_limit=0 时连 OpenWake 一起停掉（由协调器门控）。
 // 所有整数字段在 ConfigManager 里夹紧，运行期不再二次判断。
 struct OpenWakeConfig {
+    static constexpr int minDelaySeconds = 60;
+    static constexpr int minFollowupSeconds = 300;
+    static constexpr int maxDelaySeconds = 86400;
+    static constexpr int maxDailyLimit = 96;
+
     bool enabled = false;             // cognition.open_wake.enabled
     bool allowContact = false;        // 本片仅解析，运行时不产生 contact
     int initialDelaySeconds = 900;    // 首次调度延迟（60..86400）
@@ -78,6 +76,13 @@ struct OpenWakeConfig {
     int maxNonOpenJobsWhenDue = 3;    // 到期后先让出的普通回顾次数（0..20）
     int maxModelStepsPerWake = 3;     // 单次唤醒模型步数上限（1..8；本片用于日志/常量）
     int maxPerDay = 12;               // OpenWake 独立每日上限（0..96）
+    static int effectiveDailyCap(int sharedDailyLimit, int wakeDailyLimit, int sharePercent)
+    {
+        if (sharedDailyLimit <= 0 || wakeDailyLimit <= 0) return 0;
+        const int share = qMax(1, int(qint64(sharedDailyLimit) * qBound(0, sharePercent, 100) / 100));
+        return qMin(wakeDailyLimit, qMin(sharedDailyLimit, share));
+    }
+
     int sharedBudgetPercent = 30;     // 共享回顾每日预算占比（1..100）
 };
 
