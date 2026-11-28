@@ -20,12 +20,6 @@ enum class MemoryTimeTarget {
 QString memoryTimeTargetToString(MemoryTimeTarget target);
 MemoryTimeTarget memoryTimeTargetFromString(const QString &value);
 
-struct PlannerTurn {
-    QString role;       // user / assistant
-    QDateTime timestamp;
-    QString text;
-};
-
 // Planner 输出的一个独立回忆目标。timeExpression 是原始表达，
 // 不允许 Planner 直接给 from/to。
 struct MemoryRecallNeed {

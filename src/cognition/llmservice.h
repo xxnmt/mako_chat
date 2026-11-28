@@ -23,7 +23,6 @@
 #include "memoryretrievalworker.h"
 
 class MemoryManager;
-class MemoryAgent;
 
 class LLMService : public QObject
 {
@@ -150,9 +149,6 @@ private slots:
     void onReplyFinished(QNetworkReply* reply);
     //extract
     // void onExtractReplyFinished(QNetworkReply* reply);
-    // PR-4: MemoryAgent 完成/失败后继续主回复或回退 top-k
-    void onMemoryAgentFinished(const MemoryAgentResult &result);
-    void onMemoryAgentFailed(const QString &reason, const QString &requestId);
 
 private:
     QJsonArray observationHistory(const QString &subject, const QString &channel, const QString &session,
@@ -177,8 +173,6 @@ private:
     void generateWithMatters(const QJsonObject &records);
     void sendSafeRetry();
     void sendEmptyReplyRetry();
-    void sendPendingReply(const QJsonObject &agentMessage = QJsonObject(),
-                          bool partial = false);
     quint64 m_reviewGeneration = 0;
     void generatePrivateReview(qlonglong id, int version, const QJsonObject &thread);
     // 切片 C：私人回顾输出 contact.motivation/claims 后的验证链。
@@ -261,7 +255,6 @@ private:
     std::function<QString()> m_stateProvider;
 
     MemoryManager *m_memoryManager = nullptr;
-    MemoryAgent *m_memoryAgent = nullptr;
     std::unique_ptr<MemoryRetrievalService> m_retrievalService;
     struct ForegroundRun {
         RequestMeta meta;
@@ -302,9 +295,7 @@ private:
     bool m_cognitiveContextActualOverride = false;
     int m_modelRequestCount = 0;
     void patchLastActualPromptTokens(const QJsonObject &usage);
-    QJsonArray m_pendingMessages; // legacy：等待 MemoryAgent 的主请求
     quint64 m_agentGeneration = 0;
-    bool m_agentPending = false;
 
     // tool 模式：同一个主模型、同一份消息历史，工具结果只追加到会话。
     QJsonArray m_toolMessages;

@@ -402,35 +402,6 @@ private slots:
         QVERIFY2(plan.permissions, "关闭跨渠道权限必须走权限撤回");
     }
 
-    void legacyPlannerFieldsShowModeValidity()
-    {
-        auto &config = ConfigManager::instance();
-        QVERIFY(config.writeConfigDocument(QStringLiteral("setting.json"),
-            R"({"memory":{"agent_enabled":true,"agent_mode":"tool","agent_plan_v2":true,"agent_trigger":"memory_question"}})",
-            nullptr));
-        QWidget host;
-        auto *root = buildSettingsPages(new QLabel("History"), [] {}, &host);
-        auto *search = root->findChild<QLineEdit *>("settingsSearch");
-        search->setText(QStringLiteral("memory.agent_mode"));
-        auto *status = root->findChild<QLabel *>("memory.agent_mode.status");
-        QVERIFY(status);
-        QVERIFY2(status->text().contains(QStringLiteral("模型工具")), qPrintable(status->text()));
-        auto *mode = root->findChild<QComboBox *>("memory.agent_mode");
-        QVERIFY(mode);
-        mode->setCurrentIndex(mode->findData(QStringLiteral("legacy")));
-        auto *stack = root->findChild<QStackedWidget *>();
-        auto *apply = stack->currentWidget()->findChild<QPushButton *>("applySettings");
-        QVERIFY(apply);
-        apply->click();
-        QCOMPARE(config.getMemoryPolicyConfig().agent.mode,
-                 QStringLiteral("legacy"));
-        auto *root2 = buildSettingsPages(new QLabel("History"), [] {}, &host);
-        root2->findChild<QLineEdit *>("settingsSearch")->setText(QStringLiteral("memory.agent_mode"));
-        auto *status2 = root2->findChild<QLabel *>("memory.agent_mode.status");
-        QVERIFY(status2 && status2->text().contains(QStringLiteral("独立规划")));
-        QVERIFY(root2->findChild<QWidget *>("memory.agent_plan_v2"));
-    }
-
     void noChangeSaveDoesNotApplyOrRewrite()
     {
         auto &config = ConfigManager::instance();

@@ -70,11 +70,12 @@ private:
 
 void serveCompletions(QTcpServer &server,QList<QByteArray> &bodies,std::function<QString(int)> respond,
                       std::function<QString(int)> finish=[](int){return QString("stop");},
-                      std::function<QJsonObject(int)> usage=[](int){return QJsonObject{};})
+                      std::function<QJsonObject(int)> usage=[](int){return QJsonObject{};},
+                      bool nativeRecall = false)
 {
-    QObject::connect(&server,&QTcpServer::newConnection,&server,[&server,&bodies,respond,finish,usage] {
+    QObject::connect(&server,&QTcpServer::newConnection,&server,[&server,&bodies,respond,finish,usage,nativeRecall] {
         auto *socket = server.nextPendingConnection();
-        QObject::connect(socket,&QTcpSocket::readyRead,socket,[socket,&bodies,respond,finish,usage] {
+        QObject::connect(socket,&QTcpSocket::readyRead,socket,[socket,&bodies,respond,finish,usage,nativeRecall] {
             const auto bytes = socket->peek(socket->bytesAvailable());
             const auto header = bytes.indexOf("\r\n\r\n");
             if (header < 0)
@@ -87,6 +88,11 @@ void serveCompletions(QTcpServer &server,QList<QByteArray> &bodies,std::function
             bodies.append(bytes.mid(header+4));
             const QString answer = respond(bodies.size());
             QJsonObject msg{{"finish_reason",finish(bodies.size())},{"message",QJsonObject{{"content",answer}}}};
+            if (nativeRecall && finish(bodies.size()) == "tool_calls") {
+                const QJsonObject call{{"id",QString("call_%1").arg(bodies.size())},{"type","function"},
+                    {"function",QJsonObject{{"name","memory_recall"},{"arguments",answer}}}};
+                msg["message"] = QJsonObject{{"role","assistant"},{"tool_calls",QJsonArray{call}}};
+            }
             QJsonObject envelope{{"choices",QJsonArray{msg}}};
             // R12-2c-final-1：可选 usage（prompt/completion/reasoning tokens），用于验证
             // verifier 完成诊断日志字段；缺省不改变既有 mock 行为。
@@ -2004,22 +2010,21 @@ private slots:
         model.setCognitiveContextActualEnabled(true);
         QSignalSpy spoken(&model, &LLMService::sentencesReady);
         QSignalSpy failed(&model, &LLMService::replyAbnormal);
-        model.askDeepSeek(QStringLiteral("我们上周说到去哪了吗"), history, meta);
+        model.askDeepSeek(QStringLiteral("可以把我上周那次出游的原话找出来吗？我想核对自己当时的说法。"), {}, meta);
         QTRY_VERIFY_WITH_TIMEOUT(spoken.size() + failed.size() > 0, 90000);
         const auto report = model.lastCognitiveShadowReport();
         QCOMPARE(report.value(QStringLiteral("actual_mode")).toBool(), true);
         QVERIFY(report.value(QStringLiteral("projection")).toObject()
                     .value(QStringLiteral("prompt_tokens")).toInt() > 0);
-        bool toolRound = false;
+        int toolResults = 0;
         for (const auto &value : model.lastRequestMessages()) {
-            const QString content = value.toObject().value(QStringLiteral("content")).toString();
-            if (content.contains(QStringLiteral("MEMORY_AGENT_DATA"))
-                || content.contains(QStringLiteral("memory_recall"))) {
-                toolRound = true;
-            }
+            const auto msg = value.toObject();
+            if (msg["role"] == "tool" && msg["name"] == "memory_recall"
+                && !msg["tool_call_id"].toString().isEmpty())
+                ++toolResults;
         }
-        qInfo() << "[R12-3b] real tool round observed:" << toolRound
-                << "requests=" << model.modelRequestCount();
+        qInfo() << "[C2] actual native recall results:" << toolResults;
+        QVERIFY2(toolResults > 0, "No native recall result was observed for this historical lookup.");
         if (!failed.isEmpty()) {
             QVERIFY2(failed.first().at(0).toString() != QStringLiteral("network_error"),
                      "real tool path must not fail on network");
@@ -5954,20 +5959,6 @@ private slots:
     void initTestCase()
     {
         qRegisterMetaType<MemoryAgentResult>("MemoryAgentResult");
-        qRegisterMetaType<MemoryAgentAudit>("MemoryAgentAudit");
-    }
-
-    void toolDefinitionsDoNotExposeScope()
-    {
-        const QString text = QString::fromUtf8(
-            QJsonDocument(MemoryAgentTools::toolDefinitions())
-                .toJson(QJsonDocument::Compact));
-        QVERIFY(text.contains(QStringLiteral("memory_search")));
-        QVERIFY(text.contains(QStringLiteral("memory_read")));
-        QVERIFY(text.contains(QStringLiteral("memory_related")));
-        QVERIFY(!text.contains(QStringLiteral("viewer")));
-        QVERIFY(!text.contains(QStringLiteral("allowed_groups")));
-        QVERIFY(!text.contains(QStringLiteral("session_id")));
     }
 
     void searchReadAndRejectUnknownHandle()
@@ -6512,72 +6503,6 @@ private slots:
         QVERIFY(result.items.first().id.startsWith(QStringLiteral("item:")));
     }
 
-    void agentUsesNeedsPlanAndRecentContext()
-    {
-        QTemporaryDir dir;
-        QVERIFY(dir.isValid());
-        MemoryManager mm(dir.filePath("agent_plan_mode.db"));
-        mm.seedIdentity({QStringLiteral("20001")});
-        const QDateTime now = QDateTime::currentDateTime();
-        const QString groupId = QStringLiteral("30011");
-        const qlonglong interactionId = makeInteractionAt(
-            mm, groupId, now.addSecs(-60), QStringLiteral("火锅约定"),
-            QStringLiteral("20001"), QStringLiteral("主人"));
-        QVERIFY(interactionId > 0);
-        QVERIFY(mm.saveInteractionSummary(
-            interactionId, QStringLiteral("主人提到火锅约定"), QStringLiteral("ready")));
-
-        MemoryAgentScope scope = ownerGroupScope(groupId, now);
-        scope.timezone = QStringLiteral("Asia/Shanghai");
-        PlannerTurn turn;
-        turn.role = QStringLiteral("user");
-        turn.timestamp = now.addSecs(-120);
-        turn.text = QStringLiteral("之前说火锅什么");
-        scope.recentTurns = {turn};
-
-        MemoryAgent agent;
-        agent.setMemoryManager(&mm);
-        QJsonArray capturedMessages;
-        agent.setPlannerTransport(
-            [&capturedMessages](const QJsonArray &messages,
-                                MemoryAgent::PlannerCallback callback) {
-                capturedMessages = messages;
-                const QJsonObject response{
-                    {QStringLiteral("needs"),
-                     QJsonArray{QJsonObject{
-                         {QStringLiteral("id"), QStringLiteral("need-1")},
-                         {QStringLiteral("query"), QStringLiteral("火锅")},
-                         {QStringLiteral("kinds"),
-                          QJsonArray{QStringLiteral("summary")}},
-                         {QStringLiteral("source_hint"),
-                          QStringLiteral("current_group")}}}}};
-                QTimer::singleShot(0, [callback, response]() {
-                    callback(true, response, QString());
-                });
-            });
-
-        QSignalSpy finishedSpy(&agent, &MemoryAgent::finished);
-        QSignalSpy failedSpy(&agent, &MemoryAgent::failed);
-        agent.start(scope, QStringLiteral("我们之前说火锅什么"));
-        QTRY_COMPARE_WITH_TIMEOUT(finishedSpy.count(), 1, 3000);
-        QCOMPARE(failedSpy.count(), 0);
-        const MemoryAgentResult result =
-            finishedSpy.first().first().value<MemoryAgentResult>();
-        QVERIFY(!result.items.isEmpty());
-        QCOMPARE(result.needs.size(), 1);
-        QCOMPARE(result.needs.first().status, QStringLiteral("success"));
-        QString plannerInput;
-        for (const QJsonValue &message : capturedMessages) {
-            plannerInput += message.toObject()
-                                .value(QStringLiteral("content"))
-                                .toString();
-        }
-        QVERIFY(plannerInput.contains(QStringLiteral("recent_turns")));
-        QVERIFY(plannerInput.contains(QStringLiteral("之前说火锅什么")));
-        QVERIFY(plannerInput.contains(QStringLiteral("current_time")));
-        QVERIFY(plannerInput.contains(QStringLiteral("memory_capabilities")));
-    }
-
     void toolSearchKeepsAssistantExpression()
     {
         QTemporaryDir dir;
@@ -6788,6 +6713,63 @@ private slots:
         QVERIFY(!result.evidence.isEmpty());
     }
 
+    void foregroundRecallContinuations_data()
+    {
+        QTest::addColumn<QString>("protocol");
+        QTest::newRow("legacy-setting-native") << QStringLiteral("native");
+        QTest::newRow("legacy-setting-envelope") << QStringLiteral("json_envelope");
+    }
+
+    void foregroundRecallContinuations()
+    {
+        QFETCH(QString, protocol);
+        SemanticReviewConfigGuard guard;
+        QVERIFY(guard.enable());
+        const QJsonObject memory{{"agent_mode","legacy"},{"agent_protocol",protocol}};
+        QVERIFY(ConfigManager::instance().writeConfigDocument("setting.json",
+            QJsonDocument(QJsonObject{{"memory",memory}}).toJson(), nullptr));
+        QTemporaryDir dir;
+        MemoryManager db(dir.filePath("history.db"));
+        RequestMeta meta;
+        meta.channel = Channel::kPet;
+        meta.sessionId = Channel::kDefaultSession;
+        meta.subject = "user";
+        meta.eventId = meta.runId = "synthetic";
+        QVERIFY(db.saveQATurn("野餐集合点叫蓝桥，备用地点叫白塔。","{}",{},meta));
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        QList<QByteArray> bodies;
+        const bool native = protocol == "native";
+        serveCompletions(server,bodies,[native](int n) {
+            if (n > 2) return QStringLiteral(R"({"sentences":[{"zh_text":"蓝桥和白塔","ja_text":"はい","tags":{"emotion":"happy"}}]})");
+            QJsonObject args{{"needs",QJsonArray{QJsonObject{{"id","place"},
+                {"query",n == 1 ? "集合点" : "备用地点"},{"kinds",QJsonArray{"chat_history"}}}}}};
+            if (!native) args["action"] = "recall";
+            return QString::fromUtf8(QJsonDocument(args).toJson(QJsonDocument::Compact));
+        },[native](int n){return QString(native && n <= 2 ? "tool_calls" : "stop");},
+          [](int){return QJsonObject{};}, native);
+        LLMService model("test",nullptr,QUrl(QString("http://127.0.0.1:%1/").arg(server.serverPort())));
+        model.setMemoryManager(&db);
+        QSignalSpy spoken(&model,&LLMService::sentencesReady);
+        model.askDeepSeek("那次碰面约在哪里，下雨又去哪里？",{},meta);
+        QTRY_COMPARE_WITH_TIMEOUT(spoken.size(),1,8000);
+        QCOMPARE(bodies.size(),3);
+        const auto first = QJsonDocument::fromJson(bodies.first()).object();
+        if (native) QCOMPARE(first["tool_choice"].toString(),QString("auto"));
+        for (int n=1; n<=2; ++n) {
+            int results = 0;
+            for (const auto &value : QJsonDocument::fromJson(bodies.at(n)).object()["messages"].toArray()) {
+                const auto msg = value.toObject();
+                const auto content = msg["content"].toString();
+                if (native ? msg["role"] == "tool" : content.startsWith("【MEMORY_AGENT_DATA】")) {
+                    QVERIFY2(content.contains("蓝桥"),qPrintable(content));
+                    ++results;
+                }
+            }
+            QCOMPARE(results,n);
+        }
+    }
+
     void toolGateDoesNotReadUserText()
     {
         MemoryAgentConfig config;
@@ -6795,27 +6777,20 @@ private slots:
         group.channel = Channel::kQQGroup;
         group.sessionId = QStringLiteral("30003");
         group.turnKind = QStringLiteral("reply");
-        QVERIFY(MemoryAgentPlanner::canExposeTools(group, config));
-        // tool 模式下旧关键词门控必须失效；是否调用由主模型决定。
-        QVERIFY(!MemoryAgentPlanner::shouldRun(
-            group, QStringLiteral("你还记得昨天吗"), config));
+        QVERIFY(MemoryAgentTools::canExposeTools(group, config));
 
         RequestMeta pet;
         pet.channel = Channel::kPet;
         pet.turnKind = QStringLiteral("reply");
-        QVERIFY(MemoryAgentPlanner::canExposeTools(pet, config));
+        QVERIFY(MemoryAgentTools::canExposeTools(pet, config));
 
         RequestMeta proactive;
         proactive.channel = Channel::kQQPrivate;
         proactive.turnKind = QStringLiteral("proactive");
-        QVERIFY(!MemoryAgentPlanner::canExposeTools(proactive, config));
+        QVERIFY(!MemoryAgentTools::canExposeTools(proactive, config));
 
-        config.mode = QStringLiteral("legacy");
-        QVERIFY(!MemoryAgentPlanner::canExposeTools(group, config));
-
-        config.mode = QStringLiteral("tool");
         config.enabled = false;
-        QVERIFY(!MemoryAgentPlanner::canExposeTools(group, config));
+        QVERIFY(!MemoryAgentTools::canExposeTools(group, config));
     }
 
     void recallToolRejectsScopeFieldsAndKeepsPerNeedStatus()
@@ -7448,160 +7423,6 @@ private slots:
         QCOMPARE(plan.needs.first().timeFrame.festival, QStringLiteral("七夕"));
     }
 
-    void plannerOnlyRunsForQQMemoryQuestions()
-    {
-        MemoryAgentConfig config;
-        config.mode = QStringLiteral("legacy");
-        RequestMeta group;
-        group.channel = Channel::kQQGroup;
-        group.sessionId = QStringLiteral("30003");
-        group.turnKind = QStringLiteral("reply");
-
-        QVERIFY(MemoryAgentPlanner::shouldRun(
-            group, QStringLiteral("你还记得我们之前聊过什么吗"), config));
-        QVERIFY(!MemoryAgentPlanner::shouldRun(
-            group, QStringLiteral("今天天气不错"), config));
-
-        RequestMeta pet;
-        pet.channel = Channel::kPet;
-        QVERIFY(!MemoryAgentPlanner::shouldRun(
-            pet, QStringLiteral("你记得上次吗"), config));
-
-        config.trigger = QStringLiteral("always");
-        QVERIFY(MemoryAgentPlanner::shouldRun(group, QStringLiteral("随便聊聊"),
-                                              config));
-        config.enabled = false;
-        QVERIFY(!MemoryAgentPlanner::shouldRun(group, QStringLiteral("你记得吗"),
-                                               config));
-    }
-
-    void timeoutKeepsPartialResults()
-    {
-        QTemporaryDir dir;
-        QVERIFY(dir.isValid());
-        MemoryManager mm(dir.filePath("agent_partial.db"));
-        mm.seedIdentity({QStringLiteral("20001")});
-        const QDateTime now = QDateTime::currentDateTime();
-        QVERIFY(mm.appendRawEvent(QStringLiteral("qq"), Channel::kQQGroup,
-                                  QStringLiteral("30006"), QStringLiteral("message"),
-                                  QStringLiteral("火锅约定"), QStringLiteral("p-1"),
-                                  QStringLiteral("in"), QStringLiteral("20001"),
-                                  QStringLiteral("主人"), QString(),
-                                  now.addSecs(-60)));
-
-        MemoryAgent agent;
-        agent.setMemoryManager(&mm);
-        MemoryAgentScope scope = ownerGroupScope(QStringLiteral("30006"), now);
-        scope.timeoutMs = 100;
-        int calls = 0;
-        agent.setPlannerTransport(
-            [&calls](const QJsonArray &, MemoryAgent::PlannerCallback callback) {
-                ++calls;
-                if (calls == 1) {
-                    const QJsonObject response{
-                        {QStringLiteral("tool_calls"),
-                         QJsonArray{QJsonObject{
-                             {QStringLiteral("name"), QStringLiteral("memory_search")},
-                             {QStringLiteral("arguments"), QJsonObject{
-                                  {QStringLiteral("query"), QStringLiteral("火锅")},
-                                  {QStringLiteral("limit"), 5}}}}}}};
-                    QTimer::singleShot(0, [callback, response]() {
-                        callback(true, response, QString());
-                    });
-                }
-                // 第二轮不回调，触发 partial timeout。
-            });
-
-        QSignalSpy finishedSpy(&agent, &MemoryAgent::finished);
-        QSignalSpy failedSpy(&agent, &MemoryAgent::failed);
-        agent.start(scope, QStringLiteral("记得火锅吗"));
-        QTRY_COMPARE_WITH_TIMEOUT(finishedSpy.count(), 1, 2000);
-        QCOMPARE(failedSpy.count(), 0);
-        const MemoryAgentResult result =
-            finishedSpy.first().first().value<MemoryAgentResult>();
-        QCOMPARE(result.status, QStringLiteral("timeout"));
-        QVERIFY(!result.items.isEmpty());
-    }
-
-    void agentLoopFinishesAndTimeoutFallsBack()
-    {
-        QTemporaryDir dir;
-        QVERIFY(dir.isValid());
-        MemoryManager mm(dir.filePath("agent_loop.db"));
-        mm.seedIdentity({QStringLiteral("20001")});
-        const QDateTime now = QDateTime::currentDateTime();
-        QVERIFY(mm.appendRawEvent(QStringLiteral("qq"), Channel::kQQGroup,
-                                  QStringLiteral("30004"), QStringLiteral("message"),
-                                  QStringLiteral("火锅约定"), QStringLiteral("l-1"),
-                                  QStringLiteral("in"), QStringLiteral("20001"),
-                                  QStringLiteral("主人"), QString(),
-                                  now.addSecs(-60)));
-
-        MemoryAgentScope scope = ownerGroupScope(QStringLiteral("30004"), now);
-        MemoryAgent agent;
-        agent.setMemoryManager(&mm);
-        agent.setApiKey(QStringLiteral("test-key"));
-        int calls = 0;
-        agent.setPlannerTransport(
-            [&calls](const QJsonArray &, MemoryAgent::PlannerCallback callback) {
-                ++calls;
-                const QJsonObject response = calls == 1
-                    ? QJsonObject{{QStringLiteral("tool_calls"),
-                                   QJsonArray{QJsonObject{
-                                       {QStringLiteral("name"), QStringLiteral("memory_search")},
-                                       {QStringLiteral("arguments"), QJsonObject{
-                                            {QStringLiteral("query"), QStringLiteral("火锅")},
-                                            {QStringLiteral("limit"), 5}}}}}}}
-                    : QJsonObject{{QStringLiteral("done"), true}};
-                QTimer::singleShot(0, [callback, response]() {
-                    callback(true, response, QString());
-                });
-            });
-
-        QSignalSpy finishedSpy(&agent, &MemoryAgent::finished);
-        QSignalSpy failedSpy(&agent, &MemoryAgent::failed);
-        agent.start(scope, QStringLiteral("我们之前说火锅什么"));
-        QTRY_COMPARE_WITH_TIMEOUT(finishedSpy.count(), 1, 3000);
-        QCOMPARE(failedSpy.count(), 0);
-        const MemoryAgentResult result =
-            finishedSpy.first().first().value<MemoryAgentResult>();
-        QVERIFY(!result.items.isEmpty());
-        QVERIFY(agent.metrics().totalRuns >= 1);
-        QVERIFY(agent.metrics().p95() >= 0);
-        QVERIFY(!agent.auditTrail().isEmpty());
-        bool sawSearchAudit = false;
-        for (const MemoryAgentAudit &audit : agent.auditTrail()) {
-            QVERIFY(!audit.argsHash.contains(QStringLiteral("火锅")));
-            if (audit.tool == QStringLiteral("memory_search")) {
-                sawSearchAudit = true;
-                QVERIFY(audit.queryLength > 0);
-                QVERIFY(audit.resultCount >= 1);
-            }
-        }
-        QVERIFY(sawSearchAudit);
-
-        MemoryAgentMetrics metrics;
-        for (int i = 1; i <= 100; ++i) {
-            metrics.recordRun(true, false, i);
-        }
-        QCOMPARE(metrics.p50(), 50);
-        QCOMPARE(metrics.p95(), 95);
-
-        MemoryAgent timeoutAgent;
-        timeoutAgent.setMemoryManager(&mm);
-        MemoryAgentScope timeoutScope = ownerGroupScope(QStringLiteral("30004"), now);
-        timeoutScope.timeoutMs = 50;
-        timeoutAgent.setPlannerTransport(
-            [](const QJsonArray &, MemoryAgent::PlannerCallback) {
-                // 故意不回调，触发 deadline。
-            });
-        QSignalSpy timeoutFailed(&timeoutAgent, &MemoryAgent::failed);
-        timeoutAgent.start(timeoutScope, QStringLiteral("还记得什么"));
-        QTRY_COMPARE_WITH_TIMEOUT(timeoutFailed.count(), 1, 2000);
-        QVERIFY(timeoutAgent.metrics().timeoutRuns >= 1);
-    }
-    // R12-1b 补充：ActivityReview 输出协议与前台 sentences JSON 分离；最终 schema 明确，
-    // 回顾专用字段（成果/分享）出现，前台能力清单/句子标签协议不进入回顾请求。
     void activityReviewProtocolSeparatedFromForeground()
     {
         SemanticReviewConfigGuard guard;

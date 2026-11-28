@@ -14,7 +14,7 @@
 #include "recentcontext.h"
 
 // MemoryAgent 的服务端作用域。所有字段由 LLMService 在服务端构建；
-// Planner 只能提供 query/kinds/source_hint/time.expression，不能覆盖
+// 主模型只能提供 query/kinds/source_hint/time.expression，不能覆盖
 // viewer/owner/location/allowed_groups。
 struct MemoryAgentScope {
     QString requestId;
@@ -28,10 +28,9 @@ struct MemoryAgentScope {
     int maxResults = 8;
     int timeoutMs = 6000;
     int maxRounds = 2;
-    bool planV2 = true;
     // 仅对 Owner QQ 私聊生效：允许读取自己的 pet/private 记忆。
     bool ownerCrossChannelPrivate = false;
-    // tool 模式下有 time 的 need 必须提供结构化 frame；legacy 不强制。
+    // tool 模式下有 time 的 need 必须提供结构化 frame。
     bool requireTimeFrame = false;
     // 仅用于审计/回复边界，不包含敏感 ID。
     QString accessScope;
@@ -39,7 +38,6 @@ struct MemoryAgentScope {
     QDateTime referenceTime;
     QDateTime now() const { return referenceTime.isValid() ? referenceTime : QDateTime::currentDateTime(); }
     QString timezone;
-    QList<PlannerTurn> recentTurns;
     MemoryAccessContext access;
     RecentContextQuery recentQueryTemplate;
 };
@@ -78,59 +76,7 @@ struct MemoryAgentResult {
     QString status;
 };
 
-struct MemoryAgentAudit {
-    QString requestId;
-    QString channel;
-    QString tool;
-    QString argsHash;           // 参数摘要，不存 query 原文
-    int queryLength = 0;
-    int resultCount = 0;
-    int latencyMs = 0;
-    QString status;             // ok / denied / invalid_arguments / error / timeout
-};
-
-struct MemoryAgentMetrics {
-    int totalRuns = 0;
-    int okRuns = 0;
-    int failedRuns = 0;
-    int timeoutRuns = 0;
-    int deniedTools = 0;
-    QVector<qint64> runLatenciesMs;
-
-    void recordRun(bool ok, bool timedOut, qint64 latencyMs)
-    {
-        ++totalRuns;
-        if (ok) {
-            ++okRuns;
-        } else {
-            ++failedRuns;
-        }
-        if (timedOut) {
-            ++timeoutRuns;
-        }
-        runLatenciesMs.append(latencyMs);
-        if (runLatenciesMs.size() > 200) {
-            runLatenciesMs.remove(0, runLatenciesMs.size() - 200);
-        }
-    }
-
-    qint64 percentile(int p) const
-    {
-        if (runLatenciesMs.isEmpty()) {
-            return 0;
-        }
-        QVector<qint64> sorted = runLatenciesMs;
-        std::sort(sorted.begin(), sorted.end());
-        const int index = qBound(0, (sorted.size() * p + 99) / 100 - 1,
-                                 sorted.size() - 1);
-        return sorted.at(index);
-    }
-
-    qint64 p50() const { return percentile(50); }
-    qint64 p95() const { return percentile(95); }
-};
 
 Q_DECLARE_METATYPE(MemoryAgentResult)
-Q_DECLARE_METATYPE(MemoryAgentAudit)
 
 #endif // MEMORYAGENTTYPES_H

@@ -103,7 +103,7 @@ long_term_summary.created_at == message_time
 - **只要 need 带 `time`，tool 路径就必须同时提供 `time.frame`**；只有 `expression` 时返回 `time_frame_required`，不再默认回退旧 Resolver；
 - `frame` 只接受受控字段，时区由服务端提供；
 - `absolute_date` 由模型复制、服务端校验，模型不计算日期；
-- `legacy` 路径仍可使用旧 Resolver，但那不是普通 tool 路径。
+- 主模型工具以服务端提供的参考时间解释结构化时间范围。
 
 ### 5.1 JSON Envelope 回退
 
@@ -235,14 +235,14 @@ source_kinds / scanned_count / result_count / latency_ms
 | key | 默认 | 说明 |
 |---|---|---|
 | `memory.agent_enabled` | `true` | 开关 |
-| `memory.agent_mode` | `tool` | `tool` / `legacy` |
+| `memory.agent_mode` | `tool` | C2 已退役，原始键兼容保留；旧模式通过主模型工具补查 |
 | `memory.agent_protocol` | `native` | `native` / `json_envelope` |
 | `memory.owner_cross_channel_private` | `false` | 仅 Owner 私聊读取自己的 pet/private |
 | `memory.agent_timeout_ms` | `6000` | 检索预算 |
 | `memory.agent_max_rounds` | `2` | 工具轮数 |
 | `memory.agent_max_results` | `8` | 单 need 结果上限 |
-| `memory.agent_plan_v2` | `true` | 仅 legacy |
-| `memory.agent_trigger` | `memory_question` | 仅 legacy |
+| `memory.agent_plan_v2` | `true` | C2 已退役，原始键兼容保留；旧模式通过主模型工具补查 |
+| `memory.agent_trigger` | `memory_question` | C2 已退役，原始键兼容保留；旧模式通过主模型工具补查 |
 
 ## 10. 验收集
 

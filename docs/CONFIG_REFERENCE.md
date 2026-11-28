@@ -41,10 +41,8 @@ app_data/config/identity.json
         "long_term_memory_enabled": true,
         "debug_full_logs": false,
         "agent_enabled": true,
-        "agent_mode": "tool",
         "agent_protocol": "native",
-        "owner_cross_channel_private": false,
-        "agent_trigger": "memory_question"
+        "owner_cross_channel_private": false
     },
     "time": {
         "night_start": "22:00",
@@ -135,11 +133,11 @@ app_data/config/identity.json
 | 字段 | 默认值 | 范围 | 说明 |
 |------|--------|------|------|
 | `agent_enabled` | `true` | bool | 是否允许 QQ 记忆检索；pet 永不进入 |
-| `agent_mode` | `"tool"` | `tool` / `legacy` | `tool`：主 Conversation Agent 自主调用 `memory_recall`；`legacy`：旧关键词门控 + 独立 Planner |
+| `agent_mode` | `"tool"` | `tool` / `legacy` | C2 已退役，原始键兼容保留；旧模式通过主模型工具补查 |
 | `agent_protocol` | `"native"` | `native` / `json_envelope` | 原生 DeepSeek tools，或 JSON 动作协议兜底 |
 | `owner_cross_channel_private` | `false` | bool | 主人在 Pet、QQ 私聊或群聊中补查本人私聊历史的工具开关。自动检索与当前认识按全局长期记忆、身份、敏感及盲区规则读取 |
-| `agent_plan_v2` | `true` | bool | 仅 legacy 路径：多 need Planner；false 回退旧 `tool_calls` |
-| `agent_trigger` | `"memory_question"` | `memory_question` / `always` | 仅 legacy 路径使用 |
+| `agent_plan_v2` | `true` | bool | C2 已退役，原始键兼容保留；旧模式通过主模型工具补查 |
+| `agent_trigger` | `"memory_question"` | `memory_question` / `always` | C2 已退役，原始键兼容保留；旧模式通过主模型工具补查 |
 | `agent_timeout_ms` | `6000` | 1000–15000 | 单次工具检索预算 |
 | `agent_max_rounds` | `2` | 1–4 | 主模型最多工具轮数 |
 | `agent_max_results` | `8` | 1–20 | 单个 need 的结果上限；执行器当前硬上限为 8 |
@@ -154,7 +152,7 @@ app_data/config/identity.json
 >
 > `mode=overview` 扫描完整时间段并返回 `coverage`、`buckets`、`handles`；默认 3 小时桶、最多 8 桶，服务端限幅。
 >
-> 时间：`time.expression + target + frame`。tool 路径只要带 `time` 就必须提供 `frame`，否则返回 `time_frame_required`；legacy 才走旧 Resolver。frame 支持 relative_day/week/month、absolute_date、festival、recent_window；公共节日在 `calendar/festivals.json`，不写 Resolver 关键词。`episodic.event_time` 不能冒充 message_time；long summary 的 `created_at` 不能冒充 message_time。`event_time` 无独立索引时保持 fallback；`fact_validity` 返回 `unsupported`。最大 31 天。
+> 时间：`time.expression + target + frame`。tool 路径只要带 `time` 就必须提供 `frame`，否则返回 `time_frame_required`。frame 支持 relative_day/week/month、absolute_date、festival、recent_window；公共节日在 `calendar/festivals.json`，不写 Resolver 关键词。`episodic.event_time` 不能冒充 message_time；long summary 的 `created_at` 不能冒充 message_time。`event_time` 无独立索引时保持 fallback；`fact_validity` 返回 `unsupported`。最大 31 天。
 
 ### 1.7 memory：隐私规则
 

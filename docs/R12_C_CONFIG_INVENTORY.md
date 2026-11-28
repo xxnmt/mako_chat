@@ -65,12 +65,12 @@
 
 | 设置 / 路径 | 文件 | 默认及类型范围 | 消费者 | 生效 | 条件与生命周期 |
 |---|---|---|---|---|---|
-| 启用补查工具 / `memory.agent_enabled` | setting.json | `true` / `bool` | LLMService（llmservice.cpp:714、1343、1697、4701、4896）、MemoryExecutor（memoryexecutor.cpp:104）、MemoryAgentPlanner（memoryagent.cpp:1094） | 下一轮 | 工具和 Planner 入口开关 |
-| 回忆方式 / `memory.agent_mode` | setting.json | `"tool"` / `choice:tool=模型工具\|legacy=独立规划` | LLMService（llmservice.cpp:714、1343、1697、4701、4896）、MemoryExecutor（memoryexecutor.cpp:104）、MemoryAgentPlanner（memoryagent.cpp:1094） | 下一轮 | 工具或独立 Planner |
-| 工具协议 / `memory.agent_protocol` | setting.json | `"native"` / `choice:native=原生调用\|json_envelope=JSON 信封` | LLMService（llmservice.cpp:714、1343、1697、4701、4896）、MemoryExecutor（memoryexecutor.cpp:104）、MemoryAgentPlanner（memoryagent.cpp:1094） | 下一轮 | 原生工具或 JSON 信封 |
-| 规划与定向检索预算（毫秒） / `memory.agent_timeout_ms` | setting.json | `6000` / `num:1000:15000` | LLMService 共享 scope（cognition/llmservice.cpp:1344）、MemoryAgentPlanner（memory/memoryagent.cpp:1039）、MemoryRecallTool → MemoryExecutor（memory/memoryrecalltool.cpp:386、memory/memoryexecutor.cpp:104） | 下一轮 | 旧 Planner 周期及共享定向执行器预算，概览独立 |
-| 最多工具轮数 / `memory.agent_max_rounds` | setting.json | `2` / `num:1:4` | LLMService（llmservice.cpp:714、1343、1697、4701、4896）、MemoryExecutor（memoryexecutor.cpp:104）、MemoryAgentPlanner（memoryagent.cpp:1094） | 下一轮 | 工具及规划轮数另受硬上限 |
-| 最多返回条数 / `memory.agent_max_results` | setting.json | `8` / `num:1:20` | LLMService（llmservice.cpp:714、1343、1697、4701、4896）、MemoryExecutor（memoryexecutor.cpp:104）、MemoryAgentPlanner（memoryagent.cpp:1094） | 下一轮 | 共享检索结果还会再夹紧 |
+| 启用补查工具 / `memory.agent_enabled` | setting.json | `true` / `bool` | MemoryAgentTools::canExposeTools | 下一轮 | 主模型补查权限 |
+| 回忆方式 / `memory.agent_mode` | setting.json | `"tool"` / `choice:tool=模型工具\|legacy=独立规划` | ConfigManager::loadSetting | 下一轮 | 历史键。legacy 加载时记录兼容诊断，使用主模型工具 |
+| 工具协议 / `memory.agent_protocol` | setting.json | `"native"` / `choice:native=原生调用\|json_envelope=JSON 信封` | LLMService::startMemoryToolPath | 下一轮 | 原生或 JSON 信封 |
+| 定向检索预算（毫秒） / `memory.agent_timeout_ms` | setting.json | `6000` / `num:1000:15000` | MemoryRecallTool::execute → MemoryExecutor | 下一轮 | 定向执行预算，概览独立 |
+| 最多工具轮数 / `memory.agent_max_rounds` | setting.json | `2` / `num:1:4` | LLMService 工具回调 | 下一轮 | 补查轮数另受共享查询预算限制 |
+| 最多返回条数 / `memory.agent_max_results` | setting.json | `8` / `num:1:20` | LLMService 构造 MemoryAgentScope → MemoryRecallTool | 下一轮 | 共享结果上限 |
 
 ### 连接
 
@@ -207,12 +207,12 @@
 | 重排端点 / `memory.retrieval.rerank_endpoint` | setting.json | `""` / `text` | LLMService::retrieveMemory（cognition/llmservice.cpp:391–400）、工具检索（memory/memoryagent.cpp:56–60） | 下一查询 | 显式端点优先且须开启重排 |
 | 重排模型 / `memory.retrieval.rerank_model` | setting.json | `"qwen3-rerank"` / `text` | LLMService::retrieveMemory（cognition/llmservice.cpp:391–400）、工具检索（memory/memoryagent.cpp:56–60） | 下一查询 | 仅实际请求时应用 |
 
-### 兼容性：Legacy Planner
+### 已退役的独立规划设置（保留 C1 索引）
 
 | 设置 / 路径 | 文件 | 默认及类型范围 | 消费者 | 生效 | 条件与生命周期 |
 |---|---|---|---|---|---|
-| 启用第二版检索规划 / `memory.agent_plan_v2` | setting.json | `true` / `bool` | LLMService（llmservice.cpp:714、1343、1697、4701、4896）、MemoryExecutor（memoryexecutor.cpp:104）、MemoryAgentPlanner（memoryagent.cpp:1094） | 下一轮 | 仅 legacy，V1/V2 |
-| 规划触发方式 / `memory.agent_trigger` | setting.json | `"memory_question"` / `choice:memory_question=回忆类问题\|always=每轮` | LLMService（llmservice.cpp:714、1343、1697、4701、4896）、MemoryExecutor（memoryexecutor.cpp:104）、MemoryAgentPlanner（memoryagent.cpp:1094） | 下一轮 | 仅 legacy，决定独立规划是否触发 |
+| 启用第二版检索规划 / `memory.agent_plan_v2` | setting.json | `true` / `bool` | 无运行消费者 | 下一轮 | 历史键，保留原值，退出设置界面 |
+| 规划触发方式 / `memory.agent_trigger` | setting.json | `"memory_question"` / `choice:memory_question=回忆类问题\|always=每轮` | 无运行消费者 | 下一轮 | 历史键，保留原值，退出设置界面 |
 
 ### 日志与诊断
 

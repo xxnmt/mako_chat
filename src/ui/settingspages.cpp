@@ -61,12 +61,9 @@ QString settingHelp(const Field &field)
         {"memory.retrieval.embedding_api_key_env", "未配置百炼密钥时，用此名称读取环境变量。填写的是变量名。"},
         {"memory.retrieval.embedding_endpoint", "可填写完整向量接口地址。留空时从百炼服务地址推导。"},
         {"memory.retrieval.rerank_endpoint", "可填写完整重排接口地址。留空时从百炼服务地址推导。"},
-        {"memory.agent_mode", "模型工具：对话模型决定何时调用记忆工具。独立规划：先单独规划检索，再把找到的材料交给对话模型。"},
         {"memory.agent_protocol", "原生调用使用模型的工具接口，JSON 信封通过结构化正文表达工具调用。"},
-        {"memory.agent_trigger", "回忆类问题：独立规划模式按回忆意图决定是否启动。每轮：独立规划模式在每轮都尝试规划。模型工具模式由模型按需发起。"},
-        {"memory.agent_plan_v2", "开启后，独立规划使用按查找目标组织的新版计划。关闭后使用旧版检索规划协议。"},
         {"memory.agent_max_rounds", "单轮对话允许的记忆补查轮数上限。前台仍受共享补查预算和重复调用限制。"},
-        {"memory.agent_timeout_ms", "独立 Planner 使用此值作为整轮期限，共享检索执行器也使用此值。模型工具的定向检索受此预算约束，概览走独立查询。它不是主模型请求或 HTTP 超时。"},
+        {"memory.agent_timeout_ms", "模型工具的定向检索受此预算约束，概览走独立查询。它不是主模型请求或 HTTP 超时。"},
         {"memory.agent_max_results", "记忆补查返回的结果数量限制。详细内容可按工具支持的方式进一步核对。"},
         {"memory.owner_cross_channel_private", "允许在主人私密会话中使用其他私密渠道的个人记忆。"},
         {"memory.privacy_rules", "管理员配置的内容规则。exact 使用字面子字符串匹配，pattern 使用正则。规则作用于可见资料及相应读写阶段。"},
@@ -738,9 +735,8 @@ QList<Page> pages()
             }},
             {"主动回忆工具", {
                 field("memory.agent_enabled", "启用补查工具", true, "bool"),
-                field("memory.agent_mode", "回忆方式", "tool", "choice:tool=模型工具|legacy=独立规划"),
                 field("memory.agent_protocol", "工具协议", "native", "choice:native=原生调用|json_envelope=JSON 信封"),
-                field("memory.agent_timeout_ms", "规划与定向检索预算（毫秒）", 6000, "num:1000:15000"),
+                field("memory.agent_timeout_ms", "定向检索预算（毫秒）", 6000, "num:1000:15000"),
                 field("memory.agent_max_rounds", "最多工具轮数", 2, "num:1:4"),
                 field("memory.agent_max_results", "最多返回条数", 8, "num:1:20"),
             }},
@@ -840,7 +836,7 @@ QList<Page> pages()
                 field("cognition.max_review_failures", "连续失败暂停阈值", 4, "num:1:10"),
             }, true},
         }},
-        {"高级与诊断", "检索服务、Legacy 兼容参数与诊断日志；普通使用无需修改。", "setting.json", {
+        {"高级与诊断", "检索服务与诊断日志；普通使用无需修改。", "setting.json", {
             {"检索服务（高级诊断）", {
                 field("memory.retrieval.embedding_enabled", "启用向量召回", false, "bool"),
                 field("memory.retrieval.embedding_provider", "向量服务", "", "choice:=未指定|dashscope=阿里云百炼"),
@@ -850,10 +846,6 @@ QList<Page> pages()
                 field("memory.retrieval.embedding_dimension", "向量维度（0 为自动）", 0, "num:0:8192"),
                 field("memory.retrieval.rerank_endpoint", "重排端点", "", "text"),
                 field("memory.retrieval.rerank_model", "重排模型", "qwen3-rerank", "text"),
-            }},
-            {"兼容性：Legacy Planner", {
-                field("memory.agent_plan_v2", "启用第二版检索规划", true, "bool"),
-                field("memory.agent_trigger", "规划触发方式", "memory_question", "choice:memory_question=回忆类问题|always=每轮"),
             }},
             {"日志与诊断", {
                 field("logging.directory", "日志文件夹", "", "log_directory"),
@@ -943,9 +935,6 @@ PageView buildPage(const Page &page, const std::function<void()> &applied, QWidg
     }
 
     for (const auto &group : page.groups) {
-        const auto agent = ConfigManager::instance().getMemoryPolicyConfig().agent;
-        if (group.title == QStringLiteral("兼容性：Legacy Planner")
-            && (!agent.enabled || agent.mode != QStringLiteral("legacy"))) continue;
         auto *card = new QGroupBox(group.title, contents);
         card->setStyleSheet(QStringLiteral(
             "QGroupBox { border: 1px solid palette(mid); border-radius: 8px; margin-top: 10px; }"
@@ -1048,16 +1037,6 @@ PageView buildPage(const Page &page, const std::function<void()> &applied, QWidg
                 status->setObjectName(QStringLiteral("openWakeEffectiveDailyCap"));
                 status->setText(openWakeCapStatus());
                 form->addRow(new QLabel(QStringLiteral("有效上限"), card), status);
-            }
-            if (key == "memory.agent_mode") {
-                const bool legacy = configured.toString() == QStringLiteral("legacy");
-                auto *modeStatus = new QLabel(
-                    legacy ? QStringLiteral("当前模式：独立规划。高级与诊断中的 Legacy 触发/规划字段参与运行。")
-                           : QStringLiteral("当前模式：模型工具。高级与诊断中的 Legacy 触发/规划字段仅保留配置，不参与运行。"),
-                    card);
-                modeStatus->setWordWrap(true);
-                modeStatus->setObjectName(key + QStringLiteral(".status"));
-                form->addRow(new QLabel(QStringLiteral("当前模式有效性"), card), modeStatus);
             }
             indexes.append(view.bindings->size());
             view.bindings->append(std::move(binding));

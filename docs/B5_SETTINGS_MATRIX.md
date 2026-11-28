@@ -35,7 +35,7 @@
 | `memory.retrieval.candidate_limit/rerank_limit/rerank_enabled` | 记忆与检索 | 40/10/true | 检索查询 | 下一次检索（不打断索引） | 1 |
 | `memory.retrieval.embedding_*`、`rerank_endpoint/model` | 高级与诊断 | 空/0 | MemoryIndexWorker/检索服务 | 差异时 reconfigure；向量模型/维度/provider 变化走安全批次，不自动全库重建 | 3/5 |
 | `memory.agent_*` 主参数 | 记忆与检索 | 见 UI | LLMService/MemoryAgentPlanner 每轮读取 | 下一轮对话 | 1 |
-| `memory.agent_plan_v2/agent_trigger` | 高级与诊断（Legacy） | true/memory_question | 仅 `agent_mode=legacy` 时参与 | 下一轮对话；界面按模式标注有效性 | 5 |
+| `memory.agent_plan_v2/agent_trigger` | 历史字段 | 保留原值 | 无运行消费者 | 无需迁移 | C2 |
 | `memory.recent_group_context.*` | QQ 渠道 | 见 UI | 检索/上下文构建 | 下一次请求 | 1 |
 | `memory.qq_group_idle_minutes/qq_group_batch_size` | QQ 渠道 | 15/50 | RawEventProcessor | 下一批整理 | 1 |
 | `memory.interaction_*` | QQ 渠道 | 90/20/10 | InteractionSegmenter | 下一次整理 | 1 |

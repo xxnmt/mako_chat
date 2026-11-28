@@ -127,11 +127,8 @@ bool ConfigManager::loadSetting()
 
         m_memoryPolicy.agent.enabled =
             memoryObj.value("agent_enabled").toBool(true);
-        m_memoryPolicy.agent.mode =
-            memoryObj.value("agent_mode").toString(QStringLiteral("tool")).toLower();
-        if (m_memoryPolicy.agent.mode != QStringLiteral("legacy")) {
-            m_memoryPolicy.agent.mode = QStringLiteral("tool");
-        }
+        if (memoryObj.value("agent_mode").toString().compare(QStringLiteral("legacy"), Qt::CaseInsensitive) == 0)
+            qInfo() << "[MemoryTool] legacy configuration uses main-model tools";
         m_memoryPolicy.agent.protocol =
             memoryObj.value("agent_protocol")
                 .toString(QStringLiteral("native"))
@@ -141,13 +138,6 @@ bool ConfigManager::loadSetting()
         }
         m_memoryPolicy.agent.ownerCrossChannelPrivate =
             memoryObj.value("owner_cross_channel_private").toBool(false);
-        m_memoryPolicy.agent.planV2 =
-            memoryObj.value("agent_plan_v2").toBool(true);
-        m_memoryPolicy.agent.trigger =
-            memoryObj.value("agent_trigger").toString(QStringLiteral("memory_question"));
-        if (m_memoryPolicy.agent.trigger != QStringLiteral("always")) {
-            m_memoryPolicy.agent.trigger = QStringLiteral("memory_question");
-        }
         m_memoryPolicy.agent.timeoutMs =
             qBound(1000, memoryObj.value("agent_timeout_ms").toInt(6000), 15000);
         m_memoryPolicy.agent.maxRounds =
@@ -393,12 +383,9 @@ QJsonObject ConfigManager::effectiveSettings() const
     retrievalObj.insert("rerank_model", m_memoryPolicy.retrieval.rerankModel);
     memoryObj.insert("retrieval", retrievalObj);
     memoryObj.insert("agent_enabled", m_memoryPolicy.agent.enabled);
-    memoryObj.insert("agent_mode", m_memoryPolicy.agent.mode);
     memoryObj.insert("agent_protocol", m_memoryPolicy.agent.protocol);
     memoryObj.insert("owner_cross_channel_private",
                      m_memoryPolicy.agent.ownerCrossChannelPrivate);
-    memoryObj.insert("agent_plan_v2", m_memoryPolicy.agent.planV2);
-    memoryObj.insert("agent_trigger", m_memoryPolicy.agent.trigger);
     memoryObj.insert("agent_timeout_ms", m_memoryPolicy.agent.timeoutMs);
     memoryObj.insert("agent_max_rounds", m_memoryPolicy.agent.maxRounds);
     memoryObj.insert("agent_max_results", m_memoryPolicy.agent.maxResults);
