@@ -766,13 +766,20 @@ private slots:
     void malformedReviewCommit_defersUntilEligible_data()
     {
         QTest::addColumn<bool>("concern");
-        QTest::newRow("reflection") << false;
-        QTest::newRow("concern") << true;
+        QTest::addColumn<QString>("nonFailure");
+        for (const auto &reason : {"filtered", "not_visible", "withheld",
+                                  "evidence_changed", "source_unavailable"}) {
+            QTest::newRow(qPrintable(QStringLiteral("reflection-%1").arg(reason)))
+                << false << QString::fromLatin1(reason);
+            QTest::newRow(qPrintable(QStringLiteral("concern-%1").arg(reason)))
+                << true << QString::fromLatin1(reason);
+        }
     }
 
     void malformedReviewCommit_defersUntilEligible()
     {
         QFETCH(bool, concern);
+        QFETCH(QString, nonFailure);
         ProactiveIdentityGuard config;
         QVERIFY(config.writeIdentity(R"({"proactive":{"enabled":true,"private_writing":true}})"));
         QTemporaryDir dir;
@@ -811,11 +818,43 @@ private slots:
         QCOMPARE(requests.size(), 2);
         review.receive(id,version,malformed,{});
         QCOMPARE(db.reviewFailure(kind,ref).value("consecutive_failures").toInt(), 1);
+        const auto retry = requests.last();
+        const auto retryOrigin = originProposal(retry.at(2).toJsonObject());
+        review.receive(retry.at(0).toLongLong(), retry.at(1).toInt(), retryOrigin, nonFailure);
+        const auto afterRejection = db.reviewFailure(kind,ref);
+        QCOMPARE(afterRejection.value("last_reason").toString(), nonFailure);
+        QCOMPARE(afterRejection.value("consecutive_failures").toInt(), 1);
+        QVERIFY(rewindReviewCooldown(path,"policy-rejection-elapsed"));
+        QCOMPARE(review.wake(12,0).kind, kind);
+        QCOMPARE(requests.size(), 3);
+        if (concern) {
+            review.yieldAttention(QStringLiteral("incoming_message"));
+            QVERIFY(rewindReviewCooldown(path,"attention-yield-elapsed"));
+            QCOMPARE(review.wake(12,0).kind, kind);
+            QCOMPARE(requests.size(), 4);
+        }
         const auto next = requests.last();
+        QVERIFY(db.recordReviewFailure(kind,ref,"policy","filtered",false,nullptr,retry.at(1).toInt()));
+        QCOMPARE(db.reviewFailure(kind,ref), afterRejection);
         auto valid = originProposal(next.at(2).toJsonObject());
         valid[concern ? "concern_action" : "choice"] = concern ? "contact" : "rest";
-        if (concern) valid["contact"] = QJsonObject{{"timing","invalid"}};
-        review.receive(next.at(0).toLongLong(),next.at(1).toInt(),valid,{});
+        const bool missingBasis = concern && nonFailure == QStringLiteral("withheld");
+        const QString contactRejection = missingBasis ? QStringLiteral("missing_basis")
+                                                      : QStringLiteral("invalid_contact");
+        if (concern) valid["contact"] = missingBasis
+            ? QJsonObject{{"timing","now"},{"reason","fixture"},{"message","Hello"}}
+            : QJsonObject{{"timing","invalid"}};
+        {
+            MessageCapture capture;
+            review.receive(next.at(0).toLongLong(),next.at(1).toInt(),valid,{});
+            if (concern) {
+                bool loggedFinalReason = false;
+                for (const auto &line : capture.lines())
+                    loggedFinalReason |= line.message.contains("[Review] result kind=concern")
+                        && line.message.contains(QStringLiteral("reason=") + contactRejection);
+                QVERIFY(loggedFinalReason);
+            }
+        }
         QVERIFY(db.reviewFailure(kind,ref).isEmpty());
         QVERIFY(!db.hasProposedContact(turn,next.at(1).toInt()));
     }

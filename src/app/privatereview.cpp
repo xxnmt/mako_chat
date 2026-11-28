@@ -353,6 +353,8 @@ bool PrivateReview::errorCountsAsFailure(const QString &error)
     // 策略/权限拦截：不计入认知失败，但调用方仍按原语义 defer。
     if (text == QStringLiteral("filtered") || text == QStringLiteral("writing_disabled")
         || text == QStringLiteral("permission_denied")
+        || text == QStringLiteral("internal_note_filtered")
+        || text == QStringLiteral("internal_concern_filtered")
         || text == QStringLiteral("not_visible")
         // R12-2c-3：外部行动被 withheld（动作层授权/核验拒绝）不是"她想错了"，
         // 不计入认知失败，也不推进来源退避。
@@ -361,6 +363,11 @@ bool PrivateReview::errorCountsAsFailure(const QString &error)
     // 来源已变/CAS 冲突不是"她想错了"，记录诊断但不累计连续失败。
     if (text == QStringLiteral("invalid_or_stale_proposal")
         || text == QStringLiteral("evidence_changed")
+        || text == QStringLiteral("evidence_unavailable")
+        || text == QStringLiteral("prior_conflict")
+        || text == QStringLiteral("prior_evidence_unavailable")
+        || text == QStringLiteral("prior_permission_changed")
+        || text == QStringLiteral("evidence_permission_changed")
         || text == QStringLiteral("source_unavailable")
         || text == QStringLiteral("commit_conflict")
         || text == QStringLiteral("cas_conflict"))
@@ -864,6 +871,26 @@ void PrivateReview::receive(qlonglong id, int version, const QJsonObject &propos
         return;
     }
 
+    const auto logReflectionCommit = [&](const QString &decision,
+                                         const MemoryManager::ReflectionCommitResult &commit) {
+        const auto stage = reviewStage(proposal, error, bool(commit));
+        if (!commit) {
+            const QString &reason = commit.failure;
+            if (reason != QStringLiteral("version_conflict")
+                && reason != QStringLiteral("cas_conflict")
+                && reason != QStringLiteral("commit_conflict")) {
+                recordFailure(attempt, reason, stage, errorCountsAsFailure(reason));
+            }
+            logResult(decision, stage, reason);
+            return;
+        }
+        const QString reason = commit.contactRejection.isEmpty()
+            ? proposal.value(QStringLiteral("contact")).toObject()
+                      .value(QStringLiteral("withhold_reason")).toString()
+            : commit.contactRejection;
+        logResult(decision, stage, reason);
+    };
+
     if (attempt.origin.kind == CognitiveOrigin::Reflection) {
         const auto choice = proposal["choice"].toString();
         const auto decision = choice.isEmpty() ? QStringLiteral("none") : choice;
@@ -891,17 +918,8 @@ void PrivateReview::receive(qlonglong id, int version, const QJsonObject &propos
                 && store.hasProposedContact(id,version))
                 emit contactProposed(id,version);
             store.clearReviewFailure(kindName(attempt.origin.kind), ref);
-            logResult(decision, reviewStage(proposal,error,true),
-                      proposal["contact"].toObject()["withhold_reason"].toString());
-        } else {
-            const QString reason = commit.failure;
-            if (reason != QStringLiteral("version_conflict") && reason != QStringLiteral("cas_conflict")) {
-                const bool retry = reason != QStringLiteral("writing_disabled")
-                    && reason != QStringLiteral("permission_denied");
-                recordFailure(attempt, reason, reviewStage(proposal,error,false), retry);
-            }
-            logResult(decision, reviewStage(proposal,error,false), reason);
         }
+        logReflectionCommit(decision, commit);
         return;
     }
     if (attempt.origin.kind == CognitiveOrigin::Concern) {
@@ -915,22 +933,13 @@ void PrivateReview::receive(qlonglong id, int version, const QJsonObject &propos
             qInfo() << "[Concern] committed" << id << version << action << contact["timing"].toString();
             // 投递权限与安静时段由 AppController 的 canContactNow 再核验；这里只把"现在联系"的
             // 决定交给投递层，keep/revise/resolve/drop 只在记忆层落库，不产生外部消息。
-            // 依据核验被拒时 finishConcernReview 仍返回 true 但不会写 contact 行，此时不 emit。
+            // 被拒的联系没有 proposed 行，内部认识仍可提交。
             if (action == "contact" && contact["timing"].toString() == "now"
                 && store.hasProposedContact(id,version))
                 emit contactProposed(id,version);
             store.clearReviewFailure(kindName(attempt.origin.kind), ref);
-            logResult(decision, reviewStage(proposal,error,true),
-                      contact["withhold_reason"].toString());
-            return;
         }
-        const QString reason = commit.failure;
-        if (reason != QStringLiteral("version_conflict") && reason != QStringLiteral("cas_conflict")) {
-            const bool retry = reason != QStringLiteral("writing_disabled")
-                && reason != QStringLiteral("permission_denied");
-            recordFailure(attempt, reason, reviewStage(proposal,error,false), retry);
-        }
-        logResult(decision, reviewStage(proposal,error,false), reason);
+        logReflectionCommit(decision, commit);
         return;
     }
     // R12-1b：ActivityReview 统一提交（legacy/internal 同一 finishActivity + CAS）。

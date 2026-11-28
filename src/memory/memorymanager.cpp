@@ -6162,7 +6162,7 @@ bool MemoryManager::recordReviewFailure(const QString &sourceKind, const QString
     if (!snapshotError.isEmpty()) return fail(QStringLiteral("db_error"));
     // R12-2c-3：迟到失败隔离。每次真实回顾尝试都有独立 run_id/版本；若源当前版本已前进，
     // 说明这份失败来自旧尝试，不得推进新版本来源的失败计数/退避状态。只审计、不写库。
-    if (countsAsFailure && expectedVersion > 0 && kind != kReviewKindOpenWake
+    if (expectedVersion > 0 && kind != kReviewKindOpenWake
         && snapshot.present && snapshot.version != expectedVersion) {
         m_db.rollback();
         rollback.dismiss();
