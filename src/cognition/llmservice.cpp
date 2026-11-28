@@ -4063,30 +4063,23 @@ bool LLMService::cognitiveShadowEnabled() const
 
 void LLMService::setCognitiveContextActualEnabled(bool enabled)
 {
-    m_cognitiveContextActualEnabled = enabled;
-    m_cognitiveContextActualEnvChecked = true;
+    // 测试/调用方显式 setter：最高优先级，且在本次进程内持续有效。
+    m_cognitiveContextActualOverrideSet = true;
+    m_cognitiveContextActualOverride = enabled;
 }
 
 bool LLMService::cognitiveContextActualEnabled() const
 {
-    // 显式 setter 优先（测试/调用方强制）；否则进程启动时读取一次环境变量：
-    // 环境变量只要显式设置（含 "0"/"false"/"off"）就覆盖 identity.json 配置值；
-    // 未设置时退回配置值（cognition.context_actual_enabled，缺省 false）。
-    auto *self = const_cast<LLMService *>(this);
-    if (!self->m_cognitiveContextActualEnvChecked) {
-        self->m_cognitiveContextActualEnvChecked = true;
-        const QByteArray value = qgetenv("MAKO_COGNITIVE_CONTEXT_ACTUAL");
-        if (!value.trimmed().isEmpty()) {
-            const QByteArray lowered = value.trimmed().toLower();
-            self->m_cognitiveContextActualEnabled =
-                lowered == QByteArray("1") || lowered == QByteArray("true")
-                || lowered == QByteArray("on");
-        } else {
-            self->m_cognitiveContextActualEnabled =
-                ConfigManager::instance().contextActualEnabled();
-        }
+    // 不永久缓存配置值：每次独立认知运行读取当前有效配置，使设置保存后无需重启。
+    // 优先级：显式 setter > 显式环境变量（含 0/false/off）> identity.json 配置。
+    if (m_cognitiveContextActualOverrideSet) return m_cognitiveContextActualOverride;
+    const QByteArray value = qgetenv("MAKO_COGNITIVE_CONTEXT_ACTUAL").trimmed();
+    if (!value.isEmpty()) {
+        const QByteArray lowered = value.toLower();
+        return lowered == QByteArray("1") || lowered == QByteArray("true")
+            || lowered == QByteArray("on");
     }
-    return m_cognitiveContextActualEnabled;
+    return ConfigManager::instance().contextActualEnabled();
 }
 
 void LLMService::patchLastActualPromptTokens(const QJsonObject &usage)

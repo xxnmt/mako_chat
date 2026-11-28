@@ -1854,6 +1854,26 @@ private slots:
             LLMService model(QStringLiteral("test"), nullptr, endpoint);
             QVERIFY(!model.cognitiveContextActualEnabled());
         }
+        // 配置值不永久缓存：同一 LLMService 在下一次独立调用读取当前有效配置。
+        QVERIFY(writeConfig(true));
+        LLMService hot(QStringLiteral("test"), nullptr, endpoint);
+        QVERIFY(hot.cognitiveContextActualEnabled());
+        QVERIFY(writeConfig(false));
+        QVERIFY(!hot.cognitiveContextActualEnabled());
+        QVERIFY(writeConfig(true));
+        QVERIFY(hot.cognitiveContextActualEnabled());
+        // 环境变量在运行期显式设置也立即覆盖（含关闭）。
+        qputenv("MAKO_COGNITIVE_CONTEXT_ACTUAL", "0");
+        QVERIFY(!hot.cognitiveContextActualEnabled());
+        qunsetenv("MAKO_COGNITIVE_CONTEXT_ACTUAL");
+        QVERIFY(hot.cognitiveContextActualEnabled());
+        // setter 仍在环境变量/配置之上。
+        qputenv("MAKO_COGNITIVE_CONTEXT_ACTUAL", "0");
+        hot.setCognitiveContextActualEnabled(true);
+        QVERIFY(hot.cognitiveContextActualEnabled());
+        hot.setCognitiveContextActualEnabled(false);
+        QVERIFY(!hot.cognitiveContextActualEnabled());
+        qunsetenv("MAKO_COGNITIVE_CONTEXT_ACTUAL");
     }
 
     // R12-3a 第二切片：隔离数据库上的真实模型集成（opt-in；凭据来自环境变量）。

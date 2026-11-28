@@ -143,6 +143,179 @@ QJsonValue readPath(const QJsonObject &object, const QStringList &path)
     return value;
 }
 
+// identity.json 的字段由 ConfigManager 夹紧/归一；界面优先显示“当前有效值”。
+// 未覆盖的路径返回 Undefined，调用方回退到原始文件值。
+QString idsText(const QJsonArray &list);
+
+QString validateCognitionConfig(const QJsonObject &merged)
+{
+    const QJsonObject cognition = merged.value(QStringLiteral("cognition")).toObject();
+    const QJsonObject openWake = cognition.value(QStringLiteral("open_wake")).toObject();
+    const auto number = [&openWake](const QString &key, int fallback) {
+        return openWake.contains(key) ? openWake.value(key).toInt(fallback) : fallback;
+    };
+    const int minimum = number(QStringLiteral("min_interval_seconds"), 300);
+    const int preferred = number(QStringLiteral("default_interval_seconds"), 1800);
+    const int maximum = number(QStringLiteral("max_interval_seconds"), 86400);
+    if (!(minimum >= 300 && minimum <= 86400)
+        || !(preferred >= 300 && preferred <= 86400)
+        || !(maximum >= 300 && maximum <= 86400))
+        return QStringLiteral("唤醒间隔应为 300 至 86400 秒");
+    if (minimum > preferred)
+        return QStringLiteral("最小唤醒间隔不能大于默认唤醒间隔");
+    if (preferred > maximum)
+        return QStringLiteral("默认唤醒间隔不能大于最大唤醒间隔");
+    if (cognition.contains(QStringLiteral("review_backoff_seconds"))) {
+        const auto backoff = cognition.value(QStringLiteral("review_backoff_seconds"));
+        if (!backoff.isArray() || backoff.toArray().isEmpty() || backoff.toArray().size() > 5)
+            return QStringLiteral("回顾失败退避应为 1 至 5 个整数秒");
+        for (const auto &value : backoff.toArray()) {
+            const int seconds = value.toInt(-1);
+            if (seconds < 30 || seconds > 86400)
+                return QStringLiteral("回顾失败退避每个值应为 30 至 86400 秒");
+        }
+    }
+    if (cognition.contains(QStringLiteral("max_review_failures"))) {
+        const int failures = cognition.value(QStringLiteral("max_review_failures")).toInt(-1);
+        if (failures < 1 || failures > 10)
+            return QStringLiteral("连续失败暂停阈值应为 1 至 10");
+    }
+    if (cognition.contains(QStringLiteral("snapshot_budget_bytes"))) {
+        const int budget = cognition.value(QStringLiteral("snapshot_budget_bytes")).toInt(-1);
+        if (budget < 2048 || budget > 8192)
+            return QStringLiteral("认知快照预算应为 2048 至 8192 字节");
+    }
+    return {};
+}
+
+bool applyValueToBinding(Binding &binding, const QJsonValue &value)
+{
+    const QString &type = binding.field.type;
+    QWidget *row = binding.row;
+    if (type == "bool") {
+        if (auto *box = qobject_cast<QCheckBox *>(row))
+            box->setChecked(value.toBool());
+        else if (auto *widget = row->findChild<QCheckBox *>())
+            widget->setChecked(value.toBool());
+        else return false;
+    } else if (type.startsWith("num:")) {
+        auto *spin = qobject_cast<QSpinBox *>(row);
+        if (!spin) return false;
+        spin->setValue(value.toInt());
+    } else if (type.startsWith("choice:")) {
+        auto *choice = qobject_cast<QComboBox *>(row);
+        if (!choice) return false;
+        int index = choice->findData(value.toString());
+        if (index < 0) {
+            choice->addItem(value.toString(), value.toString());
+            index = choice->count() - 1;
+        }
+        choice->setCurrentIndex(index);
+    } else if (type == "time") {
+        auto *time = qobject_cast<QTimeEdit *>(row);
+        if (!time) return false;
+        time->setTime(QTime::fromString(value.toString(), QStringLiteral("HH:mm")));
+    } else if (type == "ints") {
+        auto *text = row->findChild<QLineEdit *>();
+        if (!text) return false;
+        QStringList values;
+        for (const auto &entry : value.toArray()) values.append(QString::number(entry.toInt()));
+        text->setText(values.join(QStringLiteral(", ")));
+    } else if (type == "text" || type == "secret" || type == "ids") {
+        auto *text = row->findChild<QLineEdit *>();
+        if (!text) return false;
+        text->setText(type == "ids" ? idsText(value.toArray()) : value.toString());
+    } else {
+        return false;
+    }
+    return true;
+}
+
+QJsonValue effectiveIdentityValue(const QString &path)
+{
+    auto &config = ConfigManager::instance();
+    if (path.startsWith(QStringLiteral("cognition.open_wake."))) {
+        const auto openWake = config.getOpenWakeConfig();
+        const QString key = path.section(QLatin1Char('.'), -1);
+        if (key == QStringLiteral("enabled")) return openWake.enabled;
+        if (key == QStringLiteral("allow_contact")) return openWake.allowContact;
+        if (key == QStringLiteral("initial_delay_seconds")) return openWake.initialDelaySeconds;
+        if (key == QStringLiteral("default_interval_seconds")) return openWake.defaultIntervalSeconds;
+        if (key == QStringLiteral("min_interval_seconds")) return openWake.minIntervalSeconds;
+        if (key == QStringLiteral("max_interval_seconds")) return openWake.maxIntervalSeconds;
+        if (key == QStringLiteral("max_per_day")) return openWake.maxPerDay;
+        if (key == QStringLiteral("shared_budget_percent")) return openWake.sharedBudgetPercent;
+        if (key == QStringLiteral("max_model_steps_per_wake")) return openWake.maxModelStepsPerWake;
+        if (key == QStringLiteral("max_non_open_jobs_when_due")) return openWake.maxNonOpenJobsWhenDue;
+        return {};
+    }
+    if (path == QStringLiteral("cognition.snapshot_budget_bytes"))
+        return config.getSnapshotBudgetBytes();
+    if (path == QStringLiteral("cognition.context_actual_enabled"))
+        return config.contextActualEnabled();
+    if (path == QStringLiteral("cognition.review_backoff_seconds")) {
+        QJsonArray values;
+        for (const int seconds : config.getProactiveConfig().reviewBackoffSeconds)
+            values.append(seconds);
+        return values;
+    }
+    if (path == QStringLiteral("cognition.max_review_failures"))
+        return config.getProactiveConfig().maxReviewFailures;
+    if (path.startsWith(QStringLiteral("proactive."))) {
+        const auto proactive = config.getProactiveConfig();
+        if (path == QStringLiteral("proactive.enabled")) return proactive.enabled;
+        if (path == QStringLiteral("proactive.private_writing")) return proactive.privateWriting;
+        if (path == QStringLiteral("proactive.daily_limit")) return proactive.dailyLimit;
+        if (path == QStringLiteral("proactive.contact_daily_limit")) return proactive.contactDailyLimit;
+        if (path == QStringLiteral("proactive.concern_default_check_minutes"))
+            return proactive.concernDefaultCheckMinutes;
+        if (path == QStringLiteral("proactive.concern_retention_days"))
+            return proactive.concernRetentionDays;
+        if (path == QStringLiteral("proactive.cooldown_seconds")) return proactive.cooldownSeconds;
+        if (path == QStringLiteral("proactive.idle_seconds")) return proactive.idleSeconds;
+        if (path == QStringLiteral("proactive.quiet_hours.start")) return proactive.quietStart;
+        if (path == QStringLiteral("proactive.quiet_hours.end")) return proactive.quietEnd;
+        if (path == QStringLiteral("proactive.targets")) {
+            QJsonArray targets;
+            for (const auto &target : proactive.targets) {
+                targets.append(QJsonObject{{QStringLiteral("channel"), target.first},
+                                           {QStringLiteral("session_id"), target.second}});
+            }
+            return targets;
+        }
+        if (path == QStringLiteral("proactive.schedule")) {
+            QJsonArray schedule;
+            for (const auto &item : proactive.schedule) {
+                schedule.append(QJsonObject{{QStringLiteral("at"), item.at},
+                                            {QStringLiteral("type"), item.type}});
+            }
+            return schedule;
+        }
+        return {};
+    }
+    if (path == QStringLiteral("identity.self.qq")) {
+        QJsonArray ids;
+        for (const auto &id : config.getSelfQQAccounts()) ids.append(id);
+        return ids;
+    }
+    if (path == QStringLiteral("identity.master.qq")) {
+        QJsonArray ids;
+        for (const auto &id : config.getMasterQQAccounts()) ids.append(id);
+        return ids;
+    }
+    if (path == QStringLiteral("memory.blind_zones")) {
+        QJsonArray zones;
+        for (const auto &zone : config.blindZones()) {
+            zones.append(QJsonObject{{QStringLiteral("channel"), zone.channel},
+                                     {QStringLiteral("session_id"), zone.sessionId}});
+        }
+        return zones;
+    }
+    if (path == QStringLiteral("appearance.follow_external_mood"))
+        return config.getFollowExternalMood();
+    return {};
+}
+
 void setPath(QJsonObject &object, const QStringList &path, const QJsonValue &value, qsizetype offset = 0)
 {
     const auto &key = path.at(offset);
@@ -553,21 +726,11 @@ QList<Page> pages()
                 field("memory.retrieval.candidate_limit", "候选数量上限", 40, "num:10:200"),
                 field("memory.retrieval.rerank_enabled", "启用重排", true, "bool"),
                 field("memory.retrieval.rerank_limit", "重排数量上限", 10, "num:1:40"),
-                field("memory.retrieval.rerank_endpoint", "重排端点", "", "text"),
-                field("memory.retrieval.rerank_model", "重排模型", "qwen3-rerank", "text"),
-                field("memory.retrieval.embedding_enabled", "启用向量召回", false, "bool"),
-                field("memory.retrieval.embedding_provider", "向量服务", "", "choice:=未指定|dashscope=阿里云百炼|local_hash_test=本地测试"),
-                field("memory.retrieval.embedding_endpoint", "向量端点", "", "text"),
-                field("memory.retrieval.embedding_api_key_env", "向量密钥环境变量", "DASHSCOPE_API_KEY", "text"),
-                field("memory.retrieval.embedding_model", "向量模型", "", "text"),
-                field("memory.retrieval.embedding_dimension", "向量维度（0 为自动）", 0, "num:0:8192"),
             }},
             {"主动回忆工具", {
                 field("memory.agent_enabled", "启用补查工具", true, "bool"),
                 field("memory.agent_mode", "回忆方式", "tool", "choice:tool=模型工具|legacy=独立规划"),
                 field("memory.agent_protocol", "工具协议", "native", "choice:native=原生调用|json_envelope=JSON 信封"),
-                field("memory.agent_plan_v2", "启用第二版检索规划", true, "bool"),
-                field("memory.agent_trigger", "规划触发方式", "memory_question", "choice:memory_question=回忆类问题|always=每轮"),
                 field("memory.agent_timeout_ms", "工具超时（毫秒）", 6000, "num:1000:15000"),
                 field("memory.agent_max_rounds", "最多工具轮数", 2, "num:1:4"),
                 field("memory.agent_max_results", "最多返回条数", 8, "num:1:20"),
@@ -615,16 +778,11 @@ QList<Page> pages()
                 field("memory.recent_group_context.warm_line_max_chars", "较旧单条消息字数", 24, "num:8:200"),
             }},
         }},
-        {"隐私与日志", "设置跨渠道记忆、内容过滤和诊断日志。", "setting.json", {
+        {"隐私规则", "设置跨渠道记忆、内容过滤与策略版本。", "setting.json", {
             {"记忆权限", {
                 field("memory.owner_cross_channel_private", "允许主人跨私聊渠道使用个人记忆", false, "bool"),
                 field("memory.privacy_policy_version", "策略版本标识", "r3", "text"),
                 field("memory.privacy_rules", "内容过滤规则", QJsonArray{}, "rules"),
-            }},
-            {"日志", {
-                field("logging.directory", "日志文件夹", "", "log_directory"),
-                field("logging.separate_runs", "每次启动单独创建日志", true, "bool"),
-                field("memory.debug_full_logs", "记录完整对话与模型请求", false, "bool"),
             }},
         }},
         {"身份与盲区", "绑定账户，并指定不进入长期记忆的会话。", "identity.json", {
@@ -637,34 +795,29 @@ QList<Page> pages()
                 field("appearance.follow_external_mood", "桌宠跟随外部渠道情绪", true, "bool"),
             }},
         }},
-        {"主动交流", "设置自主写作、联系目标和安静时段。", "identity.json", {
-            {"活动和联系", {
+        {"认知与自主行为", "设置主动联系、回顾、内部唤醒、每日上限与统一认知上下文。", "identity.json", {
+            {"主动联系与回顾", {
                 field("proactive.enabled", "允许主动联系", false, "bool"),
                 field("proactive.private_writing", "允许私下回顾与创作", false, "bool"),
-                field("proactive.daily_limit", "每日回顾上限", 3, "num:0:999"),
-                field("proactive.contact_daily_limit", "每日联系上限", 3, "num:0:99"),
                 field("proactive.concern_default_check_minutes", "关注再检查间隔（分钟）", 720, "num:0:10080"),
-                field("proactive.concern_retention_days", "关注保留天数", 14, "num:1:365"),
+                field("proactive.concern_retention_days", "关注保留天数（到期清理暂未接入，仅保存）", 14, "num:1:365"),
                 field("proactive.cooldown_seconds", "回顾间隔（秒）", 900, "num:60:604800"),
                 field("proactive.idle_seconds", "空闲等待（秒）", 1800, "num:0:604800"),
                 field("proactive.quiet_hours.start", "安静开始", "23:00", "time"),
                 field("proactive.quiet_hours.end", "安静结束", "08:00", "time"),
                 field("proactive.targets", "允许联系的会话", QJsonArray{}, "targets"),
-                field("proactive.schedule", "计划时间（调度暂未接入）", QJsonArray{}, "schedule"),
             }},
-        }},
-        {"认知与自主行为", "设置内部唤醒、每日上限、认知快照预算与统一认知上下文。", "identity.json", {
-            {"常用", {
+            {"每日上限（三个上限相互独立）", {
+                field("proactive.daily_limit", "每日回顾上限", 3, "num:0:999"),
+                field("cognition.open_wake.max_per_day", "每日自主唤醒上限", 12, "num:0:96"),
+                field("proactive.contact_daily_limit", "每日主动联系上限（0 表示不限）", 3, "num:0:99"),
+            }},
+            {"内部唤醒与快照", {
                 field("cognition.open_wake.enabled", "启用内部唤醒（OpenWake）", false, "bool"),
                 field("cognition.open_wake.allow_contact", "允许内部唤醒联系主人", false, "bool"),
                 field("cognition.open_wake.shared_budget_percent", "共享每日预算占比（%）", 30, "num:1:100"),
                 field("cognition.snapshot_budget_bytes", "认知快照提示词预算（字节）", 4096, "num:2048:8192"),
                 field("cognition.context_actual_enabled", "启用统一认知上下文（B5 实验功能）", false, "bool"),
-            }},
-            {"每日上限（三个上限相互独立）", {
-                field("proactive.daily_limit", "每日回顾上限", 3, "num:0:999"),
-                field("cognition.open_wake.max_per_day", "每日自主唤醒上限", 12, "num:0:96"),
-                field("proactive.contact_daily_limit", "每日主动联系上限", 3, "num:0:99"),
             }},
             {"高级设置：调度与失败退避", {
                 field("cognition.open_wake.initial_delay_seconds", "首次唤醒延迟（秒）", 900, "num:60:86400"),
@@ -676,6 +829,27 @@ QList<Page> pages()
                 field("cognition.review_backoff_seconds", "回顾失败退避（秒，逗号分隔）", QJsonArray{120, 300, 900}, "ints"),
                 field("cognition.max_review_failures", "连续失败暂停阈值", 4, "num:1:10"),
             }, true},
+        }},
+        {"高级与诊断", "检索服务、Legacy 兼容参数与诊断日志；普通使用无需修改。", "setting.json", {
+            {"检索服务（高级诊断）", {
+                field("memory.retrieval.embedding_enabled", "启用向量召回", false, "bool"),
+                field("memory.retrieval.embedding_provider", "向量服务（local_hash_test 仅用于诊断）", "", "choice:=未指定|dashscope=阿里云百炼|local_hash_test=本地测试"),
+                field("memory.retrieval.embedding_endpoint", "向量端点", "", "text"),
+                field("memory.retrieval.embedding_api_key_env", "向量密钥环境变量", "DASHSCOPE_API_KEY", "text"),
+                field("memory.retrieval.embedding_model", "向量模型", "", "text"),
+                field("memory.retrieval.embedding_dimension", "向量维度（0 为自动）", 0, "num:0:8192"),
+                field("memory.retrieval.rerank_endpoint", "重排端点", "", "text"),
+                field("memory.retrieval.rerank_model", "重排模型", "qwen3-rerank", "text"),
+            }},
+            {"兼容性：Legacy Planner", {
+                field("memory.agent_plan_v2", "启用第二版检索规划", true, "bool"),
+                field("memory.agent_trigger", "规划触发方式", "memory_question", "choice:memory_question=回忆类问题|always=每轮"),
+            }},
+            {"日志与诊断", {
+                field("logging.directory", "日志文件夹", "", "log_directory"),
+                field("logging.separate_runs", "每次启动单独创建日志", true, "bool"),
+                field("memory.debug_full_logs", "记录完整对话与模型请求", false, "bool"),
+            }},
         }},
         {"时间与状态", "设置昼夜切换与桌宠状态持续时间。", "setting.json", {
             {"昼夜切换", {
@@ -770,10 +944,14 @@ PageView buildPage(const Page &page, const std::function<void()> &applied, QWidg
         form->setVerticalSpacing(12);
         QList<int> indexes;
         for (const auto &field : group.fields) {
-            const auto configured = isPermissionTable(field)
-                ? QJsonValue(permissionLists(*snapshot, field)) : readPath(*snapshot, field.path);
-            auto value = prompt ? QJsonValue(promptText) : configured;
             const auto key = field.path.join('.');
+            QJsonValue configured = isPermissionTable(field)
+                ? QJsonValue(permissionLists(*snapshot, field)) : readPath(*snapshot, field.path);
+            if (!prompt && page.file == QStringLiteral("identity.json")) {
+                const auto effectiveIdentity = effectiveIdentityValue(key);
+                if (!effectiveIdentity.isUndefined()) configured = effectiveIdentity;
+            }
+            auto value = prompt ? QJsonValue(promptText) : configured;
             const bool derivedEndpoint = key == "memory.retrieval.embedding_endpoint"
                 || key == "memory.retrieval.rerank_endpoint";
             const auto runtime = readPath(effective, field.path);
@@ -843,13 +1021,23 @@ PageView buildPage(const Page &page, const std::function<void()> &applied, QWidg
                                  .arg(envOn ? QStringLiteral("开") : QStringLiteral("关"));
                 } else {
                     status = QStringLiteral("当前实际运行：按 identity.json 配置为「%1」。"
-                                            "保存后需重启应用生效；旧上下文路径仍可回退。")
+                                            "保存后下一次独立认知运行生效；旧上下文路径仍可回退。")
                                  .arg(configured.toBool() ? QStringLiteral("开") : QStringLiteral("关"));
                 }
                 auto *runtimeStatus = new QLabel(status, card);
                 runtimeStatus->setWordWrap(true);
                 runtimeStatus->setObjectName(key + QStringLiteral(".status"));
                 form->addRow(new QLabel(QStringLiteral("当前运行状态"), card), runtimeStatus);
+            }
+            if (key == "memory.agent_mode") {
+                const bool legacy = configured.toString() == QStringLiteral("legacy");
+                auto *modeStatus = new QLabel(
+                    legacy ? QStringLiteral("当前模式：独立规划。高级与诊断中的 Legacy 触发/规划字段参与运行。")
+                           : QStringLiteral("当前模式：模型工具。高级与诊断中的 Legacy 触发/规划字段仅保留配置，不参与运行。"),
+                    card);
+                modeStatus->setWordWrap(true);
+                modeStatus->setObjectName(key + QStringLiteral(".status"));
+                form->addRow(new QLabel(QStringLiteral("当前模式有效性"), card), modeStatus);
             }
             indexes.append(view.bindings->size());
             view.bindings->append(std::move(binding));
@@ -864,6 +1052,7 @@ PageView buildPage(const Page &page, const std::function<void()> &applied, QWidg
     cards->addStretch();
     auto *footer = new QHBoxLayout;
     auto *feedback = new QLabel(panel);
+    feedback->setObjectName(QStringLiteral("settingsFeedback"));
     feedback->setWordWrap(true);
     auto *apply = new QPushButton(QStringLiteral("保存并应用"), panel);
     apply->setObjectName("applySettings");
@@ -933,6 +1122,13 @@ PageView buildPage(const Page &page, const std::function<void()> &applied, QWidg
                     return;
                 }
             }
+            if (!prompt && page.file == QStringLiteral("identity.json")) {
+                const QString invalid = validateCognitionConfig(merged);
+                if (!invalid.isEmpty()) {
+                    feedback->setText(invalid);
+                    return;
+                }
+            }
             if (!prompt) updated = QJsonDocument(merged).toJson();
             QString error;
             if (!ConfigManager::instance().writeConfigDocument(page.file, updated, &error)) {
@@ -957,10 +1153,44 @@ PageView buildPage(const Page &page, const std::function<void()> &applied, QWidg
                     binding.initial = true;
                 }
             }
+            // 保存成功后回读“当前有效值”：identity 字段按 ConfigManager 夹紧/归一后的值显示。
+            if (!prompt) {
+                QByteArray refreshed;
+                if (readFile(page.file, refreshed)) {
+                    const auto freshObject = QJsonDocument::fromJson(refreshed).object();
+                    for (auto &binding : *bindings) {
+                        if (isPermissionTable(binding.field)) continue;
+                        const auto key = binding.field.path.join('.');
+                        QJsonValue effectiveValue = readPath(freshObject, binding.field.path);
+                        if (page.file == QStringLiteral("identity.json")) {
+                            const auto normalized = effectiveIdentityValue(key);
+                            if (!normalized.isUndefined()) effectiveValue = normalized;
+                        }
+                        if (effectiveValue.isUndefined()) continue;
+                        if (applyValueToBinding(binding, effectiveValue)) {
+                            try { binding.initial = binding.value(); }
+                            catch (const QString &) {}
+                        }
+                    }
+                }
+            }
             applied();
+            QStringList changedKeys;
+            for (const auto &[index, value] : edits) {
+                Q_UNUSED(value);
+                changedKeys.append(bindings->at(index).field.path.join('.'));
+            }
+            const bool nextRunOnly = page.file == QStringLiteral("identity.json")
+                && std::any_of(changedKeys.cbegin(), changedKeys.cend(), [](const QString &key) {
+                       return key.startsWith(QStringLiteral("cognition."))
+                           || key.startsWith(QStringLiteral("proactive."));
+                   });
             feedback->setText(restrictedAfterRemoval
                 ? QStringLiteral("已保存。回复名单为空，已启用空名单限制。")
-                : QStringLiteral("已保存并应用。"));
+                : nextRunOnly
+                    ? QStringLiteral("已保存；普通认知/自主参数在下一轮独立运行或调度边界生效，"
+                                     "不会打断当前对话、活动或语音。")
+                    : QStringLiteral("已保存并应用。"));
         });
     return view;
 }

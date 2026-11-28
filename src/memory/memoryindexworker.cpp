@@ -7,6 +7,23 @@
 #include <QScopeGuard>
 #include <memory>
 
+namespace {
+bool sameRetrievalConfig(const MemoryRetrievalConfig &a, const MemoryRetrievalConfig &b)
+{
+    return a.indexEnabled == b.indexEnabled && a.autoBackfill == b.autoBackfill
+        && a.candidateLimit == b.candidateLimit && a.rerankLimit == b.rerankLimit
+        && a.rerankEnabled == b.rerankEnabled && a.embeddingEnabled == b.embeddingEnabled
+        && a.embeddingProvider == b.embeddingProvider
+        && a.embeddingEndpoint == b.embeddingEndpoint
+        && a.embeddingApiKeyEnv == b.embeddingApiKeyEnv
+        && a.embeddingApiKey == b.embeddingApiKey
+        && a.dashscopeBaseUrl == b.dashscopeBaseUrl
+        && a.embeddingModel == b.embeddingModel
+        && a.embeddingDimension == b.embeddingDimension
+        && a.rerankEndpoint == b.rerankEndpoint && a.rerankModel == b.rerankModel;
+}
+} // namespace
+
 MemoryIndexWorker::MemoryIndexWorker(MemoryManager &memory, const MemoryRetrievalConfig &config)
     : QThread(&memory), m_path(memory.databasePath()), m_memory(memory), m_nextConfig(config)
 {
@@ -52,10 +69,16 @@ void MemoryIndexWorker::schedule()
 
 void MemoryIndexWorker::reconfigure(const MemoryRetrievalConfig &config)
 {
+    // 相同有效配置不打断正在运行的索引批次。
+    if (sameRetrievalConfig(m_nextConfig, config)) return;
     m_nextConfig = config;
     m_timer.stop();
-    m_pending = m_busy;
-    if (m_busy) requestInterruption();
+    // 运行中的批次使用旧配置完成（安全批次边界）；结束后再按新配置继续。
+    if (m_busy) {
+        m_pending = true;
+        return;
+    }
+    m_pending = false;
     schedule();
 }
 

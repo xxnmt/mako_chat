@@ -1,5 +1,6 @@
 #include <QtTest>
 #include <QCheckBox>
+#include <QComboBox>
 #include <QDir>
 #include <QFile>
 #include <QLabel>
@@ -18,6 +19,7 @@
 
 #include "configmanager.h"
 #include "settingspages.h"
+#include "settingsapplyplan.h"
 #include "ttsreferencemanager.h"
 #include <QTemporaryDir>
 
@@ -147,7 +149,7 @@ private slots:
                                                             config.getMemoryPolicyConfig(), {});
         QVERIFY(decision.allowReply && decision.ephemeralReply);
         QVERIFY(!decision.persistRaw && !decision.persistChat);
-        search->setText(QStringLiteral("主动交流"));
+        search->setText(QStringLiteral("认知与自主行为"));
         // 执行端约束：联系每日上限、关注默认间隔与保留天数都要在设置页可编辑。
         struct NumericField {
             QString path;
@@ -191,6 +193,250 @@ private slots:
         // 每天三个上限分别显示，且沿用现有配置值。
         QCOMPARE(root->findChild<QSpinBox *>("proactive.daily_limit")->value(), 288);
         QCOMPARE(root->findChild<QSpinBox *>("proactive.contact_daily_limit")->value(), 0);
+    }
+
+    void settingsNavigationConsolidatedWithoutDuplicateLimits()
+    {
+        auto &config = ConfigManager::instance();
+        QVERIFY(config.writeConfigDocument(QStringLiteral("identity.json"),
+            R"({"proactive":{"daily_limit":288,"contact_daily_limit":0,"cooldown_seconds":60,"idle_seconds":120},"cognition":{"open_wake":{"max_per_day":12}}})",
+            nullptr));
+        QWidget host;
+        auto *root = buildSettingsPages(new QLabel("History"), [] {}, &host);
+        host.resize(900, 700);
+        host.show();
+        root->show();
+        QCoreApplication::processEvents();
+        auto *navigation = root->findChild<QListWidget *>();
+        QVERIFY(navigation);
+        QStringList titles;
+        for (int i = 0; i < navigation->count(); ++i) titles.append(navigation->item(i)->text());
+        QVERIFY(titles.contains(QStringLiteral("认知与自主行为")));
+        QVERIFY(!titles.contains(QStringLiteral("主动交流")));
+        QVERIFY(titles.contains(QStringLiteral("高级与诊断")));
+        // 三个上限只在认知页各有一个主要编辑入口。
+        QCOMPARE(root->findChildren<QWidget *>(QStringLiteral("proactive.daily_limit")).size(), 1);
+        QCOMPARE(root->findChildren<QWidget *>(QStringLiteral("proactive.contact_daily_limit")).size(), 1);
+        QCOMPARE(root->findChildren<QWidget *>(QStringLiteral("cognition.open_wake.max_per_day")).size(), 1);
+        // 高级诊断字段不再出现在记忆与检索主要入口。
+        auto *search = root->findChild<QLineEdit *>("settingsSearch");
+        auto *stack = root->findChild<QStackedWidget *>();
+        search->setText(QStringLiteral("记忆与检索"));
+        QVERIFY(!stack->currentWidget()->findChild<QWidget *>("memory.retrieval.embedding_provider"));
+        search->setText(QStringLiteral("高级与诊断"));
+        QVERIFY(stack->currentWidget()->findChild<QWidget *>("memory.retrieval.embedding_provider"));
+        QVERIFY(stack->currentWidget()->findChild<QWidget *>("memory.agent_plan_v2"));
+        search->setText(QStringLiteral("日志")); // 日志已移入高级与诊断
+        QVERIFY(stack->currentWidget()->findChild<QWidget *>("logging.directory"));
+    }
+
+    void cognitionPageRejectsInvalidIntervalCombination()
+    {
+        auto &config = ConfigManager::instance();
+        const QByteArray identity =
+            R"({"proactive":{"daily_limit":288,"contact_daily_limit":0},"cognition":{"open_wake":{"min_interval_seconds":300,"default_interval_seconds":1800,"max_interval_seconds":86400}}})";
+        QVERIFY(config.writeConfigDocument("identity.json", identity, nullptr));
+        QWidget host;
+        auto *root = buildSettingsPages(new QLabel("History"), [] {}, &host);
+        auto *search = root->findChild<QLineEdit *>("settingsSearch");
+        search->setText(QStringLiteral("认知与自主行为"));
+        root->findChild<QCheckBox *>("showAdvancedSettings")->setChecked(true);
+        QCoreApplication::processEvents();
+        auto *minimum = root->findChild<QSpinBox *>(
+            "cognition.open_wake.min_interval_seconds");
+        auto *preferred = root->findChild<QSpinBox *>(
+            "cognition.open_wake.default_interval_seconds");
+        auto *apply = root->findChild<QStackedWidget *>()->currentWidget()
+                          ->findChild<QPushButton *>("applySettings");
+        QVERIFY(minimum && preferred && apply);
+        minimum->setValue(7200);
+        preferred->setValue(1800);
+        apply->click();
+        auto *feedback = root->findChild<QStackedWidget *>()->currentWidget()
+                             ->findChild<QLabel *>("settingsFeedback");
+        QVERIFY(feedback);
+        QVERIFY2(feedback->text().contains(QStringLiteral("最小唤醒间隔")),
+                 qPrintable(feedback->text()));
+        QFile file(config.getConfigDirPath() + "/identity.json");
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        const auto saved = QJsonDocument::fromJson(file.readAll()).object();
+        QCOMPARE(saved.value("cognition").toObject().value("open_wake").toObject()
+                     .value("min_interval_seconds").toInt(), 300);
+    }
+
+    void cognitionPageShowsNormalizedEffectiveValues()
+    {
+        auto &config = ConfigManager::instance();
+        QVERIFY(config.writeConfigDocument(QStringLiteral("identity.json"),
+            R"({"cognition":{"open_wake":{"min_interval_seconds":7200,"default_interval_seconds":1800,"max_interval_seconds":3600},"snapshot_budget_bytes":99999}})",
+            nullptr));
+        QWidget host;
+        auto *root = buildSettingsPages(new QLabel("History"), [] {}, &host);
+        auto *search = root->findChild<QLineEdit *>("settingsSearch");
+        search->setText(QStringLiteral("认知与自主行为"));
+        root->findChild<QCheckBox *>("showAdvancedSettings")->setChecked(true);
+        QCoreApplication::processEvents();
+        // ConfigManager 归一后：最小=最大=默认=7200，快照预算夹到 8192。
+        QCOMPARE(root->findChild<QSpinBox *>(
+                     "cognition.open_wake.min_interval_seconds")->value(), 7200);
+        QCOMPARE(root->findChild<QSpinBox *>(
+                     "cognition.open_wake.default_interval_seconds")->value(), 7200);
+        QCOMPARE(root->findChild<QSpinBox *>(
+                     "cognition.open_wake.max_interval_seconds")->value(), 7200);
+        QCOMPARE(root->findChild<QSpinBox *>("cognition.snapshot_budget_bytes")->value(), 8192);
+    }
+
+    void settingsDiffPlanOnlyMarksAffectedModules()
+    {
+        const QJsonObject base{
+            {QStringLiteral("setting"), QJsonObject{
+                 {QStringLiteral("api"), QJsonObject{{QStringLiteral("deepseek_api_key"), QStringLiteral("k")}}},
+                 {QStringLiteral("tts"), QJsonObject{{QStringLiteral("mode"), QStringLiteral("api")}}},
+                 {QStringLiteral("logging"), QJsonObject{{QStringLiteral("directory"), QString()}}},
+                 {QStringLiteral("qq"), QJsonObject{{QStringLiteral("enabled"), true},
+                                                    {QStringLiteral("ws_url"), QStringLiteral("ws://a")},
+                                                    {QStringLiteral("reply"), QJsonObject{{QStringLiteral("private"), QStringLiteral("master")}}}}},
+                 {QStringLiteral("memory"), QJsonObject{{QStringLiteral("retrieval"),
+                     QJsonObject{{QStringLiteral("candidate_limit"), 40},
+                                 {QStringLiteral("embedding_model"), QString()}}}}}}},
+            {QStringLiteral("identity"), QJsonObject{
+                 {QStringLiteral("proactive"), QJsonObject{{QStringLiteral("daily_limit"), 288}}},
+                 {QStringLiteral("appearance"), QJsonObject{{QStringLiteral("follow_external_mood"), true}}},
+                 {QStringLiteral("cognition"), QJsonObject{{QStringLiteral("snapshot_budget_bytes"), 4096}}}}}};
+        const auto unchanged = base;
+        QVERIFY(!MakoSettings::plan(unchanged, base).anyModuleUpdate());
+        auto changed = base;
+        auto identity = base.value(QStringLiteral("identity")).toObject();
+        identity.insert(QStringLiteral("cognition"), QJsonObject{
+            {QStringLiteral("snapshot_budget_bytes"), 4096},
+            {QStringLiteral("context_actual_enabled"), true}});
+        changed.insert(QStringLiteral("identity"), identity);
+        QVERIFY(!MakoSettings::plan(base, changed).anyModuleUpdate());
+        changed = base;
+        auto setting = changed.value(QStringLiteral("setting")).toObject();
+        setting.insert(QStringLiteral("api"), QJsonObject{{QStringLiteral("deepseek_api_key"), QStringLiteral("new")}});
+        changed.insert(QStringLiteral("setting"), setting);
+        auto plan = MakoSettings::plan(base, changed);
+        QVERIFY(plan.deepseekKey && !plan.ttsReload && !plan.indexReconfigure && !plan.qqConfig);
+        changed = base;
+        setting = changed.value(QStringLiteral("setting")).toObject();
+        setting.insert(QStringLiteral("tts"), QJsonObject{{QStringLiteral("mode"), QStringLiteral("mock")}});
+        changed.insert(QStringLiteral("setting"), setting);
+        plan = MakoSettings::plan(base, changed);
+        QVERIFY(plan.ttsReload && !plan.deepseekKey && !plan.indexReconfigure);
+        changed = base;
+        setting = changed.value(QStringLiteral("setting")).toObject();
+        setting.insert(QStringLiteral("logging"), QJsonObject{{QStringLiteral("directory"), QStringLiteral("logs2")}});
+        changed.insert(QStringLiteral("setting"), setting);
+        plan = MakoSettings::plan(base, changed);
+        QVERIFY(plan.logging && !plan.deepseekKey && !plan.permissions);
+        // 普通检索参数不打断索引；向量模型变化才 reconfigure。
+        changed = base;
+        setting = changed.value(QStringLiteral("setting")).toObject();
+        auto memory = setting.value(QStringLiteral("memory")).toObject();
+        memory.insert(QStringLiteral("retrieval"), QJsonObject{
+            {QStringLiteral("candidate_limit"), 55},
+            {QStringLiteral("embedding_model"), QString()}});
+        setting.insert(QStringLiteral("memory"), memory);
+        changed.insert(QStringLiteral("setting"), setting);
+        plan = MakoSettings::plan(base, changed);
+        QVERIFY(!plan.indexReconfigure);
+        changed = base;
+        setting = changed.value(QStringLiteral("setting")).toObject();
+        memory = setting.value(QStringLiteral("memory")).toObject();
+        memory.insert(QStringLiteral("retrieval"), QJsonObject{
+            {QStringLiteral("candidate_limit"), 40},
+            {QStringLiteral("embedding_model"), QStringLiteral("text-embedding-v4")}});
+        setting.insert(QStringLiteral("memory"), memory);
+        changed.insert(QStringLiteral("setting"), setting);
+        plan = MakoSettings::plan(base, changed);
+        QVERIFY(plan.indexReconfigure);
+        // QQ 普通回应权限变化只更新配置，不重连。
+        changed = base;
+        setting = changed.value(QStringLiteral("setting")).toObject();
+        auto qq = setting.value(QStringLiteral("qq")).toObject();
+        qq.insert(QStringLiteral("reply"), QJsonObject{{QStringLiteral("private"), QStringLiteral("all")}});
+        setting.insert(QStringLiteral("qq"), qq);
+        changed.insert(QStringLiteral("setting"), setting);
+        plan = MakoSettings::plan(base, changed);
+        QVERIFY(plan.qqConfig && !plan.qqReconnect);
+        // 连接地址变化才重连。
+        setting = changed.value(QStringLiteral("setting")).toObject();
+        qq = setting.value(QStringLiteral("qq")).toObject();
+        qq.insert(QStringLiteral("ws_url"), QStringLiteral("ws://b"));
+        setting.insert(QStringLiteral("qq"), qq);
+        changed.insert(QStringLiteral("setting"), setting);
+        plan = MakoSettings::plan(base, changed);
+        QVERIFY(plan.qqConfig && plan.qqReconnect);
+        // 外观只影响情绪跟随；权限变化才走撤回。
+        changed = base;
+        changed["identity"] = QJsonObject{{QStringLiteral("proactive"),
+            QJsonObject{{QStringLiteral("daily_limit"), 288}}},
+            {QStringLiteral("appearance"), QJsonObject{{QStringLiteral("follow_external_mood"), false}}},
+            {QStringLiteral("cognition"), QJsonObject{{QStringLiteral("snapshot_budget_bytes"), 4096}}}};
+        plan = MakoSettings::plan(base, changed);
+        QVERIFY(plan.followExternalMood && !plan.permissions);
+        changed = base;
+        changed["identity"] = QJsonObject{{QStringLiteral("proactive"),
+            QJsonObject{{QStringLiteral("daily_limit"), 288},
+                        {QStringLiteral("contact_daily_limit"), 0}}},
+            {QStringLiteral("appearance"), QJsonObject{{QStringLiteral("follow_external_mood"), true}}},
+            {QStringLiteral("cognition"), QJsonObject{{QStringLiteral("snapshot_budget_bytes"), 4096}}}};
+        plan = MakoSettings::plan(base, changed);
+        QVERIFY(!plan.permissions); // 未涉及权限字段
+    }
+
+    void legacyPlannerFieldsShowModeValidity()
+    {
+        auto &config = ConfigManager::instance();
+        QVERIFY(config.writeConfigDocument(QStringLiteral("setting.json"),
+            R"({"memory":{"agent_enabled":true,"agent_mode":"tool","agent_plan_v2":true,"agent_trigger":"memory_question"}})",
+            nullptr));
+        QWidget host;
+        auto *root = buildSettingsPages(new QLabel("History"), [] {}, &host);
+        auto *search = root->findChild<QLineEdit *>("settingsSearch");
+        search->setText(QStringLiteral("memory.agent_mode"));
+        auto *status = root->findChild<QLabel *>("memory.agent_mode.status");
+        QVERIFY(status);
+        QVERIFY2(status->text().contains(QStringLiteral("模型工具")), qPrintable(status->text()));
+        auto *mode = root->findChild<QComboBox *>("memory.agent_mode");
+        QVERIFY(mode);
+        mode->setCurrentIndex(mode->findData(QStringLiteral("legacy")));
+        auto *stack = root->findChild<QStackedWidget *>();
+        auto *apply = stack->currentWidget()->findChild<QPushButton *>("applySettings");
+        QVERIFY(apply);
+        apply->click();
+        QCOMPARE(config.getMemoryPolicyConfig().agent.mode,
+                 QStringLiteral("legacy"));
+        auto *root2 = buildSettingsPages(new QLabel("History"), [] {}, &host);
+        root2->findChild<QLineEdit *>("settingsSearch")->setText(QStringLiteral("memory.agent_mode"));
+        auto *status2 = root2->findChild<QLabel *>("memory.agent_mode.status");
+        QVERIFY(status2 && status2->text().contains(QStringLiteral("独立规划")));
+    }
+
+    void noChangeSaveDoesNotApplyOrRewrite()
+    {
+        auto &config = ConfigManager::instance();
+        QVERIFY(config.writeConfigDocument(QStringLiteral("setting.json"),
+            R"({"memory":{"short_term_length":15}})", nullptr));
+        QFile before(config.getConfigFilePath());
+        QVERIFY(before.open(QIODevice::ReadOnly));
+        const auto beforeBytes = before.readAll();
+        before.close();
+        int applied = 0;
+        QWidget host;
+        auto *root = buildSettingsPages(new QLabel("History"), [&] { ++applied; }, &host);
+        auto *search = root->findChild<QLineEdit *>("settingsSearch");
+        search->setText(QStringLiteral("记忆与检索"));
+        auto *stack = root->findChild<QStackedWidget *>();
+        auto *apply = stack->currentWidget()->findChild<QPushButton *>("applySettings");
+        QVERIFY(apply);
+        apply->click();
+        QCOMPARE(applied, 0);
+        QFile after(config.getConfigFilePath());
+        QVERIFY(after.open(QIODevice::ReadOnly));
+        QCOMPARE(after.readAll(), beforeBytes);
+        after.close();
     }
 
     void cognitionPageLoadsSavesAndPreservesUnknownFields()

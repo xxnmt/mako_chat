@@ -298,8 +298,8 @@ private:
     bool m_cognitiveShadowEnabled = false;
     bool m_cognitiveShadowEnvChecked = false;
     QJsonArray m_cognitiveShadowReports; // 最近 N 次 shadow/actual 报告（生产默认关闭）
-    bool m_cognitiveContextActualEnabled = false;
-    bool m_cognitiveContextActualEnvChecked = false;
+    bool m_cognitiveContextActualOverrideSet = false;
+    bool m_cognitiveContextActualOverride = false;
     int m_modelRequestCount = 0;
     void patchLastActualPromptTokens(const QJsonObject &usage);
     QJsonArray m_pendingMessages; // legacy：等待 MemoryAgent 的主请求

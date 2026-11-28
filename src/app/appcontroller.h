@@ -4,6 +4,7 @@
 #include <QObject>
 #include <QQueue>
 #include <QMap>
+#include <QJsonObject>
 #include "sentencedata.h"
 #include "utterance.h"
 
@@ -51,6 +52,10 @@ private:
     class MemoryIndexWorker *m_memoryIndex = nullptr;
     void initConnections();
     void applyTimeSettings();   // 把 ConfigManager 的时间/退火配置应用到 TimeManager
+    // B5：设置保存按有效配置差异只更新真正受影响的模块；未变化不触发任何运行更新。
+    QJsonObject m_appliedConfig;
+    QJsonObject configSnapshot() const;
+    void applyConfigDiff(const QJsonObject &before, const QJsonObject &after);
     void applyPetTags(const QMap<QString, QString> &tags); // 桌宠：立绘 + 全局情绪同步
 
     CognitiveCoordinator *m_coordinator;

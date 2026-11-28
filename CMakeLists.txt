@@ -52,6 +52,7 @@ qt_add_executable(Windows_AI
     src/cognition/promptassembler.h src/cognition/promptassembler.cpp
     src/benchmark/benchmarkrunner.h src/benchmark/benchmarkrunner.cpp src/benchmark/benchmarksnapshot.h src/benchmark/benchmarksnapshot.cpp
     src/app/appcontroller.h src/app/appcontroller.cpp
+    src/app/settingsapplyplan.h
     src/app/actionoutboxdispatcher.h src/app/actionoutboxdispatcher.cpp
     src/app/privatereview.cpp src/app/privatereview.h
     src/app/cognitivecoordinator.h src/app/cognitivecoordinator.cpp

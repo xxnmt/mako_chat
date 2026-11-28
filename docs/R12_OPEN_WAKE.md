@@ -255,3 +255,22 @@ R12 最后一次集中功能收尾；不新增认知能力、不改生产配置/
   `tst_memorymanager 157 passed/1 skipped`。生产配置/库未改，未启动应用。
 - 候选二进制与 B5 操作说明见 [B5_ACCEPTANCE_PREP.md](B5_ACCEPTANCE_PREP.md)。
 
+## B5 最终：设置系统整理与完整配置热更新（2026-11-28）
+
+- **配置盘点**：新增 [B5_SETTINGS_MATRIX.md](B5_SETTINGS_MATRIX.md)，覆盖 setting/identity/prompt
+  的路径、界面入口、默认/范围、读取者、生效时机与热更新类别。
+- **差异更新**：`settingsapplyplan.h` 纯函数 + AppController 保存前后有效配置比较；
+  无修改保存不触发任何模块更新、不重写文件；认知参数不重启 QQ/TTS/索引，外观只更新情绪，
+  日志只重配日志，普通检索参数不打断索引。
+- **索引/TTS/QQ**：索引相同配置早退、运行批次用旧配置完成后切换；TTS 沿用安全切换；
+  QQ 仅连接参数变化重连，unknown 不重发。
+- **actual 热更新**：取消配置缓存，每次独立运行读取当前有效配置；优先级
+  setter > 环境变量（含 0/false/off）> identity；同一轮工具/consult 不混用；无需重启。
+- **设置界面**：主动交流合并入认知页；三个上限单入口；向量/Legacy/日志移入高级与诊断；
+  Legacy 按当前模式显示有效性；未实现 schedule 隐藏保留；非法区间保存前拒绝；
+  保存后回读有效值；actual 状态显示配置/环境覆盖。
+- **验证**：全量 `ctest 24/24`（102.88s）；`tst_settingspages 11 passed`；
+  `tst_memoryagent 127 passed/6 skipped`。生产库/配置未改，未启动应用。
+- 候选：`build/stage-b/Windows_AI.exe` SHA-256
+  `6E2C52729522FC38E62A9B265B3145E769A1CB3B3005905A0B011085644A2998`。
+

@@ -659,3 +659,36 @@ R12 最后一次集中功能收尾。修复预算裁剪与 dedup 的语义冲突
   候选二进制 `build/stage-b/Windows_AI.exe` SHA-256
   `49D23A58135C96FA72644CB5D0E777B15C28655C39824C41E72E8E4ED55F2D50`。
 - **未做**：不启动 B5 自然运行、不永久启用 actual、不改生产配置/库、不进入 R13。
+
+---
+
+## 2026-11-28 · B5 最终：设置系统整理与完整配置热更新
+
+基于 `edcbb55`。只改配置读取/保存、设置界面与保存差异更新；不改认知算法、调度架构、
+行动核验或数据库。
+
+- **配置盘点**：新增 `docs/B5_SETTINGS_MATRIX.md`，按 setting/identity/prompt 建立
+  配置路径→界面→默认/范围→读取者→生效时机→缓存/副作用→类别（热更新/安全边界/重载/
+  兼容未实现）映射。
+- **差异更新**：新增 `src/app/settingsapplyplan.h`（纯函数），AppController 保存时比较
+  有效配置快照，只更新受影响模块；无修改保存不调用任何模块、不重写文件。认知参数不重启
+  QQ/TTS/索引；外观只更新情绪跟随；日志只重配日志；普通检索参数不打断索引。
+- **索引/TTS/QQ**：`MemoryIndexWorker::reconfigure` 相同配置早退，运行中批次用旧配置完成；
+  TTS 沿用 `reloadProvider` 相等性与权重安全切换；QQ 连接参数变化才重连，普通权限只更新配置。
+- **actual 热更新**：取消配置永久缓存；每次独立运行读取当前有效配置；优先级
+  `setter > 显式环境变量（含 0/false/off）> identity.json`；同一轮主请求/工具轮/consult
+  仍使用同一模式（模式在 prepareReply 入口捕获一次，投影只构建一次）；无需重启。
+- **设置界面**：原「主动交流」合并入「认知与自主行为」；三个每日上限单入口并注明语义
+  （0=不限等）；向量/重排/Legacy Planner/日志移入「高级与诊断」，Legacy 字段按当前模式
+  显示是否参与；`proactive.schedule` 隐藏保留；保留权限/日志/身份/外观等原有页面。
+- **校验/状态**：保存前校验 `min ≤ default ≤ max`、退避数组长度/范围、快照预算等，
+  非法组合给具体原因且不写入；保存后回读有效值（identity 按 ConfigManager 归一）；
+  feedback 区分“已保存并应用”与“下一轮认知生效”；actual 状态显示配置值/环境变量覆盖。
+- **测试**：`tst_settingspages 11 passed`（导航合并/单入口/高级搬迁/非法区间拒绝/有效值归一/
+  无修改不写入/未展示字段/actual 状态/Legacy 模式有效性）；`tst_memoryagent 127 passed/6 skipped`
+  （actual 配置热读取、环境变量/setter 优先级）；全量 **ctest 24/24**（102.23s）。
+- **候选**：`build/stage-b/Windows_AI.exe`，113,178,793 B，SHA-256
+  `6E2C52729522FC38E62A9B265B3145E769A1CB3B3005905A0B011085644A2998`。
+- **生产**：库/配置哈希未变，未启动应用、未发真实消息；actual 默认关闭。
+- **未做/边界**：不新增 schema、不重建检索系统、不做 QFileSystemWatcher 自动监听、
+  不新增独立权限规则；本轮后停止扩展设置系统，进入 B5 部署与使用。

@@ -1,4 +1,5 @@
 #include "appcontroller.h"
+#include "settingsapplyplan.h"
 #include "memoryindexworker.h"
 #include "cognitivecoordinator.h"
 #include "runtimelog.h"
@@ -32,6 +33,8 @@
 #include <QDebug>
 #include <QTimer>
 #include <QHash>
+#include <QFile>
+#include <QDir>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -105,6 +108,49 @@ void reconcileActionPermissions(MemoryManager &memory)
 }
 
 } // namespace
+
+QJsonObject AppController::configSnapshot() const
+{
+    QJsonObject snapshot;
+    const auto &config = ConfigManager::instance();
+    snapshot.insert(QStringLiteral("setting"), config.effectiveSettings());
+    QJsonObject identity;
+    QFile file(QDir(config.getConfigDirPath()).filePath(QStringLiteral("identity.json")));
+    if (file.open(QIODevice::ReadOnly))
+        identity = QJsonDocument::fromJson(file.readAll()).object();
+    snapshot.insert(QStringLiteral("identity"), identity);
+    return snapshot;
+}
+
+void AppController::applyConfigDiff(const QJsonObject &before, const QJsonObject &after)
+{
+    const MakoSettings::ApplyPlan plan = MakoSettings::plan(before, after);
+    auto &config = ConfigManager::instance();
+
+    if (plan.logging) {
+        QString logError;
+        if (!RuntimeLog::configure(config.logDirectory(), config.separateLogRuns(), &logError))
+            qWarning().noquote() << "[RuntimeLog] could not switch directory:" << logError;
+    }
+    if (plan.deepseekKey) m_llmService->setApiKey(config.getApiKey());
+    if (plan.followExternalMood)
+        m_globalMood->setFollowExternalMood(config.getFollowExternalMood());
+    if (plan.masterAccounts)
+        m_memoryManager->updateMasterAccounts(config.getMasterQQAccounts());
+    if (plan.qqConfig) {
+        m_qqClient->setConfig(config.getQQConfig());
+        if (plan.qqReconnect) m_qqClient->start();
+    }
+    if (plan.membership) m_membershipService->start();
+    if (plan.indexReconfigure && m_memoryIndex)
+        m_memoryIndex->reconfigure(config.getMemoryPolicyConfig().retrieval);
+    if (plan.ttsReload) m_ttsService->reloadProvider();
+    if (plan.timeSettings) {
+        applyTimeSettings();
+        m_timeManager->start();
+    }
+    if (plan.permissions) reconcileActionPermissions(*m_memoryManager);
+}
 
 AppController::AppController(QObject *parent)
     : QObject{parent}
@@ -530,6 +576,7 @@ AppController::~AppController()
 void AppController::startApp()
 {
     reconcileActionPermissions(*m_memoryManager);
+    m_appliedConfig = configSnapshot();
     // 切片 B：启动恢复先于轮询，且这里是唯一的启动恢复点。上一进程留在 dispatching 的
     // 主动外发无法确认是否已送达，按 at-most-once 冻结为 unknown（绝不自动重发）；
     // 随后启动 outbox 唯一发送循环（dispatcher.start 不再隐式恢复，避免覆盖 600s 阈值）。
@@ -796,22 +843,11 @@ void AppController::initConnections()
     //     m_llmService->setApiKey(ConfigManager::instance().getApiKey());});
     connect(m_character, &CharacterWidget::settingsRequested, m_settingsWidget, &SettingsWidget::show);
     connect(m_settingsWidget, &SettingsWidget::settingsSaved, this, [this](){
-        auto &config = ConfigManager::instance();
-        reconcileActionPermissions(*m_memoryManager);
-        QString logError;
-        if (!RuntimeLog::configure(config.logDirectory(),config.separateLogRuns(),&logError))
-            qWarning().noquote() << "[RuntimeLog] could not switch directory:" << logError;
-        m_llmService->setApiKey(config.getApiKey());
-        m_globalMood->setFollowExternalMood(config.getFollowExternalMood());
-        m_memoryManager->updateMasterAccounts(config.getMasterQQAccounts());
-        m_qqClient->setConfig(config.getQQConfig());
-        m_qqClient->start();
-        m_membershipService->start();
-        m_memoryIndex->reconfigure(config.getMemoryPolicyConfig().retrieval);
-        m_ttsService->reloadProvider();
-        // TD-037：时间/退火配置热生效（start() 会立即重估昼夜状态）
-        applyTimeSettings();
-        m_timeManager->start();
+        // B5：只按有效配置差异更新受影响模块；无修改/无关保存不触发运行副作用。
+        const QJsonObject before = m_appliedConfig;
+        const QJsonObject after = configSnapshot();
+        applyConfigDiff(before, after);
+        m_appliedConfig = after;
     });
 
     connect(m_llmService,&LLMService::sentencesReady,this,&AppController::handleMakoReply);
