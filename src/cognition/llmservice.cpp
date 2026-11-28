@@ -1849,6 +1849,10 @@ void LLMService::requestPrivateReview(qlonglong id, int version, const QJsonObje
     }
     auto &cfg=ConfigManager::instance();
     const auto policy=cfg.getMemoryPolicyConfig();
+    if (!cfg.getProactiveConfig().privateWriting || !policy.longTermMemoryEnabled) {
+        emit privateReviewFinished(id,version,errorProposal(),QStringLiteral("writing_disabled"));
+        return;
+    }
     RetrievalRequest request;
     request.query=thread["owner_statement"].toString();
     request.terms=RecentContextPlanner::extractTerms(request.query.left(100));

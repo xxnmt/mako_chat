@@ -2085,6 +2085,8 @@ private slots:
                     : QStringLiteral(R"({"sentences":[{"zh_text":"好呀","ja_text":"いいよ","tags":{"emotion":"happy"}}]})");
         });
         LLMService service("test",nullptr,QUrl(QString("http://127.0.0.1:%1/").arg(server.serverPort())));
+        // This scenario checks the legacy projection wording independently of Actual.
+        service.setCognitiveContextActualEnabled(false);
         service.setMemoryManager(&db);
         service.processObservation();
         QTRY_COMPARE_WITH_TIMEOUT(db.matterHeads(meta.subject).size(),1,5000);
@@ -2170,6 +2172,8 @@ private slots:
         });
         LLMService service("test", nullptr,
             QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.serverPort())));
+        // This scenario checks the legacy projection wording independently of Actual.
+        service.setCognitiveContextActualEnabled(false);
         service.setMemoryManager(&db);
         RequestMeta meta = seed;
         meta.runId = meta.eventId = QStringLiteral("final");
@@ -4668,7 +4672,7 @@ private slots:
     // V01：verifier 请求输出预算提高到 1024（真实 provider 默认 thinking 下 reasoning 也占
     // 输出预算；256 时生产日志 9 次核验 8 次 truncated），且绝不发送 thinking:{disabled}
     // （真实 provider 会连接重置）。每个动作仍只有 1 次 verifier 请求。
-    void verifierOutputBudgetIs1024WithoutThinkingParam()
+    void verifierOutputBudgetIs2048WithoutThinkingParam()
     {
         SemanticReviewConfigGuard config;
         QVERIFY(config.enable());
@@ -4728,7 +4732,7 @@ private slots:
         const QJsonObject requestBody = QJsonDocument::fromJson(bodies.first()).object();
         QCOMPARE(requestBody.value(QStringLiteral("max_tokens")).toInt(),
                  LLMService::kVerifierMaxTokens);
-        QCOMPARE(requestBody.value(QStringLiteral("max_tokens")).toInt(), 1024);
+        QCOMPARE(requestBody.value(QStringLiteral("max_tokens")).toInt(), 2048);
         QCOMPARE(requestBody.value(QStringLiteral("model")).toString(),
                  QStringLiteral("deepseek-v4-flash"));
         QCOMPARE(requestBody.value(QStringLiteral("response_format")).toObject()
@@ -4802,7 +4806,7 @@ private slots:
                     QVERIFY(line.message.contains(QStringLiteral("reasoning_tokens=124")));
                     QVERIFY(line.message.contains(QStringLiteral("input_chars=")));
                     QVERIFY(line.message.contains(QStringLiteral("output_chars=")));
-                    QVERIFY(line.message.contains(QStringLiteral("max_tokens=1024")));
+                    QVERIFY(line.message.contains(QStringLiteral("max_tokens=2048")));
                     QVERIFY(line.message.contains(QStringLiteral("latency_ms=")));
                     QVERIFY(line.message.contains(QStringLiteral("provider=deepseek")));
                     QVERIFY(line.message.contains(QStringLiteral("model=deepseek-v4-flash")));
@@ -5833,7 +5837,7 @@ private slots:
     void persistentFailureWired()
     {
         OpenWakeConfigGuard config;
-        QVERIFY(config.write(openWakeTestJson(false, 12, 3)));
+        QVERIFY(config.write(openWakeTestJson(false, 12, 3), {{"private_writing", true}}));
         {
             QTemporaryDir dir;
             MemoryManager db(dir.filePath("failure-reflection.db"));

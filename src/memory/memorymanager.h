@@ -161,7 +161,12 @@ public:
 
     QJsonObject claimPrivateReflection(int dailyLimit, int cooldownSeconds,
                                        QString *reason = nullptr, QDateTime *nextEligibleAt = nullptr);
-    bool finishPrivateReflection(qlonglong turn, int version, const QString &choice, const QString &note,
+    struct ReflectionCommitResult {
+        QString failure;
+        QString contactRejection;
+        operator bool() const { return failure.isEmpty(); }
+    };
+    ReflectionCommitResult finishPrivateReflection(qlonglong turn, int version, const QString &choice, const QString &note,
                                  const QJsonObject &contact = {}, const QJsonArray &consulted = {},
                                  const QJsonObject &prior = {}, const QString &priorAction = {},
                                  const QJsonObject &concern = {});

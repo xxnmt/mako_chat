@@ -1072,14 +1072,21 @@ bool MemoryManager::finishConcernReview(qlonglong turn,int version,const QJsonOb
         contactMessage=contact["message"].toString().trimmed();
         // 切片 C：contact 带 claims 数组或 motivation 对象即走新契约；否则保持 v29 依据路径。
         contactNewContract=contactUsesNewContract(contact);
-        if (contactTiming!=QStringLiteral("private") && contactTiming!=QStringLiteral("next_chat")
-            && contactTiming!=QStringLiteral("now")) return false;
-        if (contactReason.isEmpty() || contactReason.size()>240
-            || !policy.allows(channel,session,contactReason)) return false;
-        if (contactTiming==QStringLiteral("now") && !contactNewContract
-            && (contactMessage.isEmpty() || contactMessage.size()>300
-                || !policy.allows(channel,session,contactMessage))) return false;
-        if (contactNewContract) {
+        const bool contactValid = (contactTiming=="private" || contactTiming=="next_chat" || contactTiming=="now")
+            && !contactReason.isEmpty() && contactReason.size()<=240
+            && policy.allows(channel,session,contactReason)
+            && (contactTiming!="now" || (!contactMessage.isEmpty() && contactMessage.size()<=300
+                                        && policy.allows(channel,session,contactMessage)));
+        if (!contactValid) {
+            qInfo()<<"[Concern] invalid_contact turn="<<turn<<"version="<<version;
+            sql=QStringLiteral("UPDATE private_reflection SET state='consider',claimed_by=NULL,"
+                               "next_check_at=0,updated_at=unixepoch() "
+                               "WHERE turn_id=? AND version=? AND state='pending'");
+            bindings<<turn<<version;
+            contactBasisRejected=true;
+            contactNewContract=false;
+            revisionAction=QStringLiteral("contact_rejected");
+        } else if (contactNewContract) {
             // 确定性复核（动机合法性 + claims refs/authority/时序 + quiet/冷却/目标）。
             // 语义核验已由 LLMService 完成并写进 contact.semantic_status；这里不再调用模型。
             newCheck=checkNewContractContact(this,channel,session,turn,contact,contactTiming);
@@ -1289,25 +1296,34 @@ bool MemoryManager::consultPrivateReflection(qint64 turn,int version,const QStri
     return true;
 }
 
-bool MemoryManager::finishPrivateReflection(qlonglong turn, int version, const QString &choice, const QString &note,
+MemoryManager::ReflectionCommitResult MemoryManager::finishPrivateReflection(qlonglong turn, int version, const QString &choice, const QString &note,
                                             const QJsonObject &contact,const QJsonArray &consulted,
                                             const QJsonObject &prior,const QString &priorAction,
                                             const QJsonObject &concern)
 {
-    if (choice != "rest" && choice != "consider") return false;
-    if (choice == "consider" && (note.trimmed().isEmpty() || note.size()>240)) return false;
-    if (!m_db.transaction()) return false;
+    const auto fail = [](const char *code) {
+        return ReflectionCommitResult{QString::fromLatin1(code), {}};
+    };
+    QString contactRejection;
+    if (choice != "rest" && choice != "consider") return fail("invalid_internal_structure");
+    if (choice == "consider" && (note.trimmed().isEmpty() || note.size()>240)) return fail("invalid_internal_structure");
+    if (!m_db.transaction()) return fail("db_error");
     auto rollback = qScopeGuard([this]{ m_db.rollback(); });
     QSqlQuery q(m_db);
-    q.prepare("SELECT h.channel,h.session_id,s.input" + sourceRows + "WHERE " + eligible + " AND h.id=?");
+    q.prepare("SELECT h.channel,h.session_id,s.input,r.version,r.state" + sourceRows +
+              "JOIN private_reflection r ON r.turn_id=h.id WHERE " + eligible + " AND h.id=?");
     q.addBindValue(turn);
-    if (!q.exec() || !q.next()) return false;
+    if (!q.exec()) return fail("db_error");
+    if (!q.next()) return fail("source_unavailable");
+    if (q.value(3).toInt()!=version || q.value(4).toString()!="pending")
+        return fail("version_conflict");
     const MemoryReadPolicy policy;
     const auto channel = q.value(0).toString(), session = q.value(1).toString();
-    if (!policy.allows(channel,session,q.value(2).toString()) || !policy.allows(channel,session,note)) return false;
+    if (!policy.allows(channel,session,q.value(2).toString())) return fail("permission_denied");
+    if (!policy.allows(channel,session,note)) return fail("internal_note_filtered");
     q.finish();
     if (!priorAction.isEmpty() && (prior.isEmpty() ||
-        (priorAction!="resolve" && !(priorAction=="revise" && choice=="consider")))) return false;
+        (priorAction!="resolve" && !(priorAction=="revise" && choice=="consider")))) return fail("invalid_internal_structure");
     if (!prior.isEmpty()) {
         const auto previous=prior["source_turn"].toInteger();
         const auto current=concernByHead(previous);
@@ -1318,39 +1334,41 @@ bool MemoryManager::finishPrivateReflection(qlonglong turn, int version, const Q
             || priorRef==QStringLiteral("reflection/%1").arg(previous);
         if (previous<=0 || previous==turn || current.isEmpty()
             || !sameRef
-            || current["version"].toInteger()!=prior["version"].toInteger()
-            || !basisVisible(m_db,previous,policy,channel,session)
-            || !visibleSession(current["source_channel"].toString(),current["source_session"].toString(),
-                               channel,session)) return false;
+            || current["version"].toInteger()!=prior["version"].toInteger()) return fail("prior_conflict");
+        if (!visibleSession(current["source_channel"].toString(),current["source_session"].toString(),
+                            channel,session)) return fail("prior_permission_changed");
+        if (!basisVisible(m_db,previous,policy,channel,session)) return fail("prior_evidence_unavailable");
         // The new note may rely on any evidence that supported the previous note.
         q.prepare("INSERT OR IGNORE INTO reflection_basis(turn,source) SELECT ?,source FROM reflection_basis WHERE turn=?");
         q.addBindValue(turn);
         q.addBindValue(previous);
-        if (!q.exec()) return false;
+        if (!q.exec()) return fail("db_error");
         q.prepare("INSERT OR IGNORE INTO reflection_basis(turn,source) VALUES(?,?)");
         q.addBindValue(turn);
         q.addBindValue(previous);
-        if (!q.exec()) return false;
+        if (!q.exec()) return fail("db_error");
         if (!priorAction.isEmpty()) {
             q.prepare("INSERT INTO reflection_change(turn,prior_turn,action) VALUES(?,?,?)");
             q.addBindValue(turn);
             q.addBindValue(previous);
             q.addBindValue(priorAction);
-            if (!q.exec()) return false;
+            if (!q.exec()) return fail("db_error");
         }
     }
     for (const auto &value : consulted) {
         const auto row=value.toObject();
         q.prepare("SELECT user_input,channel,session_id FROM chat_history WHERE id=? AND subject='user' AND sensitive=0");
         q.addBindValue(row["turn"].toInteger());
-        if (!q.exec() || !q.next()) return false;
+        if (!q.exec()) return fail("db_error");
+        if (!q.next()) return fail("evidence_unavailable");
         const auto text=q.value(0).toString();
         if (row["turn"].toInteger()==turn || !visibleSession(q.value(1).toString(),q.value(2).toString(),channel,session) ||
-            text.left(512)!=row["text"].toString() || !policy.allows(q.value(1).toString(),q.value(2).toString(),text)) return false;
+            text.left(512)!=row["text"].toString()) return fail("evidence_changed");
+        if (!policy.allows(q.value(1).toString(),q.value(2).toString(),text)) return fail("evidence_permission_changed");
         q.finish();
         q.prepare("INSERT OR IGNORE INTO reflection_basis(turn,source) VALUES(?,?)");
         q.addBindValue(turn); q.addBindValue(row["turn"].toInteger());
-        if (!q.exec()) return false;
+        if (!q.exec()) return fail("db_error");
     }
     if (choice=="consider") {
         // 回顾模型可以顺带给出关注的结构化描述（topic/watch/matter/下一次检查时间）。
@@ -1360,7 +1378,7 @@ bool MemoryManager::finishPrivateReflection(qlonglong turn, int version, const Q
         const auto matter=concern["matter"].toString().trimmed();
         if ((!topic.isEmpty() && !policy.allows(channel,session,topic))
             || (!watch.isEmpty() && !policy.allows(channel,session,watch))
-            || (!matter.isEmpty() && !policy.allows(channel,session,matter))) return false;
+            || (!matter.isEmpty() && !policy.allows(channel,session,matter))) return fail("internal_concern_filtered");
         // 模型没给 next_check_after_minutes 时用配置的默认间隔；显式 0 仍表示只在新证据时。
         const int concernDefaultMinutes =
             ConfigManager::instance().getProactiveConfig().concernDefaultCheckMinutes;
@@ -1398,37 +1416,29 @@ bool MemoryManager::finishPrivateReflection(qlonglong turn, int version, const Q
         q.addBindValue(turn);
         q.addBindValue(version);
     }
-    if (!q.exec() || q.numRowsAffected()!=1) return false;
+    if (!q.exec()) return fail("db_error");
+    if (q.numRowsAffected()!=1) return fail("cas_conflict");
     if (choice=="consider" && !contact.isEmpty() && ConfigManager::instance().getProactiveConfig().enabled) {
         const auto timing = contact["timing"].toString();
         const auto reason = contact["reason"].toString().trimmed();
         const auto message = contact["message"].toString().trimmed();
-        if (timing!="private" && timing!="next_chat" && timing!="now") return false;
-        if (reason.isEmpty() || reason.size()>240 || !policy.allows(channel,session,reason)) return false;
-        // 切片 C：带 claims/motivation 的 contact 走新契约；否则保持 v29 依据路径。
+        const bool shapeValid = (timing=="private" || timing=="next_chat" || timing=="now")
+            && !reason.isEmpty() && reason.size()<=240 && policy.allows(channel,session,reason)
+            && (timing!="now" || (!message.isEmpty() && message.size()<=300
+                                  && policy.allows(channel,session,message)));
+        if (!shapeValid) contactRejection = QStringLiteral("invalid_contact");
         const bool newContract = contactUsesNewContract(contact);
-        if (!newContract && timing=="now"
-            && (message.isEmpty() || message.size()>300 || !policy.allows(channel,session,message)))
-            return false;
         QString basisType,basisRefs,motivationJson,claimsJson,semanticStatus;
-        bool writeContact=true;
+        bool writeContact=shapeValid;
         bool withheldContact=false;
-        if (newContract) {
+        if (writeContact && newContract) {
             const auto check=checkNewContractContact(this,channel,session,turn,contact,timing);
             motivationJson=check.motivationJson;
             claimsJson=check.claimsJson;
             semanticStatus=check.semanticStatus;
             withheldContact=check.withheld;
-            if (!withheldContact && timing=="now"
-                && (message.isEmpty() || message.size()>300
-                    || !policy.allows(channel,session,message))) return false;
-            if (withheldContact) {
-                qInfo()<<"[Reflection] new_contract_withheld turn="<<turn<<"version="<<version
-                       <<"reason="<<check.reason;
-                if (!message.isEmpty()
-                    && (message.size()>300 || !policy.allows(channel,session,message))) return false;
-            }
-        } else if (timing=="now") {
+            if (withheldContact) contactRejection=check.reason;
+        } else if (writeContact && timing=="now") {
             // "现在联系"必须先通过服务端依据核验；不通过只是不写联系意图，
             // 本次仍按 consider 落库（上面的关注更新已生效），不因依据不足而 defer。
             const auto rejection=validateContactBasis(channel,session,turn,contact);
@@ -1437,6 +1447,7 @@ bool MemoryManager::finishPrivateReflection(qlonglong turn, int version, const Q
                        <<"type="<<contact["basis"].toObject()["type"].toString()
                        <<"reason="<<rejection;
                 writeContact=false;
+                contactRejection=rejection;
             } else {
                 const auto basis=contact["basis"].toObject();
                 basisType=basis["type"].toString();
@@ -1476,12 +1487,12 @@ bool MemoryManager::finishPrivateReflection(qlonglong turn, int version, const Q
                 q.addBindValue(basisType.isEmpty() ? QVariant() : QVariant(basisType));
                 q.addBindValue(basisRefs.isEmpty() ? QVariant() : QVariant(basisRefs));
             }
-            if (!q.exec()) return false;
+            if (!q.exec()) return fail("db_error");
         }
     }
-    if (!m_db.commit()) return false;
+    if (!m_db.commit()) return fail("db_error");
     rollback.dismiss();
-    return true;
+    return {{}, contactRejection};
 }
 
 QString MemoryManager::claimReflectionContact(qlonglong turn, int version, const QString &channel, const QString &session)

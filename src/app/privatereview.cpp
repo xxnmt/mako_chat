@@ -612,7 +612,8 @@ WakeResult PrivateReview::wakeNonOpen(int dailyLimit, int cooldownSeconds)
     if (context.isEmpty()) {
         claimReason.clear();
         nextEligibleAt = QDateTime{};
-        context = store.claimPrivateReflection(dailyLimit, cooldownSeconds, &claimReason, &nextEligibleAt);
+        if (ConfigManager::instance().getProactiveConfig().privateWriting)
+            context = store.claimPrivateReflection(dailyLimit, cooldownSeconds, &claimReason, &nextEligibleAt);
         kind = CognitiveOrigin::Reflection;
         if (context.isEmpty()) {
             const bool reflectionBlocked = !claimReason.isEmpty()
@@ -872,9 +873,16 @@ void PrivateReview::receive(qlonglong id, int version, const QJsonObject &propos
         const auto prior=proposal["_prior"].toObject();
         const auto action=proposal["prior_action"].toString();
         // 新来源回顾可以顺带更新关注的结构化描述（topic/watch/next_check_after_minutes）。
-        if (error.isEmpty() && store.finishPrivateReflection(id,version,choice,proposal["note"].toString(),
-                                                             contact,evidence,prior,action,
-                                                             proposal["concern"].toObject())) {
+        const QString commitError = !error.isEmpty() ? error
+            : !ConfigManager::instance().getProactiveConfig().privateWriting
+                ? QStringLiteral("writing_disabled") : QString();
+        const auto commit = commitError.isEmpty()
+            ? store.finishPrivateReflection(id,version,choice,proposal["note"].toString(),
+                                            contact,evidence,prior,action,proposal["concern"].toObject())
+            : MemoryManager::ReflectionCommitResult{commitError,{}};
+        if (commit) {
+            if (!commit.contactRejection.isEmpty())
+                qInfo() << "[Reflection] contact_rejected" << id << version << commit.contactRejection;
             qInfo() << "[Reflection] committed" << id << version << choice << contact["timing"].toString()
                     << "prior_turn=" << prior["source_turn"].toInteger() << "prior_action=" << action;
             // 只有服务端确实落库了 proposed 的 now 联系才通知投递层；
@@ -886,11 +894,12 @@ void PrivateReview::receive(qlonglong id, int version, const QJsonObject &propos
             logResult(decision, reviewStage(proposal,error,true),
                       proposal["contact"].toObject()["withhold_reason"].toString());
         } else {
-            const QString reason = error.isEmpty() ? QStringLiteral("invalid_or_stale_proposal") : error;
-            // R12-1a：失败退避持久化到 review_failure（跨重启可靠），
-            // 主动让出（yieldAttention）走另一条路径，不经过这里。
-            recordFailure(attempt, reason, reviewStage(proposal,error,false),
-                          errorCountsAsFailure(reason));
+            const QString reason = commit.failure;
+            if (reason != QStringLiteral("version_conflict") && reason != QStringLiteral("cas_conflict")) {
+                const bool retry = reason != QStringLiteral("writing_disabled")
+                    && reason != QStringLiteral("permission_denied");
+                recordFailure(attempt, reason, reviewStage(proposal,error,false), retry);
+            }
             logResult(decision, reviewStage(proposal,error,false), reason);
         }
         return;

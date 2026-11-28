@@ -105,7 +105,7 @@ public:
     // 长证据下 reasoning+输出会超过 256 → finish_reason=length（生产日志 9 次核验中 8 次
     // truncated）。提高到 1024 并保留默认 thinking（不支持 thinking:disabled：该参数会导致
     // 连接重置），每个动作仍最多 1 次请求，不通过削减证据来"解决"截断。
-    static constexpr int kVerifierMaxTokens = 1024;
+    static constexpr int kVerifierMaxTokens = 2048;
     static VerifierInputBudget allocateVerifierInput(const QJsonObject &identity,
                                                      const QJsonObject &core,
                                                      const QJsonArray &requiredClaims,

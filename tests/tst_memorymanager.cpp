@@ -763,6 +763,48 @@ class TestMemoryManager : public QObject
     Q_OBJECT
 
 private slots:
+    void reflectionCommitReportsFailureAndIsolatesContact()
+    {
+        ProactiveIdentityGuard config;
+        QVERIFY(config.enableContact());
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        MemoryManager db(dir.filePath(QStringLiteral("reflection-commit.db")));
+        RequestMeta meta;
+        meta.subject = QStringLiteral("user");
+        meta.eventId = meta.runId = QStringLiteral("reflection-commit-fixture");
+        const auto turn = db.recordInput(QStringLiteral("The coast was quiet."), meta, true);
+        QVERIFY(turn > 0);
+        QVERIFY(db.recordQuiet(turn, QStringLiteral("close")));
+        PrivateReview review(db);
+        QVERIFY(!review.wake(12, 0).started);
+        const auto job = db.claimPrivateReflection(12, 0);
+        QCOMPARE(job.value("id").toInteger(), turn);
+        const int version = job.value("version").toInt();
+        QCOMPARE(db.finishPrivateReflection(turn, version + 1, "rest", {}, {}).failure,
+                 QStringLiteral("version_conflict"));
+        QCOMPARE(db.finishPrivateReflection(turn, version, "consider", {}, {}).failure,
+                 QStringLiteral("invalid_internal_structure"));
+        QCOMPARE(db.finishPrivateReflection(turn, version, "rest", {}, {},
+                     QJsonArray{QJsonObject{{"turn", turn + 100}, {"text", "missing"}}}).failure,
+                 QStringLiteral("evidence_unavailable"));
+        QSqlQuery fault(QSqlDatabase::database(QStringLiteral("memory_db_connection")));
+        QVERIFY(fault.exec("CREATE TRIGGER reject_test_contact BEFORE INSERT ON reflection_contact "
+                           "BEGIN SELECT RAISE(ABORT,'fixture failure'); END"));
+        const auto failed = db.finishPrivateReflection(turn, version, "consider",
+            QStringLiteral("Remember the coast."),
+            QJsonObject{{"timing", "private"}, {"reason", "fixture"}});
+        QCOMPARE(failed.failure, QStringLiteral("db_error"));
+        QVERIFY(!db.hasProposedContact(turn, version));
+        QVERIFY(fault.exec("DROP TRIGGER reject_test_contact"));
+        const auto completed = db.finishPrivateReflection(turn, version, "consider",
+            QStringLiteral("Remember the coast."), QJsonObject{{"timing", "invalid"}});
+        QVERIFY(completed);
+        QCOMPARE(completed.contactRejection, QStringLiteral("invalid_contact"));
+        QVERIFY(!db.hasProposedContact(turn, version));
+        QVERIFY(db.claimPrivateReflection(12, 0).isEmpty());
+    }
+
     void retrievalDistinguishesFailedIndexFromEmptyIndex()
     {
         QTemporaryDir dir;
@@ -1331,7 +1373,8 @@ private slots:
                 {QStringLiteral("review_backoff_seconds"), QJsonArray{120, 300, 900}},
                 {QStringLiteral("max_review_failures"), maxFailures}};
             return guard.writeIdentity(QJsonDocument(
-                QJsonObject{{QStringLiteral("cognition"), cognition}})
+                QJsonObject{{QStringLiteral("cognition"), cognition},
+                            {QStringLiteral("proactive"), QJsonObject{{"private_writing", true}}}})
                 .toJson(QJsonDocument::Compact));
         };
         // 连续失败：前 N-1 次按退避序列，第 N 次 suspended(86400)，之后暂停期内不得重领。
@@ -9033,7 +9076,7 @@ private slots:
         QTemporaryDir dir;
         QVERIFY(dir.isValid());
         ProactiveIdentityGuard identity;
-        QVERIFY(identity.enableContact());
+        QVERIFY(identity.writeIdentity(R"({"proactive":{"enabled":true,"private_writing":true}})"));
         const QString path = dir.filePath(QStringLiteral("a26-runid.db"));
         MemoryManager db(path);
         const qlonglong turn = seedReflectionSource(db, QStringLiteral("a26-r"));
